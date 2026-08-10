@@ -466,6 +466,33 @@ func TestOrderFromCartCheckout(t *testing.T) {
 	require.Equal(t, 4, skuStock(t, env, skuB))
 }
 
+// 券不可用：不存在 404 / 已用 409 / 已过期 409（跨模块错误正确映射 HTTP 状态码）。
+func TestOrderCouponUnusableHTTP(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("couponbad"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+
+	// 不存在的券 → 404。
+	w, _ := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 1, 999999)
+	require.Equal(t, http.StatusNotFound, w.Code)
+
+	// 已核销的券 → 409。
+	couponID := thresholdCoupon(t, env, token, 5000, 5000)
+	w, _ = createOrder(t, env, token, uniqueName("req"), addrID, skuID, 1, couponID)
+	require.Equal(t, http.StatusCreated, w.Code)
+	w, _ = createOrder(t, env, token, uniqueName("req2"), addrID, skuID, 1, couponID)
+	require.Equal(t, http.StatusConflict, w.Code)
+
+	// 已过期的券 → 409（领券后把模板有效期改到过去）。
+	couponID2 := thresholdCoupon(t, env, token, 5000, 5000)
+	require.NoError(t, env.gdb.Exec(
+		"UPDATE coupon_templates SET valid_until = NOW(3) - INTERVAL 1 MINUTE "+
+			"WHERE id = (SELECT template_id FROM user_coupons WHERE id = ?)", couponID2).Error)
+	w, _ = createOrder(t, env, token, uniqueName("req3"), addrID, skuID, 1, couponID2)
+	require.Equal(t, http.StatusConflict, w.Code)
+}
+
 // 满减券：门槛不足 409；满足后金额正确、券核销。
 func TestOrderCouponThresholdAndAmount(t *testing.T) {
 	env := requireEnv(t)

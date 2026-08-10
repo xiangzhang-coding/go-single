@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -147,10 +148,16 @@ func (r *GORMUserCouponRepository) GetViewByID(ctx context.Context, userID, coup
 	return &v, nil
 }
 
-// Use 条件核销：unused→used 单条 UPDATE；RowsAffected=0 即券已被用/不存在。
+// Use 条件核销：unused→used 单条 UPDATE（含模板有效期窗口，原子校验防
+// 结算后券恰好过期仍被核销）；RowsAffected=0 即券已用/过期/不存在。
+// 窗口上界经 Go 传入而非 NOW(3)：DATETIME 按 Go 本地墙钟写入（go-sql-driver
+// 的 loc=Local 行为），与 MySQL 服务器时区解耦，任何时区组合都自洽。
 func (r *GORMUserCouponRepository) Use(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error) {
+	now := time.Now()
 	res := tx.WithContext(ctx).Model(&model.UserCoupon{}).
 		Where("id = ? AND user_id = ? AND status = ?", couponID, userID, model.CouponStatusUnused).
+		Where("EXISTS (SELECT 1 FROM coupon_templates t WHERE t.id = user_coupons.template_id "+
+			"AND t.valid_from <= ? AND t.valid_until >= ?)", now, now).
 		Updates(map[string]any{"status": model.CouponStatusUsed, "used_at": gorm.Expr("NOW(3)")})
 	if res.Error != nil {
 		return false, res.Error

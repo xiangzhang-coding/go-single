@@ -18,6 +18,7 @@ import (
 
 	cartmodel "github.com/xiangzhang-coding/go-single/internal/cart/model"
 	couponmodel "github.com/xiangzhang-coding/go-single/internal/coupon/model"
+	couponsvc "github.com/xiangzhang-coding/go-single/internal/coupon/service"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
@@ -204,9 +205,11 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 	if !acquired {
 		return s.replayIdempotent(ctx, orderNo)
 	}
-	// 任一下单失败：释放幂等键，允许客户端修正后重试。
+	// 校验类失败（库存不足/券不可用等）释放幂等键，允许客户端修正后重试；
+	// 基础设施类失败（DB/Redis 瞬时故障）保留幂等键——若下单实际已提交，
+	// 重试会命中幂等键返回同一订单号，避免同一 client_request_id 生成两单。
 	defer func() {
-		if err != nil {
+		if err != nil && isValidationError(err) {
 			if delErr := s.cache.Del(ctx, idemKey(userID, p.ClientRequestID)); delErr != nil {
 				err = fmt.Errorf("%w: release idempotency key: %v", err, delErr)
 			}
@@ -233,6 +236,16 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 	if p.CouponID > 0 {
 		coupon, err = s.coupons.GetUsable(ctx, userID, p.CouponID)
 		if err != nil {
+			// 跨模块错误翻译为本模块业务错误（handler 据此映射 HTTP 状态码）。
+			if errors.Is(err, couponsvc.ErrCouponNotFound) {
+				return nil, ErrCouponNotFound
+			}
+			if errors.Is(err, couponsvc.ErrCouponUsed) {
+				return nil, ErrCouponUsed
+			}
+			if errors.Is(err, couponsvc.ErrCouponExpired) {
+				return nil, ErrCouponExpired
+			}
 			return nil, err
 		}
 	}
@@ -627,6 +640,21 @@ func validStatus(status string) bool {
 	switch status {
 	case model.OrderStatusPendingPayment, model.OrderStatusPaid, model.OrderStatusShipped,
 		model.OrderStatusCompleted, model.OrderStatusCancelled:
+		return true
+	}
+	return false
+}
+
+// isValidationError 校验类业务错误：客户端修正输入后重试即可；
+// 其余（基础设施/未知）错误保留幂等键，防重复下单。
+func isValidationError(err error) bool {
+	switch {
+	case errors.Is(err, ErrInvalidInput), errors.Is(err, ErrCartEmpty),
+		errors.Is(err, ErrInsufficientStock), errors.Is(err, ErrSKUNotFound),
+		errors.Is(err, ErrSKUUnavailable), errors.Is(err, ErrCouponNotFound),
+		errors.Is(err, ErrCouponUsed), errors.Is(err, ErrCouponExpired),
+		errors.Is(err, ErrCouponThresholdNotMet), errors.Is(err, ErrAddressNotFound),
+		errors.Is(err, ErrAddressForbidden):
 		return true
 	}
 	return false
