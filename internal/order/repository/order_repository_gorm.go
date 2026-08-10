@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
@@ -35,8 +36,18 @@ func (s *GORMOrderStore) WithinTx(ctx context.Context, fn func(tx *gorm.DB) erro
 	return s.db.WithContext(ctx).Transaction(fn)
 }
 
+// Create 创建订单；MySQL 1062（order_no 主键 / (user_id, activity_id) 唯一约束）
+// 映射为 ErrOrderDuplicate（秒杀落单幂等命中），其余错误原样返回。
 func (s *GORMOrderStore) Create(ctx context.Context, tx *gorm.DB, order *model.Order) error {
-	return tx.WithContext(ctx).Create(order).Error
+	err := tx.WithContext(ctx).Create(order).Error
+	if err == nil {
+		return nil
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+		return ErrOrderDuplicate
+	}
+	return err
 }
 
 func (s *GORMOrderStore) GetByNo(ctx context.Context, orderNo string) (*model.Order, error) {

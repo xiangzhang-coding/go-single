@@ -5,11 +5,14 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
@@ -44,6 +47,18 @@ func idemKey(activityID, userID int64) string {
 	return fmt.Sprintf("flashsale:idem:%d:%d", activityID, userID)
 }
 func rlKey(userID int64) string { return fmt.Sprintf("flashsale:rl:%d", userID) }
+
+// SeckillOrderQueue 秒杀异步落单队列：预扣成功后发布"抢购成功"消息，
+// 消费者落单（唯一约束幂等）+ 同事务扣活动库存；失败重投/死信（平台 mq 层）。
+const SeckillOrderQueue = "flashsale.order.create"
+
+// SeckillSuccessMessage 抢购成功消息体：携带预扣时生成的订单号，
+// 前端据此轮询 GET /api/orders/{order_no} 得知异步落单结果。
+type SeckillSuccessMessage struct {
+	OrderNo    string `json:"order_no"`
+	UserID     int64  `json:"user_id"`
+	ActivityID int64  `json:"activity_id"`
+}
 
 // stockKeyMargin 预热库存 TTL 的余量：剩余时长 + 1h，活动结束后自清理。
 const stockKeyMargin = time.Hour
@@ -131,18 +146,24 @@ type Service interface {
 	// UnpublishActivity 下架：清除预热库存，后续抢购被拒。
 	UnpublishActivity(ctx context.Context, id int64) error
 
-	// ---- 抢购（T11）----
+	// ---- 抢购（T11/T12）----
 	// Seckill 抢购全流程：按用户限流（Redis 固定窗口计数）→ 幂等键
-	// （用户+活动，TTL 30min，挡预扣请求重复提交）→ Lua 原子预扣；
+	// （用户+活动，TTL 30min，挡预扣请求重复提交）→ Lua 原子预扣 →
+	// 生成雪花订单号 → 发 MQ"抢购成功"消息（异步落单）。
 	// 预扣被业务拒绝（抢光/限购/窗口外/下架）时释放幂等键允许重试，
-	// 基础设施失败保留幂等键（防瞬时故障下重复预扣）；成功返回 nil（"排队中"）。
-	// 异步落单（发 MQ）见 T12。
-	Seckill(ctx context.Context, userID, activityID int64) error
+	// 基础设施失败保留幂等键（防瞬时故障下重复预扣）；成功返回订单号
+	// （前端据此轮询订单接口），MQ 发布失败同样保留幂等键（对账兜底）。
+	Seckill(ctx context.Context, userID, activityID int64) (orderNo string, err error)
 
 	// ---- 抢购预扣（底层原子操作，T11 抢购接口复用）----
 	// PreDeduct Lua 原子预扣：活动由调用方读库（与优惠券领券同模式，
 	// 状态/窗口/限购作为 ARGV 传入，Redis 内原子扣减）。
 	PreDeduct(ctx context.Context, userID, activityID int64) error
+
+	// ---- 落单库存扣减（T12，order 模块事务内调用）----
+	// DeductStock 事务内条件扣减活动库存（MySQL 落单事实源）；实现 order 侧
+	// ActivityStock 端口，返回是否扣减成功（库存不足返回 (false, nil)）。
+	DeductStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) (bool, error)
 }
 
 // ProductService product 模块暴露的最小查询接口（跨模块进程内调用，面向接口非 HTTP；
@@ -152,20 +173,38 @@ type ProductService interface {
 	GetSKU(ctx context.Context, id int64) (*productmodel.SKU, error)
 }
 
-type flashsaleService struct {
-	store    repository.Store
-	products ProductService
-	cache    cache.Cache
-	perUser  *limiter.RedisCounter
+// MessagePublisher MQ 发布端口（platform/mq 实现）：秒杀预扣成功后
+// 发布"抢购成功"消息驱动异步落单；发布确认确保不丢（失败保留幂等键 + 对账兜底）。
+type MessagePublisher interface {
+	Publish(ctx context.Context, queue string, body []byte) error
 }
 
-// New 构造秒杀服务。userLimiter 为按用户限流配置（Max<=0 不启用）。
-func New(store repository.Store, products ProductService, c cache.Cache, userLimiter limiter.RedisCounterConfig) Service {
+// OrderNoGenerator 秒杀订单号生成器（雪花 ID，与 order 模块共用同一实例）。
+type OrderNoGenerator interface {
+	Next() (int64, error)
+}
+
+type flashsaleService struct {
+	store     repository.Store
+	products  ProductService
+	cache     cache.Cache
+	perUser   *limiter.RedisCounter
+	publisher MessagePublisher
+	nos       OrderNoGenerator
+}
+
+// New 构造秒杀服务。userLimiter 为按用户限流配置（Max<=0 不启用）；
+// publisher 为 MQ 发布端口（预扣成功后发"抢购成功"消息，T12）；
+// nos 为雪花订单号生成器（与 order 模块共用，抢购即生成订单号供前端轮询）。
+func New(store repository.Store, products ProductService, c cache.Cache, userLimiter limiter.RedisCounterConfig,
+	publisher MessagePublisher, nos OrderNoGenerator) Service {
 	return &flashsaleService{
-		store:    store,
-		products: products,
-		cache:    c,
-		perUser:  limiter.NewRedisCounter(c, userLimiter),
+		store:     store,
+		products:  products,
+		cache:     c,
+		perUser:   limiter.NewRedisCounter(c, userLimiter),
+		publisher: publisher,
+		nos:       nos,
 	}
 }
 
@@ -285,28 +324,30 @@ func (s *flashsaleService) UnpublishActivity(ctx context.Context, id int64) erro
 // Seckill 抢购全流程（DESIGN.md 秒杀时序）：
 //  1. 按用户限流：Redis 固定窗口计数（INCR+TTL，跨请求状态）；
 //  2. 幂等键：原子抢占（用户+活动，TTL 30min），已存在即重复提交被拦；
-//  3. Lua 原子预扣（PreDeduct，窗口/状态/限购/库存全在 Redis 内原子判定）。
+//  3. Lua 原子预扣（PreDeduct，窗口/状态/限购/库存全在 Redis 内原子判定）；
+//  4. 预扣成功 → 生成雪花订单号 + 发 MQ"抢购成功"消息 → 返回订单号。
 //
 // 预扣被业务拒绝时释放幂等键（允许窗口内重试）；基础设施失败保留幂等键
 // （防瞬时故障下重复预扣，与 order 模块 client_request_id 同取舍）。
-func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64) error {
+// MQ 发布失败同样保留幂等键：用户不可重复抢购，订单由对账（T15）兜底补单。
+func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64) (string, error) {
 	// 1. 按用户限流：fail-closed（限流不可用时拒绝放行，保护后端）。
 	ok, err := s.perUser.Allow(ctx, rlKey(userID))
 	if err != nil {
-		return fmt.Errorf("flashsale rate limit: %w", err)
+		return "", fmt.Errorf("flashsale rate limit: %w", err)
 	}
 	if !ok {
-		return ErrRateLimited
+		return "", ErrRateLimited
 	}
 
 	// 2. 幂等键：挡预扣请求的重复提交（DB 唯一约束挡落单重复，见 T12）。
 	key := idemKey(activityID, userID)
 	code, err := s.cache.Eval(ctx, idemScript, []string{key}, 1, int64(idemTTL.Seconds()))
 	if err != nil {
-		return fmt.Errorf("acquire flashsale idempotency: %w", err)
+		return "", fmt.Errorf("acquire flashsale idempotency: %w", err)
 	}
 	if code != 1 {
-		return ErrDuplicateRequest
+		return "", ErrDuplicateRequest
 	}
 
 	// 3. Lua 原子预扣。
@@ -314,12 +355,40 @@ func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64
 		if isBusinessReject(err) {
 			// 业务拒绝：释放幂等键，允许用户重试（如未开始时提前抢、活动恢复上架后重抢）。
 			if delErr := s.cache.Del(ctx, key); delErr != nil {
-				return fmt.Errorf("%w: release idempotency key: %v", err, delErr)
+				return "", fmt.Errorf("%w: release idempotency key: %v", err, delErr)
 			}
 		}
-		return err
+		return "", err
 	}
-	return nil
+
+	// 4. 生成订单号 + 发 MQ（预扣成功绝不丢单：发布确认失败保留幂等键，对账兜底）。
+	orderNo, err := s.publishSeckillSuccess(ctx, userID, activityID)
+	if err != nil {
+		return "", err
+	}
+	return orderNo, nil
+}
+
+// publishSeckillSuccess 生成雪花订单号并发布"抢购成功"消息（异步落单队列）。
+// 失败返回错误（保留幂等键；对账 cron 识别"有预扣无订单"补单）。
+func (s *flashsaleService) publishSeckillSuccess(ctx context.Context, userID, activityID int64) (string, error) {
+	no, err := s.nos.Next()
+	if err != nil {
+		return "", fmt.Errorf("generate seckill order no: %w", err)
+	}
+	orderNo := strconv.FormatInt(no, 10)
+	body, err := json.Marshal(SeckillSuccessMessage{
+		OrderNo:    orderNo,
+		UserID:     userID,
+		ActivityID: activityID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal seckill message: %w", err)
+	}
+	if err := s.publisher.Publish(ctx, SeckillOrderQueue, body); err != nil {
+		return "", fmt.Errorf("publish seckill success message: %w", err)
+	}
+	return orderNo, nil
 }
 
 // isBusinessReject 预扣的业务拒绝分支（非基础设施故障）。

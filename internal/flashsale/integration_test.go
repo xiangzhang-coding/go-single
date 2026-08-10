@@ -142,11 +142,16 @@ func buildEnv() (*testEnv, error) {
 	productHandler := producthandler.New(productSvc, verifier)
 
 	// 默认 env 的秒杀服务关闭按用户限流；限流专项测试经 newFlashsaleRouter 另起路由。
+	// MQ 用 fake 发布端口（记录消息不投递）：T11 抢购路径测试无需真实 RabbitMQ；
+	// 异步落单闭环（T12）走真实 MQ，见 seckill_order_integration_test.go。
+	pub := &fakePublisher{}
 	flashsaleSvc := flashsalesvc.New(
 		flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(gdb)},
 		productSvc,
 		cacheClient,
 		limiter.RedisCounterConfig{},
+		pub,
+		&fakeNos{next: 900000},
 	)
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
 
@@ -172,6 +177,34 @@ func buildEnv() (*testEnv, error) {
 // allowAll 恒放行中间件：默认 env 抢购接口不测全局限流（专项测试另起路由）。
 func allowAll(_ *gin.Context) {}
 
+// fakePublisher 记录发布消息的 MQ 替身：T11 抢购路径无需真实 RabbitMQ。
+type fakePublisher struct {
+	mu    sync.Mutex
+	queue string
+	body  []byte
+}
+
+func (f *fakePublisher) Publish(_ context.Context, queue string, body []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queue = queue
+	f.body = body
+	return nil
+}
+
+// fakeNos 雪花订单号替身（确定性序列，避免依赖真实实现）。
+type fakeNos struct {
+	mu   sync.Mutex
+	next int64
+}
+
+func (f *fakeNos) Next() (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.next++
+	return f.next, nil
+}
+
 // newFlashsaleRouter 构建独立秒杀路由（按需注入限流配置），复用 user/product
 // handler（共享同一 gdb/verifier），供限流与抢购接口专项测试使用。
 func (e *testEnv) newFlashsaleRouter(t *testing.T, limitCfg limiter.TokenBucketConfig, rlCfg limiter.RedisCounterConfig) http.Handler {
@@ -181,6 +214,8 @@ func (e *testEnv) newFlashsaleRouter(t *testing.T, limitCfg limiter.TokenBucketC
 		e.productSvc,
 		e.cacheClient,
 		rlCfg,
+		&fakePublisher{},
+		&fakeNos{next: 910000},
 	)
 	h := flashsalehandler.New(svc, e.verifier)
 	limitMW, err := limiter.NewTokenBucket(limitCfg)

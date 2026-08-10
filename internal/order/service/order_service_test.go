@@ -36,13 +36,19 @@ type fakeOrders struct {
 	txLog      []string
 	getErr     error
 	skipCancel map[string]bool // 模拟并发下状态已变：Cancel 返回未更新
+	duplicate  map[string]bool // 模拟唯一约束命中：Create 返回 ErrOrderDuplicate
+	createLog  []*model.Order  // 建单流水（含重复尝试），供幂等断言
 }
 
 func newFakeOrders() *fakeOrders {
-	return &fakeOrders{byID: map[string]*model.Order{}, skipCancel: map[string]bool{}}
+	return &fakeOrders{byID: map[string]*model.Order{}, skipCancel: map[string]bool{}, duplicate: map[string]bool{}}
 }
 
 func (f *fakeOrders) Create(_ context.Context, _ *gorm.DB, o *model.Order) error {
+	f.createLog = append(f.createLog, o)
+	if f.duplicate[o.OrderNo] {
+		return repository.ErrOrderDuplicate
+	}
 	f.byID[o.OrderNo] = o
 	return nil
 }
@@ -417,6 +423,35 @@ func (f *fakeUsers) GetAddress(_ context.Context, userID, id int64) (*usermodel.
 	return a, nil
 }
 
+// fakeActivities 模拟 flashsale 侧 ActivityStock 端口（订单事务内扣活动库存）。
+type fakeActivities struct {
+	stocks    map[int64]int
+	deductErr error
+	deducted  []int64 // 扣减流水（活动ID），供断言幂等不重复扣
+}
+
+func newFakeActivities() *fakeActivities {
+	return &fakeActivities{stocks: map[int64]int{}}
+}
+
+func (f *fakeActivities) seed(activityID int64, stock int) {
+	f.stocks[activityID] = stock
+}
+
+// DeductStock 模拟 GORM 条件扣减：库存不足返回 (false, nil)。
+func (f *fakeActivities) DeductStock(_ context.Context, _ *gorm.DB, activityID int64, quantity int) (bool, error) {
+	if f.deductErr != nil {
+		return false, f.deductErr
+	}
+	s, ok := f.stocks[activityID]
+	if !ok || s < quantity {
+		return false, nil
+	}
+	f.stocks[activityID] = s - quantity
+	f.deducted = append(f.deducted, activityID)
+	return true, nil
+}
+
 // fakeNos 序列号生成器：1, 2, 3, ...
 type fakeNos struct{ next int64 }
 
@@ -428,24 +463,27 @@ func (f *fakeNos) Next() (int64, error) {
 // ---- 测试夹具 ----
 
 type fixture struct {
-	svc     Service
-	orders  *fakeOrders
-	items   *fakeItems
-	cache   *fakeIdemCache
-	prods   *fakeProducts
-	coupons *fakeCoupons
-	cart    *fakeCart
-	users   *fakeUsers
+	svc        Service
+	orders     *fakeOrders
+	items      *fakeItems
+	cache      *fakeIdemCache
+	prods      *fakeProducts
+	coupons    *fakeCoupons
+	cart       *fakeCart
+	users      *fakeUsers
+	activities *fakeActivities
 }
 
 func newFixture() *fixture {
 	orders, items, cache := newFakeOrders(), newFakeItems(), newFakeIdemCache()
 	prods, coupons, cart, users := newFakeProducts(), newFakeCoupons(), newFakeCart(), newFakeUsers()
+	activities := newFakeActivities()
 	svc := New(
 		repository.Store{Orders: orders, Items: items, Tx: fakeTx{}},
-		cache, &fakeNos{}, prods, coupons, cart, users,
+		cache, &fakeNos{}, prods, coupons, cart, users, activities,
 	)
-	return &fixture{svc: svc, orders: orders, items: items, cache: cache, prods: prods, coupons: coupons, cart: cart, users: users}
+	return &fixture{svc: svc, orders: orders, items: items, cache: cache, prods: prods,
+		coupons: coupons, cart: cart, users: users, activities: activities}
 }
 
 // seed 标准商品 + 地址 + 券：skuID=1 售价 100 分 库存 10。
@@ -764,6 +802,23 @@ func TestCancelRestoresStockAndCoupon(t *testing.T) {
 	err = fx.svc.Cancel(context.Background(), 42, res.Order.OrderNo)
 	require.ErrorIs(t, err, ErrIllegalTransition)
 	require.Equal(t, 10, fx.prods.skus[1].Stock, "重复取消不得重复回补")
+}
+
+// 秒杀订单禁止用户取消（T12 守卫）：回补路径（活动库存/Redis/用户计数）未实现，
+// 走普通订单回补会错补 SKU 库存；取消由后续秒杀取消任务负责。
+func TestCancelRejectsSeckillOrders(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("SK1")))
+
+	err := fx.svc.Cancel(context.Background(), 42, "SK1")
+	require.ErrorIs(t, err, ErrIllegalTransition, "秒杀订单应拒绝普通取消路径")
+
+	o := fx.orders.byID["SK1"]
+	require.Equal(t, model.OrderStatusPendingPayment, o.Status, "状态不得被改写")
+	require.Equal(t, 10, fx.prods.skus[1].Stock, "不得错补 SKU 库存")
+	require.Equal(t, 9, fx.activities.stocks[100], "活动库存不得被回补（回补任务未实现）")
 }
 
 // 超时取消：仅取消已过 expire_at 的待支付普通订单，回补库存并回退券；
@@ -1125,4 +1180,146 @@ func TestCreateFromCartWithCoupon(t *testing.T) {
 	require.Equal(t, 8, fx.prods.skus[1].Stock)
 	require.Equal(t, 4, fx.prods.skus[2].Stock)
 	require.Equal(t, couponmodel.CouponStatusUsed, fx.coupons.coupons[11].Status)
+}
+
+// ---- 秒杀异步落单（T12：CreateSeckill）----
+
+// seckillParams 合法秒杀落单参数（用户 42 默认地址 seed 自 fx.seed）。
+func (fx *fixture) seckillParams(orderNo string) SeckillCreateParams {
+	addr := fx.users.addresses[1] // fx.seed 种入的地址（ID 1）
+	return SeckillCreateParams{
+		OrderNo:    orderNo,
+		UserID:     42,
+		ActivityID: 100,
+		SKUID:      1,
+		Price:      9900,
+		Quantity:   1,
+		Address:    addr,
+	}
+}
+
+// 成功路径：单事务建秒杀订单（类型/活动/秒杀价/10min 超时/地址快照）+
+// 订单项 + 活动库存扣减。
+func TestCreateSeckillHappyPath(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("S1")))
+
+	o := fx.orders.byID["S1"]
+	require.NotNil(t, o)
+	require.Equal(t, model.OrderTypeSeckill, o.OrderType)
+	require.Equal(t, model.OrderStatusPendingPayment, o.Status)
+	require.NotNil(t, o.ActivityID)
+	require.Equal(t, int64(100), *o.ActivityID)
+	require.Equal(t, int64(9900), o.TotalAmount)
+	require.Equal(t, int64(0), o.DiscountAmount, "秒杀订单不使用券")
+	require.Equal(t, int64(9900), o.PayAmount)
+	require.Equal(t, "张三", o.Receiver, "地址快照应固化")
+	require.Nil(t, o.CouponID)
+	require.WithinDuration(t, time.Now().Add(10*time.Minute), o.ExpireAt, time.Second,
+		"秒杀订单超时 10min（与普通 15min 区分）")
+
+	require.Len(t, fx.items.byOrder["S1"], 1)
+	it := fx.items.byOrder["S1"][0]
+	require.Equal(t, int64(1), it.SKUID)
+	require.Equal(t, int64(9900), it.Price)
+	require.Equal(t, 1, it.Quantity)
+	require.Equal(t, int64(9900), it.Subtotal)
+
+	require.Equal(t, 9, fx.activities.stocks[100], "落单应同时扣减活动库存")
+	require.Equal(t, 10, fx.prods.skus[1].Stock, "秒杀不扣 SKU 库存（活动独立库存）")
+}
+
+// 重复 order_no（MQ 重投同一消息）：幂等成功，不重复扣库存。
+func TestCreateSeckillDuplicateOrderNoIdempotent(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("S1")))
+	// 模拟重投：仓库命中唯一约束 → ErrOrderDuplicate。
+	fx.orders.duplicate["S1"] = true
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("S1")))
+
+	require.Equal(t, 9, fx.activities.stocks[100], "重复落单不得再次扣库存")
+	require.Len(t, fx.items.byOrder["S1"], 1, "重复落单不得再插订单项")
+	require.Len(t, fx.orders.createLog, 2, "第二次为重复尝试（被唯一约束拦截）")
+}
+
+// 并发重复（同 (user_id, activity_id) 不同 order_no 竞态）：唯一约束命中视为成功。
+func TestCreateSeckillDuplicateUserActivityIdempotent(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("S1")))
+	// 模拟并发竞态：第二个消息同用户同活动（不同订单号）被唯一约束拦截。
+	fx.orders.duplicate["S2"] = true
+	p2 := fx.seckillParams("S2")
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), p2))
+
+	require.Equal(t, 9, fx.activities.stocks[100], "仅首个消息扣库存")
+	require.Nil(t, fx.orders.byID["S2"], "重复订单不得落库")
+}
+
+// 活动库存不足：ErrSeckillStockInsufficient（永久失败 → 死信，对账兜底），
+// 订单与订单项整体回滚（fakeTx 直接执行，断言错误传播）。
+func TestCreateSeckillStockInsufficient(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 0) // MySQL 库存为 0
+
+	err := fx.svc.CreateSeckill(context.Background(), fx.seckillParams("S1"))
+	require.ErrorIs(t, err, ErrSeckillStockInsufficient)
+}
+
+// 活动扣库存基础设施故障：错误原样传播（瞬时 → 重投）。
+func TestCreateSeckillDeductInfraFailure(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+	fx.activities.deductErr = errors.New("mysql timeout")
+
+	err := fx.svc.CreateSeckill(context.Background(), fx.seckillParams("S1"))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrSeckillStockInsufficient)
+}
+
+// 参数校验：空订单号 / 缺地址 / 非法数量 → ErrInvalidInput（永久失败）。
+func TestCreateSeckillValidation(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+
+	cases := []struct {
+		name string
+		mut  func(*SeckillCreateParams)
+	}{
+		{"空订单号", func(p *SeckillCreateParams) { p.OrderNo = "" }},
+		{"缺地址", func(p *SeckillCreateParams) { p.Address = nil }},
+		{"非法活动", func(p *SeckillCreateParams) { p.ActivityID = 0 }},
+		{"非法数量", func(p *SeckillCreateParams) { p.Quantity = 0 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := fx.seckillParams("S1")
+			tc.mut(&p)
+			err := fx.svc.CreateSeckill(context.Background(), p)
+			require.ErrorIs(t, err, ErrInvalidInput)
+		})
+	}
+}
+
+// SKU 不存在：ErrSKUNotFound（永久失败 → 死信）。
+func TestCreateSeckillSKUMissing(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+	p := fx.seckillParams("S1")
+	p.SKUID = 999
+
+	err := fx.svc.CreateSeckill(context.Background(), p)
+	require.ErrorIs(t, err, ErrSKUNotFound)
 }

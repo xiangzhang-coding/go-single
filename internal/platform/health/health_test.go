@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
 )
 
 type fakeDB struct{ err error }
@@ -24,6 +26,11 @@ func (f *fakeDep) Set(context.Context, string, string, time.Duration) error { re
 func (f *fakeDep) Del(context.Context, string) error                        { return nil }
 func (f *fakeDep) Eval(context.Context, string, []string, ...any) (int64, error) {
 	return 0, nil
+}
+func (f *fakeDep) Publish(context.Context, string, []byte) error { return nil }
+func (f *fakeDep) Consume(context.Context, string, mq.MessageHandler) error {
+	<-context.Background().Done()
+	return nil
 }
 
 func TestCheckAllOK(t *testing.T) {

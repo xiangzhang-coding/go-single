@@ -4,6 +4,8 @@ package repository
 import (
 	"context"
 
+	"gorm.io/gorm"
+
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 )
 
@@ -16,6 +18,10 @@ type ActivityRepository interface {
 	List(ctx context.Context) ([]model.Activity, error)
 	// UpdateStatus 上架/下架状态迁移。
 	UpdateStatus(ctx context.Context, id int64, status string) error
+	// DeductStock 事务内条件扣减活动库存（stock >= quantity，防超卖）；
+	// 返回是否扣减成功（库存不足返回 (false, nil)）。供秒杀异步落单在订单
+	// 事务内扣减（MySQL 为落单事实源，与 Redis 预扣对账）。
+	DeductStock(ctx context.Context, tx *gorm.DB, id int64, quantity int) (bool, error)
 }
 
 // Store 聚合活动仓储，作为 service 的构造入参。

@@ -228,10 +228,16 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(db), UserCoupon: couponrepo.NewGORMUserCoupon(db)}, cacheClient)
 	couponHandler := couponhandler.New(couponSvc, verifier)
 
+	// 雪花订单号生成器：普通下单与秒杀抢购共用同一实例（worker_id 单实例唯一）。
+	orderNoGen, err := snowflake.New(cfg.Snowflake.WorkerID)
+	if err != nil {
+		log.Fatal("初始化雪花订单号生成器失败", zap.Error(err))
+	}
+
 	// flashsale 模块：admin 秒杀活动管理（创建/编辑/上架/下架），
 	// 上架预热库存进 Redis（未开始可覆盖、进行中只减不增）；SKU 校验经 product 服务接口。
-	// 抢购（T11）：全局令牌桶限流中间件 + 按用户 Redis 计数限流 + 幂等键 +
-	// Lua 原子预扣，预扣成功返回"排队中"。
+	// 抢购（T11/T12）：全局令牌桶限流中间件 + 按用户 Redis 计数限流 + 幂等键 +
+	// Lua 原子预扣 + 生成雪花订单号发 MQ（异步落单），成功返回 202 排队中 + order_no。
 	seckillTokenBucket, err := limiter.NewTokenBucket(limiter.TokenBucketConfig{
 		QPS:   cfg.FlashSale.QPS,
 		Burst: cfg.FlashSale.Burst,
@@ -239,11 +245,11 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	if err != nil {
 		log.Fatal("初始化秒杀令牌桶限流失败", zap.Error(err))
 	}
-	flashsaleHandler := flashsalehandler.New(
-		flashsalesvc.New(flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(db)}, productSvc, cacheClient,
-			limiter.RedisCounterConfig{Max: cfg.FlashSale.PerUserMax, Window: cfg.FlashSale.PerUserWindow}),
-		verifier,
-	)
+	flashsaleStore := flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(db)}
+	flashsaleSvc := flashsalesvc.New(flashsaleStore, productSvc, cacheClient,
+		limiter.RedisCounterConfig{Max: cfg.FlashSale.PerUserMax, Window: cfg.FlashSale.PerUserWindow},
+		mqClient, orderNoGen)
+	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
 
 	// social 模块：好友申请/通过/拒绝与好友列表；用户名经 userSvc 跨模块进程内调用补齐。
 	socialHandler := socialhandler.New(
@@ -253,15 +259,29 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 
 	// order 模块：购物车结算/直购下单（单事务：订单+订单项+库存+地址快照+券核销+
 	// 删除购物车条目）、client_request_id 幂等（Redis SETNX）、雪花订单号、
-	// 订单列表/详情、取消（回补库存+回退券）、确认收货与 admin 发货。
-	orderNoGen, err := snowflake.New(cfg.Snowflake.WorkerID)
-	if err != nil {
-		log.Fatal("初始化雪花订单号生成器失败", zap.Error(err))
-	}
+	// 订单列表/详情、取消（回补库存+回退券）、确认收货与 admin 发货；
+	// CreateSeckill（T12）：秒杀异步落单单事务 + 扣活动库存（flashsale 实现端口）。
 	orderStore := orderrepo.NewGORMOrder(db)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc)
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc)
 	orderHandler := orderhandler.New(orderSvc, verifier)
+
+	// T12 秒杀异步落单消费者：订阅"抢购成功"消息 → 查活动/默认地址 →
+	// order 服务幂等建单 + 同事务扣活动库存；瞬时失败 Nack 重投、
+	// 永久失败进死信（对账兜底）。消费中断 3s 后重连（at-least-once 不丢消息）。
+	seckillConsumer := flashsalesvc.NewSeckillOrderConsumer(
+		flashsaleStore.Activities, orderSvc, userSvc, log)
+	go func() {
+		for {
+			err := mqClient.Consume(context.Background(), flashsalesvc.SeckillOrderQueue, seckillConsumer.Handle)
+			if err != nil {
+				log.Error("秒杀落单消费者中断，3s 后重连", zap.Error(err))
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			return
+		}
+	}()
 
 	// payment 模块：模拟支付回调（成功/失败），流水唯一约束（payment_id）挡重复回调，
 	// 成功路径单事务（流水 + 订单 待支付→已支付，WHERE 校验状态机与金额）；

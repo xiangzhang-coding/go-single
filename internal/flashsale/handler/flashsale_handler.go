@@ -1,5 +1,6 @@
 // Package handler 暴露 flashsale 模块的 HTTP 接口：admin 秒杀活动管理
-// （创建/编辑/列表/上架/下架）+ 用户抢购（限流 → 幂等键 → Lua 预扣 → 排队中）。
+// （创建/编辑/列表/上架/下架）+ 用户抢购（限流 → 幂等键 → Lua 预扣 →
+// 发 MQ 异步落单 → 202 排队中 + order_no 供前端轮询）。
 package handler
 
 import (
@@ -38,7 +39,7 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 // 用户（Bearer）：
 //
 //	POST /api/flashsales/:id/purchase      抢购（seckillTokenBucket 全局令牌桶限流，
-//	                                        成功返回 202 排队中；异步落单见 T12）
+//	                                        成功返回 202 排队中 + order_no，异步落单见 T12）
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup, seckillTokenBucket gin.HandlerFunc) {
 	admin := rg.Group("/admin", auth.Middleware(h.verifier), auth.RequireAdmin())
 	admin.POST("/flashsales", h.CreateActivity)
@@ -124,7 +125,8 @@ func (h *Handler) UnpublishActivity(c *gin.Context) {
 }
 
 // Purchase 抢购：限流（全局令牌桶中间件 + 按用户 Redis 计数）→ 幂等键 →
-// Lua 原子预扣；预扣成功立即返回 202"排队中"（异步落单与订单查询见 T12）。
+// Lua 原子预扣 → 发 MQ 异步落单；预扣成功立即返回 202"排队中"与订单号，
+// 前端据此轮询 GET /api/orders/{order_no} 得知异步落单结果（T12）。
 func (h *Handler) Purchase(c *gin.Context) {
 	id, ok := idParam(c)
 	if !ok {
@@ -135,11 +137,12 @@ func (h *Handler) Purchase(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 		return
 	}
-	if err := h.svc.Seckill(c.Request.Context(), claims.UserID, id); err != nil {
+	orderNo, err := h.svc.Seckill(c.Request.Context(), claims.UserID, id)
+	if err != nil {
 		writeError(c, err)
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"status": "queued", "message": "排队中"})
+	c.JSON(http.StatusAccepted, gin.H{"status": "queued", "order_no": orderNo, "message": "排队中"})
 }
 
 func activityParams(req activityRequest) service.ActivityParams {

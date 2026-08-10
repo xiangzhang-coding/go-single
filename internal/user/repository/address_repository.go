@@ -11,7 +11,11 @@ type AddressRepository interface {
 	Create(ctx context.Context, a *model.Address) error
 	Update(ctx context.Context, a *model.Address) error
 	Delete(ctx context.Context, id int64) error
+	// GetByID 读取单条地址。
 	GetByID(ctx context.Context, id int64) (*model.Address, error)
+	// GetDefaultAddress 读取用户默认地址（JOIN users.default_address_id 指针）；
+	// 无默认地址返回 (nil, nil)。
+	GetDefaultAddress(ctx context.Context, userID int64) (*model.Address, error)
 	// ListByUser 我的地址列表（JOIN users 派生 is_default 标记，默认地址排最前）。
 	ListByUser(ctx context.Context, userID int64) ([]model.Address, error)
 	CountByUser(ctx context.Context, userID int64) (int64, error)

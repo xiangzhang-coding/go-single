@@ -64,6 +64,9 @@ type Service interface {
 	SetDefaultAddress(ctx context.Context, userID, id int64) error
 	// GetAddress 读取单条地址（owner 校验）：供 order 模块下单固化为地址快照。
 	GetAddress(ctx context.Context, userID, id int64) (*model.Address, error)
+	// GetDefaultAddress 读取用户默认地址：供秒杀异步落单固化地址快照；
+	// 无默认地址返回 (nil, nil)。
+	GetDefaultAddress(ctx context.Context, userID int64) (*model.Address, error)
 }
 
 type userService struct {
@@ -235,6 +238,11 @@ func (s *userService) GetAddress(ctx context.Context, userID, id int64) (*model.
 		return nil, ErrAddressForbidden
 	}
 	return a, nil
+}
+
+// GetDefaultAddress 读取用户默认地址；无默认地址返回 (nil, nil)（秒杀落单场景）。
+func (s *userService) GetDefaultAddress(ctx context.Context, userID int64) (*model.Address, error) {
+	return s.store.Addresses.GetDefaultAddress(ctx, userID)
 }
 
 func validateCredentials(username, password string) error {

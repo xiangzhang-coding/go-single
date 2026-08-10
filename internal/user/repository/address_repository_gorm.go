@@ -63,6 +63,25 @@ func (r *GORMAddressRepository) CountByUser(ctx context.Context, userID int64) (
 	return n, err
 }
 
+// GetDefaultAddress 按 users.default_address_id 指针读取默认地址；
+// 无默认地址（指针为空或地址已删）返回 (nil, nil)。
+func (r *GORMAddressRepository) GetDefaultAddress(ctx context.Context, userID int64) (*model.Address, error) {
+	var a model.Address
+	err := r.db.WithContext(ctx).
+		Table("user_addresses AS a").
+		Joins("JOIN users AS u ON u.id = a.user_id AND u.default_address_id = a.id").
+		Select("a.*").
+		Where("a.user_id = ?", userID).
+		Take(&a).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
 // SetDefault 单条 UPDATE 原子切换默认指向；地址归属由 service 先校验。
 func (r *GORMAddressRepository) SetDefault(ctx context.Context, userID, addressID int64) error {
 	return r.db.WithContext(ctx).Model(&model.User{}).

@@ -50,5 +50,21 @@ func (r *GORMActivityRepository) UpdateStatus(ctx context.Context, id int64, sta
 	return r.db.WithContext(ctx).Model(&model.Activity{}).Where("id = ?", id).Update("status", status).Error
 }
 
+// DeductStock 条件扣减：UPDATE ... SET stock = stock - ? WHERE id = ? AND stock >= ?。
+// RowsAffected=0（活动不存在或库存不足）返回 (false, nil)，由调用方区分语义。
+func (r *GORMActivityRepository) DeductStock(ctx context.Context, tx *gorm.DB, id int64, quantity int) (bool, error) {
+	exec := tx
+	if exec == nil {
+		exec = r.db.WithContext(ctx)
+	}
+	res := exec.Model(&model.Activity{}).
+		Where("id = ? AND stock >= ?", id, quantity).
+		Update("stock", gorm.Expr("stock - ?", quantity))
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
 // 编译期断言：GORM 实现满足仓储接口。
 var _ ActivityRepository = (*GORMActivityRepository)(nil)

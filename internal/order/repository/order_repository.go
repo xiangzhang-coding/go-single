@@ -5,12 +5,17 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
 )
+
+// ErrOrderDuplicate 重复键（MySQL 1062）：order_no 主键或 (user_id, activity_id)
+// 唯一约束命中——秒杀异步落单的幂等命中（重复投递/并发消费），视为成功。
+var ErrOrderDuplicate = errors.New("order duplicate")
 
 // TxRunner 事务运行器：开启跨模块单事务（订单 + 订单项 + 库存扣减 +
 // 券核销 + 删除购物车条目），fn 内任一错误整体回滚。
@@ -21,6 +26,7 @@ type TxRunner interface {
 // OrderRepository 订单数据访问接口。
 type OrderRepository interface {
 	// Create 事务内创建订单（order_no 为主键，雪花 ID）。
+	// 重复键（order_no 或 (user_id, activity_id)）返回 ErrOrderDuplicate。
 	Create(ctx context.Context, tx *gorm.DB, order *model.Order) error
 	// GetByNo 按订单号读取（不含归属过滤，归属校验在 service 层）。
 	GetByNo(ctx context.Context, orderNo string) (*model.Order, error)

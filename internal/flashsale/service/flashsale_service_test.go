@@ -5,6 +5,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
@@ -68,6 +70,16 @@ func (f *fakeActivities) UpdateStatus(_ context.Context, id int64, status string
 		v.Status = status
 	}
 	return nil
+}
+
+// DeductStock 模拟 GORM 条件扣减：库存不足返回 (false, nil)。
+func (f *fakeActivities) DeductStock(_ context.Context, _ *gorm.DB, id int64, quantity int) (bool, error) {
+	v, ok := f.byID[id]
+	if !ok || v.Stock < quantity {
+		return false, nil
+	}
+	v.Stock -= quantity
+	return true, nil
 }
 
 // ---- fake product 服务 ----
@@ -211,21 +223,50 @@ func strToInt(s string) int {
 	return n
 }
 
+// discardSeckill 只断言错误的抢购调用（成功时返回的订单号在发布测试中断言）。
+func discardSeckill(svc Service, ctx context.Context, userID, activityID int64) error {
+	_, err := svc.Seckill(ctx, userID, activityID)
+	return err
+}
+
 // ---- 测试夹具 ----
+
+// fakePublisher 记录发布的消息；err 模拟 MQ 发布失败。
+type fakePublisher struct {
+	queue string
+	body  []byte
+	err   error
+}
+
+func (f *fakePublisher) Publish(_ context.Context, queue string, body []byte) error {
+	f.queue = queue
+	f.body = body
+	return f.err
+}
+
+// fakeNos 雪花订单号替身：1, 2, 3, ...
+type fakeNos struct{ next int64 }
+
+func (f *fakeNos) Next() (int64, error) {
+	f.next++
+	return f.next, nil
+}
 
 type fixture struct {
 	svc      Service
 	acts     *fakeActivities
 	products *fakeProducts
 	cache    *fakeCache
+	pub      *fakePublisher
 }
 
 func newFixture() *fixture {
 	acts := newFakeActivities()
 	products := newFakeProducts()
 	fc := newFakeCache()
-	svc := New(repository.Store{Activities: acts}, products, fc, limiter.RedisCounterConfig{})
-	return &fixture{svc: svc, acts: acts, products: products, cache: fc}
+	pub := &fakePublisher{}
+	svc := New(repository.Store{Activities: acts}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{})
+	return &fixture{svc: svc, acts: acts, products: products, cache: fc, pub: pub}
 }
 
 // newFixtureLimited 同 newFixture，但启用按用户限流（Max 次 / Window）。
@@ -233,8 +274,10 @@ func newFixtureLimited(max int, window time.Duration) *fixture {
 	acts := newFakeActivities()
 	products := newFakeProducts()
 	fc := newFakeCache()
-	svc := New(repository.Store{Activities: acts}, products, fc, limiter.RedisCounterConfig{Max: max, Window: window})
-	return &fixture{svc: svc, acts: acts, products: products, cache: fc}
+	pub := &fakePublisher{}
+	svc := New(repository.Store{Activities: acts}, products, fc, limiter.RedisCounterConfig{Max: max, Window: window},
+		pub, &fakeNos{})
+	return &fixture{svc: svc, acts: acts, products: products, cache: fc, pub: pub}
 }
 
 // createActivity 有效参数活动：进行中窗口（1 分钟前开始，1 小时后结束）。
@@ -601,17 +644,61 @@ func TestListActivities(t *testing.T) {
 
 // ---- 抢购（T11：限流 → 幂等键 → Lua 预扣）----
 
-// 抢购成功：预扣生效（库存减、计数加），幂等键落键。
+// 抢购成功（T12）：返回订单号，且"抢购成功"消息已发布到异步落单队列
+// （消息体 = order_no/user_id/activity_id，供消费者落单、前端轮询）。
 func TestSeckillOK(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 
-	require.NoError(t, fx.svc.Seckill(context.Background(), 7, a.ID))
+	orderNo, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, orderNo, "抢购成功应返回订单号供前端轮询")
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)])
 	require.Equal(t, 1, fx.cache.count[countKey(a.ID, 7)])
 	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "预扣成功应保留幂等键")
+
+	require.Equal(t, SeckillOrderQueue, fx.pub.queue, "消息应发布到异步落单队列")
+	var msg SeckillSuccessMessage
+	require.NoError(t, json.Unmarshal(fx.pub.body, &msg))
+	require.Equal(t, orderNo, msg.OrderNo)
+	require.Equal(t, int64(7), msg.UserID)
+	require.Equal(t, a.ID, msg.ActivityID)
 }
+
+// MQ 发布失败（T12）：保留幂等键 + 不重复预扣（预扣成功绝不丢单：
+// 用户不可重抢，订单由对账兜底补单）；返回错误。
+func TestSeckillPublishFailureKeepsIdemKey(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.pub.err = errors.New("rabbitmq down")
+
+	_, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.Error(t, err)
+	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "发布失败应保留幂等键（防重复预扣）")
+	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)], "预扣已生效，库存不再变动")
+	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 7, a.ID), ErrDuplicateRequest,
+		"幂等键保留 → 重试被拦，不会二次预扣")
+}
+
+// 订单号生成失败（时钟回拨等）：保留幂等键，同发布失败语义。
+func TestSeckillOrderNoFailureKeepsIdemKey(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.svc = New(repository.Store{Activities: fx.acts}, fx.products, fx.cache,
+		limiter.RedisCounterConfig{}, fx.pub, &failingNos{})
+
+	_, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.Error(t, err)
+	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "订单号生成失败应保留幂等键")
+}
+
+// failingNos 恒失败订单号生成器。
+type failingNos struct{}
+
+func (failingNos) Next() (int64, error) { return 0, errors.New("clock rollback") }
 
 // 重复抢购：幂等键拦截（同一用户+活动 30min 内第二次被拒，库存不再扣）。
 func TestSeckillDuplicateBlocked(t *testing.T) {
@@ -619,15 +706,15 @@ func TestSeckillDuplicateBlocked(t *testing.T) {
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 
-	require.NoError(t, fx.svc.Seckill(context.Background(), 7, a.ID))
-	require.ErrorIs(t, fx.svc.Seckill(context.Background(), 7, a.ID), ErrDuplicateRequest)
+	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a.ID))
+	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 7, a.ID), ErrDuplicateRequest)
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)], "重复请求不得再次预扣")
 	require.Equal(t, 1, fx.cache.count[countKey(a.ID, 7)])
 
 	// 不同活动不互相拦截。
 	a2 := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a2.ID))
-	require.NoError(t, fx.svc.Seckill(context.Background(), 7, a2.ID))
+	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a2.ID))
 }
 
 // 按用户限流：窗口内超过 Max 次请求被拒（429 语义），且不触碰幂等键与库存。
@@ -636,14 +723,14 @@ func TestSeckillPerUserRateLimited(t *testing.T) {
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 
-	require.NoError(t, fx.svc.Seckill(context.Background(), 7, a.ID))
-	require.ErrorIs(t, fx.svc.Seckill(context.Background(), 7, a.ID), ErrRateLimited)
+	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a.ID))
+	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 7, a.ID), ErrRateLimited)
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)], "限流拒绝不得预扣")
 	_, ok := fx.cache.idem[idemKey(a.ID, 7)]
 	require.True(t, ok, "首次请求已落幂等键；第二次被限流拒绝发生在幂等键抢占之前，不改变既有键")
 
 	// 不同用户互不影响。
-	require.NoError(t, fx.svc.Seckill(context.Background(), 8, a.ID))
+	require.NoError(t, discardSeckill(fx.svc, context.Background(), 8, a.ID))
 }
 
 // 限流配置关闭（Max<=0）：不限流——同一用户跨活动请求不被限流拦截
@@ -655,9 +742,9 @@ func TestSeckillRateLimitDisabled(t *testing.T) {
 	a2 := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a2.ID))
 
-	require.NoError(t, fx.svc.Seckill(context.Background(), 7, a.ID))
-	require.NoError(t, fx.svc.Seckill(context.Background(), 7, a2.ID), "关闭限流后同一用户可继续抢购其他活动")
-	require.ErrorIs(t, fx.svc.Seckill(context.Background(), 7, a.ID), ErrDuplicateRequest)
+	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a.ID))
+	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a2.ID), "关闭限流后同一用户可继续抢购其他活动")
+	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 7, a.ID), ErrDuplicateRequest)
 }
 
 // 预扣业务拒绝：释放幂等键（允许重试）；库存与计数不受影响。
@@ -667,8 +754,8 @@ func TestSeckillBusinessRejectReleasesIdemKey(t *testing.T) {
 	// 抢光：第一个用户成功，第二个用户被拒（不同用户，幂等键不同）。
 	soldOut := fx.createActivity(t, func(p *ActivityParams) { p.Stock = 1 })
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), soldOut.ID))
-	require.NoError(t, fx.svc.Seckill(context.Background(), 1, soldOut.ID))
-	require.ErrorIs(t, fx.svc.Seckill(context.Background(), 2, soldOut.ID), ErrSoldOut)
+	require.NoError(t, discardSeckill(fx.svc, context.Background(), 1, soldOut.ID))
+	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 2, soldOut.ID), ErrSoldOut)
 	require.False(t, fx.cache.idem[idemKey(soldOut.ID, 2)], "抢光拒绝应释放幂等键")
 	require.Equal(t, 0, fx.cache.stock[stockKey(soldOut.ID)])
 
@@ -678,14 +765,14 @@ func TestSeckillBusinessRejectReleasesIdemKey(t *testing.T) {
 		p.EndAt = time.Now().Add(2 * time.Hour)
 	})
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), future.ID))
-	require.ErrorIs(t, fx.svc.Seckill(context.Background(), 3, future.ID), ErrNotInWindow)
+	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 3, future.ID), ErrNotInWindow)
 	require.False(t, fx.cache.idem[idemKey(future.ID, 3)])
 }
 
 // 活动不存在：视为业务拒绝，释放幂等键。
 func TestSeckillActivityNotFound(t *testing.T) {
 	fx := newFixture()
-	require.ErrorIs(t, fx.svc.Seckill(context.Background(), 1, 999), ErrActivityNotFound)
+	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 1, 999), ErrActivityNotFound)
 	require.False(t, fx.cache.idem[idemKey(999, 1)], "活动不存在应释放幂等键")
 }
 
@@ -696,7 +783,7 @@ func TestSeckillInfraFailureKeepsIdemKey(t *testing.T) {
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.cache.deductErr = errors.New("redis down")
 
-	err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	err := discardSeckill(fx.svc, context.Background(), 7, a.ID)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrSoldOut, "基础设施故障不应映射为业务拒绝")
 	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "基础设施失败应保留幂等键")
@@ -716,7 +803,7 @@ func TestSeckillConcurrentNoOversell(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = fx.svc.Seckill(context.Background(), int64(i+1), a.ID)
+			errs[i] = discardSeckill(fx.svc, context.Background(), int64(i+1), a.ID)
 		}(i)
 	}
 	wg.Wait()
@@ -735,6 +822,6 @@ func TestSeckillConcurrentNoOversell(t *testing.T) {
 	// 同一用户再次提交（不同活动）：独立幂等键，仍可抢购。
 	dup := fx.createActivity(t, func(p *ActivityParams) { p.Stock = 1 })
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), dup.ID))
-	require.NoError(t, fx.svc.Seckill(context.Background(), 1, dup.ID))
-	require.ErrorIs(t, fx.svc.Seckill(context.Background(), 1, dup.ID), ErrDuplicateRequest)
+	require.NoError(t, discardSeckill(fx.svc, context.Background(), 1, dup.ID))
+	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 1, dup.ID), ErrDuplicateRequest)
 }

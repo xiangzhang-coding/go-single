@@ -54,6 +54,22 @@ func (f *fakeAddresses) GetByID(_ context.Context, id int64) (*model.Address, er
 	return f.byID[id], nil
 }
 
+// GetDefaultAddress 模拟 GORM 实现：按 defaults 指针读取，无默认返回 (nil, nil)。
+func (f *fakeAddresses) GetDefaultAddress(_ context.Context, userID int64) (*model.Address, error) {
+	def, ok := f.defaults[userID]
+	if !ok {
+		return nil, nil
+	}
+	a, ok := f.byID[def]
+	if !ok {
+		return nil, nil
+	}
+	if a.UserID != userID {
+		return nil, nil
+	}
+	return a, nil
+}
+
 // ListByUser 模拟 GORM 实现：派生 is_default 标记，默认地址排最前。
 func (f *fakeAddresses) ListByUser(_ context.Context, userID int64) ([]model.Address, error) {
 	def := f.defaults[userID]
@@ -292,4 +308,22 @@ func TestSetDefaultAddress(t *testing.T) {
 	// 不存在的地址 → 404；他人地址 → 403。
 	require.ErrorIs(t, fx.svc.SetDefaultAddress(context.Background(), 1, 999), ErrAddressNotFound)
 	require.ErrorIs(t, fx.svc.SetDefaultAddress(context.Background(), 2, a.ID), ErrAddressForbidden)
+}
+
+// ---- 默认地址读取（秒杀异步落单用）----
+
+func TestGetDefaultAddress(t *testing.T) {
+	fx := newAddressFixture()
+	a := fx.create(t, 1, nil)
+
+	got, err := fx.svc.GetDefaultAddress(context.Background(), 1)
+	require.NoError(t, err)
+	require.NotNil(t, got, "有默认地址应返回")
+	assert.Equal(t, a.ID, got.ID)
+	assert.Equal(t, int64(1), got.UserID)
+
+	// 无默认地址（从未建地址）→ (nil, nil)。
+	none, err := fx.svc.GetDefaultAddress(context.Background(), 99)
+	require.NoError(t, err)
+	assert.Nil(t, none)
 }

@@ -60,6 +60,13 @@ const (
 	redisTestDB   = 15
 )
 
+// noopActivity 秒杀活动库存端口替身：本包不触达秒杀落单，恒成功即可。
+type noopActivity struct{}
+
+func (noopActivity) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
+	return true, nil
+}
+
 type testEnv struct {
 	router http.Handler
 	gdb    *gorm.DB
@@ -156,7 +163,7 @@ func buildEnv() (*testEnv, error) {
 	}
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc)
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, noopActivity{})
 	orderHandler := orderhandler.New(orderSvc, verifier)
 
 	paymentStore := paymentrepo.NewGORMPayment(gdb)
