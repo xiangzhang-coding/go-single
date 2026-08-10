@@ -256,5 +256,3 @@ func TestListItems(t *testing.T) {
 	assert.Equal(t, int64(1), list[0].SKUID)
 	assert.Equal(t, 2, list[0].Quantity)
 }
-
-

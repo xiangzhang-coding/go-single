@@ -27,6 +27,9 @@ import (
 	couponhandler "github.com/xiangzhang-coding/go-single/internal/coupon/handler"
 	couponrepo "github.com/xiangzhang-coding/go-single/internal/coupon/repository"
 	couponsvc "github.com/xiangzhang-coding/go-single/internal/coupon/service"
+	flashsalehandler "github.com/xiangzhang-coding/go-single/internal/flashsale/handler"
+	flashsalerepo "github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
+	flashsalesvc "github.com/xiangzhang-coding/go-single/internal/flashsale/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/config"
@@ -213,6 +216,13 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		verifier,
 	)
 
+	// flashsale 模块：admin 秒杀活动管理（创建/编辑/上架/下架），
+	// 上架预热库存进 Redis（未开始可覆盖、进行中只减不增）；SKU 校验经 product 服务接口。
+	flashsaleHandler := flashsalehandler.New(
+		flashsalesvc.New(flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(db)}, productSvc, cacheClient),
+		verifier,
+	)
+
 	// social 模块：好友申请/通过/拒绝与好友列表；用户名经 userSvc 跨模块进程内调用补齐。
 	socialHandler := socialhandler.New(
 		socialsvc.New(socialrepo.Store{Requests: socialrepo.NewGORMRequest(db), Friendships: socialrepo.NewGORMFriendship(db)}, userSvc),
@@ -228,6 +238,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	productHandler.RegisterRoutes(api)
 	cartHandler.RegisterRoutes(api)
 	couponHandler.RegisterRoutes(api)
+	flashsaleHandler.RegisterRoutes(api)
 	socialHandler.RegisterRoutes(api)
 	fileHandler.RegisterRoutes(api)
 

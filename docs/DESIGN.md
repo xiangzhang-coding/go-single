@@ -241,6 +241,7 @@ graph LR
     order --> product
     order --> coupon
     order --> user
+    flashsale --> product
     flashsale -->|MQ 异步| order
     payment --> order
     social --> order
