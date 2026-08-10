@@ -1,0 +1,24 @@
+server:
+  port: 8080
+  mode: debug
+
+log:
+  level: info
+
+mysql:
+  host: 127.0.0.1
+  port: 3306
+  user: shop
+  password: shop123
+  database: go_shop
+
+redis:
+  addr: 127.0.0.1:6379
+  password: ""
+  db: 0
+
+mq:
+  url: amqp://guest:guest@127.0.0.1:5672/
+
+migrations:
+  path: ./migrations
