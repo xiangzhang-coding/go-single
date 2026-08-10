@@ -33,6 +33,9 @@ import (
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
+	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
+	socialrepo "github.com/xiangzhang-coding/go-single/internal/social/repository"
+	socialsvc "github.com/xiangzhang-coding/go-single/internal/social/service"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
@@ -184,11 +187,18 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		verifier,
 	)
 
+	// social 模块：好友申请/通过/拒绝与好友列表；用户名经 userSvc 跨模块进程内调用补齐。
+	socialHandler := socialhandler.New(
+		socialsvc.New(socialrepo.Store{Requests: socialrepo.NewGORMRequest(db), Friendships: socialrepo.NewGORMFriendship(db)}, userSvc),
+		verifier,
+	)
+
 	api := r.Group("/api")
 	userHandler.RegisterRoutes(api)
 	addressHandler.RegisterRoutes(api)
 	productHandler.RegisterRoutes(api)
 	couponHandler.RegisterRoutes(api)
+	socialHandler.RegisterRoutes(api)
 
 	return r
 }
