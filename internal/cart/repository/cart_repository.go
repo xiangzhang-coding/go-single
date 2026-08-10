@@ -26,9 +26,10 @@ type CartItemRepository interface {
 	Delete(ctx context.Context, id int64) error
 	// ListByUser 我的购物车列表：条目 + SKU/商品只读快照（跨表读模型，一次查询）。
 	ListByUser(ctx context.Context, userID int64) ([]model.CartItemView, error)
-	// DeleteBySKUs 事务内批量删除指定 SKU 的条目（结算后清理已购），
-	// tx 由调用方（order 模块）开启，与订单创建同事务原子提交。
-	DeleteBySKUs(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error
+	// LockByUser 在结算事务内读取并锁定当前条目，避免读取数量后被并发改量。
+	LockByUser(ctx context.Context, tx *gorm.DB, userID int64) ([]model.CartItem, error)
+	// DeleteByIDs 事务内按条目 ID 删除已结算的行，避免按 SKU 删除并发新增/修改的条目。
+	DeleteByIDs(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error
 }
 
 // Store 聚合仓储实现，作为 service 的构造入参。

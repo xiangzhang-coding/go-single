@@ -33,6 +33,7 @@ func TestLoad(t *testing.T) {
 	require.False(t, cfg.MinIO.UseSSL)
 	require.Equal(t, "http://127.0.0.1:19000", cfg.MinIO.PublicURL)
 	require.Equal(t, "./migrations", cfg.Migrations.Path)
+	require.Equal(t, int64(1), cfg.Snowflake.WorkerID)
 }
 
 func TestMySQLDSN(t *testing.T) {
@@ -43,10 +44,12 @@ func TestMySQLDSN(t *testing.T) {
 func TestLoadEnvOverride(t *testing.T) {
 	t.Setenv("GO_SINGLE_SERVER_PORT", "9090")
 	t.Setenv("GO_SINGLE_REDIS_ADDR", "10.0.0.1:6379")
+	t.Setenv("GO_SINGLE_SNOWFLAKE_WORKER_ID", "7")
 
 	root := repoRoot(t)
 	cfg, err := LoadFrom(filepath.Join(root, "configs"), root)
 	require.NoError(t, err)
 	require.Equal(t, 9090, cfg.Server.Port)
 	require.Equal(t, "10.0.0.1:6379", cfg.Redis.Addr)
+	require.Equal(t, int64(7), cfg.Snowflake.WorkerID)
 }

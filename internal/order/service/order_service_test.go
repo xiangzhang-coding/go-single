@@ -31,8 +31,9 @@ import (
 // ---- fake 订单仓储 ----
 
 type fakeOrders struct {
-	byID  map[string]*model.Order
-	txLog []string
+	byID   map[string]*model.Order
+	txLog  []string
+	getErr error
 }
 
 func newFakeOrders() *fakeOrders { return &fakeOrders{byID: map[string]*model.Order{}} }
@@ -43,6 +44,9 @@ func (f *fakeOrders) Create(_ context.Context, _ *gorm.DB, o *model.Order) error
 }
 
 func (f *fakeOrders) GetByNo(_ context.Context, orderNo string) (*model.Order, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	return f.byID[orderNo], nil
 }
 
@@ -201,6 +205,17 @@ func (f *fakeProducts) GetSKU(_ context.Context, id int64) (*productmodel.SKU, e
 	return s, nil
 }
 
+func (f *fakeProducts) GetSKUForUpdate(ctx context.Context, _ *gorm.DB, id int64) (*productmodel.SKU, error) {
+	s, err := f.GetSKU(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if f.offSale[s.ProductID] {
+		return nil, productsvc.ErrProductNotFound
+	}
+	return s, nil
+}
+
 func (f *fakeProducts) GetDetail(_ context.Context, productID int64) (*productmodel.ProductDetail, error) {
 	if f.offSale[productID] {
 		return nil, productsvc.ErrProductNotFound
@@ -234,15 +249,17 @@ func (f *fakeProducts) RestoreStock(_ context.Context, _ *gorm.DB, skuID int64, 
 // fakeCoupons 以券表模拟 coupon 模块。
 type fakeCoupons struct {
 	coupons map[int64]*couponmodel.UserCouponView
+	owners  map[int64]int64
 }
 
 func newFakeCoupons() *fakeCoupons {
-	return &fakeCoupons{coupons: map[int64]*couponmodel.UserCouponView{}}
+	return &fakeCoupons{coupons: map[int64]*couponmodel.UserCouponView{}, owners: map[int64]int64{}}
 }
 
-// seed 一张可用的券：thresholdType=true 为满减（minAmount 门槛），false 为直减。
+// seed 一张属于 userID 的可用券；minAmount=0 表示直减券，否则为满减券。
 func (f *fakeCoupons) seed(id, userID, value, minAmount int64) {
 	now := time.Now()
+	f.owners[id] = userID
 	f.coupons[id] = &couponmodel.UserCouponView{
 		ID: id, TemplateID: 1, Name: "券", Value: value, MinAmount: minAmount,
 		Status:    couponmodel.CouponStatusUnused,
@@ -255,6 +272,9 @@ func (f *fakeCoupons) GetUsable(_ context.Context, userID, couponID int64) (*cou
 	if !ok {
 		return nil, couponsvc.ErrCouponNotFound
 	}
+	if f.owners[couponID] != userID {
+		return nil, couponsvc.ErrCouponNotFound
+	}
 	if c.Status == couponmodel.CouponStatusUsed {
 		return nil, couponsvc.ErrCouponUsed
 	}
@@ -265,9 +285,9 @@ func (f *fakeCoupons) GetUsable(_ context.Context, userID, couponID int64) (*cou
 	return c, nil
 }
 
-func (f *fakeCoupons) UseCoupon(_ context.Context, _ *gorm.DB, _ int64, couponID int64) error {
+func (f *fakeCoupons) UseCoupon(_ context.Context, _ *gorm.DB, userID, couponID int64) error {
 	c, ok := f.coupons[couponID]
-	if !ok {
+	if !ok || f.owners[couponID] != userID {
 		return couponsvc.ErrCouponNotFound
 	}
 	if c.Status != couponmodel.CouponStatusUnused {
@@ -281,9 +301,9 @@ func (f *fakeCoupons) UseCoupon(_ context.Context, _ *gorm.DB, _ int64, couponID
 	return nil
 }
 
-func (f *fakeCoupons) RollbackCoupon(_ context.Context, _ *gorm.DB, _ int64, couponID int64) error {
+func (f *fakeCoupons) RollbackCoupon(_ context.Context, _ *gorm.DB, userID, couponID int64) error {
 	c, ok := f.coupons[couponID]
-	if !ok {
+	if !ok || f.owners[couponID] != userID {
 		return couponsvc.ErrCouponNotFound
 	}
 	if c.Status != couponmodel.CouponStatusUsed {
@@ -310,18 +330,22 @@ func (f *fakeCart) seed(userID, skuID int64, quantity int) {
 	f.items[userID] = append(f.items[userID], view)
 }
 
-func (f *fakeCart) ListItems(_ context.Context, userID int64) ([]cartmodel.CartItemView, error) {
-	return f.items[userID], nil
+func (f *fakeCart) LockItems(_ context.Context, _ *gorm.DB, userID int64) ([]cartmodel.CartItem, error) {
+	items := make([]cartmodel.CartItem, 0, len(f.items[userID]))
+	for _, view := range f.items[userID] {
+		items = append(items, view.CartItem)
+	}
+	return items, nil
 }
 
-func (f *fakeCart) DeletePurchased(_ context.Context, _ *gorm.DB, userID int64, skuIDs []int64) error {
-	ids := make(map[int64]bool, len(skuIDs))
-	for _, s := range skuIDs {
-		ids[s] = true
+func (f *fakeCart) DeletePurchased(_ context.Context, _ *gorm.DB, userID int64, itemIDs []int64) error {
+	ids := make(map[int64]bool, len(itemIDs))
+	for _, id := range itemIDs {
+		ids[id] = true
 	}
 	var kept []cartmodel.CartItemView
 	for _, v := range f.items[userID] {
-		if !ids[v.SKUID] {
+		if !ids[v.ID] {
 			kept = append(kept, v)
 		}
 	}
@@ -485,6 +509,8 @@ func TestCreateIdempotentInFlight(t *testing.T) {
 	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("inflight", 1, 1))
 	require.NoError(t, err)
 	require.True(t, res.Idempotent)
+	require.True(t, res.Processing)
+	require.Empty(t, res.Order.Status, "订单尚未落库时不能伪装为待支付成功")
 	require.Equal(t, "12345", res.Order.OrderNo)
 }
 
@@ -501,9 +527,9 @@ func TestCreateFailureReleasesIdempotencyKey(t *testing.T) {
 	require.False(t, res.Idempotent, "失败后幂等键应释放，可重新下单")
 }
 
-// 基础设施失败（事务内 DB 超时，幂等键已写入）：错误非校验类 → 幂等键保留，
-// 恢复后重试命中幂等键返回同一订单号，杜绝同一 client_request_id 生成两单。
-func TestCreateInfraFailureRetainsIdempotencyKey(t *testing.T) {
+// 基础设施失败（事务内 DB 超时，且确认订单未落库）：幂等键释放，
+// 恢复后重试可以重新创建，而不是永久返回不存在的订单号。
+func TestCreateInfraFailureReleasesMissingOrderReservation(t *testing.T) {
 	fx := newFixture()
 	fx.seed(t)
 
@@ -511,15 +537,35 @@ func TestCreateInfraFailureRetainsIdempotencyKey(t *testing.T) {
 	_, err := fx.svc.Create(context.Background(), 42, fx.directParams("infra", 1, 1))
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrInvalidInput, "基础设施失败不应包装为输入错误")
-	require.Zero(t, fx.cache.dels, "基础设施失败不得释放幂等键")
+	require.Equal(t, 1, fx.cache.dels, "确认订单未落库后应释放幂等键")
 
-	// 恢复后重试：命中幂等键，返回首提生成的同一订单号，不生成第二单。
+	// 恢复后重试：重新获得幂等键并成功创建。
 	fx.prods.deductErr = nil
 	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("infra", 1, 1))
 	require.NoError(t, err)
+	require.False(t, res.Idempotent)
+	require.Len(t, fx.orders.byID, 1)
+}
+
+// 基础设施失败后无法确认订单是否提交：保留幂等键，重试返回明确的在途结果，
+// 不冒险创建第二单。
+func TestCreateInfraFailureKeepsUnknownReservation(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.prods.deductErr = errors.New("db timeout")
+	fx.orders.getErr = errors.New("order lookup timeout")
+
+	_, err := fx.svc.Create(context.Background(), 42, fx.directParams("unknown", 1, 1))
+	require.Error(t, err)
+	require.Zero(t, fx.cache.dels)
+
+	fx.prods.deductErr = nil
+	fx.orders.getErr = nil
+	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("unknown", 1, 1))
+	require.NoError(t, err)
 	require.True(t, res.Idempotent)
-	require.Equal(t, "1", res.Order.OrderNo, "返回首提生成的同一订单号")
-	require.Empty(t, fx.orders.byID, "不得生成第二单")
+	require.True(t, res.Processing)
+	require.Empty(t, fx.orders.byID, "未知状态下不得生成第二单")
 }
 
 // 库存不足：条件扣减失败 → 下单拒绝，库存不变。
@@ -531,6 +577,17 @@ func TestCreateInsufficientStock(t *testing.T) {
 	require.ErrorIs(t, err, ErrInsufficientStock)
 	require.Equal(t, 5, fx.prods.skus[2].Stock, "库存不足时不得扣减")
 	require.Empty(t, fx.orders.byID, "不得生成订单")
+}
+
+// 事务内商品服务错误应翻译为订单模块错误，而不是泄漏为 HTTP 500。
+func TestCreateTranslatesTransactionalProductError(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.prods.deductErr = productsvc.ErrSKUNotFound
+
+	_, err := fx.svc.Create(context.Background(), 42, fx.directParams("product-error", 1, 1))
+	require.ErrorIs(t, err, ErrSKUNotFound)
+	require.NotErrorIs(t, err, productsvc.ErrSKUNotFound)
 }
 
 // SKU 不存在 / 商品下架：下单拒绝。
@@ -614,6 +671,19 @@ func TestCreateCouponUnusable(t *testing.T) {
 		Items: []ItemParams{{SKUID: 1, Quantity: 1}},
 	})
 	require.ErrorIs(t, err, ErrCouponUsed)
+}
+
+// 券 owner 校验：订单用户不能使用其他用户持有的券。
+func TestCreateRejectsOtherUsersCoupon(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.coupons.seed(12, 7, 10, 0)
+
+	_, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "coupon-owner", AddressID: 1, CouponID: 12,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}},
+	})
+	require.ErrorIs(t, err, ErrCouponNotFound)
 }
 
 // 地址：不存在 404 / 归属他人 403。
@@ -765,6 +835,12 @@ func TestCreateInputValidation(t *testing.T) {
 
 	_, err = fx.svc.Create(context.Background(), 42, CreateParams{
 		ClientRequestID: "r19", AddressID: 1, Items: []ItemParams{{SKUID: 1, Quantity: 0}},
+	})
+	require.ErrorIs(t, err, ErrInvalidInput)
+
+	_, err = fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "r20", AddressID: 1, CouponID: -1,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}},
 	})
 	require.ErrorIs(t, err, ErrInvalidInput)
 }

@@ -60,6 +60,8 @@ type Service interface {
 	GetDetail(ctx context.Context, id int64) (*model.ProductDetail, error)
 	// GetSKU 供后续模块（购物车）校验 SKU 存在/上架。
 	GetSKU(ctx context.Context, id int64) (*model.SKU, error)
+	// GetSKUForUpdate 在订单事务内锁定 SKU 并校验商品仍上架，供订单固化成交价。
+	GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.SKU, error)
 	// DeductStock 事务内条件扣减库存（stock>=N 防超卖），供 order 模块下单调用；
 	// 扣减成功后失效详情缓存。返回是否扣减成功。
 	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
@@ -320,6 +322,35 @@ func (s *productService) GetSKU(ctx context.Context, id int64) (*model.SKU, erro
 	return sku, nil
 }
 
+// GetSKUForUpdate 锁定 SKU 行，并读取商品状态；库存扣减随后仍会在 SQL
+// 条件中再次校验 on_sale，避免下架与下单并发时售出已下架商品。
+func (s *productService) GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.SKU, error) {
+	// 先用非锁定读取得 product_id，再按 product → SKU 的固定顺序加锁；
+	// 所有订单都遵守同一顺序，避免多 SKU/多商品订单形成锁环。
+	sku, err := s.store.SKU.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if sku == nil {
+		return nil, ErrSKUNotFound
+	}
+	p, err := s.store.Product.GetByIDForUpdate(ctx, tx, sku.ProductID)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil || !p.IsOnSale() {
+		return nil, ErrProductNotFound
+	}
+	lockedSKU, err := s.store.SKU.GetByIDForUpdate(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	if lockedSKU == nil {
+		return nil, ErrSKUNotFound
+	}
+	return lockedSKU, nil
+}
+
 // DeductStock 先确认 SKU 存在（同时取得 product_id 供缓存失效），
 // 再在同一事务内条件扣减；事务由 order 模块开启并提交。
 func (s *productService) DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error) {
@@ -333,6 +364,23 @@ func (s *productService) DeductStock(ctx context.Context, tx *gorm.DB, skuID int
 	ok, err := s.store.SKU.DeductStock(ctx, tx, skuID, quantity)
 	if err != nil {
 		return false, err
+	}
+	if !ok {
+		// 条件更新失败不一定是库存不足：SKU 可能被删除，或商品在并发期间下架。
+		latest, getErr := s.store.SKU.GetByID(ctx, skuID)
+		if getErr != nil {
+			return false, getErr
+		}
+		if latest == nil {
+			return false, ErrSKUNotFound
+		}
+		product, getErr := s.store.Product.GetByID(ctx, latest.ProductID)
+		if getErr != nil {
+			return false, getErr
+		}
+		if product == nil || !product.IsOnSale() {
+			return false, ErrProductNotFound
+		}
 	}
 	if ok {
 		s.invalidateDetail(ctx, sku.ProductID)

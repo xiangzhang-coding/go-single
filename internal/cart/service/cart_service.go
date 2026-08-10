@@ -48,9 +48,10 @@ type Service interface {
 	DeleteItem(ctx context.Context, userID, itemID int64) error
 	// ListItems 我的购物车列表（含 SKU/商品展示快照，新加购的排最前）。
 	ListItems(ctx context.Context, userID int64) ([]model.CartItemView, error)
-	// DeletePurchased 事务内删除已购 SKU 的条目（order 模块结算后调用，
-	// tx 由 order 模块开启并提交）。
-	DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error
+	// LockItems 结算事务内锁定并读取当前购物车条目。
+	LockItems(ctx context.Context, tx *gorm.DB, userID int64) ([]model.CartItem, error)
+	// DeletePurchased 事务内删除已锁定、已结算的条目。
+	DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error
 }
 
 type cartService struct {
@@ -120,6 +121,9 @@ func (s *cartService) mergeItem(ctx context.Context, existing *model.CartItem, q
 		q = maxQuantity
 	}
 	if err := s.store.Items.UpdateQuantity(ctx, existing.ID, q); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrCartItemNotFound
+		}
 		return nil, err
 	}
 	existing.Quantity = q
@@ -137,7 +141,13 @@ func (s *cartService) UpdateQuantity(ctx context.Context, userID, itemID int64, 
 	if err := s.ensureOwned(ctx, userID, itemID); err != nil {
 		return err
 	}
-	return s.store.Items.UpdateQuantity(ctx, itemID, quantity)
+	if err := s.store.Items.UpdateQuantity(ctx, itemID, quantity); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrCartItemNotFound
+		}
+		return err
+	}
+	return nil
 }
 
 // DeleteItem 删条目：条目归属校验后删除。
@@ -155,9 +165,14 @@ func (s *cartService) ListItems(ctx context.Context, userID int64) ([]model.Cart
 	return s.store.Items.ListByUser(ctx, userID)
 }
 
-// DeletePurchased 结算后清理已购条目；调用方（order 模块）负责开启事务。
-func (s *cartService) DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error {
-	return s.store.Items.DeleteBySKUs(ctx, tx, userID, skuIDs)
+// LockItems 结算事务内锁定当前购物车条目，调用方（order 模块）负责开启事务。
+func (s *cartService) LockItems(ctx context.Context, tx *gorm.DB, userID int64) ([]model.CartItem, error) {
+	return s.store.Items.LockByUser(ctx, tx, userID)
+}
+
+// DeletePurchased 按锁定的条目 ID 清理，避免按 SKU 误删并发变更。
+func (s *cartService) DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error {
+	return s.store.Items.DeleteByIDs(ctx, tx, userID, itemIDs)
 }
 
 // ensureOwned 对象级授权（防 IDOR）：条目不存在 404；归属他人 403。

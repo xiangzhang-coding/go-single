@@ -232,7 +232,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// order 模块：购物车结算/直购下单（单事务：订单+订单项+库存+地址快照+券核销+
 	// 删除购物车条目）、client_request_id 幂等（Redis SETNX）、雪花订单号、
 	// 订单列表/详情、取消（回补库存+回退券）、确认收货与 admin 发货。
-	orderNoGen, err := snowflake.New(1)
+	orderNoGen, err := snowflake.New(cfg.Snowflake.WorkerID)
 	if err != nil {
 		log.Fatal("初始化雪花订单号生成器失败", zap.Error(err))
 	}

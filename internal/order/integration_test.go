@@ -466,6 +466,47 @@ func TestOrderFromCartCheckout(t *testing.T) {
 	require.Equal(t, 4, skuStock(t, env, skuB))
 }
 
+// 购物车结算读取必须在同一事务内加锁：先由另一事务改量并持锁，
+// 结算应等待提交后读取最新数量，而不是使用旧快照再删除当前行。
+func TestOrderCartCheckoutUsesLockedCurrentQuantity(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("cart-lock"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+
+	w, _ := doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, skuID), token)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	lockTx := env.gdb.Begin()
+	require.NoError(t, lockTx.Error)
+	defer lockTx.Rollback()
+	// 当前测试创建了唯一 SKU，按 SKU 更新该条目并持有行锁。
+	require.NoError(t, lockTx.Exec("UPDATE cart_items SET quantity = 3 WHERE sku_id = ?", skuID).Error)
+
+	type response struct {
+		w    *httptest.ResponseRecorder
+		body map[string]any
+	}
+	result := make(chan response, 1)
+	go func() {
+		w, body := doJSON(t, env, http.MethodPost, "/api/orders",
+			fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"from_cart":true}`, uniqueName("req"), addrID), token)
+		result <- response{w: w, body: body}
+	}()
+
+	select {
+	case got := <-result:
+		t.Fatalf("购物车行尚未解锁，结算不应提前完成，状态码=%d body=%s", got.w.Code, got.w.Body.String())
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	require.NoError(t, lockTx.Commit().Error)
+	got := <-result
+	require.Equal(t, http.StatusCreated, got.w.Code, "解锁后结算应成功: %s", got.w.Body.String())
+	require.Equal(t, float64(29700), got.body["total_amount"], "应使用锁释放后的最新数量 3")
+	require.Equal(t, 7, skuStock(t, env, skuID))
+}
+
 // 券不可用：不存在 404 / 已用 409 / 已过期 409（跨模块错误正确映射 HTTP 状态码）。
 func TestOrderCouponUnusableHTTP(t *testing.T) {
 	env := requireEnv(t)
@@ -491,6 +532,19 @@ func TestOrderCouponUnusableHTTP(t *testing.T) {
 			"(SELECT template_id FROM user_coupons WHERE id = ?)", time.Now().Add(-time.Minute), couponID2).Error)
 	w, _ = createOrder(t, env, token, uniqueName("req3"), addrID, skuID, 1, couponID2)
 	require.Equal(t, http.StatusConflict, w.Code)
+}
+
+// 券归属校验：用户不能在订单中使用他人的券（防止跨用户越权）。
+func TestOrderCouponOwnership(t *testing.T) {
+	env := requireEnv(t)
+	alice := registerAndToken(t, env, uniqueName("coupon-owner"))
+	bob := registerAndToken(t, env, uniqueName("coupon-thief"))
+	addrID := address(t, env, bob)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+	couponID := thresholdCoupon(t, env, alice, 5000, 5000)
+
+	w, _ := createOrder(t, env, bob, uniqueName("req"), addrID, skuID, 1, couponID)
+	require.Equal(t, http.StatusNotFound, w.Code, "他人券应按不存在处理")
 }
 
 // 满减券：门槛不足 409；满足后金额正确、券核销。
@@ -689,8 +743,8 @@ func TestOrderConcurrentIdempotency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			w, body := createOrder(t, env, token, rid, addrID, skuID, 1, 0)
-			require.True(t, w.Code == http.StatusCreated || w.Code == http.StatusOK,
-				"并发提交应返回 201/200，实际 %d: %s", w.Code, w.Body.String())
+			require.True(t, w.Code == http.StatusCreated || w.Code == http.StatusOK || w.Code == http.StatusAccepted,
+				"并发提交应返回 201/200/202，实际 %d: %s", w.Code, w.Body.String())
 			orderNos <- body["order_no"].(string)
 		}()
 	}
@@ -866,6 +920,10 @@ func TestOrderInvalidRequests(t *testing.T) {
 
 	// 非法订单号参数 → 400。
 	w, _ = doJSON(t, env, http.MethodGet, "/api/orders/abc", "", token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	w, _ = doJSON(t, env, http.MethodGet, "/api/orders/0", "", token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	w, _ = doJSON(t, env, http.MethodGet, "/api/orders/-1", "", token)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 
 	// 不存在的订单：详情/取消/确认/发货 → 404。

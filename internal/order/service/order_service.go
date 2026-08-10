@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -78,6 +79,7 @@ return 0
 // 事务内条件扣减与回补库存（tx 由 order 模块开启）。
 type ProductService interface {
 	GetSKU(ctx context.Context, id int64) (*productmodel.SKU, error)
+	GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*productmodel.SKU, error)
 	GetDetail(ctx context.Context, id int64) (*productmodel.ProductDetail, error)
 	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
 	RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error
@@ -90,10 +92,11 @@ type CouponService interface {
 	RollbackCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) error
 }
 
-// CartService 购物车模块最小接口：结算读取购物车内容，事务内删除已购条目。
+// CartService 购物车模块最小接口：在订单事务内锁定并读取当前条目，
+// 再按条目 ID 删除已购行。
 type CartService interface {
-	ListItems(ctx context.Context, userID int64) ([]cartmodel.CartItemView, error)
-	DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error
+	LockItems(ctx context.Context, tx *gorm.DB, userID int64) ([]cartmodel.CartItem, error)
+	DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error
 }
 
 // UserService 用户模块最小接口：读取地址簿固化为地址快照（owner 校验）。
@@ -122,10 +125,12 @@ type CreateParams struct {
 }
 
 // CreateResult 下单结果；Idempotent=true 表示命中了 client_request_id
-// 幂等键（重复提交），Order 为既有订单。
+// 幂等键（重复提交），Order 为既有订单。Processing=true 表示订单号已被
+// 幂等请求占用但订单尚未提交，HTTP 层应返回 202，客户端轮询详情。
 type CreateResult struct {
 	Order      *model.OrderView
 	Idempotent bool
+	Processing bool
 }
 
 // Service order 模块的业务接口。
@@ -194,6 +199,9 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 	if p.ClientRequestID == "" || len(p.ClientRequestID) > 64 {
 		return nil, fmt.Errorf("%w: invalid client_request_id", ErrInvalidInput)
 	}
+	if p.CouponID < 0 {
+		return nil, fmt.Errorf("%w: invalid coupon id", ErrInvalidInput)
+	}
 	if err := validateItems(&p); err != nil {
 		return nil, err
 	}
@@ -205,11 +213,18 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 	if !acquired {
 		return s.replayIdempotent(ctx, orderNo)
 	}
-	// 校验类失败（库存不足/券不可用等）释放幂等键，允许客户端修正后重试；
-	// 基础设施类失败（DB/Redis 瞬时故障）保留幂等键——若下单实际已提交，
-	// 重试会命中幂等键返回同一订单号，避免同一 client_request_id 生成两单。
+	// 校验类失败释放幂等键，允许客户端修正后重试；基础设施类失败先查订单：
+	// 已提交则保留幂等键返回同一订单号，确认未提交则释放，避免永久占用请求。
 	defer func() {
-		if err != nil && isValidationError(err) {
+		if err == nil {
+			return
+		}
+		shouldRelease := isValidationError(err)
+		if !shouldRelease {
+			existing, lookupErr := s.store.Orders.GetByNo(ctx, orderNo)
+			shouldRelease = lookupErr == nil && existing == nil
+		}
+		if shouldRelease {
 			if delErr := s.cache.Del(ctx, idemKey(userID, p.ClientRequestID)); delErr != nil {
 				err = fmt.Errorf("%w: release idempotency key: %v", err, delErr)
 			}
@@ -226,10 +241,8 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 		}
 		return nil, err
 	}
-
-	lines, err := s.collectLines(ctx, userID, &p)
-	if err != nil {
-		return nil, err
+	if address == nil {
+		return nil, ErrAddressNotFound
 	}
 
 	var coupon *couponmodel.UserCouponView
@@ -240,66 +253,87 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 		}
 	}
 
-	snapshots, total, err := s.loadSnapshots(ctx, lines)
-	if err != nil {
-		return nil, err
-	}
-
-	discount := int64(0)
-	if coupon != nil {
-		if total < coupon.MinAmount {
-			return nil, ErrCouponThresholdNotMet
-		}
-		// 券额不超过商品总额（应付不为负）。
-		discount = coupon.Value
-		if discount > total {
-			discount = total
-		}
-	}
-	pay := total - discount
-
-	order, items := buildOrder(userID, orderNo, address, snapshots, total, discount, pay, coupon)
-
+	var (
+		snapshots   []lineSnapshot
+		total       int64
+		order       *model.Order
+		items       []model.OrderItem
+		cartItemIDs []int64
+	)
 	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
-		for _, sn := range snapshots {
-			ok, err := s.products.DeductStock(ctx, tx, sn.skuID, sn.quantity)
+		if p.FromCart {
+			cartItems, err := s.cart.LockItems(ctx, tx, userID)
 			if err != nil {
 				return err
 			}
-			if !ok {
-				return ErrInsufficientStock
+			if len(cartItems) == 0 {
+				return ErrCartEmpty
+			}
+			lines := make([]orderLine, 0, len(cartItems))
+			cartItemIDs = make([]int64, 0, len(cartItems))
+			for _, item := range cartItems {
+				lines = append(lines, orderLine{skuID: item.SKUID, quantity: item.Quantity})
+				cartItemIDs = append(cartItemIDs, item.ID)
+			}
+			snapshots, total, err = s.loadSnapshots(ctx, tx, lines)
+			if err != nil {
+				return err
+			}
+		} else {
+			lines := directLines(&p)
+			snapshots, total, err = s.loadSnapshots(ctx, tx, lines)
+			if err != nil {
+				return err
 			}
 		}
-		if coupon != nil {
-			// 核销失败：已用/过期/不存在经 translateCouponError 区分（409/404）。
-			if err := s.coupons.UseCoupon(ctx, tx, userID, p.CouponID); err != nil {
-				return translateCouponError(err)
-			}
-		}
-		if err := s.store.Orders.Create(ctx, tx, order); err != nil {
+
+		discount, pay, err := calculateAmounts(total, coupon)
+		if err != nil {
 			return err
 		}
-		for i := range items {
-			if err := s.store.Items.Create(ctx, tx, &items[i]); err != nil {
-				return err
-			}
-		}
-		if p.FromCart {
-			skuIDs := make([]int64, 0, len(snapshots))
-			for _, sn := range snapshots {
-				skuIDs = append(skuIDs, sn.skuID)
-			}
-			if err := s.cart.DeletePurchased(ctx, tx, userID, skuIDs); err != nil {
-				return err
-			}
-		}
-		return nil
+		order, items = buildOrder(userID, orderNo, address, snapshots, total, discount, pay, coupon)
+		return s.persistOrder(ctx, tx, userID, p.CouponID, coupon, snapshots, order, items, cartItemIDs)
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	return &CreateResult{Order: &model.OrderView{Order: *order, Items: items}}, nil
+}
+
+// persistOrder 在同一事务内完成库存、券、订单、订单项与购物车清理。
+func (s *orderService) persistOrder(ctx context.Context, tx *gorm.DB, userID, couponID int64,
+	coupon *couponmodel.UserCouponView, snapshots []lineSnapshot, order *model.Order,
+	items []model.OrderItem, cartItemIDs []int64) error {
+	for _, sn := range snapshots {
+		ok, err := s.products.DeductStock(ctx, tx, sn.skuID, sn.quantity)
+		if err != nil {
+			return translateProductError(err)
+		}
+		if !ok {
+			return ErrInsufficientStock
+		}
+	}
+	if coupon != nil {
+		// 核销失败：已用/过期/不存在经 translateCouponError 区分（409/404）。
+		if err := s.coupons.UseCoupon(ctx, tx, userID, couponID); err != nil {
+			return translateCouponError(err)
+		}
+	}
+	if err := s.store.Orders.Create(ctx, tx, order); err != nil {
+		return err
+	}
+	for i := range items {
+		if err := s.store.Items.Create(ctx, tx, &items[i]); err != nil {
+			return err
+		}
+	}
+	if len(cartItemIDs) > 0 {
+		if err := s.cart.DeletePurchased(ctx, tx, userID, cartItemIDs); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // acquireIdempotency 生成雪花订单号并原子抢占幂等键（SETNX+EX）；
@@ -343,7 +377,11 @@ func (s *orderService) replayIdempotent(ctx context.Context, orderNo string) (*C
 		return nil, err
 	}
 	if view == nil {
-		return &CreateResult{Order: &model.OrderView{Order: model.Order{OrderNo: orderNo}}, Idempotent: true}, nil
+		return &CreateResult{
+			Order:      &model.OrderView{Order: model.Order{OrderNo: orderNo}},
+			Idempotent: true,
+			Processing: true,
+		}, nil
 	}
 	return &CreateResult{Order: view, Idempotent: true}, nil
 }
@@ -397,38 +435,78 @@ func validateItems(p *CreateParams) error {
 }
 
 // collectLines 购物车结算：读取购物车全部条目；直购：透传请求项。
-func (s *orderService) collectLines(ctx context.Context, userID int64, p *CreateParams) ([]orderLine, error) {
-	if !p.FromCart {
-		lines := make([]orderLine, 0, len(p.Items))
-		for _, it := range p.Items {
-			lines = append(lines, orderLine{skuID: it.SKUID, quantity: it.Quantity})
-		}
-		return lines, nil
-	}
-	items, err := s.cart.ListItems(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
-	if len(items) == 0 {
-		return nil, ErrCartEmpty
-	}
-	lines := make([]orderLine, 0, len(items))
-	for _, it := range items {
+// directLines 将直购请求转换为统一下单行；购物车行只在事务内经 LockItems 读取。
+func directLines(p *CreateParams) []orderLine {
+	lines := make([]orderLine, 0, len(p.Items))
+	for _, it := range p.Items {
 		lines = append(lines, orderLine{skuID: it.SKUID, quantity: it.Quantity})
 	}
-	return lines, nil
+	return lines
+}
+
+func calculateAmounts(total int64, coupon *couponmodel.UserCouponView) (int64, int64, error) {
+	discount := int64(0)
+	if coupon != nil {
+		if total < coupon.MinAmount {
+			return 0, 0, ErrCouponThresholdNotMet
+		}
+		discount = coupon.Value
+		if discount > total {
+			discount = total
+		}
+	}
+	return discount, total - discount, nil
+}
+
+// translateProductError 将事务内商品服务错误翻译为订单模块错误，避免 HTTP 500。
+func translateProductError(err error) error {
+	switch {
+	case errors.Is(err, productsvc.ErrSKUNotFound):
+		return ErrSKUNotFound
+	case errors.Is(err, productsvc.ErrProductNotFound):
+		return ErrSKUUnavailable
+	}
+	return err
 }
 
 // loadSnapshots 读取 SKU 价格并校验存在/上架（GetDetail 仅上架可见，404 即下架），
 // 累计商品总额，产出订单项快照。
-func (s *orderService) loadSnapshots(ctx context.Context, lines []orderLine) ([]lineSnapshot, int64, error) {
-	snapshots := make([]lineSnapshot, 0, len(lines))
+func (s *orderService) loadSnapshots(ctx context.Context, tx *gorm.DB, lines []orderLine) ([]lineSnapshot, int64, error) {
+	type candidate struct {
+		line      orderLine
+		productID int64
+	}
+	candidates := make([]candidate, 0, len(lines))
+	for _, line := range lines {
+		sku, err := s.products.GetSKU(ctx, line.skuID)
+		if err != nil {
+			return nil, 0, translateProductError(err)
+		}
+		if sku == nil {
+			return nil, 0, ErrSKUNotFound
+		}
+		candidates = append(candidates, candidate{line: line, productID: sku.ProductID})
+	}
+	// 先按商品再按 SKU 排序；GetSKUForUpdate 按 product → SKU 加锁，
+	// 多商品订单之间使用全局一致的锁顺序，避免死锁。
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].productID != candidates[j].productID {
+			return candidates[i].productID < candidates[j].productID
+		}
+		return candidates[i].line.skuID < candidates[j].line.skuID
+	})
+
+	snapshots := make([]lineSnapshot, 0, len(candidates))
 	var total int64
-	for _, l := range lines {
-		sku, err := s.products.GetSKU(ctx, l.skuID)
+	for _, candidate := range candidates {
+		l := candidate.line
+		sku, err := s.products.GetSKUForUpdate(ctx, tx, l.skuID)
 		if err != nil {
 			if errors.Is(err, productsvc.ErrSKUNotFound) {
 				return nil, 0, ErrSKUNotFound
+			}
+			if errors.Is(err, productsvc.ErrProductNotFound) {
+				return nil, 0, ErrSKUUnavailable
 			}
 			return nil, 0, err
 		}
@@ -560,7 +638,7 @@ func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string)
 		}
 		for _, it := range view.Items {
 			if err := s.products.RestoreStock(ctx, tx, it.SKUID, it.Quantity); err != nil {
-				return err
+				return translateProductError(err)
 			}
 		}
 		if view.CouponID != nil {

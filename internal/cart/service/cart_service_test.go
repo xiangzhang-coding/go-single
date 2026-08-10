@@ -72,14 +72,25 @@ func (f *fakeItems) ListByUser(_ context.Context, userID int64) ([]model.CartIte
 	return out, nil
 }
 
-// DeleteBySKUs 批量删除指定 SKU 条目；tx 参数忽略（单测无真实事务）。
-func (f *fakeItems) DeleteBySKUs(_ context.Context, _ *gorm.DB, userID int64, skuIDs []int64) error {
-	ids := make(map[int64]bool, len(skuIDs))
-	for _, s := range skuIDs {
-		ids[s] = true
+// LockByUser 返回用户当前条目；tx 参数忽略（单测无真实事务）。
+func (f *fakeItems) LockByUser(_ context.Context, _ *gorm.DB, userID int64) ([]model.CartItem, error) {
+	var out []model.CartItem
+	for _, v := range f.byID {
+		if v.UserID == userID {
+			out = append(out, *v)
+		}
+	}
+	return out, nil
+}
+
+// DeleteByIDs 按条目 ID 删除；tx 参数忽略（单测无真实事务）。
+func (f *fakeItems) DeleteByIDs(_ context.Context, _ *gorm.DB, userID int64, itemIDs []int64) error {
+	ids := make(map[int64]bool, len(itemIDs))
+	for _, id := range itemIDs {
+		ids[id] = true
 	}
 	for id, v := range f.byID {
-		if v.UserID == userID && ids[v.SKUID] {
+		if v.UserID == userID && ids[id] {
 			delete(f.byID, id)
 		}
 	}

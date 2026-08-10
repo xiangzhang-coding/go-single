@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/cart/model"
 )
@@ -59,8 +60,17 @@ func (r *GORMCartItemRepository) GetByUserAndSKU(ctx context.Context, userID, sk
 }
 
 func (r *GORMCartItemRepository) UpdateQuantity(ctx context.Context, id int64, quantity int) error {
-	return r.db.WithContext(ctx).Model(&model.CartItem{}).Where("id = ?", id).
-		Update("quantity", quantity).Error
+	res := r.db.WithContext(ctx).Model(&model.CartItem{}).Where("id = ?", id).
+		Update("quantity", quantity)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		// MySQL 将"改成原值"报告为 0 行；先确认条目仍存在，避免把合法幂等改量误报 404。
+		var item model.CartItem
+		return r.db.WithContext(ctx).Select("id").First(&item, id).Error
+	}
+	return nil
 }
 
 func (r *GORMCartItemRepository) Delete(ctx context.Context, id int64) error {
@@ -86,12 +96,23 @@ func (r *GORMCartItemRepository) ListByUser(ctx context.Context, userID int64) (
 	return views, nil
 }
 
-// DeleteBySKUs 结算后清理已购条目（与订单创建同一事务）。
-func (r *GORMCartItemRepository) DeleteBySKUs(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error {
-	if len(skuIDs) == 0 {
+// LockByUser 结算事务内读取当前条目并加排他锁。
+// 在 InnoDB 下，用户索引范围锁住后，改量/新增会等待本次结算提交，
+// 结算使用的数量与随后删除的条目 ID 保持同一事务快照。
+func (r *GORMCartItemRepository) LockByUser(ctx context.Context, tx *gorm.DB, userID int64) ([]model.CartItem, error) {
+	items := make([]model.CartItem, 0)
+	err := tx.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_id = ?", userID).Order("id ASC").Find(&items).Error
+	return items, err
+}
+
+// DeleteByIDs 结算后按锁定的条目 ID 清理（与订单创建同一事务）。
+func (r *GORMCartItemRepository) DeleteByIDs(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error {
+	if len(itemIDs) == 0 {
 		return nil
 	}
-	return tx.WithContext(ctx).Where("user_id = ? AND sku_id IN ?", userID, skuIDs).
+	return tx.WithContext(ctx).Where("user_id = ? AND id IN ?", userID, itemIDs).
 		Delete(&model.CartItem{}).Error
 }
 

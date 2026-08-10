@@ -21,6 +21,7 @@ type Config struct {
 	MinIO      MinIO
 	Migrations Migrations
 	Auth       Auth
+	Snowflake  Snowflake
 }
 
 type Auth struct {
@@ -28,6 +29,11 @@ type Auth struct {
 	Secret string
 	// TTL 令牌有效期，如 "2h"。
 	TTL time.Duration
+}
+
+// Snowflake 雪花订单号生成器配置；多实例部署时每个实例必须使用不同 worker_id。
+type Snowflake struct {
+	WorkerID int64 `mapstructure:"worker_id"`
 }
 
 type Server struct {
@@ -133,4 +139,5 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("migrations.path", "./migrations")
 	v.SetDefault("auth.secret", "dev-secret-change-me")
 	v.SetDefault("auth.ttl", "2h")
+	v.SetDefault("snowflake.worker_id", 1)
 }

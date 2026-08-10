@@ -102,6 +102,10 @@ func (f *fakeProducts) GetByID(_ context.Context, id int64) (*model.Product, err
 	return f.byID[id], nil
 }
 
+func (f *fakeProducts) GetByIDForUpdate(ctx context.Context, _ *gorm.DB, id int64) (*model.Product, error) {
+	return f.GetByID(ctx, id)
+}
+
 func (f *fakeProducts) List(_ context.Context, categoryID *int64, status string, offset, limit int) ([]model.Product, int64, error) {
 	var total int64
 	var matched []model.Product
@@ -166,6 +170,10 @@ func (f *fakeSKUs) Delete(_ context.Context, id int64) error {
 
 func (f *fakeSKUs) GetByID(_ context.Context, id int64) (*model.SKU, error) {
 	return f.byID[id], nil
+}
+
+func (f *fakeSKUs) GetByIDForUpdate(ctx context.Context, _ *gorm.DB, id int64) (*model.SKU, error) {
+	return f.GetByID(ctx, id)
 }
 
 func (f *fakeSKUs) ListByProduct(_ context.Context, productID int64) ([]model.SKU, error) {

@@ -224,10 +224,17 @@ func (s *userService) ensureOwned(ctx context.Context, userID, id int64) error {
 
 // GetAddress 读取单条地址并校验归属；供 order 模块下单时固化为地址快照。
 func (s *userService) GetAddress(ctx context.Context, userID, id int64) (*model.Address, error) {
-	if err := s.ensureOwned(ctx, userID, id); err != nil {
+	a, err := s.store.Addresses.GetByID(ctx, id)
+	if err != nil {
 		return nil, err
 	}
-	return s.store.Addresses.GetByID(ctx, id)
+	if a == nil {
+		return nil, ErrAddressNotFound
+	}
+	if a.UserID != userID {
+		return nil, ErrAddressForbidden
+	}
+	return a, nil
 }
 
 func validateCredentials(username, password string) error {

@@ -89,7 +89,10 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 	status := http.StatusCreated
-	if result.Idempotent {
+	if result.Processing {
+		// 幂等键已占用但订单尚未提交：不是创建成功，客户端应轮询详情。
+		status = http.StatusAccepted
+	} else if result.Idempotent {
 		status = http.StatusOK
 	}
 	c.JSON(status, result.Order)
@@ -178,7 +181,8 @@ func (h *Handler) Ship(c *gin.Context) {
 // orderNoParam 校验路径参数为纯数字订单号（雪花 ID 十进制）。
 func orderNoParam(c *gin.Context) (string, bool) {
 	raw := c.Param("order_no")
-	if _, err := strconv.ParseInt(raw, 10, 64); err != nil || len(raw) == 0 {
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 || len(raw) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid order_no"})
 		return "", false
 	}

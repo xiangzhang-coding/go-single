@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/product/model"
 )
@@ -114,6 +115,18 @@ func (r *GORMProductRepository) GetByID(ctx context.Context, id int64) (*model.P
 	return &p, nil
 }
 
+// GetByIDForUpdate 在订单事务内读取并锁定商品状态。
+func (r *GORMProductRepository) GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.Product, error) {
+	var p model.Product
+	if err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&p, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
 func (r *GORMProductRepository) List(ctx context.Context, categoryID *int64, status string, offset, limit int) ([]model.Product, int64, error) {
 	q := r.db.WithContext(ctx).Model(&model.Product{})
 	if categoryID != nil {
@@ -175,6 +188,18 @@ func (r *GORMSKURepository) GetByID(ctx context.Context, id int64) (*model.SKU, 
 	return &s, nil
 }
 
+// GetByIDForUpdate 在订单事务内读取并锁定 SKU 行。
+func (r *GORMSKURepository) GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.SKU, error) {
+	var s model.SKU
+	if err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&s, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &s, nil
+}
+
 func (r *GORMSKURepository) ListByProduct(ctx context.Context, productID int64) ([]model.SKU, error) {
 	var list []model.SKU
 	if err := r.db.WithContext(ctx).Where("product_id = ?", productID).Order("id ASC").Find(&list).Error; err != nil {
@@ -183,12 +208,16 @@ func (r *GORMSKURepository) ListByProduct(ctx context.Context, productID int64) 
 	return list, nil
 }
 
-// DeductStock 条件更新：stock=stock-N WHERE stock>=N；RowsAffected=0 即库存不足。
-// tx 由调用方（order 下单事务）提供，与订单创建同事务原子提交。
+// DeductStock 条件更新：stock=stock-N WHERE stock>=N 且商品仍上架；
+// RowsAffected=0 表示库存不足、SKU 不存在或商品已下架。tx 由调用方
+// （order 下单事务）提供，与订单创建同事务原子提交。
 func (r *GORMSKURepository) DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error) {
-	res := tx.WithContext(ctx).Model(&model.SKU{}).
-		Where("id = ? AND stock >= ?", skuID, quantity).
-		Update("stock", gorm.Expr("stock - ?", quantity))
+	res := tx.WithContext(ctx).Exec(`
+		UPDATE skus s
+		JOIN products p ON p.id = s.product_id
+		SET s.stock = s.stock - ?
+		WHERE s.id = ? AND s.stock >= ? AND p.status = ?`,
+		quantity, skuID, quantity, model.ProductStatusOnSale)
 	if res.Error != nil {
 		return false, res.Error
 	}

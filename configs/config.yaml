@@ -34,3 +34,7 @@ migrations:
 auth:
   secret: dev-secret-change-me
   ttl: 2h
+
+snowflake:
+  # 多实例部署时每个实例必须配置不同的 worker_id（0-1023）。
+  worker_id: 1
