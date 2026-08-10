@@ -32,8 +32,8 @@ import (
 )
 
 const (
-	testDBName   = "go_shop_test"
-	testSecret   = "integration-test-secret"
+	testDBName    = "go_shop_test"
+	testSecret    = "integration-test-secret"
 	migrationsDir = "../../migrations"
 )
 
@@ -41,6 +41,7 @@ const (
 type testEnv struct {
 	router   http.Handler
 	verifier auth.TokenVerifier
+	gdb      *gorm.DB
 }
 
 var (
@@ -102,13 +103,16 @@ func buildEnv() (*testEnv, error) {
 	}
 
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
-	handler := userhandler.New(usersvc.New(userrepo.NewGORM(gdb), verifier), verifier)
+	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier)
+	handler := userhandler.New(userSvc, verifier)
+	addressHandler := userhandler.NewAddress(userSvc, verifier)
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	api := r.Group("/api")
 	handler.RegisterRoutes(api)
-	return &testEnv{router: r, verifier: verifier}, nil
+	addressHandler.RegisterRoutes(api)
+	return &testEnv{router: r, verifier: verifier, gdb: gdb}, nil
 }
 
 func testDSN(dbName string) string {

@@ -165,9 +165,11 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	}
 	r.GET("/healthz", healthHandler(checker))
 
-	// user 模块：注册/登录/鉴权。
+	// user 模块：注册/登录/鉴权 + 地址簿（默认地址唯一由 users.default_address_id 指针保证）。
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: cfg.Auth.Secret, TTL: cfg.Auth.TTL})
-	userHandler := userhandler.New(usersvc.New(userrepo.NewGORM(db), verifier), verifier)
+	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(db), Addresses: userrepo.NewGORMAddress(db)}, verifier)
+	userHandler := userhandler.New(userSvc, verifier)
+	addressHandler := userhandler.NewAddress(userSvc, verifier)
 
 	// product 模块：admin 维护类目/商品/SKU，游客浏览（详情走缓存）。
 	productRepo := productrepo.NewGORMProduct(db)
@@ -184,6 +186,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 
 	api := r.Group("/api")
 	userHandler.RegisterRoutes(api)
+	addressHandler.RegisterRoutes(api)
 	productHandler.RegisterRoutes(api)
 	couponHandler.RegisterRoutes(api)
 

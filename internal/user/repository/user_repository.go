@@ -17,3 +17,9 @@ type UserRepository interface {
 	GetByUsername(ctx context.Context, username string) (*model.User, error)
 	GetByID(ctx context.Context, id int64) (*model.User, error)
 }
+
+// Store 聚合 user 模块各仓储，作为 service 的构造入参。
+type Store struct {
+	Users     UserRepository
+	Addresses AddressRepository
+}

@@ -55,13 +55,13 @@ type fakeIssuer struct {
 
 func (f *fakeIssuer) Issue(_ int64, _ string) (string, error) { return f.token, f.err }
 
-func newTestService(users *fakeUsers, issuer TokenIssuer) Service {
-	return New(users, issuer)
+func newTestService(users *fakeUsers, addresses *fakeAddresses, issuer TokenIssuer) Service {
+	return New(repository.Store{Users: users, Addresses: addresses}, issuer)
 }
 
 func TestRegisterSuccess(t *testing.T) {
 	repo := newFakeUsers()
-	svc := newTestService(repo, &fakeIssuer{token: "t"})
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{token: "t"})
 
 	u, err := svc.Register(context.Background(), "alice", "secret123")
 	require.NoError(t, err)
@@ -75,7 +75,7 @@ func TestRegisterSuccess(t *testing.T) {
 
 func TestRegisterDuplicateUsername(t *testing.T) {
 	repo := newFakeUsers()
-	svc := newTestService(repo, &fakeIssuer{})
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
 
 	_, err := svc.Register(context.Background(), "alice", "secret123")
 	require.NoError(t, err)
@@ -84,7 +84,7 @@ func TestRegisterDuplicateUsername(t *testing.T) {
 }
 
 func TestRegisterInvalidInput(t *testing.T) {
-	svc := newTestService(newFakeUsers(), &fakeIssuer{})
+	svc := newTestService(newFakeUsers(), newFakeAddresses(), &fakeIssuer{})
 
 	_, err := svc.Register(context.Background(), "ab", "secret123")
 	require.ErrorIs(t, err, ErrInvalidUsername)
@@ -98,7 +98,7 @@ func TestRegisterInvalidInput(t *testing.T) {
 
 func TestLoginSuccess(t *testing.T) {
 	repo := newFakeUsers()
-	svc := newTestService(repo, &fakeIssuer{token: "jwt-token"})
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{token: "jwt-token"})
 
 	_, err := svc.Register(context.Background(), "bob", "secret123")
 	require.NoError(t, err)
@@ -111,7 +111,7 @@ func TestLoginSuccess(t *testing.T) {
 
 func TestLoginWrongPassword(t *testing.T) {
 	repo := newFakeUsers()
-	svc := newTestService(repo, &fakeIssuer{token: "t"})
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{token: "t"})
 
 	_, err := svc.Register(context.Background(), "bob", "secret123")
 	require.NoError(t, err)
@@ -121,7 +121,7 @@ func TestLoginWrongPassword(t *testing.T) {
 }
 
 func TestLoginUnknownUser(t *testing.T) {
-	svc := newTestService(newFakeUsers(), &fakeIssuer{token: "t"})
+	svc := newTestService(newFakeUsers(), newFakeAddresses(), &fakeIssuer{token: "t"})
 
 	_, _, err := svc.Login(context.Background(), "ghost", "secret123")
 	require.ErrorIs(t, err, ErrInvalidCredentials)
@@ -129,7 +129,7 @@ func TestLoginUnknownUser(t *testing.T) {
 
 func TestGetByID(t *testing.T) {
 	repo := newFakeUsers()
-	svc := newTestService(repo, &fakeIssuer{})
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
 
 	u, err := svc.Register(context.Background(), "carol", "secret123")
 	require.NoError(t, err)
@@ -145,7 +145,7 @@ func TestGetByID(t *testing.T) {
 func TestRegisterRepoErrorPropagates(t *testing.T) {
 	repo := newFakeUsers()
 	repo.createErr = fmt.Errorf("db down: %w", errors.New("connection refused"))
-	svc := newTestService(repo, &fakeIssuer{})
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
 
 	_, err := svc.Register(context.Background(), "dave", "secret123")
 	require.Error(t, err)

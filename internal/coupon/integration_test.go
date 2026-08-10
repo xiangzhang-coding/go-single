@@ -122,7 +122,8 @@ func buildEnv() (*testEnv, error) {
 	}
 
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
-	userHandler := userhandler.New(usersvc.New(userrepo.NewGORM(gdb), verifier), verifier)
+	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier)
+	userHandler := userhandler.New(userSvc, verifier)
 	couponHandler := couponhandler.New(
 		couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(gdb), UserCoupon: couponrepo.NewGORMUserCoupon(gdb)}, cacheClient),
 		verifier,
