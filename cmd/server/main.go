@@ -17,12 +17,19 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/mysql"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"go.uber.org/zap"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 
+	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/config"
 	"github.com/xiangzhang-coding/go-single/internal/platform/health"
 	"github.com/xiangzhang-coding/go-single/internal/platform/logger"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
+	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
+	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
+	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
 )
 
 func main() {
@@ -49,7 +56,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	defer sqlDB.Close()
 
 	if err := runMigrations(cfg, log); err != nil {
 		return err
@@ -68,7 +79,7 @@ func run() error {
 	}
 	defer mqClient.Close()
 
-	router := newRouter(cfg, log, db, cacheClient, mqClient)
+	router := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
@@ -96,21 +107,28 @@ func run() error {
 	return srv.Shutdown(ctx)
 }
 
-func openMySQL(cfg *config.Config) (*sql.DB, error) {
-	db, err := sql.Open("mysql", cfg.MySQL.DSN())
+func openMySQL(cfg *config.Config) (*gorm.DB, error) {
+	gdb, err := gorm.Open(mysql.Open(cfg.MySQL.DSN()), &gorm.Config{
+		// record not found 属正常分支（仓储已处理），仅记录 warn 及以上。
+		Logger: gormlogger.Default.LogMode(gormlogger.Warn),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("打开 MySQL: %w", err)
 	}
-	db.SetMaxOpenConns(20)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	sqlDB, err := gdb.DB()
+	if err != nil {
+		return nil, fmt.Errorf("获取 SQL 连接池: %w", err)
+	}
+	sqlDB.SetMaxOpenConns(20)
+	sqlDB.SetMaxIdleConns(5)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
+	if err := sqlDB.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("MySQL 连接失败: %w", err)
 	}
-	return db, nil
+	return gdb, nil
 }
 
 func runMigrations(cfg *config.Config, log *zap.Logger) error {
@@ -127,19 +145,25 @@ func runMigrations(cfg *config.Config, log *zap.Logger) error {
 	return nil
 }
 
-func newRouter(cfg *config.Config, log *zap.Logger, db *sql.DB, cacheClient cache.Cache, mqClient mq.MQ) *gin.Engine {
+func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Cache, mqClient mq.MQ) *gin.Engine {
 	gin.SetMode(cfg.Server.Mode)
 
 	r := gin.New()
 	r.Use(gin.Recovery(), requestLogger(log))
 
 	checker := &health.Checker{
-		MySQL:   db,
+		MySQL:   sqlDB,
 		Cache:   cacheClient,
 		MQ:      mqClient,
 		Timeout: 2 * time.Second,
 	}
 	r.GET("/healthz", healthHandler(checker))
+
+	// user 模块：注册/登录/鉴权。
+	verifier := auth.NewJWT(auth.JWTConfig{Secret: cfg.Auth.Secret, TTL: cfg.Auth.TTL})
+	userHandler := userhandler.New(usersvc.New(userrepo.NewGORM(db), verifier), verifier)
+	api := r.Group("/api")
+	userHandler.RegisterRoutes(api)
 
 	return r
 }

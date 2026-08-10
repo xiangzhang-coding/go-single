@@ -22,3 +22,7 @@ mq:
 
 migrations:
   path: ./migrations
+
+auth:
+  secret: dev-secret-change-me
+  ttl: 2h

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -18,6 +19,14 @@ type Config struct {
 	Redis      Redis
 	MQ         MQ
 	Migrations Migrations
+	Auth       Auth
+}
+
+type Auth struct {
+	// Secret JWT HS256 签名密钥（生产环境用环境变量 GO_SINGLE_AUTH_SECRET 注入）。
+	Secret string
+	// TTL 令牌有效期，如 "2h"。
+	TTL time.Duration
 }
 
 type Server struct {
@@ -100,4 +109,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("redis.db", 0)
 	v.SetDefault("mq.url", "amqp://guest:guest@127.0.0.1:5672/")
 	v.SetDefault("migrations.path", "./migrations")
+	v.SetDefault("auth.secret", "dev-secret-change-me")
+	v.SetDefault("auth.ttl", "2h")
 }
