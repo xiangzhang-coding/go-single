@@ -33,6 +33,9 @@ import (
 	orderhandler "github.com/xiangzhang-coding/go-single/internal/order/handler"
 	orderrepo "github.com/xiangzhang-coding/go-single/internal/order/repository"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
+	paymenthandler "github.com/xiangzhang-coding/go-single/internal/payment/handler"
+	paymentrepo "github.com/xiangzhang-coding/go-single/internal/payment/repository"
+	paymentsvc "github.com/xiangzhang-coding/go-single/internal/payment/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/config"
@@ -237,9 +240,16 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		log.Fatal("初始化雪花订单号生成器失败", zap.Error(err))
 	}
 	orderStore := orderrepo.NewGORMOrder(db)
-	orderHandler := orderhandler.New(
-		ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
-			cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc),
+	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc)
+	orderHandler := orderhandler.New(orderSvc, verifier)
+
+	// payment 模块：模拟支付回调（成功/失败），流水唯一约束（payment_id）挡重复回调，
+	// 成功路径单事务（流水 + 订单 待支付→已支付，WHERE 校验状态机与金额）；
+	// 订单读取与状态迁移经 order 服务进程内调用。
+	paymentStore := paymentrepo.NewGORMPayment(db)
+	paymentHandler := paymenthandler.New(
+		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc),
 		verifier,
 	)
 
@@ -255,6 +265,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	flashsaleHandler.RegisterRoutes(api)
 	socialHandler.RegisterRoutes(api)
 	orderHandler.RegisterRoutes(api)
+	paymentHandler.RegisterRoutes(api)
 	fileHandler.RegisterRoutes(api)
 
 	return r

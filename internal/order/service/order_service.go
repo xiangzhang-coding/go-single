@@ -144,6 +144,9 @@ type Service interface {
 	GetDetail(ctx context.Context, userID int64, orderNo string) (*model.OrderView, error)
 	// Cancel 取消待支付订单：回补库存 + 回退券；状态机非法跃迁拒绝。
 	Cancel(ctx context.Context, userID int64, orderNo string) error
+	// MarkPaid 支付成功状态迁移：待支付 → 已支付（支付模块事务内条件更新；
+	// WHERE 同时校验 status 与 pay_amount，false = 状态已变或金额不符）。
+	MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error)
 	// Ship 后台发货：已支付 → 已发货（admin）。
 	Ship(ctx context.Context, orderNo string) error
 	// ConfirmReceipt 确认收货：已发货 → 已完成（owner 校验）。
@@ -652,6 +655,13 @@ func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string)
 		return err
 	}
 	return nil
+}
+
+// MarkPaid 支付成功状态迁移：待支付 → 已支付（事务由支付模块开启）。
+// 状态机（仅 待支付→已支付）与金额核对（pay_amount = 回调金额）由条件更新
+// WHERE 原子兜底；false 表示状态已变或金额不符，由支付模块区分错误。
+func (s *orderService) MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error) {
+	return s.store.Orders.MarkPaid(ctx, tx, orderNo, payAmount)
 }
 
 // Ship 后台发货：已支付 → 已发货（admin；发货不校验归属）。

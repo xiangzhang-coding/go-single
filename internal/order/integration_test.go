@@ -37,6 +37,9 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
 	orderrepo "github.com/xiangzhang-coding/go-single/internal/order/repository"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
+	paymenthandler "github.com/xiangzhang-coding/go-single/internal/payment/handler"
+	paymentrepo "github.com/xiangzhang-coding/go-single/internal/payment/repository"
+	paymentsvc "github.com/xiangzhang-coding/go-single/internal/payment/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
@@ -161,6 +164,12 @@ func buildEnv() (*testEnv, error) {
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc)
 	orderHandler := orderhandler.New(orderSvc, verifier)
 
+	paymentStore := paymentrepo.NewGORMPayment(gdb)
+	paymentHandler := paymenthandler.New(
+		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc),
+		verifier,
+	)
+
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	api := r.Group("/api")
@@ -170,6 +179,7 @@ func buildEnv() (*testEnv, error) {
 	cartHandler.RegisterRoutes(api)
 	couponHandler.RegisterRoutes(api)
 	orderHandler.RegisterRoutes(api)
+	paymentHandler.RegisterRoutes(api)
 	return &testEnv{router: r, verifier: verifier, redis: rc, gdb: gdb}, nil
 }
 
@@ -637,8 +647,12 @@ func TestOrderShipAndConfirmLifecycle(t *testing.T) {
 	w, _ = doJSON(t, env, http.MethodPost, "/api/admin/orders/"+orderNo+"/ship", "", token)
 	require.Equal(t, http.StatusForbidden, w.Code)
 
-	// 直接置库模拟支付回调（T08 实现后由支付接口驱动此跃迁）。
-	require.NoError(t, env.gdb.Model(&model.Order{}).Where("order_no = ?", orderNo).Update("status", model.OrderStatusPaid).Error)
+	// 模拟支付回调：待支付 → 已支付（T08 支付模块驱动此跃迁）。
+	w, _ = doJSON(t, env, http.MethodPost, "/api/payments/mock",
+		fmt.Sprintf(`{"order_id":%q,"payment_id":%q,"amount":9900,"result":"success"}`, orderNo, uniqueName("pay")), token)
+	require.Equal(t, http.StatusCreated, w.Code, "支付失败: %s", w.Body.String())
+	require.Equal(t, model.OrderStatusPaid, orderByNo(t, env, orderNo).Status)
+	require.NotNil(t, orderByNo(t, env, orderNo).PaidAt)
 
 	// 已支付 → 已发货（admin）。
 	w, _ = doJSON(t, env, http.MethodPost, "/api/admin/orders/"+orderNo+"/ship", "", admin)

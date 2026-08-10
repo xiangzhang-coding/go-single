@@ -164,9 +164,10 @@ go_single/
 
 ## 模拟支付
 
-- 接口形态：外部 API 端点 `POST /api/payments/mock {order_id, result: success|fail}`（前端订单详情页"模拟支付"按钮或 curl 调用）→ payment handler → payment service → 进程内调用 order service 驱动状态流转
-- 成功：状态机校验（仅 待支付→已支付 合法）+ 支付流水表唯一约束（payment_id）+ 金额核对（应付金额）
-- 失败：订单停留待支付，记录失败流水，允许重试支付（待支付 状态内可重复发起）
+- 接口形态：外部 API 端点 `POST /api/payments/mock {order_id, payment_id, amount, result: success|fail}`（前端订单详情页"模拟支付"按钮或 curl 调用）→ payment handler → payment service → 进程内调用 order service 驱动状态流转；`payment_id` 为客户端生成的支付流水号（每次尝试重新生成），`amount` 为回调申报金额（分）
+- 成功：状态机校验（仅 待支付→已支付 合法）+ 支付流水表唯一约束（payment_id，重复回调 409）+ 金额核对（回调金额 = 应付金额，不符 409）
+- 失败：订单停留待支付，记录失败流水，允许重试支付（待支付 状态内可重复发起，重试须用新 payment_id）
+- 归属：owner 校验先于流水检查（防 IDOR，他人订单 403）；流水落库与订单状态迁移同一事务
 
 ## 优惠券（与秒杀互斥）
 

@@ -71,6 +71,22 @@ func (s *GORMOrderStore) Cancel(ctx context.Context, tx *gorm.DB, orderNo string
 	return s.transition(ctx, tx, orderNo, model.OrderStatusPendingPayment, model.OrderStatusCancelled, "cancelled_at")
 }
 
+// MarkPaid 条件更新 待支付→已支付（支付回调）；WHERE 同时校验 status 与
+// pay_amount：RowsAffected=0 表示状态已变（并发/非法跃迁）或回调金额与应付不符。
+func (s *GORMOrderStore) MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error) {
+	exec := tx
+	if exec == nil {
+		exec = s.db.WithContext(ctx)
+	}
+	res := exec.Model(&model.Order{}).
+		Where("order_no = ? AND status = ? AND pay_amount = ?", orderNo, model.OrderStatusPendingPayment, payAmount).
+		Updates(map[string]any{"status": model.OrderStatusPaid, "paid_at": time.Now()})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
 // Ship 条件更新 已支付→已发货（admin 发货）。
 func (s *GORMOrderStore) Ship(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error) {
 	return s.transition(ctx, tx, orderNo, model.OrderStatusPaid, model.OrderStatusShipped, "shipped_at")

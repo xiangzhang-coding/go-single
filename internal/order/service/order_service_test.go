@@ -70,6 +70,15 @@ func (f *fakeOrders) Cancel(_ context.Context, tx *gorm.DB, orderNo string) (boo
 	return true, nil
 }
 
+func (f *fakeOrders) MarkPaid(_ context.Context, _ *gorm.DB, orderNo string, payAmount int64) (bool, error) {
+	o, ok := f.byID[orderNo]
+	if !ok || o.Status != model.OrderStatusPendingPayment || o.PayAmount != payAmount {
+		return false, nil
+	}
+	o.Status = model.OrderStatusPaid
+	return true, nil
+}
+
 func (f *fakeOrders) Ship(_ context.Context, _ *gorm.DB, orderNo string) (bool, error) {
 	o, ok := f.byID[orderNo]
 	if !ok || o.Status != model.OrderStatusPaid {
@@ -753,6 +762,40 @@ func TestStateMachineRejectsIllegalTransitions(t *testing.T) {
 	// 已完成后再取消：非法。
 	err = fx.svc.Cancel(context.Background(), 42, no)
 	require.ErrorIs(t, err, ErrIllegalTransition)
+}
+
+// 支付状态迁移（MarkPaid）：金额核对 + 状态机由条件更新兜底。
+func TestMarkPaidEnforcesAmountAndStateMachine(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("r14a", 1, 1))
+	require.NoError(t, err)
+	no := res.Order.OrderNo
+	payAmount := res.Order.PayAmount
+	require.Positive(t, payAmount)
+
+	// 金额不符：拒绝（订单仍待支付）。
+	ok, err := fx.svc.MarkPaid(context.Background(), nil, no, payAmount+1)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, model.OrderStatusPendingPayment, fx.orders.byID[no].Status)
+
+	// 金额正确：待支付 → 已支付。
+	ok, err = fx.svc.MarkPaid(context.Background(), nil, no, payAmount)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, model.OrderStatusPaid, fx.orders.byID[no].Status)
+
+	// 重复支付回调：状态已变（已支付 → 已支付 非法），金额核对先失配也拒绝。
+	ok, err = fx.svc.MarkPaid(context.Background(), nil, no, payAmount)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// 不存在的订单：false（仓储层幂等语义，由支付服务映射 404）。
+	ok, err = fx.svc.MarkPaid(context.Background(), nil, "999", 1)
+	require.NoError(t, err)
+	require.False(t, ok)
 }
 
 // owner 校验（防 IDOR）：他人订单的详情/取消/确认收货被拒。

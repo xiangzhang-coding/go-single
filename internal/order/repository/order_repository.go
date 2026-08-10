@@ -27,6 +27,9 @@ type OrderRepository interface {
 	List(ctx context.Context, userID int64, status string, offset, limit int) ([]model.Order, int64, error)
 	// Cancel 事务内条件更新 待支付→已取消；返回是否更新成功。
 	Cancel(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error)
+	// MarkPaid 事务内条件更新 待支付→已支付（支付回调）；WHERE 同时校验
+	// status 与 pay_amount（状态机 + 金额核对原子兜底），返回是否更新成功。
+	MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error)
 	// Ship 事务内条件更新 已支付→已发货（admin 发货）。
 	Ship(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error)
 	// ConfirmReceipt 事务内条件更新 已发货→已完成（用户确认收货）。
