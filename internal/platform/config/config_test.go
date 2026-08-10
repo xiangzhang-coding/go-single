@@ -28,6 +28,10 @@ func TestLoad(t *testing.T) {
 	require.Equal(t, "go_shop", cfg.MySQL.Database)
 	require.Equal(t, "127.0.0.1:6379", cfg.Redis.Addr)
 	require.Contains(t, cfg.MQ.URL, "amqp://")
+	require.Equal(t, "127.0.0.1:19000", cfg.MinIO.Endpoint)
+	require.Equal(t, "go-shop", cfg.MinIO.Bucket)
+	require.False(t, cfg.MinIO.UseSSL)
+	require.Equal(t, "http://127.0.0.1:19000", cfg.MinIO.PublicURL)
 	require.Equal(t, "./migrations", cfg.Migrations.Path)
 }
 

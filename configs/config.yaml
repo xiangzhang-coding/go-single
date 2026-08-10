@@ -20,6 +20,14 @@ redis:
 mq:
   url: amqp://guest:guest@127.0.0.1:5672/
 
+minio:
+  endpoint: 127.0.0.1:19000
+  access_key: minioadmin
+  secret_key: minioadmin
+  bucket: go-shop
+  use_ssl: false
+  public_url: http://127.0.0.1:19000
+
 migrations:
   path: ./migrations
 

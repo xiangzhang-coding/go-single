@@ -27,6 +27,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/config"
+	"github.com/xiangzhang-coding/go-single/internal/platform/file"
 	"github.com/xiangzhang-coding/go-single/internal/platform/health"
 	"github.com/xiangzhang-coding/go-single/internal/platform/logger"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
@@ -88,7 +89,20 @@ func run() error {
 	}
 	defer mqClient.Close()
 
-	router := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient)
+	// 文件上传：MinIO 私有桶 + 后端代理（前端不直连）。
+	fileSvc, err := file.NewMinIO(file.MinIOConfig{
+		Endpoint:  cfg.MinIO.Endpoint,
+		AccessKey: cfg.MinIO.AccessKey,
+		SecretKey: cfg.MinIO.SecretKey,
+		Bucket:    cfg.MinIO.Bucket,
+		UseSSL:    cfg.MinIO.UseSSL,
+		PublicURL: cfg.MinIO.PublicURL,
+	})
+	if err != nil {
+		return err
+	}
+
+	router := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient, fileSvc)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
@@ -154,7 +168,7 @@ func runMigrations(cfg *config.Config, log *zap.Logger) error {
 	return nil
 }
 
-func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Cache, mqClient mq.MQ) *gin.Engine {
+func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Cache, mqClient mq.MQ, fileSvc *file.MinIO) *gin.Engine {
 	gin.SetMode(cfg.Server.Mode)
 
 	r := gin.New()
@@ -193,12 +207,16 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		verifier,
 	)
 
+	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
+	fileHandler := file.NewHandler(fileSvc, verifier)
+
 	api := r.Group("/api")
 	userHandler.RegisterRoutes(api)
 	addressHandler.RegisterRoutes(api)
 	productHandler.RegisterRoutes(api)
 	couponHandler.RegisterRoutes(api)
 	socialHandler.RegisterRoutes(api)
+	fileHandler.RegisterRoutes(api)
 
 	return r
 }
