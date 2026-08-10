@@ -1,0 +1,11 @@
+# Prometheus 抓取配置：后端以宿主机进程运行（go run ./cmd/server，:8080），
+# 容器内经 host.docker.internal 访问宿主（Linux 需 extra_hosts: host-gateway）。
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: go-single
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8080"]

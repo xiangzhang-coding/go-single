@@ -30,6 +30,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/file"
 	"github.com/xiangzhang-coding/go-single/internal/platform/health"
 	"github.com/xiangzhang-coding/go-single/internal/platform/logger"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
@@ -172,7 +173,11 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	gin.SetMode(cfg.Server.Mode)
 
 	r := gin.New()
-	r.Use(gin.Recovery(), requestLogger(log))
+	// metrics 在最外层：panic 被 Recovery 恢复为 500 后仍能完成计数。
+	metricRegistry := metrics.New()
+	r.Use(metricRegistry.GinMiddleware(), gin.Recovery(), requestLogger(log))
+
+	r.GET("/metrics", gin.WrapH(metricRegistry.Handler()))
 
 	checker := &health.Checker{
 		MySQL:   sqlDB,
