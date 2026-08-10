@@ -10,9 +10,31 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 )
 
-// 派生状态 SQL 片段：used 落库优先；未用且已过有效期 → expired。
-const derivedStatusExpr = "CASE WHEN uc.status = '" + model.CouponStatusUsed + "' THEN '" + model.CouponStatusUsed +
-	"' WHEN t.valid_until < NOW(3) THEN '" + model.CouponStatusExpired + "' ELSE '" + model.CouponStatusUnused + "' END"
+// derivedStatusExpr 派生状态 SQL 片段：used 落库优先；未用且已过有效期 → expired。
+// 有效期上界经 now 参数传入（DATETIME 按 Go 本地墙钟写入，与 MySQL 服务器
+// 时区解耦，见 Use 注释）；SQL 内不再使用 NOW(3)。
+func derivedStatusExpr(now time.Time) string {
+	return "CASE WHEN uc.status = '" + model.CouponStatusUsed + "' THEN '" + model.CouponStatusUsed +
+		"' WHEN t.valid_until < ? THEN '" + model.CouponStatusExpired + "' ELSE '" + model.CouponStatusUnused + "' END"
+}
+
+// listByUser 查询条件（含派生状态筛选）：now 为 Go 当前时间。
+func applyStatusFilters(q *gorm.DB, status string, now time.Time) *gorm.DB {
+	if status != "" {
+		if status == model.CouponStatusUnused || status == model.CouponStatusExpired {
+			q = q.Where("uc.status = ?", model.CouponStatusUnused)
+		} else {
+			q = q.Where("uc.status = ?", status)
+		}
+	}
+	switch status {
+	case model.CouponStatusUnused:
+		q = q.Where("t.valid_until >= ?", now)
+	case model.CouponStatusExpired:
+		q = q.Where("t.valid_until < ?", now)
+	}
+	return q
+}
 
 // GORMCouponTemplateRepository 券模板仓储（GORM 实现）。
 type GORMCouponTemplateRepository struct {
@@ -66,28 +88,14 @@ func (r *GORMUserCouponRepository) Create(ctx context.Context, c *model.UserCoup
 }
 
 // ListByUser 单条 SQL 完成 JOIN + 派生状态 + 筛选，避免服务层 N+1 查询模板。
+// 派生状态与有效期筛选共用同一 Go 时间（now），保证一次查询内自洽。
 func (r *GORMUserCouponRepository) ListByUser(ctx context.Context, userID int64, status string, offset, limit int) ([]model.UserCouponView, int64, error) {
+	now := time.Now()
 	q := r.db.WithContext(ctx).
 		Table("user_coupons AS uc").
 		Joins("JOIN coupon_templates AS t ON t.id = uc.template_id").
 		Where("uc.user_id = ?", userID)
-
-	if status != "" {
-		if status == model.CouponStatusUnused || status == model.CouponStatusExpired {
-			// 未用/过期需结合有效期判定（expired = 未用且已过期）。
-			q = q.Where("uc.status = ?", model.CouponStatusUnused)
-		} else {
-			q = q.Where("uc.status = ?", status)
-		}
-	}
-
-	// 派生状态筛选：unused 排除已过期；expired 仅未用且过期；used 无需额外条件。
-	switch status {
-	case model.CouponStatusUnused:
-		q = q.Where("t.valid_until >= NOW(3)")
-	case model.CouponStatusExpired:
-		q = q.Where("t.valid_until < NOW(3)")
-	}
+	q = applyStatusFilters(q, status, now)
 
 	var total int64
 	if err := q.Count(&total).Error; err != nil {
@@ -95,9 +103,10 @@ func (r *GORMUserCouponRepository) ListByUser(ctx context.Context, userID int64,
 	}
 
 	rows, err := q.Select(
-		"uc.id, uc.template_id, t.name, t.type, t.value, t.min_amount, " +
-			derivedStatusExpr + " AS status, t.valid_from, t.valid_until, uc.used_at, uc.created_at",
-	).Order("uc.id DESC").Offset(offset).Limit(limit).Rows()
+		"uc.id, uc.template_id, t.name, t.type, t.value, t.min_amount, "+
+			derivedStatusExpr(now)+" AS status, "+
+			"t.valid_from, t.valid_until, uc.used_at, uc.created_at", now).
+		Order("uc.id DESC").Offset(offset).Limit(limit).Rows()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -130,13 +139,15 @@ func (r *GORMUserCouponRepository) CountUserByTemplate(ctx context.Context, user
 
 // GetViewByID 单张券查询（归属过滤），与 ListByUser 同构的 JOIN + 派生状态。
 func (r *GORMUserCouponRepository) GetViewByID(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error) {
+	now := time.Now()
 	var v model.UserCouponView
 	err := r.db.WithContext(ctx).
 		Table("user_coupons AS uc").
 		Joins("JOIN coupon_templates AS t ON t.id = uc.template_id").
 		Select(
 			"uc.id, uc.template_id, t.name, t.type, t.value, t.min_amount, "+
-				derivedStatusExpr+" AS status, t.valid_from, t.valid_until, uc.used_at, uc.created_at").
+				derivedStatusExpr(now)+" AS status, "+
+				"t.valid_from, t.valid_until, uc.used_at, uc.created_at", now).
 		Where("uc.id = ? AND uc.user_id = ?", couponID, userID).
 		Scan(&v).Error
 	if err != nil {
@@ -150,15 +161,15 @@ func (r *GORMUserCouponRepository) GetViewByID(ctx context.Context, userID, coup
 
 // Use 条件核销：unused→used 单条 UPDATE（含模板有效期窗口，原子校验防
 // 结算后券恰好过期仍被核销）；RowsAffected=0 即券已用/过期/不存在。
-// 窗口上界经 Go 传入而非 NOW(3)：DATETIME 按 Go 本地墙钟写入（go-sql-driver
-// 的 loc=Local 行为），与 MySQL 服务器时区解耦，任何时区组合都自洽。
+// 窗口上界与 used_at 均经 Go 传入而非 NOW(3)：DATETIME 按 Go 本地墙钟写入
+// （go-sql-driver 的 loc=Local 行为），与 MySQL 服务器时区解耦，任何时区组合都自洽。
 func (r *GORMUserCouponRepository) Use(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error) {
 	now := time.Now()
 	res := tx.WithContext(ctx).Model(&model.UserCoupon{}).
 		Where("id = ? AND user_id = ? AND status = ?", couponID, userID, model.CouponStatusUnused).
 		Where("EXISTS (SELECT 1 FROM coupon_templates t WHERE t.id = user_coupons.template_id "+
 			"AND t.valid_from <= ? AND t.valid_until >= ?)", now, now).
-		Updates(map[string]any{"status": model.CouponStatusUsed, "used_at": gorm.Expr("NOW(3)")})
+		Updates(map[string]any{"status": model.CouponStatusUsed, "used_at": now})
 	if res.Error != nil {
 		return false, res.Error
 	}

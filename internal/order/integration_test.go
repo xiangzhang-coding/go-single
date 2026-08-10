@@ -484,11 +484,11 @@ func TestOrderCouponUnusableHTTP(t *testing.T) {
 	w, _ = createOrder(t, env, token, uniqueName("req2"), addrID, skuID, 1, couponID)
 	require.Equal(t, http.StatusConflict, w.Code)
 
-	// 已过期的券 → 409（领券后把模板有效期改到过去）。
+	// 已过期的券 → 409（领券后把模板有效期改到过去；时间经 Go 传入与存储墙钟同源）。
 	couponID2 := thresholdCoupon(t, env, token, 5000, 5000)
 	require.NoError(t, env.gdb.Exec(
-		"UPDATE coupon_templates SET valid_until = NOW(3) - INTERVAL 1 MINUTE "+
-			"WHERE id = (SELECT template_id FROM user_coupons WHERE id = ?)", couponID2).Error)
+		"UPDATE coupon_templates SET valid_until = ? WHERE id = "+
+			"(SELECT template_id FROM user_coupons WHERE id = ?)", time.Now().Add(-time.Minute), couponID2).Error)
 	w, _ = createOrder(t, env, token, uniqueName("req3"), addrID, skuID, 1, couponID2)
 	require.Equal(t, http.StatusConflict, w.Code)
 }
@@ -670,4 +670,230 @@ func TestOrderListStatusFilterAndPagination(t *testing.T) {
 	// 非法状态 400。
 	w, _ = doJSON(t, env, http.MethodGet, "/api/orders?status=whatever", "", token)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// 并发幂等：同一 client_request_id 并发提交 10 次，只生成一单、返回同一订单号。
+func TestOrderConcurrentIdempotency(t *testing.T) {
+	env := requireEnv(t)
+	username := uniqueName("race")
+	token := registerAndToken(t, env, username)
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+	rid := uniqueName("req")
+
+	const n = 10
+	orderNos := make(chan string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w, body := createOrder(t, env, token, rid, addrID, skuID, 1, 0)
+			require.True(t, w.Code == http.StatusCreated || w.Code == http.StatusOK,
+				"并发提交应返回 201/200，实际 %d: %s", w.Code, w.Body.String())
+			orderNos <- body["order_no"].(string)
+		}()
+	}
+	wg.Wait()
+	close(orderNos)
+
+	seen := make(map[string]bool)
+	for no := range orderNos {
+		seen[no] = true
+	}
+	require.Len(t, seen, 1, "并发重复提交必须只生成一个订单号")
+	require.Equal(t, int64(1), countOrdersByUser(t, env, username))
+	require.Equal(t, 9, skuStock(t, env, skuID), "库存只扣一次")
+}
+
+// 并发抢购：库存 5，并发 6 单各买 1 → 恰好 5 成功、1 失败，库存归零不超卖。
+func TestOrderConcurrentStockRace(t *testing.T) {
+	env := requireEnv(t)
+	username := uniqueName("seckiller")
+	token := registerAndToken(t, env, username)
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 5)
+
+	const n = 6
+	results := make(chan int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			w, _ := createOrder(t, env, token, fmt.Sprintf("race-%d-%d", i, time.Now().UnixNano()), addrID, skuID, 1, 0)
+			results <- w.Code
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	ok, conflict := 0, 0
+	for code := range results {
+		switch code {
+		case http.StatusCreated:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Fatalf("意外状态码 %d", code)
+		}
+	}
+	require.Equal(t, 5, ok, "库存 5 应恰好 5 单成功")
+	require.Equal(t, 1, conflict, "恰好 1 单库存不足")
+	require.Equal(t, 0, skuStock(t, env, skuID), "不得超卖")
+}
+
+// 快照不可变：下单后删地址、改 SKU 价格，订单详情不受影响。
+func TestOrderSnapshotImmutability(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("snapshot"))
+	addrID := address(t, env, token)
+	productID, skuID := onSaleSKU(t, env, 9900, 10)
+
+	w, body := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 2, 0)
+	require.Equal(t, http.StatusCreated, w.Code)
+	orderNo := body["order_no"].(string)
+
+	// 删除地址 + 修改 SKU 价格。
+	w, _ = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/addresses/%d", addrID), "", token)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	admin := adminToken(t, env)
+	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/skus/%d", skuID),
+		`{"specs":{"color":"红"},"price":100,"stock":10}`, admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+
+	// 订单详情仍为下单时快照。
+	w, detail := doJSON(t, env, http.MethodGet, "/api/orders/"+orderNo, "", token)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "张三", detail["receiver"], "地址快照不受地址簿删除影响")
+	it := detail["items"].([]any)[0].(map[string]any)
+	require.Equal(t, float64(9900), it["price"], "价格快照不受 SKU 改价影响")
+	require.Equal(t, float64(2), it["quantity"])
+
+	// 商品页展示新价格，订单页展示旧价格（快照语义）。
+	w, prod := doJSON(t, env, http.MethodGet, fmt.Sprintf("/api/products/%d", productID), "", "")
+	require.Equal(t, http.StatusOK, w.Code)
+	skus := prod["skus"].([]any)
+	require.Equal(t, float64(100), skus[0].(map[string]any)["price"])
+}
+
+// 购物车结算 + 券 → 取消：多条目库存回补、券回退、购物车不恢复。
+func TestOrderCancelFromCartWithCoupon(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("cartcoupon"))
+	addrID := address(t, env, token)
+	_, skuA := onSaleSKU(t, env, 1000, 10)
+	_, skuB := onSaleSKU(t, env, 2000, 5)
+	couponID := thresholdCoupon(t, env, token, 3000, 3000)
+
+	w, _ := doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":2}`, skuA), token)
+	require.Equal(t, http.StatusCreated, w.Code)
+	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, skuB), token)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	w, body := doJSON(t, env, http.MethodPost, "/api/orders",
+		fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"from_cart":true,"coupon_id":%d}`, uniqueName("req"), addrID, couponID), token)
+	require.Equal(t, http.StatusCreated, w.Code, "结算失败: %s", w.Body.String())
+	require.Equal(t, float64(4000), body["total_amount"])
+	require.Equal(t, float64(3000), body["discount_amount"])
+	require.Equal(t, float64(1000), body["pay_amount"])
+	orderNo := body["order_no"].(string)
+	require.Equal(t, 8, skuStock(t, env, skuA))
+	require.Equal(t, 4, skuStock(t, env, skuB))
+
+	w, _ = doJSON(t, env, http.MethodPost, "/api/orders/"+orderNo+"/cancel", "", token)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	require.Equal(t, 10, skuStock(t, env, skuA), "多条目订单取消应全部回补")
+	require.Equal(t, 5, skuStock(t, env, skuB))
+
+	w, mine := doJSON(t, env, http.MethodGet, "/api/coupons/mine?status=unused", "", token)
+	require.Equal(t, http.StatusOK, w.Code)
+	found := false
+	for _, c := range mine["items"].([]any) {
+		if int64(c.(map[string]any)["id"].(float64)) == couponID {
+			found = true
+		}
+	}
+	require.True(t, found, "取消后券应回退")
+}
+
+// 取消时券已被外部改动（非 used）：取消失败 409，订单保持待支付、库存不回补。
+func TestOrderCancelRollbackFailure(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("rollbackfail"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+	couponID := thresholdCoupon(t, env, token, 5000, 5000)
+
+	w, body := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 2, couponID)
+	require.Equal(t, http.StatusCreated, w.Code)
+	orderNo := body["order_no"].(string)
+	require.Equal(t, 8, skuStock(t, env, skuID))
+
+	// 外部把券改回 unused（模拟数据扰动）：回退条件更新失败 → 取消整体失败。
+	require.NoError(t, env.gdb.Exec("UPDATE user_coupons SET status = 'unused', used_at = NULL WHERE id = ?", couponID).Error)
+
+	w, _ = doJSON(t, env, http.MethodPost, "/api/orders/"+orderNo+"/cancel", "", token)
+	require.Equal(t, http.StatusConflict, w.Code)
+
+	o := orderByNo(t, env, orderNo)
+	require.Equal(t, model.OrderStatusPendingPayment, o.Status, "回退失败应整体回滚，订单保持待支付")
+	require.Equal(t, 8, skuStock(t, env, skuID), "回退失败不得回补库存")
+}
+
+// 非法请求：from_cart 与 items 互斥、空 items、缺 client_request_id、非法订单号参数。
+func TestOrderInvalidRequests(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("invalid"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 100, 5)
+
+	// from_cart 与 items 互斥 → 400。
+	w, _ := doJSON(t, env, http.MethodPost, "/api/orders",
+		fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"from_cart":true,"items":[{"sku_id":%d,"quantity":1}]}`, uniqueName("req"), addrID, skuID), token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	// 空 items → 400。
+	w, _ = doJSON(t, env, http.MethodPost, "/api/orders",
+		fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"items":[]}`, uniqueName("req"), addrID), token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	// 缺 client_request_id → 400。
+	w, _ = doJSON(t, env, http.MethodPost, "/api/orders",
+		fmt.Sprintf(`{"address_id":%d,"items":[{"sku_id":%d,"quantity":1}]}`, addrID, skuID), token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	// 非法订单号参数 → 400。
+	w, _ = doJSON(t, env, http.MethodGet, "/api/orders/abc", "", token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	// 不存在的订单：详情/取消/确认/发货 → 404。
+	admin := adminToken(t, env)
+	w, _ = doJSON(t, env, http.MethodGet, "/api/orders/1234567890123456789", "", token)
+	require.Equal(t, http.StatusNotFound, w.Code)
+	w, _ = doJSON(t, env, http.MethodPost, "/api/orders/1234567890123456789/cancel", "", token)
+	require.Equal(t, http.StatusNotFound, w.Code)
+	w, _ = doJSON(t, env, http.MethodPost, "/api/orders/1234567890123456789/confirm", "", token)
+	require.Equal(t, http.StatusNotFound, w.Code)
+	w, _ = doJSON(t, env, http.MethodPost, "/api/admin/orders/1234567890123456789/ship", "", admin)
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// 直购多 SKU：金额累计、订单项逐条、库存逐项扣减。
+func TestOrderDirectBuyMultiSKU(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("multisku"))
+	addrID := address(t, env, token)
+	_, skuA := onSaleSKU(t, env, 1000, 10)
+	_, skuB := onSaleSKU(t, env, 2000, 5)
+
+	w, body := doJSON(t, env, http.MethodPost, "/api/orders",
+		fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"items":[{"sku_id":%d,"quantity":2},{"sku_id":%d,"quantity":1}]}`,
+			uniqueName("req"), addrID, skuA, skuB), token)
+	require.Equal(t, http.StatusCreated, w.Code, "下单失败: %s", w.Body.String())
+	require.Equal(t, float64(4000), body["total_amount"])
+	require.Len(t, body["items"].([]any), 2)
+	require.Equal(t, 8, skuStock(t, env, skuA))
+	require.Equal(t, 4, skuStock(t, env, skuB))
 }

@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -81,6 +82,8 @@ func (s *GORMOrderStore) ConfirmReceipt(ctx context.Context, tx *gorm.DB, orderN
 }
 
 // transition 状态机条件更新：WHERE status=from → status=to，并记录迁移时间。
+// 迁移时间经 Go 传入而非 NOW(3)：DATETIME 按 Go 本地墙钟写入（go-sql-driver
+// 的 loc=Local 行为），与 created_at/expire_at 同源，与 MySQL 服务器时区解耦。
 // tx 为 nil 时使用仓储自身连接（单条 UPDATE，无需事务）。
 func (s *GORMOrderStore) transition(ctx context.Context, tx *gorm.DB, orderNo, from, to, atColumn string) (bool, error) {
 	exec := tx
@@ -89,7 +92,7 @@ func (s *GORMOrderStore) transition(ctx context.Context, tx *gorm.DB, orderNo, f
 	}
 	res := exec.Model(&model.Order{}).
 		Where("order_no = ? AND status = ?", orderNo, from).
-		Updates(map[string]any{"status": to, atColumn: gorm.Expr("NOW(3)")})
+		Updates(map[string]any{"status": to, atColumn: time.Now()})
 	if res.Error != nil {
 		return false, res.Error
 	}

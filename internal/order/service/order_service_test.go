@@ -6,6 +6,8 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"testing"
@@ -16,6 +18,7 @@ import (
 
 	cartmodel "github.com/xiangzhang-coding/go-single/internal/cart/model"
 	couponmodel "github.com/xiangzhang-coding/go-single/internal/coupon/model"
+	couponsvc "github.com/xiangzhang-coding/go-single/internal/coupon/service"
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
 	"github.com/xiangzhang-coding/go-single/internal/order/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
@@ -173,9 +176,10 @@ func (f *fakeIdemCache) Eval(_ context.Context, _ string, keys []string, args ..
 
 // fakeProducts 以 SKU 表模拟 product 模块：offSale 标记商品下架。
 type fakeProducts struct {
-	skus    map[int64]*productmodel.SKU
-	offSale map[int64]bool
-	details map[int64]*productmodel.ProductDetail
+	skus      map[int64]*productmodel.SKU
+	offSale   map[int64]bool
+	details   map[int64]*productmodel.ProductDetail
+	deductErr error // 模拟事务内基础设施故障（如 DB 超时）
 }
 
 func newFakeProducts() *fakeProducts {
@@ -209,6 +213,9 @@ func (f *fakeProducts) GetDetail(_ context.Context, productID int64) (*productmo
 }
 
 func (f *fakeProducts) DeductStock(_ context.Context, _ *gorm.DB, skuID int64, quantity int) (bool, error) {
+	if f.deductErr != nil {
+		return false, f.deductErr
+	}
 	s, ok := f.skus[skuID]
 	if !ok || s.Stock < quantity {
 		return false, nil
@@ -246,34 +253,44 @@ func (f *fakeCoupons) seed(id, userID, value, minAmount int64) {
 func (f *fakeCoupons) GetUsable(_ context.Context, userID, couponID int64) (*couponmodel.UserCouponView, error) {
 	c, ok := f.coupons[couponID]
 	if !ok {
-		return nil, ErrCouponNotFound
+		return nil, couponsvc.ErrCouponNotFound
 	}
 	if c.Status == couponmodel.CouponStatusUsed {
-		return nil, ErrCouponUsed
+		return nil, couponsvc.ErrCouponUsed
 	}
 	now := time.Now()
 	if now.Before(c.ValidFrom) || now.After(c.ValidUntil) {
-		return nil, ErrCouponExpired
+		return nil, couponsvc.ErrCouponExpired
 	}
 	return c, nil
 }
 
-func (f *fakeCoupons) UseCoupon(_ context.Context, _ *gorm.DB, _ int64, couponID int64) (bool, error) {
+func (f *fakeCoupons) UseCoupon(_ context.Context, _ *gorm.DB, _ int64, couponID int64) error {
 	c, ok := f.coupons[couponID]
-	if !ok || c.Status != couponmodel.CouponStatusUnused {
-		return false, nil
+	if !ok {
+		return couponsvc.ErrCouponNotFound
+	}
+	if c.Status != couponmodel.CouponStatusUnused {
+		return couponsvc.ErrCouponUsed
+	}
+	now := time.Now()
+	if now.Before(c.ValidFrom) || now.After(c.ValidUntil) {
+		return couponsvc.ErrCouponExpired
 	}
 	c.Status = couponmodel.CouponStatusUsed
-	return true, nil
+	return nil
 }
 
-func (f *fakeCoupons) RollbackCoupon(_ context.Context, _ *gorm.DB, _ int64, couponID int64) (bool, error) {
+func (f *fakeCoupons) RollbackCoupon(_ context.Context, _ *gorm.DB, _ int64, couponID int64) error {
 	c, ok := f.coupons[couponID]
-	if !ok || c.Status != couponmodel.CouponStatusUsed {
-		return false, nil
+	if !ok {
+		return couponsvc.ErrCouponNotFound
+	}
+	if c.Status != couponmodel.CouponStatusUsed {
+		return fmt.Errorf("%w: coupon %d", couponsvc.ErrCouponRollbackFailed, couponID)
 	}
 	c.Status = couponmodel.CouponStatusUnused
-	return true, nil
+	return nil
 }
 
 // fakeCart 模拟 cart 模块。
@@ -482,6 +499,27 @@ func TestCreateFailureReleasesIdempotencyKey(t *testing.T) {
 	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("retry", 1, 1))
 	require.NoError(t, err)
 	require.False(t, res.Idempotent, "失败后幂等键应释放，可重新下单")
+}
+
+// 基础设施失败（事务内 DB 超时，幂等键已写入）：错误非校验类 → 幂等键保留，
+// 恢复后重试命中幂等键返回同一订单号，杜绝同一 client_request_id 生成两单。
+func TestCreateInfraFailureRetainsIdempotencyKey(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	fx.prods.deductErr = errors.New("db timeout")
+	_, err := fx.svc.Create(context.Background(), 42, fx.directParams("infra", 1, 1))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrInvalidInput, "基础设施失败不应包装为输入错误")
+	require.Zero(t, fx.cache.dels, "基础设施失败不得释放幂等键")
+
+	// 恢复后重试：命中幂等键，返回首提生成的同一订单号，不生成第二单。
+	fx.prods.deductErr = nil
+	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("infra", 1, 1))
+	require.NoError(t, err)
+	require.True(t, res.Idempotent)
+	require.Equal(t, "1", res.Order.OrderNo, "返回首提生成的同一订单号")
+	require.Empty(t, fx.orders.byID, "不得生成第二单")
 }
 
 // 库存不足：条件扣减失败 → 下单拒绝，库存不变。
@@ -729,4 +767,119 @@ func TestCreateInputValidation(t *testing.T) {
 		ClientRequestID: "r19", AddressID: 1, Items: []ItemParams{{SKUID: 1, Quantity: 0}},
 	})
 	require.ErrorIs(t, err, ErrInvalidInput)
+}
+
+// 直购同 SKU 多行：合并为一行（只扣一次库存、只生成一条订单项）；
+// 合并后超 99 上限明确拒绝（金额敏感路径不做静默裁剪）。
+func TestCreateDirectMergesDuplicateSKUs(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	res, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "m1", AddressID: 1,
+		Items: []ItemParams{{SKUID: 1, Quantity: 2}, {SKUID: 1, Quantity: 3}},
+	})
+	require.NoError(t, err)
+	require.Len(t, res.Order.Items, 1, "同 SKU 应合并为一条订单项")
+	require.Equal(t, 5, res.Order.Items[0].Quantity)
+	require.Equal(t, int64(500), res.Order.TotalAmount)
+	require.Equal(t, 5, fx.prods.skus[1].Stock, "库存只扣一次 5")
+
+	_, err = fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "m2", AddressID: 1,
+		Items: []ItemParams{{SKUID: 1, Quantity: 60}, {SKUID: 1, Quantity: 60}},
+	})
+	require.ErrorIs(t, err, ErrInvalidInput, "合并后超上限应拒绝")
+
+	// 合并不应影响其他 SKU 的独立行。
+	res, err = fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "m3", AddressID: 1,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}, {SKUID: 2, Quantity: 1}, {SKUID: 1, Quantity: 1}},
+	})
+	require.NoError(t, err)
+	require.Len(t, res.Order.Items, 2)
+	require.Equal(t, int64(400), res.Order.TotalAmount, "100*2 + 200*1")
+}
+
+// 取消多条目订单：全部条目库存逐一回补。
+func TestCancelRestoresAllItems(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	res, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "m4", AddressID: 1,
+		Items: []ItemParams{{SKUID: 1, Quantity: 2}, {SKUID: 2, Quantity: 1}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, fx.svc.Cancel(context.Background(), 42, res.Order.OrderNo))
+	require.Equal(t, 10, fx.prods.skus[1].Stock)
+	require.Equal(t, 5, fx.prods.skus[2].Stock)
+}
+
+// 取消时券已非 used（外部扰动）：取消失败，不产生部分状态。
+func TestCancelCouponRollbackFailure(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.coupons.seed(9, 42, 50, 0)
+
+	res, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "m5", AddressID: 1, CouponID: 9,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}},
+	})
+	require.NoError(t, err)
+
+	// 模拟外部把券改回 unused：回退条件更新将失败。
+	fx.coupons.coupons[9].Status = couponmodel.CouponStatusUnused
+	err = fx.svc.Cancel(context.Background(), 42, res.Order.OrderNo)
+	require.ErrorIs(t, err, ErrCouponUsed)
+}
+
+// 已过期券：GetUsable 拒绝下单。
+func TestCreateExpiredCoupon(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.coupons.seed(10, 42, 50, 0)
+	fx.coupons.coupons[10].ValidUntil = time.Now().Add(-time.Minute)
+
+	_, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "m6", AddressID: 1, CouponID: 10,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}},
+	})
+	require.ErrorIs(t, err, ErrCouponExpired)
+}
+
+// 不存在的订单：详情/取消/发货/确认收货一律 ErrOrderNotFound。
+func TestNotFoundOnMissingOrder(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	_, err := fx.svc.GetDetail(context.Background(), 42, "999")
+	require.ErrorIs(t, err, ErrOrderNotFound)
+	err = fx.svc.Cancel(context.Background(), 42, "999")
+	require.ErrorIs(t, err, ErrOrderNotFound)
+	err = fx.svc.Ship(context.Background(), "999")
+	require.ErrorIs(t, err, ErrOrderNotFound)
+	err = fx.svc.ConfirmReceipt(context.Background(), 42, "999")
+	require.ErrorIs(t, err, ErrOrderNotFound)
+}
+
+// 购物车结算 + 券：金额含券额、购物车清空、库存扣减、券核销。
+func TestCreateFromCartWithCoupon(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.cart.seed(42, 1, 2)
+	fx.cart.seed(42, 2, 1)
+	fx.coupons.seed(11, 42, 300, 300) // 满 300 减 300
+
+	res, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "m7", AddressID: 1, FromCart: true, CouponID: 11,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(400), res.Order.TotalAmount)
+	require.Equal(t, int64(300), res.Order.DiscountAmount)
+	require.Equal(t, int64(100), res.Order.PayAmount)
+	require.Empty(t, fx.cart.items[42])
+	require.Equal(t, 8, fx.prods.skus[1].Stock)
+	require.Equal(t, 4, fx.prods.skus[2].Stock)
+	require.Equal(t, couponmodel.CouponStatusUsed, fx.coupons.coupons[11].Status)
 }

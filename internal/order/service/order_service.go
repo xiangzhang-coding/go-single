@@ -86,8 +86,8 @@ type ProductService interface {
 // CouponService 优惠券模块最小接口：结算前校验可用券，事务内核销/回退。
 type CouponService interface {
 	GetUsable(ctx context.Context, userID, couponID int64) (*couponmodel.UserCouponView, error)
-	UseCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error)
-	RollbackCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error)
+	UseCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) error
+	RollbackCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) error
 }
 
 // CartService 购物车模块最小接口：结算读取购物车内容，事务内删除已购条目。
@@ -236,17 +236,7 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 	if p.CouponID > 0 {
 		coupon, err = s.coupons.GetUsable(ctx, userID, p.CouponID)
 		if err != nil {
-			// 跨模块错误翻译为本模块业务错误（handler 据此映射 HTTP 状态码）。
-			if errors.Is(err, couponsvc.ErrCouponNotFound) {
-				return nil, ErrCouponNotFound
-			}
-			if errors.Is(err, couponsvc.ErrCouponUsed) {
-				return nil, ErrCouponUsed
-			}
-			if errors.Is(err, couponsvc.ErrCouponExpired) {
-				return nil, ErrCouponExpired
-			}
-			return nil, err
+			return nil, translateCouponError(err)
 		}
 	}
 
@@ -281,12 +271,9 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 			}
 		}
 		if coupon != nil {
-			ok, err := s.coupons.UseCoupon(ctx, tx, userID, p.CouponID)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return ErrCouponUsed
+			// 核销失败：已用/过期/不存在经 translateCouponError 区分（409/404）。
+			if err := s.coupons.UseCoupon(ctx, tx, userID, p.CouponID); err != nil {
+				return translateCouponError(err)
 			}
 		}
 		if err := s.store.Orders.Create(ctx, tx, order); err != nil {
@@ -318,17 +305,19 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 // acquireIdempotency 生成雪花订单号并原子抢占幂等键（SETNX+EX）；
 // 返回 (订单号, 是否抢占成功)。未抢占成功时订单号为既有键中的值，
 // 客户端据此查询/轮询同一订单（并发重复提交时订单可能尚未提交）。
+// 注意：基础设施类失败（Redis 故障/时钟回拨）不包装为业务错误，
+// 使调用方保持幂等键（防瞬时故障下重试生成第二单）。
 func (s *orderService) acquireIdempotency(ctx context.Context, userID int64, clientRequestID string) (string, bool, error) {
 	no, err := s.nos.Next()
 	if err != nil {
-		return "", false, fmt.Errorf("%w: order no: %v", ErrInvalidInput, err)
+		return "", false, fmt.Errorf("generate order no: %w", err)
 	}
 	orderNo := strconv.FormatInt(no, 10)
 
 	key := idemKey(userID, clientRequestID)
 	code, err := s.cache.Eval(ctx, idemScript, []string{key}, orderNo, int64(idemTTL.Seconds()))
 	if err != nil {
-		return "", false, fmt.Errorf("%w: idempotency acquire: %v", ErrInvalidInput, err)
+		return "", false, fmt.Errorf("acquire idempotency key: %w", err)
 	}
 	if code == 1 {
 		return orderNo, true, nil
@@ -339,13 +328,15 @@ func (s *orderService) acquireIdempotency(ctx context.Context, userID int64, cli
 		return "", false, err
 	}
 	if raw == "" {
-		return "", false, fmt.Errorf("%w: idempotency key empty", ErrInvalidInput)
+		return "", false, fmt.Errorf("idempotency key %s empty", key)
 	}
 	return raw, false, nil
 }
 
 // replayIdempotent 命中幂等键：返回既有订单（同一订单号）。
-// 订单号已落键但订单尚未提交（并发重复提交）时，返回订单号供客户端轮询详情。
+// 订单号已落键但订单尚未提交（并发在途，或首提遇基础设施故障且幂等键保留）时，
+// 返回仅含 order_no 的订单视图（status 为空即"未落库"标记），
+// 客户端应轮询 GET /api/orders/{order_no} 直至状态非空。
 func (s *orderService) replayIdempotent(ctx context.Context, orderNo string) (*CreateResult, error) {
 	view, err := s.loadView(ctx, orderNo)
 	if err != nil {
@@ -355,6 +346,21 @@ func (s *orderService) replayIdempotent(ctx context.Context, orderNo string) (*C
 		return &CreateResult{Order: &model.OrderView{Order: model.Order{OrderNo: orderNo}}, Idempotent: true}, nil
 	}
 	return &CreateResult{Order: view, Idempotent: true}, nil
+}
+
+// translateCouponError 跨模块错误翻译为本模块业务错误（handler 据此映射 HTTP 状态码）。
+func translateCouponError(err error) error {
+	switch {
+	case errors.Is(err, couponsvc.ErrCouponNotFound):
+		return ErrCouponNotFound
+	case errors.Is(err, couponsvc.ErrCouponUsed):
+		return ErrCouponUsed
+	case errors.Is(err, couponsvc.ErrCouponExpired):
+		return ErrCouponExpired
+	case errors.Is(err, couponsvc.ErrCouponRollbackFailed):
+		return fmt.Errorf("%w: %v", ErrCouponUsed, err)
+	}
+	return err
 }
 
 func validateItems(p *CreateParams) error {
@@ -367,6 +373,8 @@ func validateItems(p *CreateParams) error {
 	if len(p.Items) == 0 {
 		return fmt.Errorf("%w: empty items", ErrInvalidInput)
 	}
+	// 直购同 SKU 多行合并为一行：同一 SKU 只扣一次库存、只生成一条订单项。
+	merged := make(map[int64]int, len(p.Items))
 	for _, it := range p.Items {
 		if it.SKUID <= 0 {
 			return fmt.Errorf("%w: invalid sku id", ErrInvalidInput)
@@ -374,7 +382,17 @@ func validateItems(p *CreateParams) error {
 		if it.Quantity < 1 || it.Quantity > 99 {
 			return fmt.Errorf("%w: invalid quantity", ErrInvalidInput)
 		}
+		merged[it.SKUID] += it.Quantity
 	}
+	items := make([]ItemParams, 0, len(merged))
+	for skuID, qty := range merged {
+		// 合并后超过上限：明确拒绝（金额敏感路径不做静默裁剪）。
+		if qty > 99 {
+			return fmt.Errorf("%w: merged quantity exceeds 99", ErrInvalidInput)
+		}
+		items = append(items, ItemParams{SKUID: skuID, Quantity: qty})
+	}
+	p.Items = items
 	return nil
 }
 
@@ -546,12 +564,8 @@ func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string)
 			}
 		}
 		if view.CouponID != nil {
-			ok, err := s.coupons.RollbackCoupon(ctx, tx, userID, *view.CouponID)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return fmt.Errorf("%w: coupon %d not used", ErrCouponUsed, *view.CouponID)
+			if err := s.coupons.RollbackCoupon(ctx, tx, userID, *view.CouponID); err != nil {
+				return translateCouponError(err)
 			}
 		}
 		return nil
