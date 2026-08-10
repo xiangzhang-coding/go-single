@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
+
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 	"github.com/xiangzhang-coding/go-single/internal/coupon/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
@@ -21,6 +23,10 @@ var (
 	ErrNotInWindow       = errors.New("coupon not in valid period")
 	ErrSoldOut           = errors.New("coupon sold out")
 	ErrClaimLimitReached = errors.New("claim limit reached")
+
+	ErrCouponNotFound = errors.New("coupon not found")
+	ErrCouponUsed     = errors.New("coupon already used")
+	ErrCouponExpired  = errors.New("coupon not in valid period")
 )
 
 // 可领券列表的状态取值。
@@ -96,6 +102,12 @@ type Service interface {
 	Claim(ctx context.Context, userID, templateID int64) (*model.UserCoupon, error)
 	// ListMine 我的券（status 空 = 全部；unused/used/expired 筛选）。
 	ListMine(ctx context.Context, userID int64, status string, page, pageSize int) ([]model.UserCouponView, int64, error)
+	// GetUsable 校验并读取一张可用券（归属/未用/在有效期），供 order 模块结算使用。
+	GetUsable(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error)
+	// UseCoupon 事务内条件核销（unused→used，并发仅一次成功），供 order 模块下单调用。
+	UseCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error)
+	// RollbackCoupon 事务内条件回退（used→unused），供 order 模块取消订单调用。
+	RollbackCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error)
 }
 
 type couponService struct {
@@ -254,6 +266,37 @@ func (s *couponService) ListMine(ctx context.Context, userID int64, status strin
 		pageSize = 50
 	}
 	return s.store.UserCoupon.ListByUser(ctx, userID, status, (page-1)*pageSize, pageSize)
+}
+
+// GetUsable 结算前校验：券必须存在且归属当前用户、未用、处于有效期；
+// 门槛校验（满减）由 order 模块按订单总额完成（全场券，无商品维度限制）。
+func (s *couponService) GetUsable(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error) {
+	v, err := s.store.UserCoupon.GetViewByID(ctx, userID, couponID)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, ErrCouponNotFound
+	}
+	now := time.Now()
+	if v.Status == model.CouponStatusUsed {
+		return nil, ErrCouponUsed
+	}
+	if now.Before(v.ValidFrom) || now.After(v.ValidUntil) {
+		return nil, ErrCouponExpired
+	}
+	return v, nil
+}
+
+// UseCoupon 事务内核销（条件更新 unused→used），事务由 order 模块开启并提交；
+// 返回 false 表示券已不可用（并发先用/状态漂移），由调用方整体回滚。
+func (s *couponService) UseCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error) {
+	return s.store.UserCoupon.Use(ctx, tx, userID, couponID)
+}
+
+// RollbackCoupon 事务内回退（条件更新 used→unused），取消订单回退券。
+func (s *couponService) RollbackCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error) {
+	return s.store.UserCoupon.Rollback(ctx, tx, userID, couponID)
 }
 
 // ---- 校验 ----

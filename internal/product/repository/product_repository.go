@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 
+	"gorm.io/gorm"
+
 	"github.com/xiangzhang-coding/go-single/internal/product/model"
 )
 
@@ -45,6 +47,12 @@ type SKURepository interface {
 	Delete(ctx context.Context, id int64) error
 	GetByID(ctx context.Context, id int64) (*model.SKU, error)
 	ListByProduct(ctx context.Context, productID int64) ([]model.SKU, error)
+	// DeductStock 事务内条件扣减库存（stock>=quantity 才更新，防超卖）：
+	// 返回是否实际扣减。tx 由调用方（order 模块）开启，同一事务保证
+	// 订单创建与库存扣减的原子性。
+	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
+	// RestoreStock 事务内回补库存（取消订单回补；SKU 已删则空操作）。
+	RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error
 }
 
 // Store 聚合三个仓储的具体实现，作为 service 的构造入参。

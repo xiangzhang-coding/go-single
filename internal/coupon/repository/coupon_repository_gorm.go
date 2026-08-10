@@ -127,6 +127,48 @@ func (r *GORMUserCouponRepository) CountUserByTemplate(ctx context.Context, user
 	return n, err
 }
 
+// GetViewByID 单张券查询（归属过滤），与 ListByUser 同构的 JOIN + 派生状态。
+func (r *GORMUserCouponRepository) GetViewByID(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error) {
+	var v model.UserCouponView
+	err := r.db.WithContext(ctx).
+		Table("user_coupons AS uc").
+		Joins("JOIN coupon_templates AS t ON t.id = uc.template_id").
+		Select(
+			"uc.id, uc.template_id, t.name, t.type, t.value, t.min_amount, "+
+				derivedStatusExpr+" AS status, t.valid_from, t.valid_until, uc.used_at, uc.created_at").
+		Where("uc.id = ? AND uc.user_id = ?", couponID, userID).
+		Scan(&v).Error
+	if err != nil {
+		return nil, err
+	}
+	if v.ID == 0 {
+		return nil, nil
+	}
+	return &v, nil
+}
+
+// Use 条件核销：unused→used 单条 UPDATE；RowsAffected=0 即券已被用/不存在。
+func (r *GORMUserCouponRepository) Use(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error) {
+	res := tx.WithContext(ctx).Model(&model.UserCoupon{}).
+		Where("id = ? AND user_id = ? AND status = ?", couponID, userID, model.CouponStatusUnused).
+		Updates(map[string]any{"status": model.CouponStatusUsed, "used_at": gorm.Expr("NOW(3)")})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
+// Rollback 条件回退：used→unused，清空 used_at。
+func (r *GORMUserCouponRepository) Rollback(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error) {
+	res := tx.WithContext(ctx).Model(&model.UserCoupon{}).
+		Where("id = ? AND user_id = ? AND status = ?", couponID, userID, model.CouponStatusUsed).
+		Updates(map[string]any{"status": model.CouponStatusUnused, "used_at": nil})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
 // 编译期断言：GORM 实现满足仓储接口。
 var _ CouponTemplateRepository = (*GORMCouponTemplateRepository)(nil)
 var _ UserCouponRepository = (*GORMUserCouponRepository)(nil)

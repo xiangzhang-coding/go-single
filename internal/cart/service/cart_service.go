@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 
+	"gorm.io/gorm"
+
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 
@@ -46,6 +48,9 @@ type Service interface {
 	DeleteItem(ctx context.Context, userID, itemID int64) error
 	// ListItems 我的购物车列表（含 SKU/商品展示快照，新加购的排最前）。
 	ListItems(ctx context.Context, userID int64) ([]model.CartItemView, error)
+	// DeletePurchased 事务内删除已购 SKU 的条目（order 模块结算后调用，
+	// tx 由 order 模块开启并提交）。
+	DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error
 }
 
 type cartService struct {
@@ -148,6 +153,11 @@ func (s *cartService) DeleteItem(ctx context.Context, userID, itemID int64) erro
 
 func (s *cartService) ListItems(ctx context.Context, userID int64) ([]model.CartItemView, error) {
 	return s.store.Items.ListByUser(ctx, userID)
+}
+
+// DeletePurchased 结算后清理已购条目；调用方（order 模块）负责开启事务。
+func (s *cartService) DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error {
+	return s.store.Items.DeleteBySKUs(ctx, tx, userID, skuIDs)
 }
 
 // ensureOwned 对象级授权（防 IDOR）：条目不存在 404；归属他人 403。

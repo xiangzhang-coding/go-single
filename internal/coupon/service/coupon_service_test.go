@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 	"github.com/xiangzhang-coding/go-single/internal/coupon/repository"
@@ -135,6 +136,64 @@ func (f *fakeUserCoupons) CountUserByTemplate(_ context.Context, userID, templat
 		}
 	}
 	return n, nil
+}
+
+// viewOf 组装 UserCouponView（与 ListByUser 相同的 JOIN 语义）。
+func (f *fakeUserCoupons) viewOf(c *model.UserCoupon) *model.UserCouponView {
+	t, ok := f.tmpls.byID[c.TemplateID]
+	if !ok {
+		return nil
+	}
+	now := f.nowFn()
+	derived := c.Status
+	if c.Status == model.CouponStatusUnused && now.After(t.ValidUntil) {
+		derived = model.CouponStatusExpired
+	}
+	return &model.UserCouponView{
+		ID:         c.ID,
+		TemplateID: t.ID,
+		Name:       t.Name,
+		Type:       t.Type,
+		Value:      t.Value,
+		MinAmount:  t.MinAmount,
+		Status:     derived,
+		ValidFrom:  t.ValidFrom,
+		ValidUntil: t.ValidUntil,
+		UsedAt:     c.UsedAt,
+		CreatedAt:  c.CreatedAt,
+	}
+}
+
+// GetViewByID 单张券（归属过滤）：不存在返回 (nil, nil)。
+func (f *fakeUserCoupons) GetViewByID(_ context.Context, userID, couponID int64) (*model.UserCouponView, error) {
+	c, ok := f.byID[couponID]
+	if !ok || c.UserID != userID {
+		return nil, nil
+	}
+	return f.viewOf(c), nil
+}
+
+// Use 条件核销：unused→used；tx 参数忽略（单测无真实事务）。
+func (f *fakeUserCoupons) Use(_ context.Context, _ *gorm.DB, userID, couponID int64) (bool, error) {
+	c, ok := f.byID[couponID]
+	if !ok || c.UserID != userID || c.Status != model.CouponStatusUnused {
+		return false, nil
+	}
+	c.Status = model.CouponStatusUsed
+	now := time.Now()
+	c.UsedAt = &now
+	return true, nil
+}
+
+// Rollback 条件回退：used→unused。
+func (f *fakeUserCoupons) Rollback(_ context.Context, _ *gorm.DB, userID, couponID int64) (bool, error) {
+	c, ok := f.byID[couponID]
+	if !ok || c.UserID != userID || c.Status != model.CouponStatusUsed {
+		return false, nil
+	}
+	c.Status = model.CouponStatusUnused
+	c.UsedAt = nil
+	return true, nil
 }
 
 func slicePage[T any](in []T, offset, limit int) []T {

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
+
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/product/model"
 	"github.com/xiangzhang-coding/go-single/internal/product/repository"
@@ -58,6 +60,11 @@ type Service interface {
 	GetDetail(ctx context.Context, id int64) (*model.ProductDetail, error)
 	// GetSKU 供后续模块（购物车）校验 SKU 存在/上架。
 	GetSKU(ctx context.Context, id int64) (*model.SKU, error)
+	// DeductStock 事务内条件扣减库存（stock>=N 防超卖），供 order 模块下单调用；
+	// 扣减成功后失效详情缓存。返回是否扣减成功。
+	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
+	// RestoreStock 事务内回补库存，供 order 模块取消订单调用；随后失效详情缓存。
+	RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error
 }
 
 type productService struct {
@@ -311,6 +318,42 @@ func (s *productService) GetSKU(ctx context.Context, id int64) (*model.SKU, erro
 		return nil, ErrSKUNotFound
 	}
 	return sku, nil
+}
+
+// DeductStock 先确认 SKU 存在（同时取得 product_id 供缓存失效），
+// 再在同一事务内条件扣减；事务由 order 模块开启并提交。
+func (s *productService) DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error) {
+	if quantity < 1 {
+		return false, fmt.Errorf("%w: invalid quantity", ErrInvalidInput)
+	}
+	sku, err := s.GetSKU(ctx, skuID)
+	if err != nil {
+		return false, err
+	}
+	ok, err := s.store.SKU.DeductStock(ctx, tx, skuID, quantity)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		s.invalidateDetail(ctx, sku.ProductID)
+	}
+	return ok, nil
+}
+
+// RestoreStock 同事务回补库存（取消订单），随后失效详情缓存。
+func (s *productService) RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error {
+	if quantity < 1 {
+		return fmt.Errorf("%w: invalid quantity", ErrInvalidInput)
+	}
+	sku, err := s.GetSKU(ctx, skuID)
+	if err != nil {
+		return err
+	}
+	if err := s.store.SKU.RestoreStock(ctx, tx, skuID, quantity); err != nil {
+		return err
+	}
+	s.invalidateDetail(ctx, sku.ProductID)
+	return nil
 }
 
 // invalidateDetail 商品或其 SKU 变更后清缓存（缓存故障不阻断写路径）。

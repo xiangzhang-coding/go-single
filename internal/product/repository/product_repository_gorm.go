@@ -183,6 +183,25 @@ func (r *GORMSKURepository) ListByProduct(ctx context.Context, productID int64) 
 	return list, nil
 }
 
+// DeductStock 条件更新：stock=stock-N WHERE stock>=N；RowsAffected=0 即库存不足。
+// tx 由调用方（order 下单事务）提供，与订单创建同事务原子提交。
+func (r *GORMSKURepository) DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error) {
+	res := tx.WithContext(ctx).Model(&model.SKU{}).
+		Where("id = ? AND stock >= ?", skuID, quantity).
+		Update("stock", gorm.Expr("stock - ?", quantity))
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
+// RestoreStock 回补库存（取消订单）；SKU 已删除时影响 0 行，视为空操作。
+func (r *GORMSKURepository) RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error {
+	return tx.WithContext(ctx).Model(&model.SKU{}).
+		Where("id = ?", skuID).
+		Update("stock", gorm.Expr("stock + ?", quantity)).Error
+}
+
 var _ CategoryRepository = (*GORMCategoryRepository)(nil)
 var _ ProductRepository = (*GORMProductRepository)(nil)
 var _ SKURepository = (*GORMSKURepository)(nil)

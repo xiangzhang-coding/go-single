@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 
+	"gorm.io/gorm"
+
 	"github.com/xiangzhang-coding/go-single/internal/cart/model"
 )
 
@@ -24,6 +26,9 @@ type CartItemRepository interface {
 	Delete(ctx context.Context, id int64) error
 	// ListByUser 我的购物车列表：条目 + SKU/商品只读快照（跨表读模型，一次查询）。
 	ListByUser(ctx context.Context, userID int64) ([]model.CartItemView, error)
+	// DeleteBySKUs 事务内批量删除指定 SKU 的条目（结算后清理已购），
+	// tx 由调用方（order 模块）开启，与订单创建同事务原子提交。
+	DeleteBySKUs(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error
 }
 
 // Store 聚合仓储实现，作为 service 的构造入参。

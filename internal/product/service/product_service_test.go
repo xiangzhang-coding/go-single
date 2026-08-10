@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/product/model"
@@ -175,6 +176,23 @@ func (f *fakeSKUs) ListByProduct(_ context.Context, productID int64) ([]model.SK
 		}
 	}
 	return out, nil
+}
+
+// DeductStock 条件扣减：库存不足返回 (false, nil)；tx 参数忽略（单测无真实事务）。
+func (f *fakeSKUs) DeductStock(_ context.Context, _ *gorm.DB, skuID int64, quantity int) (bool, error) {
+	v, ok := f.byID[skuID]
+	if !ok || v.Stock < quantity {
+		return false, nil
+	}
+	v.Stock -= quantity
+	return true, nil
+}
+
+func (f *fakeSKUs) RestoreStock(_ context.Context, _ *gorm.DB, skuID int64, quantity int) error {
+	if v, ok := f.byID[skuID]; ok {
+		v.Stock += quantity
+	}
+	return nil
 }
 
 // ---- fake 缓存 ----

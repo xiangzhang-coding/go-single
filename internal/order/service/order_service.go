@@ -1,0 +1,633 @@
+// Package service 承载 order 模块业务：下单（购物车结算/直购）、订单列表与详情、
+// 取消待支付订单、确认收货与后台发货，状态机非法跃迁一律拒绝。
+//
+// 下单为单事务（订单 + 订单项 + 库存条件更新 stock>=N + 地址快照 + 券核销 +
+// 删除购物车条目），事务由 order 仓储开启，跨模块写操作经各模块 service 的
+// tx 参数汇入同一事务；client_request_id 幂等（Redis SETNX + TTL 15min）。
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	"gorm.io/gorm"
+
+	cartmodel "github.com/xiangzhang-coding/go-single/internal/cart/model"
+	couponmodel "github.com/xiangzhang-coding/go-single/internal/coupon/model"
+	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
+	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
+	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
+	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
+
+	"github.com/xiangzhang-coding/go-single/internal/order/model"
+	"github.com/xiangzhang-coding/go-single/internal/order/repository"
+	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+)
+
+// 业务错误：handler 据此映射 HTTP 状态码。
+var (
+	ErrInvalidInput          = errors.New("invalid input")
+	ErrOrderNotFound         = errors.New("order not found")
+	ErrOrderForbidden        = errors.New("order does not belong to user")
+	ErrOrderChanged          = errors.New("order status changed, retry")
+	ErrIllegalTransition     = errors.New("illegal order status transition")
+	ErrCartEmpty             = errors.New("cart is empty")
+	ErrInsufficientStock     = errors.New("insufficient stock")
+	ErrSKUNotFound           = errors.New("sku not found")
+	ErrSKUUnavailable        = errors.New("sku product is not on sale")
+	ErrCouponNotFound        = errors.New("coupon not found")
+	ErrCouponUsed            = errors.New("coupon already used")
+	ErrCouponExpired         = errors.New("coupon not in valid period")
+	ErrCouponThresholdNotMet = errors.New("coupon threshold not met")
+	ErrAddressNotFound       = errors.New("address not found")
+	ErrAddressForbidden      = errors.New("address does not belong to user")
+)
+
+// 超时取消：普通订单默认 15min（expire_at 写入订单，T09 定时任务扫描）。
+const (
+	normalExpire = 15 * time.Minute
+	// 幂等键 TTL：与规格一致（15min），超时后允许同一 client_request_id 重新下单。
+	idemTTL = 15 * time.Minute
+	// 分页上限与默认页大小。
+	defaultPageSize = 20
+	maxPageSize     = 50
+)
+
+// 幂等键约定：order:idem:{user_id}:{client_request_id} → 订单号。
+func idemKey(userID int64, clientRequestID string) string {
+	return fmt.Sprintf("order:idem:%d:%s", userID, clientRequestID)
+}
+
+// idemScript 原子抢占幂等键（SETNX + EXPIRE）：返回 1 抢占成功 / 0 已存在。
+// KEYS[1] 幂等键；ARGV[1] 订单号；ARGV[2] TTL 秒。
+const idemScript = `
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
+    return 1
+end
+return 0
+`
+
+// ---- 跨模块最小接口（进程内调用，面向接口非 HTTP；实现见 main 装配） ----
+
+// ProductService 商品模块最小接口：下单读取 SKU/上架校验，
+// 事务内条件扣减与回补库存（tx 由 order 模块开启）。
+type ProductService interface {
+	GetSKU(ctx context.Context, id int64) (*productmodel.SKU, error)
+	GetDetail(ctx context.Context, id int64) (*productmodel.ProductDetail, error)
+	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
+	RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error
+}
+
+// CouponService 优惠券模块最小接口：结算前校验可用券，事务内核销/回退。
+type CouponService interface {
+	GetUsable(ctx context.Context, userID, couponID int64) (*couponmodel.UserCouponView, error)
+	UseCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error)
+	RollbackCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error)
+}
+
+// CartService 购物车模块最小接口：结算读取购物车内容，事务内删除已购条目。
+type CartService interface {
+	ListItems(ctx context.Context, userID int64) ([]cartmodel.CartItemView, error)
+	DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error
+}
+
+// UserService 用户模块最小接口：读取地址簿固化为地址快照（owner 校验）。
+type UserService interface {
+	GetAddress(ctx context.Context, userID, id int64) (*usermodel.Address, error)
+}
+
+// OrderNoGenerator 订单号生成器（雪花 ID 手写实现，见 platform/snowflake）。
+type OrderNoGenerator interface {
+	Next() (int64, error)
+}
+
+// ItemParams 直购订单项。
+type ItemParams struct {
+	SKUID    int64
+	Quantity int
+}
+
+// CreateParams 下单参数；FromCart 与 Items 二选一（购物车结算 / 商品直购）。
+type CreateParams struct {
+	ClientRequestID string
+	AddressID       int64
+	CouponID        int64 // 0 = 不使用券
+	FromCart        bool
+	Items           []ItemParams
+}
+
+// CreateResult 下单结果；Idempotent=true 表示命中了 client_request_id
+// 幂等键（重复提交），Order 为既有订单。
+type CreateResult struct {
+	Order      *model.OrderView
+	Idempotent bool
+}
+
+// Service order 模块的业务接口。
+type Service interface {
+	// Create 下单（购物车结算 / 直购）：单事务创建订单；client_request_id
+	// 重复提交返回同一订单号（幂等）。
+	Create(ctx context.Context, userID int64, p CreateParams) (*CreateResult, error)
+	// List 我的订单（状态筛选 + 分页）。
+	List(ctx context.Context, userID int64, status string, page, pageSize int) ([]model.OrderView, int64, error)
+	// GetDetail 订单详情（owner 校验，防 IDOR）。
+	GetDetail(ctx context.Context, userID int64, orderNo string) (*model.OrderView, error)
+	// Cancel 取消待支付订单：回补库存 + 回退券；状态机非法跃迁拒绝。
+	Cancel(ctx context.Context, userID int64, orderNo string) error
+	// Ship 后台发货：已支付 → 已发货（admin）。
+	Ship(ctx context.Context, orderNo string) error
+	// ConfirmReceipt 确认收货：已发货 → 已完成（owner 校验）。
+	ConfirmReceipt(ctx context.Context, userID int64, orderNo string) error
+}
+
+// orderLine 下单行（购物车条目或直购项统一形态）。
+type orderLine struct {
+	skuID    int64
+	quantity int
+}
+
+// lineSnapshot 订单项快照（下单时固化的商品信息）。
+type lineSnapshot struct {
+	skuID     int64
+	productID int64
+	title     string
+	specs     json.RawMessage
+	price     int64
+	quantity  int
+}
+
+type orderService struct {
+	store repository.Store
+	cache cache.Cache
+	nos   OrderNoGenerator
+
+	products ProductService
+	coupons  CouponService
+	cart     CartService
+	users    UserService
+}
+
+// New 构造订单服务。
+func New(store repository.Store, c cache.Cache, nos OrderNoGenerator,
+	products ProductService, coupons CouponService, cart CartService, users UserService) Service {
+	return &orderService{store: store, cache: c, nos: nos, products: products, coupons: coupons, cart: cart, users: users}
+}
+
+// ---- 下单 ----
+
+// Create 下单流程：
+//  1. 生成雪花订单号并原子抢占幂等键（SETNX client_request_id，重复请求返回同一订单号）
+//  2. 读取地址（固化为快照）→ 组装订单项（购物车/直购）→ 校验券可用
+//  3. 读取 SKU 价格与上架状态，累计商品总额，计算券额与应付
+//  4. 单事务：条件扣减库存 → 核销券 → 建订单+订单项 → 删除已购购物车条目
+//
+// 任一校验失败（库存不足/券不可用等）删除幂等键，允许修正后重试。
+func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams) (result *CreateResult, err error) {
+	if userID <= 0 || p.AddressID <= 0 {
+		return nil, fmt.Errorf("%w: invalid user or address id", ErrInvalidInput)
+	}
+	if p.ClientRequestID == "" || len(p.ClientRequestID) > 64 {
+		return nil, fmt.Errorf("%w: invalid client_request_id", ErrInvalidInput)
+	}
+	if err := validateItems(&p); err != nil {
+		return nil, err
+	}
+
+	orderNo, acquired, err := s.acquireIdempotency(ctx, userID, p.ClientRequestID)
+	if err != nil {
+		return nil, err
+	}
+	if !acquired {
+		return s.replayIdempotent(ctx, orderNo)
+	}
+	// 任一下单失败：释放幂等键，允许客户端修正后重试。
+	defer func() {
+		if err != nil {
+			if delErr := s.cache.Del(ctx, idemKey(userID, p.ClientRequestID)); delErr != nil {
+				err = fmt.Errorf("%w: release idempotency key: %v", err, delErr)
+			}
+		}
+	}()
+
+	address, err := s.users.GetAddress(ctx, userID, p.AddressID)
+	if err != nil {
+		if errors.Is(err, usersvc.ErrAddressNotFound) {
+			return nil, ErrAddressNotFound
+		}
+		if errors.Is(err, usersvc.ErrAddressForbidden) {
+			return nil, ErrAddressForbidden
+		}
+		return nil, err
+	}
+
+	lines, err := s.collectLines(ctx, userID, &p)
+	if err != nil {
+		return nil, err
+	}
+
+	var coupon *couponmodel.UserCouponView
+	if p.CouponID > 0 {
+		coupon, err = s.coupons.GetUsable(ctx, userID, p.CouponID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	snapshots, total, err := s.loadSnapshots(ctx, lines)
+	if err != nil {
+		return nil, err
+	}
+
+	discount := int64(0)
+	if coupon != nil {
+		if total < coupon.MinAmount {
+			return nil, ErrCouponThresholdNotMet
+		}
+		// 券额不超过商品总额（应付不为负）。
+		discount = coupon.Value
+		if discount > total {
+			discount = total
+		}
+	}
+	pay := total - discount
+
+	order, items := buildOrder(userID, orderNo, address, snapshots, total, discount, pay, coupon)
+
+	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		for _, sn := range snapshots {
+			ok, err := s.products.DeductStock(ctx, tx, sn.skuID, sn.quantity)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return ErrInsufficientStock
+			}
+		}
+		if coupon != nil {
+			ok, err := s.coupons.UseCoupon(ctx, tx, userID, p.CouponID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return ErrCouponUsed
+			}
+		}
+		if err := s.store.Orders.Create(ctx, tx, order); err != nil {
+			return err
+		}
+		for i := range items {
+			if err := s.store.Items.Create(ctx, tx, &items[i]); err != nil {
+				return err
+			}
+		}
+		if p.FromCart {
+			skuIDs := make([]int64, 0, len(snapshots))
+			for _, sn := range snapshots {
+				skuIDs = append(skuIDs, sn.skuID)
+			}
+			if err := s.cart.DeletePurchased(ctx, tx, userID, skuIDs); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &CreateResult{Order: &model.OrderView{Order: *order, Items: items}}, nil
+}
+
+// acquireIdempotency 生成雪花订单号并原子抢占幂等键（SETNX+EX）；
+// 返回 (订单号, 是否抢占成功)。未抢占成功时订单号为既有键中的值，
+// 客户端据此查询/轮询同一订单（并发重复提交时订单可能尚未提交）。
+func (s *orderService) acquireIdempotency(ctx context.Context, userID int64, clientRequestID string) (string, bool, error) {
+	no, err := s.nos.Next()
+	if err != nil {
+		return "", false, fmt.Errorf("%w: order no: %v", ErrInvalidInput, err)
+	}
+	orderNo := strconv.FormatInt(no, 10)
+
+	key := idemKey(userID, clientRequestID)
+	code, err := s.cache.Eval(ctx, idemScript, []string{key}, orderNo, int64(idemTTL.Seconds()))
+	if err != nil {
+		return "", false, fmt.Errorf("%w: idempotency acquire: %v", ErrInvalidInput, err)
+	}
+	if code == 1 {
+		return orderNo, true, nil
+	}
+	// 已存在：返回既有订单号（同一 client_request_id 复用同一订单）。
+	raw, err := s.cache.Get(ctx, key)
+	if err != nil {
+		return "", false, err
+	}
+	if raw == "" {
+		return "", false, fmt.Errorf("%w: idempotency key empty", ErrInvalidInput)
+	}
+	return raw, false, nil
+}
+
+// replayIdempotent 命中幂等键：返回既有订单（同一订单号）。
+// 订单号已落键但订单尚未提交（并发重复提交）时，返回订单号供客户端轮询详情。
+func (s *orderService) replayIdempotent(ctx context.Context, orderNo string) (*CreateResult, error) {
+	view, err := s.loadView(ctx, orderNo)
+	if err != nil {
+		return nil, err
+	}
+	if view == nil {
+		return &CreateResult{Order: &model.OrderView{Order: model.Order{OrderNo: orderNo}}, Idempotent: true}, nil
+	}
+	return &CreateResult{Order: view, Idempotent: true}, nil
+}
+
+func validateItems(p *CreateParams) error {
+	if p.FromCart {
+		if len(p.Items) > 0 {
+			return fmt.Errorf("%w: from_cart and items are mutually exclusive", ErrInvalidInput)
+		}
+		return nil
+	}
+	if len(p.Items) == 0 {
+		return fmt.Errorf("%w: empty items", ErrInvalidInput)
+	}
+	for _, it := range p.Items {
+		if it.SKUID <= 0 {
+			return fmt.Errorf("%w: invalid sku id", ErrInvalidInput)
+		}
+		if it.Quantity < 1 || it.Quantity > 99 {
+			return fmt.Errorf("%w: invalid quantity", ErrInvalidInput)
+		}
+	}
+	return nil
+}
+
+// collectLines 购物车结算：读取购物车全部条目；直购：透传请求项。
+func (s *orderService) collectLines(ctx context.Context, userID int64, p *CreateParams) ([]orderLine, error) {
+	if !p.FromCart {
+		lines := make([]orderLine, 0, len(p.Items))
+		for _, it := range p.Items {
+			lines = append(lines, orderLine{skuID: it.SKUID, quantity: it.Quantity})
+		}
+		return lines, nil
+	}
+	items, err := s.cart.ListItems(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, ErrCartEmpty
+	}
+	lines := make([]orderLine, 0, len(items))
+	for _, it := range items {
+		lines = append(lines, orderLine{skuID: it.SKUID, quantity: it.Quantity})
+	}
+	return lines, nil
+}
+
+// loadSnapshots 读取 SKU 价格并校验存在/上架（GetDetail 仅上架可见，404 即下架），
+// 累计商品总额，产出订单项快照。
+func (s *orderService) loadSnapshots(ctx context.Context, lines []orderLine) ([]lineSnapshot, int64, error) {
+	snapshots := make([]lineSnapshot, 0, len(lines))
+	var total int64
+	for _, l := range lines {
+		sku, err := s.products.GetSKU(ctx, l.skuID)
+		if err != nil {
+			if errors.Is(err, productsvc.ErrSKUNotFound) {
+				return nil, 0, ErrSKUNotFound
+			}
+			return nil, 0, err
+		}
+		if sku == nil {
+			return nil, 0, ErrSKUNotFound
+		}
+		detail, err := s.products.GetDetail(ctx, sku.ProductID)
+		if err != nil {
+			if errors.Is(err, productsvc.ErrProductNotFound) {
+				return nil, 0, ErrSKUUnavailable
+			}
+			return nil, 0, err
+		}
+		snapshots = append(snapshots, lineSnapshot{
+			skuID:     sku.ID,
+			productID: sku.ProductID,
+			title:     detail.Product.Title,
+			specs:     sku.Specs,
+			price:     sku.Price,
+			quantity:  l.quantity,
+		})
+		total += sku.Price * int64(l.quantity)
+	}
+	return snapshots, total, nil
+}
+
+// buildOrder 组装订单与订单项（含地址快照与金额）。
+func buildOrder(userID int64, orderNo string, address *usermodel.Address,
+	snapshots []lineSnapshot, total, discount, pay int64, coupon *couponmodel.UserCouponView) (*model.Order, []model.OrderItem) {
+
+	order := &model.Order{
+		OrderNo:        orderNo,
+		UserID:         userID,
+		OrderType:      model.OrderTypeNormal,
+		Status:         model.OrderStatusPendingPayment,
+		TotalAmount:    total,
+		DiscountAmount: discount,
+		PayAmount:      pay,
+		Receiver:       address.Receiver,
+		Phone:          address.Phone,
+		Province:       address.Province,
+		City:           address.City,
+		District:       address.District,
+		Detail:         address.Detail,
+		ExpireAt:       time.Now().Add(normalExpire),
+	}
+	if coupon != nil {
+		order.CouponID = &coupon.ID
+	}
+
+	items := make([]model.OrderItem, 0, len(snapshots))
+	for _, sn := range snapshots {
+		items = append(items, model.OrderItem{
+			OrderNo:   orderNo,
+			SKUID:     sn.skuID,
+			ProductID: sn.productID,
+			Title:     sn.title,
+			Specs:     sn.specs,
+			Price:     sn.price,
+			Quantity:  sn.quantity,
+			Subtotal:  sn.price * int64(sn.quantity),
+		})
+	}
+	return order, items
+}
+
+// ---- 查询 ----
+
+// List 我的订单：状态筛选（空 = 全部）+ 分页；订单项随列表一次取出。
+func (s *orderService) List(ctx context.Context, userID int64, status string, page, pageSize int) ([]model.OrderView, int64, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = defaultPageSize
+	}
+	if pageSize > maxPageSize {
+		pageSize = maxPageSize
+	}
+	if status != "" && !validStatus(status) {
+		return nil, 0, fmt.Errorf("%w: invalid status", ErrInvalidInput)
+	}
+
+	orders, total, err := s.store.Orders.List(ctx, userID, status, (page-1)*pageSize, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	orderNos := make([]string, 0, len(orders))
+	for _, o := range orders {
+		orderNos = append(orderNos, o.OrderNo)
+	}
+	itemsByOrder, err := s.store.Items.ListByOrders(ctx, orderNos)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	views := make([]model.OrderView, 0, len(orders))
+	for _, o := range orders {
+		views = append(views, model.OrderView{Order: o, Items: itemsByOrder[o.OrderNo]})
+	}
+	return views, total, nil
+}
+
+// GetDetail 订单详情（owner 校验）。
+func (s *orderService) GetDetail(ctx context.Context, userID int64, orderNo string) (*model.OrderView, error) {
+	return s.loadOwned(ctx, userID, orderNo)
+}
+
+// ---- 生命周期 ----
+
+// Cancel 取消待支付订单：事务内 条件更新 待支付→已取消 + 回补库存 + 回退券。
+// 重复取消（或状态已变）由条件更新 RowsAffected=0 兜底，不重复回补。
+func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string) error {
+	view, err := s.loadOwned(ctx, userID, orderNo)
+	if err != nil {
+		return err
+	}
+	if !model.CanTransition(view.Status, model.OrderStatusCancelled) {
+		return fmt.Errorf("%w: %s → %s", ErrIllegalTransition, view.Status, model.OrderStatusCancelled)
+	}
+
+	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		ok, err := s.store.Orders.Cancel(ctx, tx, orderNo)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrOrderChanged
+		}
+		for _, it := range view.Items {
+			if err := s.products.RestoreStock(ctx, tx, it.SKUID, it.Quantity); err != nil {
+				return err
+			}
+		}
+		if view.CouponID != nil {
+			ok, err := s.coupons.RollbackCoupon(ctx, tx, userID, *view.CouponID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("%w: coupon %d not used", ErrCouponUsed, *view.CouponID)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Ship 后台发货：已支付 → 已发货（admin；发货不校验归属）。
+func (s *orderService) Ship(ctx context.Context, orderNo string) error {
+	order, err := s.store.Orders.GetByNo(ctx, orderNo)
+	if err != nil {
+		return err
+	}
+	if order == nil {
+		return ErrOrderNotFound
+	}
+	if !model.CanTransition(order.Status, model.OrderStatusShipped) {
+		return fmt.Errorf("%w: %s → %s", ErrIllegalTransition, order.Status, model.OrderStatusShipped)
+	}
+	ok, err := s.store.Orders.Ship(ctx, nil, orderNo)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrOrderChanged
+	}
+	return nil
+}
+
+// ConfirmReceipt 确认收货：已发货 → 已完成（owner 校验）。
+func (s *orderService) ConfirmReceipt(ctx context.Context, userID int64, orderNo string) error {
+	view, err := s.loadOwned(ctx, userID, orderNo)
+	if err != nil {
+		return err
+	}
+	if !model.CanTransition(view.Status, model.OrderStatusCompleted) {
+		return fmt.Errorf("%w: %s → %s", ErrIllegalTransition, view.Status, model.OrderStatusCompleted)
+	}
+	ok, err := s.store.Orders.ConfirmReceipt(ctx, nil, orderNo)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrOrderChanged
+	}
+	return nil
+}
+
+// ---- 内部 ----
+
+// loadOwned 读取订单 + 订单项并校验归属（防 IDOR）。
+func (s *orderService) loadOwned(ctx context.Context, userID int64, orderNo string) (*model.OrderView, error) {
+	view, err := s.loadView(ctx, orderNo)
+	if err != nil {
+		return nil, err
+	}
+	if view == nil {
+		return nil, ErrOrderNotFound
+	}
+	if view.UserID != userID {
+		return nil, ErrOrderForbidden
+	}
+	return view, nil
+}
+
+// loadView 读取订单 + 订单项；不存在返回 (nil, nil)。
+func (s *orderService) loadView(ctx context.Context, orderNo string) (*model.OrderView, error) {
+	order, err := s.store.Orders.GetByNo(ctx, orderNo)
+	if err != nil {
+		return nil, err
+	}
+	if order == nil {
+		return nil, nil
+	}
+	items, err := s.store.Items.ListByOrder(ctx, orderNo)
+	if err != nil {
+		return nil, err
+	}
+	return &model.OrderView{Order: *order, Items: items}, nil
+}
+
+func validStatus(status string) bool {
+	switch status {
+	case model.OrderStatusPendingPayment, model.OrderStatusPaid, model.OrderStatusShipped,
+		model.OrderStatusCompleted, model.OrderStatusCancelled:
+		return true
+	}
+	return false
+}

@@ -62,6 +62,8 @@ type Service interface {
 	ListAddresses(ctx context.Context, userID int64) ([]model.Address, error)
 	// SetDefaultAddress 设为默认：旧默认自动失效（单条 UPDATE 切换指针）。
 	SetDefaultAddress(ctx context.Context, userID, id int64) error
+	// GetAddress 读取单条地址（owner 校验）：供 order 模块下单固化为地址快照。
+	GetAddress(ctx context.Context, userID, id int64) (*model.Address, error)
 }
 
 type userService struct {
@@ -218,6 +220,14 @@ func (s *userService) ensureOwned(ctx context.Context, userID, id int64) error {
 		return ErrAddressForbidden
 	}
 	return nil
+}
+
+// GetAddress 读取单条地址并校验归属；供 order 模块下单时固化为地址快照。
+func (s *userService) GetAddress(ctx context.Context, userID, id int64) (*model.Address, error) {
+	if err := s.ensureOwned(ctx, userID, id); err != nil {
+		return nil, err
+	}
+	return s.store.Addresses.GetByID(ctx, id)
 }
 
 func validateCredentials(username, password string) error {

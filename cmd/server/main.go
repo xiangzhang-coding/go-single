@@ -30,6 +30,9 @@ import (
 	flashsalehandler "github.com/xiangzhang-coding/go-single/internal/flashsale/handler"
 	flashsalerepo "github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	flashsalesvc "github.com/xiangzhang-coding/go-single/internal/flashsale/service"
+	orderhandler "github.com/xiangzhang-coding/go-single/internal/order/handler"
+	orderrepo "github.com/xiangzhang-coding/go-single/internal/order/repository"
+	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/config"
@@ -38,6 +41,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/logger"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
+	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
@@ -205,16 +209,12 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	productHandler := producthandler.New(productSvc, verifier)
 
 	// cart 模块：加购校验 SKU 存在/上架（跨模块经 product 服务接口），列表拼装展示快照。
-	cartHandler := carthandler.New(
-		cartsvc.New(cartrepo.Store{Items: cartrepo.NewGORMCartItem(db)}, productSvc),
-		verifier,
-	)
+	cartSvc := cartsvc.New(cartrepo.Store{Items: cartrepo.NewGORMCartItem(db)}, productSvc)
+	cartHandler := carthandler.New(cartSvc, verifier)
 
 	// coupon 模块：admin 发布券模板，用户领券（Lua 原子防超发）与我的券。
-	couponHandler := couponhandler.New(
-		couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(db), UserCoupon: couponrepo.NewGORMUserCoupon(db)}, cacheClient),
-		verifier,
-	)
+	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(db), UserCoupon: couponrepo.NewGORMUserCoupon(db)}, cacheClient)
+	couponHandler := couponhandler.New(couponSvc, verifier)
 
 	// flashsale 模块：admin 秒杀活动管理（创建/编辑/上架/下架），
 	// 上架预热库存进 Redis（未开始可覆盖、进行中只减不增）；SKU 校验经 product 服务接口。
@@ -229,6 +229,20 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		verifier,
 	)
 
+	// order 模块：购物车结算/直购下单（单事务：订单+订单项+库存+地址快照+券核销+
+	// 删除购物车条目）、client_request_id 幂等（Redis SETNX）、雪花订单号、
+	// 订单列表/详情、取消（回补库存+回退券）、确认收货与 admin 发货。
+	orderNoGen, err := snowflake.New(1)
+	if err != nil {
+		log.Fatal("初始化雪花订单号生成器失败", zap.Error(err))
+	}
+	orderStore := orderrepo.NewGORMOrder(db)
+	orderHandler := orderhandler.New(
+		ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
+			cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc),
+		verifier,
+	)
+
 	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
 	fileHandler := file.NewHandler(fileSvc, verifier)
 
@@ -240,6 +254,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	couponHandler.RegisterRoutes(api)
 	flashsaleHandler.RegisterRoutes(api)
 	socialHandler.RegisterRoutes(api)
+	orderHandler.RegisterRoutes(api)
 	fileHandler.RegisterRoutes(api)
 
 	return r

@@ -86,4 +86,13 @@ func (r *GORMCartItemRepository) ListByUser(ctx context.Context, userID int64) (
 	return views, nil
 }
 
+// DeleteBySKUs 结算后清理已购条目（与订单创建同一事务）。
+func (r *GORMCartItemRepository) DeleteBySKUs(ctx context.Context, tx *gorm.DB, userID int64, skuIDs []int64) error {
+	if len(skuIDs) == 0 {
+		return nil
+	}
+	return tx.WithContext(ctx).Where("user_id = ? AND sku_id IN ?", userID, skuIDs).
+		Delete(&model.CartItem{}).Error
+}
+
 var _ CartItemRepository = (*GORMCartItemRepository)(nil)

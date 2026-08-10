@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/cart/model"
 	"github.com/xiangzhang-coding/go-single/internal/cart/repository"
@@ -69,6 +70,20 @@ func (f *fakeItems) ListByUser(_ context.Context, userID int64) ([]model.CartIte
 		}
 	}
 	return out, nil
+}
+
+// DeleteBySKUs 批量删除指定 SKU 条目；tx 参数忽略（单测无真实事务）。
+func (f *fakeItems) DeleteBySKUs(_ context.Context, _ *gorm.DB, userID int64, skuIDs []int64) error {
+	ids := make(map[int64]bool, len(skuIDs))
+	for _, s := range skuIDs {
+		ids[s] = true
+	}
+	for id, v := range f.byID {
+		if v.UserID == userID && ids[v.SKUID] {
+			delete(f.byID, id)
+		}
+	}
+	return nil
 }
 
 // ---- fake product 服务 ----
