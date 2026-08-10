@@ -22,4 +22,7 @@ type Cache interface {
 	Set(ctx context.Context, key string, value string, ttl time.Duration) error
 	// Del 删除 key（不存在不视为错误）。
 	Del(ctx context.Context, key string) error
+	// Eval 原子执行 Lua 脚本（Redis EVAL 封装，学习点）。
+	// 业务模块持有脚本内容，仅经此方法执行；返回整数结果，脚本约定由调用方定义。
+	Eval(ctx context.Context, script string, keys []string, args ...any) (int64, error)
 }

@@ -22,6 +22,9 @@ func (f *fakeDep) Get(context.Context, string) (string, error) {
 }
 func (f *fakeDep) Set(context.Context, string, string, time.Duration) error { return nil }
 func (f *fakeDep) Del(context.Context, string) error                        { return nil }
+func (f *fakeDep) Eval(context.Context, string, []string, ...any) (int64, error) {
+	return 0, nil
+}
 
 func TestCheckAllOK(t *testing.T) {
 	h := &Checker{MySQL: &fakeDB{}, Cache: &fakeDep{}, MQ: &fakeDep{}}

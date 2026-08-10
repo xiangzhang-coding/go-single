@@ -21,6 +21,9 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
+	couponhandler "github.com/xiangzhang-coding/go-single/internal/coupon/handler"
+	couponrepo "github.com/xiangzhang-coding/go-single/internal/coupon/repository"
+	couponsvc "github.com/xiangzhang-coding/go-single/internal/coupon/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/config"
@@ -173,9 +176,16 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		verifier,
 	)
 
+	// coupon 模块：admin 发布券模板，用户领券（Lua 原子防超发）与我的券。
+	couponHandler := couponhandler.New(
+		couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(db), UserCoupon: couponrepo.NewGORMUserCoupon(db)}, cacheClient),
+		verifier,
+	)
+
 	api := r.Group("/api")
 	userHandler.RegisterRoutes(api)
 	productHandler.RegisterRoutes(api)
+	couponHandler.RegisterRoutes(api)
 
 	return r
 }

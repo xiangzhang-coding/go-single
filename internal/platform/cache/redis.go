@@ -55,3 +55,15 @@ func (r *redisCache) Del(ctx context.Context, key string) error {
 func (r *redisCache) Close() error {
 	return r.client.Close()
 }
+
+func (r *redisCache) Eval(ctx context.Context, script string, keys []string, args ...any) (int64, error) {
+	v, err := r.client.Eval(ctx, script, keys, args...).Result()
+	if err != nil {
+		return 0, err
+	}
+	n, ok := v.(int64)
+	if !ok {
+		return 0, fmt.Errorf("Lua 脚本返回类型异常: %T", v)
+	}
+	return n, nil
+}

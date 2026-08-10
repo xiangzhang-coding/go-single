@@ -226,6 +226,11 @@ func (f *fakeCache) Del(_ context.Context, key string) error {
 	return nil
 }
 
+// Eval 模拟 Lua 执行：测试中未使用的脚本一律返回 0（安全失败）。
+func (f *fakeCache) Eval(_ context.Context, _ string, _ []string, _ ...any) (int64, error) {
+	return 0, nil
+}
+
 // ---- 测试夹具 ----
 
 type fixture struct {
