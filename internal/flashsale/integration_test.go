@@ -1,6 +1,7 @@
 // 集成测试（主 seam）：真实 MySQL + Redis（docker compose）+ httptest 起完整路由，
 // 覆盖 admin 活动管理闭环（创建/编辑/上架/下架）、上架预热一致性、
-// 进行中编辑库存只减不增、权限与下架后抢购被拒（预扣经真实 Redis Lua）。
+// 进行中编辑库存只减不增、权限与下架后抢购被拒（预扣经真实 Redis Lua）；
+// T11 抢购接口：并发不超卖 / 幂等键拦截 / 全局与按用户限流 / 窗口与下架拒绝。
 package flashsale_test
 
 import (
@@ -32,6 +33,7 @@ import (
 	flashsalesvc "github.com/xiangzhang-coding/go-single/internal/flashsale/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
@@ -50,11 +52,15 @@ const (
 
 // testEnv 每个测试包只构建一次；MySQL 或 Redis 不可达时整体跳过。
 type testEnv struct {
-	router       http.Handler
-	verifier     auth.TokenVerifier
-	gdb          *gorm.DB
-	redis        *redis.Client
-	flashsaleSvc flashsalesvc.Service
+	router         http.Handler
+	verifier       auth.TokenVerifier
+	gdb            *gorm.DB
+	redis          *redis.Client
+	cacheClient    cache.Cache
+	productSvc     productsvc.Service
+	userHandler    *userhandler.Handler
+	productHandler *producthandler.Handler
+	flashsaleSvc   flashsalesvc.Service
 }
 
 var (
@@ -135,10 +141,12 @@ func buildEnv() (*testEnv, error) {
 	productSvc := productsvc.New(productrepo.Store{Category: productrepo.NewGORMCategory(gdb), Product: productRepo, SKU: productrepo.NewGORMSKU(gdb)}, cacheClient)
 	productHandler := producthandler.New(productSvc, verifier)
 
+	// 默认 env 的秒杀服务关闭按用户限流；限流专项测试经 newFlashsaleRouter 另起路由。
 	flashsaleSvc := flashsalesvc.New(
 		flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(gdb)},
 		productSvc,
 		cacheClient,
+		limiter.RedisCounterConfig{},
 	)
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
 
@@ -147,8 +155,44 @@ func buildEnv() (*testEnv, error) {
 	api := r.Group("/api")
 	userHandler.RegisterRoutes(api)
 	productHandler.RegisterRoutes(api)
-	flashsaleHandler.RegisterRoutes(api)
-	return &testEnv{router: r, verifier: verifier, gdb: gdb, redis: rc, flashsaleSvc: flashsaleSvc}, nil
+	flashsaleHandler.RegisterRoutes(api, allowAll)
+	return &testEnv{
+		router:         r,
+		verifier:       verifier,
+		gdb:            gdb,
+		redis:          rc,
+		cacheClient:    cacheClient,
+		productSvc:     productSvc,
+		userHandler:    userHandler,
+		productHandler: productHandler,
+		flashsaleSvc:   flashsaleSvc,
+	}, nil
+}
+
+// allowAll 恒放行中间件：默认 env 抢购接口不测全局限流（专项测试另起路由）。
+func allowAll(_ *gin.Context) {}
+
+// newFlashsaleRouter 构建独立秒杀路由（按需注入限流配置），复用 user/product
+// handler（共享同一 gdb/verifier），供限流与抢购接口专项测试使用。
+func (e *testEnv) newFlashsaleRouter(t *testing.T, limitCfg limiter.TokenBucketConfig, rlCfg limiter.RedisCounterConfig) http.Handler {
+	t.Helper()
+	svc := flashsalesvc.New(
+		flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(e.gdb)},
+		e.productSvc,
+		e.cacheClient,
+		rlCfg,
+	)
+	h := flashsalehandler.New(svc, e.verifier)
+	limitMW, err := limiter.NewTokenBucket(limitCfg)
+	require.NoError(t, err)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	api := r.Group("/api")
+	e.userHandler.RegisterRoutes(api)
+	e.productHandler.RegisterRoutes(api)
+	h.RegisterRoutes(api, limitMW)
+	return r
 }
 
 func testDSN(dbName string) string {
@@ -172,6 +216,11 @@ func envOr(key, def string) string {
 
 func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
+	return doJSONOn(t, env.router, method, path, body, token)
+}
+
+func doJSONOn(t *testing.T, router http.Handler, method, path, body, token string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
 	var r *http.Request
 	if body == "" {
 		r = httptest.NewRequest(method, path, nil)
@@ -183,13 +232,19 @@ func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*http
 		r.Header.Set("Authorization", "Bearer "+token)
 	}
 	w := httptest.NewRecorder()
-	env.router.ServeHTTP(w, r)
+	router.ServeHTTP(w, r)
 
 	var parsed map[string]any
 	if w.Body.Len() > 0 {
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
 	}
 	return w, parsed
+}
+
+// purchase 在指定路由上发起抢购请求。
+func purchase(t *testing.T, router http.Handler, activityID int64, token string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	return doJSONOn(t, router, http.MethodPost, fmt.Sprintf("/api/flashsales/%d/purchase", activityID), "", token)
 }
 
 func adminToken(t *testing.T, env *testEnv) string {
@@ -249,11 +304,15 @@ func createActivity(t *testing.T, env *testEnv, admin string, skuID int64, stock
 	return int64(id)
 }
 
-// stockKey / countKey 与 service 保持一致（DESIGN.md key 约定）。
+// stockKey / countKey / idemKey 与 service 保持一致（DESIGN.md key 约定）。
 func stockKey(id int64) string { return fmt.Sprintf("flashsale:stock:%d", id) }
 func countKey(id, userID int64) string {
 	return fmt.Sprintf("flashsale:count:%d:%d", id, userID)
 }
+func idemKey(id, userID int64) string {
+	return fmt.Sprintf("flashsale:idem:%d:%d", id, userID)
+}
+func rlKey(userID int64) string { return fmt.Sprintf("flashsale:rl:%d", userID) }
 
 func redisStock(t *testing.T, env *testEnv, id int64) int {
 	t.Helper()

@@ -38,3 +38,11 @@ auth:
 snowflake:
   # 多实例部署时每个实例必须配置不同的 worker_id（0-1023）。
   worker_id: 1
+
+flashsale:
+  # 抢购接口限流：全局令牌桶（x/time/rate，进程内单实例）。
+  qps: 50
+  burst: 100
+  # 按用户限流：Redis 固定窗口计数（INCR+TTL，跨请求状态）。
+  per_user_max: 5
+  per_user_window: 1s

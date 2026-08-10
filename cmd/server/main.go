@@ -42,6 +42,7 @@ import (
 	platformcron "github.com/xiangzhang-coding/go-single/internal/platform/cron"
 	"github.com/xiangzhang-coding/go-single/internal/platform/file"
 	"github.com/xiangzhang-coding/go-single/internal/platform/health"
+	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
 	"github.com/xiangzhang-coding/go-single/internal/platform/logger"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
@@ -229,8 +230,18 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 
 	// flashsale 模块：admin 秒杀活动管理（创建/编辑/上架/下架），
 	// 上架预热库存进 Redis（未开始可覆盖、进行中只减不增）；SKU 校验经 product 服务接口。
+	// 抢购（T11）：全局令牌桶限流中间件 + 按用户 Redis 计数限流 + 幂等键 +
+	// Lua 原子预扣，预扣成功返回"排队中"。
+	seckillTokenBucket, err := limiter.NewTokenBucket(limiter.TokenBucketConfig{
+		QPS:   cfg.FlashSale.QPS,
+		Burst: cfg.FlashSale.Burst,
+	})
+	if err != nil {
+		log.Fatal("初始化秒杀令牌桶限流失败", zap.Error(err))
+	}
 	flashsaleHandler := flashsalehandler.New(
-		flashsalesvc.New(flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(db)}, productSvc, cacheClient),
+		flashsalesvc.New(flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(db)}, productSvc, cacheClient,
+			limiter.RedisCounterConfig{Max: cfg.FlashSale.PerUserMax, Window: cfg.FlashSale.PerUserWindow}),
 		verifier,
 	)
 
@@ -276,7 +287,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	productHandler.RegisterRoutes(api)
 	cartHandler.RegisterRoutes(api)
 	couponHandler.RegisterRoutes(api)
-	flashsaleHandler.RegisterRoutes(api)
+	flashsaleHandler.RegisterRoutes(api, seckillTokenBucket)
 	socialHandler.RegisterRoutes(api)
 	orderHandler.RegisterRoutes(api)
 	paymentHandler.RegisterRoutes(api)

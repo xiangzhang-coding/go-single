@@ -141,17 +141,20 @@ go_single/
 
 ```
 [1] 限流（全局令牌桶 + 按用户限流）
-[2] Lua 原子脚本（活动时间窗口 + status 下架标志 / per_user_limit / DECR 库存 / INCR 用户计数）
-[3] Redis 幂等键（用户+活动，TTL 30min，仅挡预扣请求的重复提交）→ 发 MQ → 返回"排队中"
-[4] 消费者：查 DB 秒杀订单（user_id+activity_id 唯一约束，无则创建）→ 同事务扣活动库存
+[2] Redis 幂等键（用户+活动，SETNX，TTL 30min）——先于预扣抢占，才挡得住重复提交
+[3] Lua 原子脚本（活动时间窗口 + status 下架标志 / per_user_limit / DECR 库存 / INCR 用户计数）
+    预扣成功 → 保留幂等键；业务拒绝（抢光/限购/窗口外/下架）→ 释放幂等键允许重试；
+    基础设施失败 → 保留幂等键（防瞬时故障下重复预扣，预扣成功绝不丢单）
+[4] 预扣成功 → 发 MQ → 返回"排队中"
+[5] 消费者：查 DB 秒杀订单（user_id+activity_id 唯一约束，无则创建）→ 同事务扣活动库存
     失败 → MQ 重投/死信；对账 cron 兜底
-[5] 支付回调（状态机校验）→ 已支付（随后与普通订单一致走发货/确认收货）
-[6] 超时未支付（cron 扫描；RabbitMQ 延迟队列为更优解，进 backlog）→ 取消
+[6] 支付回调（状态机校验）→ 已支付（随后与普通订单一致走发货/确认收货）
+[7] 超时未支付（cron 扫描；RabbitMQ 延迟队列为更优解，进 backlog）→ 取消
     → 回补 Redis 库存 + MySQL 库存 + 用户计数（允许再次抢购）
 ```
 
 - **库存事实源**：秒杀期以 Redis 预扣为准；活动库存落单时同步扣减、取消时回补，用于对账
-- **幂等两段式**：Redis 键挡预扣请求的重复提交；DB 唯一约束挡落单重复——预扣成功绝不丢单
+- **幂等两段式**：Redis 键挡预扣请求的重复提交（先于 Lua 抢占，见时序 [2]）；DB 唯一约束挡落单重复——预扣成功绝不丢单
 - **限购**：`per_user_limit` 字段，后台创建/编辑活动时配置（默认 1），作为 ARGV 传入 Lua
 
 ## 秒杀活动
@@ -159,7 +162,7 @@ go_single/
 - 字段：`start_at` / `end_at` / `status`（上架/下架）/ `stock`（活动独立库存）/ `price`（秒杀价）/ `per_user_limit`
 - **库存模型**：活动独立库存，与 `sku.stock`（普通订单库存）互不干扰；落单扣活动库存；对账 = Redis 活动库存 vs `flashsale.stock` vs 秒杀有效订单数
 - **上架预热**：admin 上架/编辑活动时，服务端将 `stock` 写入 Redis（SETNX，不覆盖在售中存量）；未开始的活动可覆盖（DEL+SET），进行中只可减不可增
-- **Redis key 约定**：`flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}`
+- **Redis key 约定**：`flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}` / `flashsale:rl:{user}`（按用户限流计数，固定窗口 INCR+TTL）
 - 状态判定：进行中 = `status=上架 && start_at <= now <= end_at`（时间窗口动态判定，不显式翻转）；`status` 仅用于手动下架/紧急停止
 
 ## 模拟支付

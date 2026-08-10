@@ -1,5 +1,5 @@
 // Package handler 暴露 flashsale 模块的 HTTP 接口：admin 秒杀活动管理
-// （创建/编辑/列表/上架/下架）。抢购接口见 T11。
+// （创建/编辑/列表/上架/下架）+ 用户抢购（限流 → 幂等键 → Lua 预扣 → 排队中）。
 package handler
 
 import (
@@ -34,13 +34,21 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 //	GET  /api/admin/flashsales             活动列表
 //	POST /api/admin/flashsales/:id/publish   上架（预热库存）
 //	POST /api/admin/flashsales/:id/unpublish 下架
-func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
+//
+// 用户（Bearer）：
+//
+//	POST /api/flashsales/:id/purchase      抢购（seckillTokenBucket 全局令牌桶限流，
+//	                                        成功返回 202 排队中；异步落单见 T12）
+func (h *Handler) RegisterRoutes(rg *gin.RouterGroup, seckillTokenBucket gin.HandlerFunc) {
 	admin := rg.Group("/admin", auth.Middleware(h.verifier), auth.RequireAdmin())
 	admin.POST("/flashsales", h.CreateActivity)
 	admin.PUT("/flashsales/:id", h.UpdateActivity)
 	admin.GET("/flashsales", h.ListActivities)
 	admin.POST("/flashsales/:id/publish", h.PublishActivity)
 	admin.POST("/flashsales/:id/unpublish", h.UnpublishActivity)
+
+	purchase := rg.Group("/flashsales", auth.Middleware(h.verifier))
+	purchase.POST("/:id/purchase", seckillTokenBucket, h.Purchase)
 }
 
 type activityRequest struct {
@@ -115,6 +123,25 @@ func (h *Handler) UnpublishActivity(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// Purchase 抢购：限流（全局令牌桶中间件 + 按用户 Redis 计数）→ 幂等键 →
+// Lua 原子预扣；预扣成功立即返回 202"排队中"（异步落单与订单查询见 T12）。
+func (h *Handler) Purchase(c *gin.Context) {
+	id, ok := idParam(c)
+	if !ok {
+		return
+	}
+	claims, ok := auth.ClaimsFrom(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		return
+	}
+	if err := h.svc.Seckill(c.Request.Context(), claims.UserID, id); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"status": "queued", "message": "排队中"})
+}
+
 func activityParams(req activityRequest) service.ActivityParams {
 	perUserLimit := req.PerUserLimit
 	if perUserLimit == 0 {
@@ -155,7 +182,10 @@ func writeError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrActivityNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrStockIncreaseInProgress),
+	case errors.Is(err, service.ErrRateLimited):
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+	case errors.Is(err, service.ErrDuplicateRequest),
+		errors.Is(err, service.ErrStockIncreaseInProgress),
 		errors.Is(err, service.ErrNotInWindow),
 		errors.Is(err, service.ErrSoldOut),
 		errors.Is(err, service.ErrLimitReached),

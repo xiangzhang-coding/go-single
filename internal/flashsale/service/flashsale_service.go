@@ -1,6 +1,6 @@
 // Package service 承载 flashsale 模块业务：admin 创建/编辑/上架/下架秒杀活动，
 // 上架时预热独立库存进 Redis（未开始可覆盖、进行中只减不增），
-// 并提供 Lua 原子预扣（T11 抢购接口复用）。
+// 并提供 Lua 原子预扣与抢购接口（限流 → 幂等键 → 预扣，成功返回排队中）。
 package service
 
 import (
@@ -14,6 +14,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 )
@@ -27,17 +28,28 @@ var (
 	ErrSoldOut                 = errors.New("flashsale sold out")
 	ErrLimitReached            = errors.New("per user limit reached")
 	ErrOffline                 = errors.New("flashsale activity offline")
+	ErrDuplicateRequest        = errors.New("duplicate flashsale request")
+	ErrRateLimited             = errors.New("flashsale rate limited")
 )
 
 // Redis key 约定（DESIGN.md）：flashsale:stock:{id}（活动库存，上架预热）/
-// flashsale:count:{id}:{user}（用户抢购计数，Lua 预扣 INCR）。
+// flashsale:count:{id}:{user}（用户抢购计数，Lua 预扣 INCR）/
+// flashsale:idem:{id}:{user}（幂等键，挡预扣请求重复提交）/
+// flashsale:rl:{user}（按用户限流计数）。
 func stockKey(id int64) string { return fmt.Sprintf("flashsale:stock:%d", id) }
 func countKey(id, userID int64) string {
 	return fmt.Sprintf("flashsale:count:%d:%d", id, userID)
 }
+func idemKey(activityID, userID int64) string {
+	return fmt.Sprintf("flashsale:idem:%d:%d", activityID, userID)
+}
+func rlKey(userID int64) string { return fmt.Sprintf("flashsale:rl:%d", userID) }
 
 // stockKeyMargin 预热库存 TTL 的余量：剩余时长 + 1h，活动结束后自清理。
 const stockKeyMargin = time.Hour
+
+// idemTTL 幂等键 TTL：与规格一致（30min，DESIGN.md），仅挡预扣请求的重复提交。
+const idemTTL = 30 * time.Minute
 
 // prewarmScript Lua 原子预热（进行中场景）：key 不存在则写入（SETNX 语义），
 // 已存在时仅当配置库存更低才覆盖（只减不增）；一次调用避免与预扣 DECR 竞态。
@@ -88,6 +100,15 @@ const (
 	preDeductOffline     int64 = -3
 )
 
+// idemScript 原子抢占幂等键（SETNX + EXPIRE）：返回 1 抢占成功 / 0 已存在。
+// KEYS[1] 幂等键；ARGV[1] 值；ARGV[2] TTL 秒（与 order 模块 client_request_id 同模式）。
+const idemScript = `
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
+    return 1
+end
+return 0
+`
+
 // ActivityParams 活动参数（创建/编辑共用；状态经 上架/下架 端点变更）。
 type ActivityParams struct {
 	SKUID        int64
@@ -110,7 +131,15 @@ type Service interface {
 	// UnpublishActivity 下架：清除预热库存，后续抢购被拒。
 	UnpublishActivity(ctx context.Context, id int64) error
 
-	// ---- 抢购预扣（T11 抢购接口复用）----
+	// ---- 抢购（T11）----
+	// Seckill 抢购全流程：按用户限流（Redis 固定窗口计数）→ 幂等键
+	// （用户+活动，TTL 30min，挡预扣请求重复提交）→ Lua 原子预扣；
+	// 预扣被业务拒绝（抢光/限购/窗口外/下架）时释放幂等键允许重试，
+	// 基础设施失败保留幂等键（防瞬时故障下重复预扣）；成功返回 nil（"排队中"）。
+	// 异步落单（发 MQ）见 T12。
+	Seckill(ctx context.Context, userID, activityID int64) error
+
+	// ---- 抢购预扣（底层原子操作，T11 抢购接口复用）----
 	// PreDeduct Lua 原子预扣：活动由调用方读库（与优惠券领券同模式，
 	// 状态/窗口/限购作为 ARGV 传入，Redis 内原子扣减）。
 	PreDeduct(ctx context.Context, userID, activityID int64) error
@@ -127,11 +156,17 @@ type flashsaleService struct {
 	store    repository.Store
 	products ProductService
 	cache    cache.Cache
+	perUser  *limiter.RedisCounter
 }
 
-// New 构造秒杀服务。
-func New(store repository.Store, products ProductService, c cache.Cache) Service {
-	return &flashsaleService{store: store, products: products, cache: c}
+// New 构造秒杀服务。userLimiter 为按用户限流配置（Max<=0 不启用）。
+func New(store repository.Store, products ProductService, c cache.Cache, userLimiter limiter.RedisCounterConfig) Service {
+	return &flashsaleService{
+		store:    store,
+		products: products,
+		cache:    c,
+		perUser:  limiter.NewRedisCounter(c, userLimiter),
+	}
 }
 
 // ---- admin ----
@@ -243,6 +278,55 @@ func (s *flashsaleService) UnpublishActivity(ctx context.Context, id int64) erro
 	}
 	// 清除预热库存：key 生命周期 = 上架时预热、下架时清理（再上架重新预热）。
 	return s.cache.Del(ctx, stockKey(id))
+}
+
+// ---- 抢购（T11）----
+
+// Seckill 抢购全流程（DESIGN.md 秒杀时序）：
+//  1. 按用户限流：Redis 固定窗口计数（INCR+TTL，跨请求状态）；
+//  2. 幂等键：原子抢占（用户+活动，TTL 30min），已存在即重复提交被拦；
+//  3. Lua 原子预扣（PreDeduct，窗口/状态/限购/库存全在 Redis 内原子判定）。
+//
+// 预扣被业务拒绝时释放幂等键（允许窗口内重试）；基础设施失败保留幂等键
+// （防瞬时故障下重复预扣，与 order 模块 client_request_id 同取舍）。
+func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64) error {
+	// 1. 按用户限流：fail-closed（限流不可用时拒绝放行，保护后端）。
+	ok, err := s.perUser.Allow(ctx, rlKey(userID))
+	if err != nil {
+		return fmt.Errorf("flashsale rate limit: %w", err)
+	}
+	if !ok {
+		return ErrRateLimited
+	}
+
+	// 2. 幂等键：挡预扣请求的重复提交（DB 唯一约束挡落单重复，见 T12）。
+	key := idemKey(activityID, userID)
+	code, err := s.cache.Eval(ctx, idemScript, []string{key}, 1, int64(idemTTL.Seconds()))
+	if err != nil {
+		return fmt.Errorf("acquire flashsale idempotency: %w", err)
+	}
+	if code != 1 {
+		return ErrDuplicateRequest
+	}
+
+	// 3. Lua 原子预扣。
+	if err := s.PreDeduct(ctx, userID, activityID); err != nil {
+		if isBusinessReject(err) {
+			// 业务拒绝：释放幂等键，允许用户重试（如未开始时提前抢、活动恢复上架后重抢）。
+			if delErr := s.cache.Del(ctx, key); delErr != nil {
+				return fmt.Errorf("%w: release idempotency key: %v", err, delErr)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// isBusinessReject 预扣的业务拒绝分支（非基础设施故障）。
+func isBusinessReject(err error) bool {
+	return errors.Is(err, ErrSoldOut) || errors.Is(err, ErrNotInWindow) ||
+		errors.Is(err, ErrLimitReached) || errors.Is(err, ErrOffline) ||
+		errors.Is(err, ErrActivityNotFound)
 }
 
 // ---- 抢购预扣 ----

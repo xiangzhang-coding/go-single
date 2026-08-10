@@ -22,6 +22,20 @@ type Config struct {
 	Migrations Migrations
 	Auth       Auth
 	Snowflake  Snowflake
+	FlashSale  FlashSale
+}
+
+// FlashSale 秒杀配置：抢购接口限流参数。
+// 全局令牌桶为进程内单实例（x/time/rate）；按用户为 Redis 固定窗口计数（跨请求状态）。
+type FlashSale struct {
+	// QPS 全局令牌桶每秒令牌补充速率。
+	QPS float64 `mapstructure:"qps"`
+	// Burst 全局令牌桶容量（允许的瞬时突发请求数）。
+	Burst int `mapstructure:"burst"`
+	// PerUserMax 每用户窗口内最多抢购请求数（<=0 表示不启用按用户限流）。
+	PerUserMax int `mapstructure:"per_user_max"`
+	// PerUserWindow 按用户限流窗口长度（如 "1s"）。
+	PerUserWindow time.Duration `mapstructure:"per_user_window"`
 }
 
 type Auth struct {
@@ -140,4 +154,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("auth.secret", "dev-secret-change-me")
 	v.SetDefault("auth.ttl", "2h")
 	v.SetDefault("snowflake.worker_id", 1)
+	v.SetDefault("flashsale.qps", 50)
+	v.SetDefault("flashsale.burst", 100)
+	v.SetDefault("flashsale.per_user_max", 5)
+	v.SetDefault("flashsale.per_user_window", "1s")
 }
