@@ -27,6 +27,9 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/health"
 	"github.com/xiangzhang-coding/go-single/internal/platform/logger"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
+	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
+	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
+	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
@@ -162,8 +165,17 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// user 模块：注册/登录/鉴权。
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: cfg.Auth.Secret, TTL: cfg.Auth.TTL})
 	userHandler := userhandler.New(usersvc.New(userrepo.NewGORM(db), verifier), verifier)
+
+	// product 模块：admin 维护类目/商品/SKU，游客浏览（详情走缓存）。
+	productRepo := productrepo.NewGORMProduct(db)
+	productHandler := producthandler.New(
+		productsvc.New(productrepo.Store{Category: productrepo.NewGORMCategory(db), Product: productRepo, SKU: productrepo.NewGORMSKU(db)}, cacheClient),
+		verifier,
+	)
+
 	api := r.Group("/api")
 	userHandler.RegisterRoutes(api)
+	productHandler.RegisterRoutes(api)
 
 	return r
 }

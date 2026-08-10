@@ -26,3 +26,39 @@ func TestRedisUnavailable(t *testing.T) {
 	_, err := NewRedis("127.0.0.1:1", "", 0)
 	require.Error(t, err)
 }
+
+// Get/Set/Del 与 ErrMiss 语义（测试用独立 DB，避免污染）。
+func TestRedisGetSetDel(t *testing.T) {
+	c, err := NewRedis("127.0.0.1:6379", "", 15)
+	if err != nil {
+		t.Skipf("Redis 不可用，跳过: %v", err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	key := "cache_test:getsetdel"
+	require.NoError(t, c.Del(ctx, key))
+
+	_, err = c.Get(ctx, key)
+	require.ErrorIs(t, err, ErrMiss, "未命中的 key 应返回 ErrMiss")
+
+	require.NoError(t, c.Set(ctx, key, "v1", time.Minute))
+	got, err := c.Get(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, "v1", got)
+
+	// 覆盖写 + TTL 生效。
+	require.NoError(t, c.Set(ctx, key, "v2", 50*time.Millisecond))
+	got, err = c.Get(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, "v2", got)
+	time.Sleep(100 * time.Millisecond)
+	_, err = c.Get(ctx, key)
+	require.ErrorIs(t, err, ErrMiss, "TTL 过期后应视为未命中")
+
+	require.NoError(t, c.Del(ctx, key))
+	_, err = c.Get(ctx, key)
+	require.ErrorIs(t, err, ErrMiss)
+}

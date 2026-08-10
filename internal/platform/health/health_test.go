@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -16,6 +17,11 @@ type fakeDep struct{ err error }
 
 func (f *fakeDep) Ping(context.Context) error { return f.err }
 func (f *fakeDep) Close() error               { return nil }
+func (f *fakeDep) Get(context.Context, string) (string, error) {
+	return "", nil
+}
+func (f *fakeDep) Set(context.Context, string, string, time.Duration) error { return nil }
+func (f *fakeDep) Del(context.Context, string) error                        { return nil }
 
 func TestCheckAllOK(t *testing.T) {
 	h := &Checker{MySQL: &fakeDB{}, Cache: &fakeDep{}, MQ: &fakeDep{}}

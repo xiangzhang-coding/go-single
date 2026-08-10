@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -30,6 +31,25 @@ func NewRedis(addr, password string, db int) (Cache, error) {
 
 func (r *redisCache) Ping(ctx context.Context) error {
 	return r.client.Ping(ctx).Err()
+}
+
+func (r *redisCache) Get(ctx context.Context, key string) (string, error) {
+	v, err := r.client.Get(ctx, key).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return "", ErrMiss
+		}
+		return "", err
+	}
+	return v, nil
+}
+
+func (r *redisCache) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	return r.client.Set(ctx, key, value, ttl).Err()
+}
+
+func (r *redisCache) Del(ctx context.Context, key string) error {
+	return r.client.Del(ctx, key).Err()
 }
 
 func (r *redisCache) Close() error {
