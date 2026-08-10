@@ -66,6 +66,22 @@ func (s *GORMOrderStore) List(ctx context.Context, userID int64, status string, 
 	return list, total, nil
 }
 
+// ListExpiredPending 超时扫描：待支付、普通订单且已过 expire_at，
+// 按过期时间升序（最早过期先处理），limit 分批（每 tick 处理上限，
+// 余量下个 tick 续扫，避免单次长时间占用）。
+func (s *GORMOrderStore) ListExpiredPending(ctx context.Context, now time.Time, limit int) ([]model.Order, error) {
+	var list []model.Order
+	if err := s.db.WithContext(ctx).
+		Where("status = ? AND order_type = ? AND expire_at < ?",
+			model.OrderStatusPendingPayment, model.OrderTypeNormal, now).
+		Order("expire_at ASC, order_no ASC").
+		Limit(limit).
+		Find(&list).Error; err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
 // Cancel 条件更新 待支付→已取消；RowsAffected=0 表示状态已变（并发/非法跃迁）。
 func (s *GORMOrderStore) Cancel(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error) {
 	return s.transition(ctx, tx, orderNo, model.OrderStatusPendingPayment, model.OrderStatusCancelled, "cancelled_at")

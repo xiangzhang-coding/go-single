@@ -39,6 +39,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/config"
+	platformcron "github.com/xiangzhang-coding/go-single/internal/platform/cron"
 	"github.com/xiangzhang-coding/go-single/internal/platform/file"
 	"github.com/xiangzhang-coding/go-single/internal/platform/health"
 	"github.com/xiangzhang-coding/go-single/internal/platform/logger"
@@ -116,7 +117,7 @@ func run() error {
 		return err
 	}
 
-	router := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient, fileSvc)
+	router, cronRegistry := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient, fileSvc)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
@@ -133,11 +134,18 @@ func run() error {
 		}
 	}()
 
-	// 优雅关闭：等待 SIGINT / SIGTERM。
+	// 优雅关闭：等待 SIGINT / SIGTERM；先停 cron（等待执行中的任务），再关 HTTP。
+	// 两段使用独立超时预算：cron 停止不应耗尽 HTTP 关闭的时间。
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Info("收到退出信号，正在关闭")
+
+	cronCtx, cronCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := cronRegistry.Stop(cronCtx); err != nil {
+		log.Warn("cron 停止超时", zap.Error(err))
+	}
+	cronCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -182,7 +190,7 @@ func runMigrations(cfg *config.Config, log *zap.Logger) error {
 	return nil
 }
 
-func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Cache, mqClient mq.MQ, fileSvc *file.MinIO) *gin.Engine {
+func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Cache, mqClient mq.MQ, fileSvc *file.MinIO) (*gin.Engine, *platformcron.Registry) {
 	gin.SetMode(cfg.Server.Mode)
 
 	r := gin.New()
@@ -253,6 +261,12 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		verifier,
 	)
 
+	// cron 定时任务：平台级注册机制（platform/cron），单实例调度；
+	// T09 订单超时取消——每分钟扫描已过 expire_at 的待支付普通订单，
+	// 事务内取消 + 回补库存 + 回退券；单订单失败跳过（失败数记日志，下个 tick 重试）。
+	cronRegistry := registerCron(log, orderSvc)
+	cronRegistry.Start()
+
 	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
 	fileHandler := file.NewHandler(fileSvc, verifier)
 
@@ -268,7 +282,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	paymentHandler.RegisterRoutes(api)
 	fileHandler.RegisterRoutes(api)
 
-	return r
+	return r, cronRegistry
 }
 
 func healthHandler(checker *health.Checker) gin.HandlerFunc {
@@ -280,4 +294,25 @@ func healthHandler(checker *health.Checker) gin.HandlerFunc {
 		}
 		c.JSON(code, res)
 	}
+}
+
+// registerCron 注册全部定时任务并返回调度器（Start 由调用方执行）。
+// 后续任务（如库存对账）在此追加。
+func registerCron(log *zap.Logger, orderSvc ordersvc.Service) *platformcron.Registry {
+	registry := platformcron.New(log, 5*time.Minute)
+	if err := registry.Register(platformcron.Job{
+		Name: "order-timeout-cancel",
+		Spec: "* * * * *",
+		Fn: func(ctx context.Context) error {
+			cancelled, failed, err := orderSvc.CancelExpired(ctx)
+			if err != nil {
+				return err
+			}
+			log.Info("订单超时取消完成", zap.Int("cancelled", cancelled), zap.Int("failed", failed))
+			return nil
+		},
+	}); err != nil {
+		log.Fatal("注册超时取消任务失败", zap.Error(err))
+	}
+	return registry
 }

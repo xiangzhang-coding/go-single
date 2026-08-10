@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -31,12 +32,15 @@ import (
 // ---- fake 订单仓储 ----
 
 type fakeOrders struct {
-	byID   map[string]*model.Order
-	txLog  []string
-	getErr error
+	byID       map[string]*model.Order
+	txLog      []string
+	getErr     error
+	skipCancel map[string]bool // 模拟并发下状态已变：Cancel 返回未更新
 }
 
-func newFakeOrders() *fakeOrders { return &fakeOrders{byID: map[string]*model.Order{}} }
+func newFakeOrders() *fakeOrders {
+	return &fakeOrders{byID: map[string]*model.Order{}, skipCancel: map[string]bool{}}
+}
 
 func (f *fakeOrders) Create(_ context.Context, _ *gorm.DB, o *model.Order) error {
 	f.byID[o.OrderNo] = o
@@ -61,7 +65,33 @@ func (f *fakeOrders) List(_ context.Context, userID int64, status string, offset
 	return slicePage(out, offset, limit), int64(len(out)), nil
 }
 
+func (f *fakeOrders) ListExpiredPending(_ context.Context, now time.Time, limit int) ([]model.Order, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	var out []model.Order
+	for _, o := range f.byID {
+		if o.Status == model.OrderStatusPendingPayment &&
+			o.OrderType == model.OrderTypeNormal && o.ExpireAt.Before(now) {
+			out = append(out, *o)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].ExpireAt.Equal(out[j].ExpireAt) {
+			return out[i].ExpireAt.Before(out[j].ExpireAt)
+		}
+		return out[i].OrderNo < out[j].OrderNo
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (f *fakeOrders) Cancel(_ context.Context, tx *gorm.DB, orderNo string) (bool, error) {
+	if f.skipCancel[orderNo] {
+		return false, nil
+	}
 	o, ok := f.byID[orderNo]
 	if !ok || o.Status != model.OrderStatusPendingPayment {
 		return false, nil
@@ -734,6 +764,100 @@ func TestCancelRestoresStockAndCoupon(t *testing.T) {
 	err = fx.svc.Cancel(context.Background(), 42, res.Order.OrderNo)
 	require.ErrorIs(t, err, ErrIllegalTransition)
 	require.Equal(t, 10, fx.prods.skus[1].Stock, "重复取消不得重复回补")
+}
+
+// 超时取消：仅取消已过 expire_at 的待支付普通订单，回补库存并回退券；
+// 未超时订单不受影响；返回取消数量。
+func TestCancelExpiredCancelsTimedOutOnly(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.coupons.seed(4, 42, 50, 0)
+
+	// 订单 A：带券、库存 2 件。
+	resA, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "t1", AddressID: 1, CouponID: 4,
+		Items: []ItemParams{{SKUID: 1, Quantity: 2}},
+	})
+	require.NoError(t, err)
+	// 订单 B：无券、库存 1 件。
+	resB, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "t2", AddressID: 1,
+		Items: []ItemParams{{SKUID: 2, Quantity: 1}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 8, fx.prods.skus[1].Stock)
+	require.Equal(t, 4, fx.prods.skus[2].Stock)
+
+	// 订单 A 拨成已超时；订单 B 保持未超时。
+	fx.orders.byID[resA.Order.OrderNo].ExpireAt = time.Now().Add(-time.Minute)
+	require.Equal(t, couponmodel.CouponStatusUsed, fx.coupons.coupons[4].Status, "下单后券已核销")
+
+	n, failed, err := fx.svc.CancelExpired(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, failed, "正常订单不应失败")
+	require.Equal(t, 1, n, "仅超时订单应被取消")
+
+	require.Equal(t, model.OrderStatusCancelled, fx.orders.byID[resA.Order.OrderNo].Status)
+	require.Equal(t, 10, fx.prods.skus[1].Stock, "超时取消应回补库存")
+	require.Equal(t, couponmodel.CouponStatusUnused, fx.coupons.coupons[4].Status, "超时取消应回退券")
+
+	require.Equal(t, model.OrderStatusPendingPayment, fx.orders.byID[resB.Order.OrderNo].Status, "未超时订单不受影响")
+	require.Equal(t, 4, fx.prods.skus[2].Stock, "未超时订单库存保持扣减")
+}
+
+// 超时取消只处理普通订单：秒杀订单即使超时也不在本任务范围（回补 Redis 由秒杀模块负责）。
+func TestCancelExpiredSkipsSeckillOrders(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	res, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "t3", AddressID: 1,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}},
+	})
+	require.NoError(t, err)
+	o := fx.orders.byID[res.Order.OrderNo]
+	o.OrderType = model.OrderTypeSeckill
+	o.ExpireAt = time.Now().Add(-time.Minute)
+
+	n, failed, err := fx.svc.CancelExpired(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, n)
+	require.Zero(t, failed)
+	require.Equal(t, model.OrderStatusPendingPayment, fx.orders.byID[res.Order.OrderNo].Status)
+	require.Equal(t, 9, fx.prods.skus[1].Stock)
+}
+
+// 超时取消并发兜底：扫描后订单已被支付（条件更新 RowsAffected=0）时
+// 跳过且不报错，库存不做重复回补。
+func TestCancelExpiredSkipsConcurrentPaidOrder(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	res, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "t4", AddressID: 1,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}},
+	})
+	require.NoError(t, err)
+	fx.orders.byID[res.Order.OrderNo].ExpireAt = time.Now().Add(-time.Minute)
+
+	// 模拟扫描后、条件更新前订单已被支付。
+	fx.orders.skipCancel[res.Order.OrderNo] = true
+	n, failed, err := fx.svc.CancelExpired(context.Background())
+	require.NoError(t, err, "并发已支付的订单应跳过")
+	require.Zero(t, n)
+	require.Equal(t, 1, failed, "并发已支付的订单应计入失败数（跳过不阻断）")
+	require.Equal(t, model.OrderStatusPendingPayment, fx.orders.byID[res.Order.OrderNo].Status)
+	require.Equal(t, 9, fx.prods.skus[1].Stock, "跳过不得回补库存")
+}
+
+// 超时扫描仓储故障：错误向上传播（cron 记录日志，下个 tick 重试）。
+func TestCancelExpiredPropagatesScanError(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.orders.getErr = errors.New("db down")
+
+	_, _, err := fx.svc.CancelExpired(context.Background())
+	require.Error(t, err)
 }
 
 // 状态机：待支付不可确认收货/发货；已支付不可取消。

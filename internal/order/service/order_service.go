@@ -57,6 +57,8 @@ const (
 	// 分页上限与默认页大小。
 	defaultPageSize = 20
 	maxPageSize     = 50
+	// 超时扫描每 tick 处理上限：余量下个 tick 续扫（cron 每分钟一次）。
+	cancelExpiredBatch = 500
 )
 
 // 幂等键约定：order:idem:{user_id}:{client_request_id} → 订单号。
@@ -144,6 +146,10 @@ type Service interface {
 	GetDetail(ctx context.Context, userID int64, orderNo string) (*model.OrderView, error)
 	// Cancel 取消待支付订单：回补库存 + 回退券；状态机非法跃迁拒绝。
 	Cancel(ctx context.Context, userID int64, orderNo string) error
+	// CancelExpired 超时取消（cron 任务回调）：扫描待支付且已过 expire_at 的
+	// 普通订单，逐个事务内取消（条件更新 + 回补库存 + 回退券）；
+	// 返回 (取消数, 失败数)。并发下已被支付/取消的订单跳过（条件更新兜底）。
+	CancelExpired(ctx context.Context) (cancelled, failed int, err error)
 	// MarkPaid 支付成功状态迁移：待支付 → 已支付（支付模块事务内条件更新；
 	// WHERE 同时校验 status 与 pay_amount，false = 状态已变或金额不符）。
 	MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error)
@@ -632,27 +638,73 @@ func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string)
 	}
 
 	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
-		ok, err := s.store.Orders.Cancel(ctx, tx, orderNo)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return ErrOrderChanged
-		}
-		for _, it := range view.Items {
-			if err := s.products.RestoreStock(ctx, tx, it.SKUID, it.Quantity); err != nil {
-				return translateProductError(err)
-			}
-		}
-		if view.CouponID != nil {
-			if err := s.coupons.RollbackCoupon(ctx, tx, userID, *view.CouponID); err != nil {
-				return translateCouponError(err)
-			}
-		}
-		return nil
+		return s.cancelInTx(ctx, tx, view)
 	})
 	if err != nil {
 		return err
+	}
+	return nil
+}
+
+// CancelExpired 超时取消（cron 每分钟扫描调用）：
+//  1. 扫描待支付且已过 expire_at 的普通订单（分批上限 cancelExpiredBatch）
+//  2. 逐个事务内取消：条件更新 待支付→已取消 → 回补库存 → 回退券
+//
+// 单订单失败不阻断整轮：跳过并继续其余订单，失败订单停留待支付、下个 tick
+// 重试（at-least-once），失败数供调用方记录日志。并发下已被支付/取消
+// （ErrOrderChanged）属正常跳过；其余失败（如券状态异常）同样计入失败数——
+// 孤立异常订单不应阻塞全部超时取消。扫描/批量读取等系统性错误向上传播
+// （cron 记录日志，下个 tick 重试）。
+func (s *orderService) CancelExpired(ctx context.Context) (cancelled, failed int, err error) {
+	orders, err := s.store.Orders.ListExpiredPending(ctx, time.Now(), cancelExpiredBatch)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(orders) == 0 {
+		return 0, 0, nil
+	}
+	orderNos := make([]string, 0, len(orders))
+	for _, o := range orders {
+		orderNos = append(orderNos, o.OrderNo)
+	}
+	itemsByOrder, err := s.store.Items.ListByOrders(ctx, orderNos)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	for _, o := range orders {
+		view := &model.OrderView{Order: o, Items: itemsByOrder[o.OrderNo]}
+		err := s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+			return s.cancelInTx(ctx, tx, view)
+		})
+		if err != nil {
+			failed++
+			continue
+		}
+		cancelled++
+	}
+	return cancelled, failed, nil
+}
+
+// cancelInTx 事务内取消：条件更新 待支付→已取消 + 回补库存 + 回退券；
+// 用户取消与超时取消共用（库存/券补偿逻辑单点维护）。
+func (s *orderService) cancelInTx(ctx context.Context, tx *gorm.DB, view *model.OrderView) error {
+	ok, err := s.store.Orders.Cancel(ctx, tx, view.OrderNo)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrOrderChanged
+	}
+	for _, it := range view.Items {
+		if err := s.products.RestoreStock(ctx, tx, it.SKUID, it.Quantity); err != nil {
+			return translateProductError(err)
+		}
+	}
+	if view.CouponID != nil {
+		if err := s.coupons.RollbackCoupon(ctx, tx, view.UserID, *view.CouponID); err != nil {
+			return translateCouponError(err)
+		}
 	}
 	return nil
 }

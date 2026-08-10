@@ -5,6 +5,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -25,6 +26,10 @@ type OrderRepository interface {
 	GetByNo(ctx context.Context, orderNo string) (*model.Order, error)
 	// List 我的订单：状态筛选（空 = 全部）+ 分页，返回条目与总数。
 	List(ctx context.Context, userID int64, status string, offset, limit int) ([]model.Order, int64, error)
+	// ListExpiredPending 超时扫描：待支付且已过 expire_at 的普通订单
+	// （超时取消仅针对普通订单；秒杀订单取消需回补 Redis，由秒杀模块另行处理）。
+	// now 由调用方传入（Go 时钟），limit 分批上限，供 cron 每分钟扫描。
+	ListExpiredPending(ctx context.Context, now time.Time, limit int) ([]model.Order, error)
 	// Cancel 事务内条件更新 待支付→已取消；返回是否更新成功。
 	Cancel(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error)
 	// MarkPaid 事务内条件更新 待支付→已支付（支付回调）；WHERE 同时校验

@@ -65,6 +65,7 @@ type testEnv struct {
 	verifier auth.TokenVerifier
 	redis    *redis.Client
 	gdb      *gorm.DB
+	orderSvc ordersvc.Service
 }
 
 var (
@@ -163,7 +164,6 @@ func buildEnv() (*testEnv, error) {
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc)
 	orderHandler := orderhandler.New(orderSvc, verifier)
-
 	paymentStore := paymentrepo.NewGORMPayment(gdb)
 	paymentHandler := paymenthandler.New(
 		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc),
@@ -180,7 +180,7 @@ func buildEnv() (*testEnv, error) {
 	couponHandler.RegisterRoutes(api)
 	orderHandler.RegisterRoutes(api)
 	paymentHandler.RegisterRoutes(api)
-	return &testEnv{router: r, verifier: verifier, redis: rc, gdb: gdb}, nil
+	return &testEnv{router: r, verifier: verifier, redis: rc, gdb: gdb, orderSvc: orderSvc}, nil
 }
 
 func testDSN(dbName string) string {
@@ -968,4 +968,93 @@ func TestOrderDirectBuyMultiSKU(t *testing.T) {
 	require.Len(t, body["items"].([]any), 2)
 	require.Equal(t, 8, skuStock(t, env, skuA))
 	require.Equal(t, 4, skuStock(t, env, skuB))
+}
+
+// T09 超时取消：制造已过 expire_at 的待支付订单，经 cron 任务回调（服务层
+// CancelExpired 等价调用）自动取消——状态置 cancelled、库存回补、券回退；
+// 未超时订单不受影响；已支付订单不参与扫描。
+func TestOrderTimeoutCancel(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("timeout"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+	// 直减券：满 0 减 1000（threshold 要求 min_amount >= value）。
+	tmplID := createTemplate(t, env, "direct", 1000, 0)
+	w, body := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", token)
+	require.Equal(t, http.StatusCreated, w.Code, "领券失败: %s", w.Body.String())
+	couponID := int64(body["id"].(float64))
+
+	// 订单 A：带券 2 件（将超时）；订单 B：无券 1 件（保持未超时）。
+	w, body = createOrder(t, env, token, uniqueName("req"), addrID, skuID, 2, couponID)
+	require.Equal(t, http.StatusCreated, w.Code)
+	orderA := body["order_no"].(string)
+	w, body = createOrder(t, env, token, uniqueName("req"), addrID, skuID, 1, 0)
+	require.Equal(t, http.StatusCreated, w.Code)
+	orderB := body["order_no"].(string)
+	require.Equal(t, 7, skuStock(t, env, skuID))
+
+	var couponStatus string
+	require.NoError(t, env.gdb.Raw("SELECT status FROM user_coupons WHERE id = ?", couponID).Scan(&couponStatus).Error)
+	require.Equal(t, "used", couponStatus, "下单后券应已核销")
+
+	// 订单 A 拨回已超时（expire_at 为 1 分钟前）。
+	require.NoError(t, env.gdb.Exec("UPDATE orders SET expire_at = ? WHERE order_no = ?", time.Now().Add(-time.Minute), orderA).Error)
+
+	// 共享测试库可能还有历史残留的已超时订单（它们被一并取消属正确行为），
+	// 取消数只做下限断言；重点断言本测试订单的状态与补偿结果。
+	n, _, err := env.orderSvc.CancelExpired(context.Background())
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, n, 1, "超时订单应被取消")
+
+	// 订单 A：已取消 + 回补库存 + 回退券 + cancelled_at 落库。
+	o := orderByNo(t, env, orderA)
+	require.Equal(t, model.OrderStatusCancelled, o.Status)
+	require.NotNil(t, o.CancelledAt)
+	require.Equal(t, 9, skuStock(t, env, skuID), "库存回补 2 件（订单 B 仍占用 1 件）")
+	require.NoError(t, env.gdb.Raw("SELECT status FROM user_coupons WHERE id = ?", couponID).Scan(&couponStatus).Error)
+	require.Equal(t, "unused", couponStatus, "超时取消应回退券")
+
+	// 订单 B：未超时不受影响。
+	o = orderByNo(t, env, orderB)
+	require.Equal(t, model.OrderStatusPendingPayment, o.Status)
+	require.Nil(t, o.CancelledAt)
+
+	// 再次执行（无超时订单）：取消数为 0，幂等不重复处理。
+	n, _, err = env.orderSvc.CancelExpired(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, n)
+
+	// 用户视角：列表 cancelled 含订单 A；详情状态一致。
+	w, list := doJSON(t, env, http.MethodGet, "/api/orders?status=cancelled", "", token)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, float64(1), list["total"])
+	require.Equal(t, orderA, list["orders"].([]any)[0].(map[string]any)["order_no"])
+	w, detail := doJSON(t, env, http.MethodGet, "/api/orders/"+orderA, "", token)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "cancelled", detail["status"])
+}
+
+// T09 已支付订单不受超时扫描影响（支付后状态已迁移，不再命中待支付扫描）。
+func TestOrderTimeoutCancelSkipsPaidOrder(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("paid-timeout"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+
+	w, body := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 1, 0)
+	require.Equal(t, http.StatusCreated, w.Code)
+	orderNo := body["order_no"].(string)
+
+	// 模拟支付成功 → 待支付 → 已支付。
+	w, _ = doJSON(t, env, http.MethodPost, "/api/payments/mock",
+		fmt.Sprintf(`{"order_id":%q,"payment_id":%q,"amount":9900,"result":"success"}`, orderNo, uniqueName("pay")), token)
+	require.Equal(t, http.StatusCreated, w.Code)
+	require.Equal(t, model.OrderStatusPaid, orderByNo(t, env, orderNo).Status)
+
+	// 即使 expire_at 已过，已支付订单不参与超时扫描。
+	require.NoError(t, env.gdb.Exec("UPDATE orders SET expire_at = ? WHERE order_no = ?", time.Now().Add(-time.Minute), orderNo).Error)
+	n, _, err := env.orderSvc.CancelExpired(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, n)
+	require.Equal(t, model.OrderStatusPaid, orderByNo(t, env, orderNo).Status)
 }
