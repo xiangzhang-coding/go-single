@@ -1,0 +1,25 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Env
+.env
+.env.local
+*.local.yaml
+
+# Node / 前端
+node_modules/
+dist/
+.vite/
+
+# Docusaurus
+website/build/
+website/.docusaurus/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

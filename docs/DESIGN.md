@@ -1,0 +1,290 @@
+# 设计总览
+
+## 架构
+
+DDD 风格的模块化单体：单一部署单元承载商城、秒杀、后台、好友圈与即时通信模块；模块 = 限界上下文，repository 接口 = 端口，共享基础设施集中在 `internal/platform`。模块间经 service 接口进行进程内调用（面向接口，非 HTTP）+ 单向依赖（DAG，禁止循环），仅秒杀落单走 MQ 异步。
+（见 ADR-0001 / 0003）
+
+单体阶段 Nginx 反代即网关（路由 / SSL 终止 / 静态托管 / 入口限流）；拆微服务时才引入独立 API 网关（见 BACKLOG"明确不做"）。
+
+## 学习点
+
+- Go 语言：goroutine / channel / context、面向接口编程、错误处理、GC 与内存基础
+- 工程实践：手写雪花 ID、Lua 原子脚本、模块化单体的模块边界、测试（testify）
+- 面试题库：80-100 题按主题分章（Go 基础/并发/网络/MySQL/Redis/MQ/秒杀架构/认证安全/工程实践/部署运维/可观测性/容错与降级），存于 website/docs/tech/interview/，答案与代码随模块实现同步产出
+
+## 技术栈
+
+| 层 | 主选 | Backlog 备选 |
+|---|---|---|
+| Web | Gin | stdlib 路由 |
+| ORM | GORM（之上包仓储接口） | sqlc |
+| 数据库 | MySQL 8 | PostgreSQL |
+| 缓存 | go-redis/v9 + Lua 脚本 | — |
+| MQ | RabbitMQ | Kafka |
+| 认证 | JWT 自签（HS256）+ bcrypt；TokenVerifier 接口 | session；第三方认证服务器（Keycloak/OIDC） |
+| 对象存储 | MinIO | — |
+| 日志 | zap（JSON 结构化） | slog |
+| 配置 | viper | env |
+| 校验 | go-playground/validator | — |
+| 定时任务 | robfig/cron | asynq；RabbitMQ 延迟队列（超时取消更优解） |
+| 限流 | golang.org/x/time/rate（令牌桶） | Redis 分布式限流 |
+| 数据库迁移 | golang-migrate | — |
+| API 文档 | swaggo/swag | — |
+| 测试 | testing + testify | — |
+| 依赖注入 | 手写（service 组装） | wire |
+| 反向代理 | Nginx（预写 upstream 双实例示例） | 多实例 LB 实操 |
+| 前端工具链 | bun + Vite + React + TS + Tailwind v4 + react-router + TanStack Query + zustand + axios | npm/pnpm 备选 |
+| 文档站 | Docusaurus（Cloudflare Pages 部署） | VitePress |
+| 可观测性 | Prometheus + Grafana（指标）、Loki（日志聚合） | OpenTelemetry + Jaeger（链路） |
+| 容错 | context 超时 + 有限重试 + gobreaker 熔断 + 缓存兜底降级 | 舱壁 / Sentinel-golang |
+
+## 项目结构
+
+```
+go_single/
+├── cmd/
+│   └── server/main.go            # 入口：装配所有模块
+├── internal/
+│   ├── user/                     # 用户与认证（JWT）+ 地址簿
+│   │   ├── handler/  service/  repository/(接口)  model/
+│   ├── product/                  # 商品(SPU) / SKU / 类目
+│   ├── cart/                     # 购物车，条目引用 SKU
+│   ├── order/                    # 订单 + 状态机 + 地址快照（普通/秒杀共用）
+│   ├── flashsale/                # 秒杀活动（独立库存+秒杀价+时间窗口+下架+限购）+ Lua 预扣
+│   ├── payment/                  # 模拟支付（成功/失败回调 + 流水幂等）
+│   ├── coupon/                   # 优惠券：券模板(admin) / 领券 / 下单核销；与秒杀互斥
+│   ├── social/                   # 好友（申请/通过）+ 好友圈动态（仅好友可见，购买后可分享）
+│   ├── chat/                     # WebSocket 单聊（JWT 握手认证），文本/图片/文件消息，落库+离线拉取
+│   ├── admin/                    # 管理入口 + role 鉴权：商品/订单/秒杀活动/券模板
+│   └── platform/                 # 共享基础设施
+│       ├── config/  logger/  metrics/  auth/  limiter/  cors/  cron/
+│       ├── mq/  cache/  ws/  file/(MinIO)
+├── web/                          # 演示前端总目录（多主题，工程级插拔）
+│   ├── faire/                    # 主题 "faire"：独立 Vite 工程
+│   │   ├── src/                  # 该主题专属组件/页面（可整体重写）
+│   │   ├── design/               # 四件套：DESIGN.md / CSS_Variables.css / Design_Tokens.json / Tailwind_V4.css
+│   │   ├── vite.config.ts        # dev proxy /api、/ws → 后端；VITE_API_BASE / VITE_WS_BASE 可配置
+│   │   └── public/_redirects     # Cloudflare Pages SPA fallback（置于 public/ 随构建拷入 dist）
+│   ├── <theme-b>/                # 未来第二套主题（克隆骨架再改）
+│   └── README.md                 # 主题清单 + 接入约定
+├── website/                      # Docusaurus 文档站（Cloudflare Pages 独立部署）
+│   ├── docs/
+│   │   ├── user-guide/           # 用户文档（任务导向）
+│   │   └── tech/
+│   │       ├── modules/          # 镜像 internal/：每模块一节（数据模型/接口/时序）
+│   │       ├── domains/          # 镜像 CONTEXT.md 领域分组：模块↔领域映射（薄视图）
+│   │       └── interview/        # 面试题库（分章，随模块实现同步产出）
+│   └── docusaurus.config.ts
+├── migrations/                   # golang-migrate SQL
+├── configs/                      # viper yaml
+├── deploy/
+│   ├── docker-compose.yml        # mysql/redis/rabbitmq/minio/nginx/prometheus/grafana/loki/promtail（不含前端构建，宿主 bun build 后挂载 dist）
+│   ├── nginx/nginx.conf          # 托管选定主题 dist + /api 反代 + try_files SPA fallback + upstream 双实例示例
+│   └── monitoring/               # prometheus.yml、grafana datasource/仪表盘 provisioning、promtail 配置
+├── docs/                         # 工程决策权威源：adr/ backlog design
+└── go.mod
+```
+
+## 前端（演示前端）
+
+- **定义**：工程级插拔——每套主题 = `web/` 下独立 Vite 工程，共享同一后端（契约：Swagger REST 接口），互不依赖；换主题 = 部署时选一套构建
+- **主题资产**：四件套放 `web/<theme>/design/`——DESIGN.md（设计规范，供人/AI 参考）/ CSS_Variables.css / Design_Tokens.json（W3C DTCG）/ Tailwind_V4.css（`@theme`）；组件代码一律用语义化 Tailwind 类，不写死颜色
+- **工具链**：bun（`bun install` / `bun run dev` / `bun run build`）；Vite dev proxy 把 `/api`、`/ws` 转发到后端 :8080
+- **API 对接**：HTTP base 由 `VITE_API_BASE` 控制（dev 用 `/api` 代理，云端构建传后端绝对地址）；WebSocket 地址由 `VITE_WS_BASE` 控制（dev 用 `/ws` 代理）；后端 `platform/cors` 中间件允许前端域名（跨源场景）
+- **文件上传**：统一后端代理——前端 `POST /api/files` → platform/file 转存 MinIO 返回 URL；类型白名单 png/jpeg/webp/gif，大小 ≤5MB；前端不直连 MinIO（presigned 直传明确不做）
+- **页面清单**（演示前端功能范围，各主题通用）：
+  - 登录/注册 → user；首页（商品列表）→ product；商品详情 → product + cart；购物车 → cart + product
+  - 结算（下单）→ order + user(地址簿) + coupon；订单列表/详情 → order；秒杀页 → flashsale
+  - 优惠券中心 → coupon；好友列表/申请 → social；好友圈 → social；聊天 → chat
+  - 个人中心（地址簿）→ user；后台管理 → admin（role 鉴权）
+- **交互约定**：秒杀提交后返回"排队中"，前端轮询 `GET /api/orders/{order_no}`（1.5s×30 次上限）获取结果；秒杀页倒计时由轮询接口携带服务端时间；接口 401 时前端跳转登录；演示账号 admin/admin123（user-guide 同步写明）
+- **路由**：react-router v7；面向用户的页面与后台管理（admin）按角色分组，admin 路由加 role 守卫（前端隐藏 + 后端兜底）
+- **状态管理**：TanStack Query（服务端状态：API 数据缓存、秒杀轮询、好友圈分页）+ zustand（客户端状态：登录态、用户信息、聊天连接）
+- **API client**：axios + 拦截器——统一携带 JWT（Authorization 头）、401 统一跳登录、错误统一处理
+- **JWT 存储**：localStorage（学习项目取舍；cookie 方案与 CSRF 讨论进 backlog）
+- **WS 握手**：token 经 query 参数传递（浏览器 WS API 无法自定义 header），注明 token 可能进入访问日志的风险为演示取舍
+- **组件策略**：手写组件 + 语义化 Tailwind 类（主题定制自由，与四件套主题机制契合）；shadcn/ui 进 backlog
+- **TS 类型**：api 层手写类型对齐 swagger 契约；openapi-typescript 自动生成进 backlog
+- 布局策略：桌面优先，不做移动端适配（演示项目）
+- **部署双路径**：
+  - 本地演示（同源）：Nginx 托管选定主题的构建产物（`web/<theme>/dist`）+ `location /api` 反代 :8080 + `try_files` SPA fallback
+  - 云端（Cloudflare Pages，前端可独立部署）：静态 SPA + `_redirects`（`/* → /index.html 200`，置于 `public/`）+ `VITE_API_BASE` 跨源
+- 第二套主题以第一套为骨架克隆（api 层/路由/页面框架复用，设计层重写）；`web/shared/` 公共层等到出现第二套主题再抽（YAGNI）
+
+## 订单状态机（普通/秒杀共用）
+
+待支付 → 已支付 → 已发货 → 已完成；含取消与超时取消。状态迁移仅允许合法跃迁（如 待支付→已支付），非法迁移直接拒绝。
+
+订单表含 `order_type`（normal/seckill）：普通订单与秒杀订单共用状态机；秒杀订单不使用优惠券，且 `(user_id, activity_id)` 唯一约束。
+
+- 待支付 → 已支付：支付回调
+- 已支付 → 已发货：后台发货
+- 已发货 → 已完成：用户确认收货（用户侧"确认收货"接口）
+- 待支付 → 已取消：用户取消 / 超时未支付自动取消
+
+## 普通订单流程
+
+```
+购物车/商品直购 → 校验并下单（事务：订单 + 订单项 + 库存扣减 + 地址快照 + 券核销 + 删除购物车条目）
+  → 待支付 → 支付回调 → 已支付 → 后台发货 → 已发货 → 用户确认收货 → 已完成
+  → 超时未支付（cron）→ 取消 → 回补库存 + 回退券
+```
+
+- **库存扣减时机**：下单即扣（与秒杀同原则：下单即扣、超时回补）；扣减用条件更新（`UPDATE sku SET stock=stock-N WHERE stock>=N`）防超卖
+- **幂等**：下单接口携带 `client_request_id`（Redis SETNX + TTL 15min），重复请求返回同一订单号
+- **订单号**：雪花 ID（手写实现，学习点）
+- **地址快照**：下单时从地址簿选择地址固化为订单副本，用户后续改地址不影响历史订单
+- **超时取消**：默认 普通订单 15min / 秒杀订单 10min（实现期可调）
+
+## 秒杀时序（Redis 预扣为准）
+
+```
+[1] 限流（全局令牌桶 + 按用户限流）
+[2] Lua 原子脚本（活动时间窗口 + status 下架标志 / per_user_limit / DECR 库存 / INCR 用户计数）
+[3] Redis 幂等键（用户+活动，TTL 30min，仅挡预扣请求的重复提交）→ 发 MQ → 返回"排队中"
+[4] 消费者：查 DB 秒杀订单（user_id+activity_id 唯一约束，无则创建）→ 同事务扣活动库存
+    失败 → MQ 重投/死信；对账 cron 兜底
+[5] 支付回调（状态机校验）→ 已支付（随后与普通订单一致走发货/确认收货）
+[6] 超时未支付（cron 扫描；RabbitMQ 延迟队列为更优解，进 backlog）→ 取消
+    → 回补 Redis 库存 + MySQL 库存 + 用户计数（允许再次抢购）
+```
+
+- **库存事实源**：秒杀期以 Redis 预扣为准；活动库存落单时同步扣减、取消时回补，用于对账
+- **幂等两段式**：Redis 键挡预扣请求的重复提交；DB 唯一约束挡落单重复——预扣成功绝不丢单
+- **限购**：`per_user_limit` 字段，后台创建/编辑活动时配置（默认 1），作为 ARGV 传入 Lua
+
+## 秒杀活动
+
+- 字段：`start_at` / `end_at` / `status`（上架/下架）/ `stock`（活动独立库存）/ `price`（秒杀价）/ `per_user_limit`
+- **库存模型**：活动独立库存，与 `sku.stock`（普通订单库存）互不干扰；落单扣活动库存；对账 = Redis 活动库存 vs `flashsale.stock` vs 秒杀有效订单数
+- **上架预热**：admin 上架/编辑活动时，服务端将 `stock` 写入 Redis（SETNX，不覆盖在售中存量）；未开始的活动可覆盖（DEL+SET），进行中只可减不可增
+- **Redis key 约定**：`flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}`
+- 状态判定：进行中 = `status=上架 && start_at <= now <= end_at`（时间窗口动态判定，不显式翻转）；`status` 仅用于手动下架/紧急停止
+
+## 模拟支付
+
+- 接口形态：外部 API 端点 `POST /api/payments/mock {order_id, result: success|fail}`（前端订单详情页"模拟支付"按钮或 curl 调用）→ payment handler → payment service → 进程内调用 order service 驱动状态流转
+- 成功：状态机校验（仅 待支付→已支付 合法）+ 支付流水表唯一约束（payment_id）+ 金额核对（应付金额）
+- 失败：订单停留待支付，记录失败流水，允许重试支付（待支付 状态内可重复发起）
+
+## 优惠券（与秒杀互斥）
+
+- **券模板**（admin 配置）：类型（直减/满减）、面额、满减门槛、总量、每人限领、有效期
+- **领券**：Lua 原子脚本（检查每人限领 + 总量后 INCR 计数），复用秒杀 Lua 模式防超发；DB 落库为最终态
+- **核销**：下单时可选券 → 订单事务内核销（券使用记录）→ 取消订单回退；一单一张券，满减门槛在结算时校验
+- **金额**：订单记 `discount_amount`，应付金额 = 商品总额 − 券额；支付回调核对应付金额
+- **互斥**：秒杀订单不使用优惠券；全场券，不做商品维度限制
+
+## 认证与权限
+
+- JWT 自签（HS256）+ bcrypt 密码哈希；`platform/auth` 定义 TokenVerifier 接口（轻量 seam，不属于 ADR-0003 三类；自签实现，OIDC/第三方认证服务器换实现即可，进 backlog）
+- JWT 有效期 2h，无 refresh（refresh token 进 backlog）
+- `user.role`（`user`/`admin`）+ admin 路由中间件校验，不另起认证体系；admin 账号由 migration 种入默认管理员
+- WebSocket 握手携带 JWT 校验身份
+
+## 安全设计
+
+- **对象级授权（越权防护）**：所有资源查询/变更强制校验归属——订单、购物车、地址簿、聊天消息、好友操作均校验 `owner_id`，禁止跨用户访问（IDOR）
+- **HTTPS 与安全头**：Nginx 终止 SSL（本地演示可自签证书）；响应加 `X-Content-Type-Options` / `X-Frame-Options` / `Content-Security-Policy` 等安全头
+- **上传安全**：`POST /api/files` 校验文件类型白名单 + 大小限制；MinIO 桶私有
+- **输入与注入**：validator 参数校验（设计已含）；GORM 参数化查询防 SQL 注入（设计已含）；React 默认转义防 XSS（设计已含）
+- **敏感数据**：密码 bcrypt（设计已含）；日志不记录密码与 token
+- 登出黑名单 / 密码复杂度策略 / 双因素认证进 backlog
+
+## 社交
+
+- **好友**：申请/通过流程（好友申请 待处理→通过/拒绝）；关系仓储接口化，"免申请互加"实现可切换（backlog）
+- **动态**：仅好友可见；购买成功后"分享到好友圈"按钮生成动态（引用已购 SKU + 可选文案 + 可选图片）
+- **时间线**：拉取式——好友列表 join 动态表按时间倒序分页
+
+## 即时通信
+
+- 消息类型：`text` / `image` / `file`（image/file 经 MinIO 上传，消息引用 URL）
+- 会话标识：`conversation_key = min(uidA, uidB):max(uidA, uidB)` 有序用户对，消息表含会话键
+- **三通道**：发送走 REST（`POST /api/messages`，可幂等重试）；实时接收走 WebSocket 推送；离线消息落库，上线 REST 按会话游标分页拉取
+- 连接：WebSocket 长连接 + 心跳保活（参数实现期定）
+
+## 限流与幂等
+
+- 限流：全局令牌桶中间件（golang.org/x/time/rate，QPS 可配，单实例）+ 秒杀接口按用户限流（Redis 计数 INCR+TTL，跨请求状态）；backlog 的"Redis 分布式限流"指替代全局单机令牌桶的多实例方案
+- 幂等键 TTL：秒杀幂等键 30min；下单 `client_request_id` 15min
+
+## 可观测性
+
+三支柱：指标（Prometheus + Grafana）+ 日志聚合（zap 结构化日志 → Loki）；链路追踪（OpenTelemetry + Jaeger）进 backlog（单体无跨服务，价值低）。
+
+- **指标**：`platform/metrics` 基于 client_golang 暴露 `/metrics`（自动含 Go runtime go_* 指标：goroutine 数、堆内存、GC 统计）；各模块经指标注册器添加指标点：
+  - HTTP 中间件（每请求，最常用）：QPS（counter）、延迟直方图（histogram，50/90/99 分位）、4xx/5xx 错误计数、活跃请求（gauge）
+  - 秒杀：预扣成功/失败计数、活动库存余量（gauge）
+  - 订单：创建计数、按状态计数、支付成功/失败计数
+  - MQ：发布/消费/消费失败计数
+  - 优惠券：发放/核销计数
+- **大盘**：Grafana 预配置 datasource（prometheus/loki）+ 项目仪表盘（HTTP 三件套、秒杀指标、订单指标）
+- **日志**：zap 输出结构化 JSON（stdout）；promtail 抓取容器日志 → Loki → Grafana 查询
+- **部署**：prometheus/grafana/loki/promtail 直接进 docker-compose（默认开启）
+
+## 容错与降级
+
+- **超时**：全链路 `context.WithTimeout` 逐层传递（HTTP handler → service → 存储/MQ），超时快速失败
+- **有限重试**：仅幂等操作可重试（MQ 消费失败重投已有；下单/支付等幂等接口有限次重试 + 退避），非幂等操作不重试
+- **熔断**：gobreaker 包住 MQ 消费者（连续失败熔断快速失败、半开探活）；进程内调用与本地 Redis/MySQL 不包
+- **降级**：缓存兜底——商品详情（key `product:detail:{id}`，TTL 5min）/秒杀状态优先读 Redis 缓存，缓存不可用时降级直查 DB
+- 舱壁（semaphore 并发池）与 Sentinel-golang 进 backlog
+
+## 模块依赖 DAG
+
+```mermaid
+graph LR
+    cart --> product
+    order --> cart
+    order --> product
+    order --> coupon
+    order --> user
+    flashsale -->|MQ 异步| order
+    payment --> order
+    social --> order
+    social --> product
+    admin --> user
+    admin --> product
+    admin --> order
+    admin --> flashsale
+    admin --> coupon
+    auth[user/auth 中间件] -.-> cart
+    auth -.-> order
+    auth -.-> flashsale
+    auth -.-> social
+    auth -.-> chat
+    auth -.-> coupon
+    auth -.-> admin
+    auth -.-> user
+    auth -.-> payment
+```
+
+依赖方向无环（DAG），靠 code review 守住；`depguard` lint 强制执行进 backlog。
+
+## 可插拔 seam（ADR-0003）
+
+- **仓储接口**：每模块 `repository/` 定义接口，MySQL 实现（GORM 之上再包一层）；好友关系、订单、优惠券等业务数据的访问均为仓储 seam 的具体实例
+- **缓存接口**：隔离 go-redis 客户端，Lua 脚本封装在适配器内
+- **MQ 接口**：RabbitMQ 实现，Kafka 可换
+
+## 定时任务
+
+- 订单超时取消：cron 每分钟扫描超时待支付订单（更优解：RabbitMQ 延迟队列，backlog）
+- 库存对账：cron 每小时比对 Redis 活动库存 vs `flashsale.stock` vs 秒杀有效订单数；**活动进行中只比对告警、不自动回写**（Redis 预扣领先属正常；仅识别"Redis 有扣减但无对应订单"作为补单信号）；差异告警
+- 收尾对账：cron 扫描刚过 end_at 的活动，触发最终对账——此时以 MySQL 为准对齐 Redis 库存（与每小时 cron 并存）
+
+## 文档站（website/）
+
+- **框架**：Docusaurus，构建产物部署到 Cloudflare Pages，与项目运行完全独立（构建：`bun run build` → `build/`）；语言 zh-CN
+- **结构**：
+  - `user-guide/`——用户文档，任务导向：快速开始（docker compose + go run + bun dev 三步本地启动）、演示账号（admin 种子账号与演示数据）、功能向导（注册登录→逛商品→下单→秒杀→好友圈→聊天）
+  - `tech/modules/`——镜像 `internal/`，每模块一节（数据模型/接口/时序）；每模块的详细规格，粒度细于 DESIGN 总览，互补不重复
+  - `tech/domains/`——镜像 CONTEXT.md 领域分组（商品域/交易域/社交域/通信域/运营域），模块↔领域映射；**薄视图**：只做聚合与映射，细节链接 modules/，术语指向 CONTEXT.md
+  - `tech/interview/`——面试题库（80-100 题）：Go 基础/并发/网络/MySQL/Redis/MQ/秒杀架构/认证安全/工程实践/部署运维/可观测性/容错与降级，每题含答案要点 + 可运行 Go 代码 + 关联本项目位置，随模块实现同步产出
+- **权威源**：`docs/`（ADR/DESIGN/BACKLOG）不复制进网站，放一句话摘要 + 链接（指向 GitHub 仓库文件，需仓库公开）
+
+## 术语表
+
+见 [CONTEXT.md](../CONTEXT.md)：模块化单体 / 演示前端 / 商品(SPU) / SKU / 购物车 / 订单 / 地址簿 / 地址快照 / 秒杀活动 / 预扣 / 模拟支付 / 优惠券 / 好友 / 好友申请 / 好友圈 / 动态 / 消息 / 图片消息 / 文件消息 / 对账
