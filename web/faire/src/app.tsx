@@ -1,0 +1,113 @@
+import { useEffect, type ReactNode } from "react";
+import {
+  BrowserRouter,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+} from "react-router-dom";
+
+import { AppShell } from "./components/AppShell";
+import { AuthPage } from "./pages/AuthPage";
+import { CartPage } from "./pages/CartPage";
+import { CheckoutPage } from "./pages/CheckoutPage";
+import { HomePage } from "./pages/HomePage";
+import { NotFoundPage } from "./pages/NotFoundPage";
+import { OrderDetailPage } from "./pages/OrderDetailPage";
+import { OrdersPage } from "./pages/OrdersPage";
+import { ProductDetailPage } from "./pages/ProductDetailPage";
+import { useAuthStore } from "./store/auth";
+
+function ProtectedRoute({ children }: { children: ReactNode }) {
+  const { token, user } = useAuthStore();
+  const location = useLocation();
+
+  if (!token || !user) {
+    const returnTo = `${location.pathname}${location.search}`;
+    return <Navigate to={`/login?returnTo=${encodeURIComponent(returnTo)}`} replace />;
+  }
+  return children;
+}
+
+function GuestRoute({ children }: { children: ReactNode }) {
+  const { token, user } = useAuthStore();
+  if (token && user) {
+    return <Navigate to="/" replace />;
+  }
+  return children;
+}
+
+function SessionEvents() {
+  const logout = useAuthStore((state) => state.logout);
+
+  useEffect(() => {
+    const handleSessionExpired = () => logout();
+    window.addEventListener("faire:session-expired", handleSessionExpired);
+    return () => window.removeEventListener("faire:session-expired", handleSessionExpired);
+  }, [logout]);
+
+  return null;
+}
+
+export function App() {
+  return (
+    <BrowserRouter>
+      <SessionEvents />
+      <Routes>
+        <Route
+          path="/login"
+          element={
+            <GuestRoute>
+              <AuthPage mode="login" />
+            </GuestRoute>
+          }
+        />
+        <Route
+          path="/register"
+          element={
+            <GuestRoute>
+              <AuthPage mode="register" />
+            </GuestRoute>
+          }
+        />
+        <Route element={<AppShell />}>
+          <Route index element={<HomePage />} />
+          <Route path="products/:id" element={<ProductDetailPage />} />
+          <Route
+            path="cart"
+            element={
+              <ProtectedRoute>
+                <CartPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="checkout"
+            element={
+              <ProtectedRoute>
+                <CheckoutPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="orders"
+            element={
+              <ProtectedRoute>
+                <OrdersPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="orders/:orderNo"
+            element={
+              <ProtectedRoute>
+                <OrderDetailPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route path="*" element={<NotFoundPage />} />
+        </Route>
+      </Routes>
+    </BrowserRouter>
+  );
+}
