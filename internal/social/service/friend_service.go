@@ -49,6 +49,8 @@ type Service interface {
 	ListRequests(ctx context.Context, userID int64, scope, status string) ([]model.FriendRequestView, error)
 	// ListFriends 我的好友列表（双向：双方互为好友）。
 	ListFriends(ctx context.Context, userID int64) ([]model.FriendView, error)
+	// AreFriends 两人是否已是好友（chat 等跨模块校验用）。
+	AreFriends(ctx context.Context, userID, friendID int64) (bool, error)
 }
 
 type friendService struct {
@@ -232,6 +234,12 @@ func (s *friendService) ListFriends(ctx context.Context, userID int64) ([]model.
 		})
 	}
 	return views, nil
+}
+
+// AreFriends 两人是否已是好友：好友关系按方向存两行，(userID, friendID) 任一行
+// 存在即互为好友（建关系时双向同时写入，状态总对称）。
+func (s *friendService) AreFriends(ctx context.Context, userID, friendID int64) (bool, error) {
+	return s.store.Friendships.Exists(ctx, userID, friendID)
 }
 
 // usernames 批量取用户名：去重后逐个跨模块查询（用户不存在兜底空串）。

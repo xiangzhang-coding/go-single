@@ -24,6 +24,9 @@ import (
 	carthandler "github.com/xiangzhang-coding/go-single/internal/cart/handler"
 	cartrepo "github.com/xiangzhang-coding/go-single/internal/cart/repository"
 	cartsvc "github.com/xiangzhang-coding/go-single/internal/cart/service"
+	chathandler "github.com/xiangzhang-coding/go-single/internal/chat/handler"
+	chatrepo "github.com/xiangzhang-coding/go-single/internal/chat/repository"
+	chatsvc "github.com/xiangzhang-coding/go-single/internal/chat/service"
 	couponhandler "github.com/xiangzhang-coding/go-single/internal/coupon/handler"
 	couponrepo "github.com/xiangzhang-coding/go-single/internal/coupon/repository"
 	couponsvc "github.com/xiangzhang-coding/go-single/internal/coupon/service"
@@ -263,11 +266,24 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// social 模块：好友申请/通过/拒绝与好友列表；用户名经 userSvc 跨模块进程内调用补齐。
 	// 好友圈动态：分享购买校验经 orderSvc（已支付/已发货/已完成订单含该 SKU）。
 	socialStore := socialrepo.Store{Requests: socialrepo.NewGORMRequest(db), Friendships: socialrepo.NewGORMFriendship(db), Posts: socialrepo.NewGORMPost(db)}
+	socialSvc := socialsvc.New(socialStore, userSvc)
 	socialHandler := socialhandler.New(
-		socialsvc.New(socialStore, userSvc),
+		socialSvc,
 		socialsvc.NewPosts(socialStore, userSvc, orderSvc),
 		verifier,
 	)
+
+	// chat 模块（T17 REST 通道）：发送消息（text/image/file，client_request_id 幂等）、
+	// 会话列表（最近消息 + 未读数）与消息列表（游标分页）、已读推进（离线消息上线可拉取）；
+	// 仅好友可单聊（跨模块经 socialSvc.AreFriends）、仅会话双方可访问（owner 校验）。
+	chatConversationRepo := chatrepo.NewGORMConversation(db)
+	chatStore := chatrepo.Store{
+		Conversations: chatConversationRepo,
+		Messages:      chatrepo.NewGORMMessage(db),
+		Reads:         chatrepo.NewGORMReadState(db),
+		Tx:            chatConversationRepo,
+	}
+	chatHandler := chathandler.New(chatsvc.New(chatStore, userSvc, socialSvc), verifier)
 
 	// T12 秒杀异步落单消费者：订阅"抢购成功"消息 → 查活动/默认地址 →
 	// order 服务幂等建单 + 同事务扣活动库存；瞬时失败 Nack 重投、
@@ -312,6 +328,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	couponHandler.RegisterRoutes(api)
 	flashsaleHandler.RegisterRoutes(api, seckillTokenBucket)
 	socialHandler.RegisterRoutes(api)
+	chatHandler.RegisterRoutes(api)
 	orderHandler.RegisterRoutes(api)
 	paymentHandler.RegisterRoutes(api)
 	fileHandler.RegisterRoutes(api)
