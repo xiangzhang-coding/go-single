@@ -107,7 +107,7 @@ export function CartPage() {
               <div><dt>优惠券</dt><dd>结算时选择</dd></div>
               <div className="summary-total"><dt>预计应付</dt><dd>{formatMoney(subtotal)}</dd></div>
             </dl>
-            <Button className="mt-8 w-full justify-center" disabled={hasStockIssue} onClick={() => navigate("/checkout")}>
+            <Button className="mt-8 w-full justify-center" disabled={hasStockIssue || isMutating} onClick={() => navigate("/checkout")}>
               去结算 <Icon name="arrow-right" size={17} />
             </Button>
             {hasStockIssue && <p className="mt-3 text-xs leading-5 text-smoke">先处理库存数量，才能继续结算。</p>}

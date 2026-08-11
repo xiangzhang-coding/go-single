@@ -121,10 +121,6 @@ export async function confirmOrder(orderNo: string) {
   await api.post(`/orders/${orderNo}/confirm`);
 }
 
-export async function shipOrder(orderNo: string) {
-  await api.post(`/admin/orders/${orderNo}/ship`);
-}
-
 export async function mockPay(orderNo: string, amount: number, result: "success" | "fail") {
   const { data } = await api.post<Payment>("/payments/mock", {
     order_id: orderNo,

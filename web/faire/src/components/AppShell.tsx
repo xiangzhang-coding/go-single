@@ -1,5 +1,4 @@
-import { useState, type FormEvent } from "react";
-import { Link, NavLink, Outlet, useNavigate, useSearchParams } from "react-router-dom";
+import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { getCart } from "../api/endpoints";
@@ -9,8 +8,6 @@ import { useAuthStore } from "../store/auth";
 export function AppShell() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [searchParams] = useSearchParams();
-  const [search, setSearch] = useState(searchParams.get("q") || "");
   const { token, user, logout } = useAuthStore();
   const cartQuery = useQuery({
     queryKey: ["cart"],
@@ -19,12 +16,6 @@ export function AppShell() {
     staleTime: 15_000,
   });
   const cartCount = cartQuery.data?.items.reduce((sum, item) => sum + item.quantity, 0) || 0;
-
-  function submitSearch(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const value = search.trim();
-    navigate(value ? `/?q=${encodeURIComponent(value)}` : "/");
-  }
 
   function signOut() {
     logout();
@@ -48,21 +39,6 @@ export function AppShell() {
           <Link to="/" className="brand-mark" aria-label="FAIRE 首页">
             FAIRE<span>/</span>
           </Link>
-
-          <form className="search-field" onSubmit={submitSearch} role="search">
-            <Icon name="search" size={18} />
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="搜索商品标题"
-              aria-label="搜索商品标题"
-            />
-            {search && (
-              <button type="button" aria-label="清除搜索" onClick={() => setSearch("")}>
-                <Icon name="close" size={15} />
-              </button>
-            )}
-          </form>
 
           <div className="header-actions">
             {user ? (

@@ -11,7 +11,7 @@ import {
 } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import type { Address, CreateAddressRequest, UserCouponView } from "../api/types";
-import { formatAddress, formatMoney, isCouponUsable, makeId, parseSpecs } from "../lib/format";
+import { formatAddress, formatMoney, isCouponUsable, makeClientRequestID, parseSpecs } from "../lib/format";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, Spinner } from "../components/ui";
 
 const emptyDraft: CreateAddressRequest = {
@@ -66,7 +66,7 @@ export function CheckoutPage() {
   });
   const orderMutation = useMutation({
     mutationFn: () => createOrder({
-      client_request_id: makeId(),
+      client_request_id: makeClientRequestID(),
       address_id: selectedAddressId!,
       coupon_id: selectedCouponId || 0,
       from_cart: true,
@@ -106,7 +106,7 @@ export function CheckoutPage() {
 
   function submitOrder() {
     if (!selectedAddressId) {
-      setActionError("请选择或新增一个收货地址");
+      setActionError("请选择或新增一条地址簿记录");
       return;
     }
     setActionError("");
@@ -139,7 +139,7 @@ export function CheckoutPage() {
                 {addressesQuery.data.map((address) => <AddressOption key={address.id} address={address} selected={selectedAddressId === address.id} onSelect={() => setSelectedAddressId(address.id)} />)}
               </div>
             ) : (
-              <p className="mt-4 text-sm text-smoke">还没有收货地址，先添加一条地址才能下单。</p>
+              <p className="mt-4 text-sm text-smoke">地址簿还没有记录，先添加一条地址才能下单。</p>
             )}
 
             {showAddressForm || !addressesQuery.data?.length ? (
@@ -189,7 +189,7 @@ export function CheckoutPage() {
             <div><dt>优惠券</dt><dd className={discount ? "discount-text" : ""}>{discount ? `- ${formatMoney(discount)}` : "未选择"}</dd></div>
             <div className="summary-total"><dt>应付金额</dt><dd>{formatMoney(payAmount)}</dd></div>
           </dl>
-          <div className="summary-address mt-8"><div className="flex items-center gap-2 text-sm text-smoke"><Icon name="pin" size={16} /> 收货地址</div>{selectedAddressId && <p className="mt-3 text-sm leading-6">{formatSelectedAddress(addressesQuery.data || [], selectedAddressId)}</p>}</div>
+          <div className="summary-address mt-8"><div className="flex items-center gap-2 text-sm text-smoke"><Icon name="pin" size={16} /> 地址簿记录</div>{selectedAddressId && <p className="mt-3 text-sm leading-6">{formatSelectedAddress(addressesQuery.data || [], selectedAddressId)}</p>}</div>
           <Button className="mt-8 w-full justify-center" onClick={submitOrder} disabled={orderMutation.isPending || !selectedAddressId}>{orderMutation.isPending ? <Spinner label="正在创建订单" /> : <>提交订单 <Icon name="arrow-right" size={17} /></>}</Button>
           <p className="mt-4 text-xs leading-5 text-smoke">提交后会生成待支付订单，商品库存和优惠券会在服务端事务内确认。</p>
         </aside>

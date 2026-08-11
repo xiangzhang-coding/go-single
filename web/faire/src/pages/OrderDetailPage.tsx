@@ -1,24 +1,33 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { cancelOrder, confirmOrder, getOrder, mockPay, shipOrder } from "../api/endpoints";
+import { cancelOrder, confirmOrder, getOrder, mockPay } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import { formatAddress, formatDate, formatMoney, parseSpecs } from "../lib/format";
-import { useAuthStore } from "../store/auth";
 import { Button, ErrorState, Icon, LoadingBlock, ProductVisual, Spinner, StatusBadge } from "../components/ui";
 
 export function OrderDetailPage() {
   const { orderNo = "" } = useParams();
   const queryClient = useQueryClient();
-  const { user } = useAuthStore();
   const [actionError, setActionError] = useState("");
+  const processingPolls = useRef(0);
   const orderQuery = useQuery({
     queryKey: ["order", orderNo],
     queryFn: () => getOrder(orderNo),
     enabled: Boolean(orderNo),
     retry: 2,
-    refetchInterval: (query) => (query.state.data?.status === "" ? 1500 : false),
+    refetchInterval: (query) => {
+      if (query.state.data?.status !== "") {
+        processingPolls.current = 0;
+        return false;
+      }
+      if (processingPolls.current >= 30) {
+        return false;
+      }
+      processingPolls.current += 1;
+      return 1500;
+    },
   });
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ["order", orderNo] });
@@ -42,11 +51,6 @@ export function OrderDetailPage() {
     onSuccess: refresh,
     onError: (error) => setActionError(getApiErrorMessage(error)),
   });
-  const shipMutation = useMutation({
-    mutationFn: () => shipOrder(orderNo),
-    onSuccess: refresh,
-    onError: (error) => setActionError(getApiErrorMessage(error)),
-  });
 
   if (orderQuery.isPending) {
     return <div className="site-container page-section"><LoadingBlock label="正在读取订单详情" /></div>;
@@ -58,7 +62,7 @@ export function OrderDetailPage() {
   const order = orderQuery.data;
   const processing = !order.status;
   const isPending = order.status === "pending_payment";
-  const busy = payMutation.isPending || cancelMutation.isPending || confirmMutation.isPending || shipMutation.isPending;
+  const busy = payMutation.isPending || cancelMutation.isPending || confirmMutation.isPending;
 
   function pay(result: "success" | "fail") {
     setActionError("");
@@ -83,7 +87,7 @@ export function OrderDetailPage() {
       {actionError && <div className={`notice mt-8 ${actionError.includes("成功") ? "notice-success" : "notice-error"}`}>{actionError}</div>}
 
       {processing ? (
-        <div className="processing-panel mt-10"><span className="processing-mark"><Icon name="clock" size={23} /></span><div><h2 className="font-nantes text-3xl">正在等待订单落库。</h2><p className="mt-2 text-sm leading-6 text-smoke">这是一次安全的重复提交保护，页面会自动查询订单状态。</p></div><Spinner label="每 1.5 秒更新" /></div>
+        <div className="processing-panel mt-10"><span className="processing-mark"><Icon name="clock" size={23} /></span><div><h2 className="font-nantes text-3xl">正在等待订单落库。</h2><p className="mt-2 text-sm leading-6 text-smoke">这是一次安全的重复提交保护，页面最多查询 30 次。</p></div><Spinner label="每 1.5 秒更新" /></div>
       ) : (
         <div className="order-detail-layout mt-10">
           <div className="order-detail-main">
@@ -91,7 +95,7 @@ export function OrderDetailPage() {
               <div className="detail-panel-heading"><div><p className="eyebrow text-smoke">商品明细</p><h2 className="mt-2 font-nantes text-3xl">你选择的东西</h2></div><span className="text-sm text-smoke">{order.items.length} 件</span></div>
               <div className="order-items mt-6">{order.items.map((item) => <div className="order-item" key={item.id}><ProductVisual seed={item.product_id} title={item.title} /><div className="min-w-0 flex-1"><h3 className="text-base">{item.title}</h3><p className="mt-2 text-sm text-smoke">{parseSpecs(item.specs).map(([key, value]) => `${key}: ${value}`).join(" · ") || "标准规格"} × {item.quantity}</p></div><strong>{formatMoney(item.subtotal)}</strong></div>)}</div>
             </section>
-            <section className="detail-panel mt-8"><div className="detail-panel-heading"><div><p className="eyebrow text-smoke">收货信息</p><h2 className="mt-2 font-nantes text-3xl">寄到这里</h2></div><Icon name="pin" size={20} /></div><div className="saved-address mt-6"><strong>{order.receiver}</strong><span>{order.phone}</span><p>{formatAddress(order)}</p></div></section>
+            <section className="detail-panel mt-8"><div className="detail-panel-heading"><div><p className="eyebrow text-smoke">地址快照</p><h2 className="mt-2 font-nantes text-3xl">寄到这里</h2></div><Icon name="pin" size={20} /></div><div className="saved-address mt-6"><strong>{order.receiver}</strong><span>{order.phone}</span><p>{formatAddress(order)}</p></div></section>
           </div>
 
           <aside className="order-detail-side">
@@ -104,8 +108,7 @@ export function OrderDetailPage() {
             {isPending && (
               <div className="payment-panel mt-8"><p className="eyebrow text-smoke">模拟支付</p><h2 className="mt-3 font-nantes text-3xl">现在完成支付</h2><p className="mt-3 text-sm leading-6 text-smoke">这是内部演示接口，不会连接真实支付渠道。成功后订单进入“已支付”。</p><Button className="mt-6 w-full justify-center" onClick={() => pay("success")} disabled={busy}>{payMutation.isPending ? <Spinner label="支付处理中" /> : <>模拟支付成功 <Icon name="check" size={17} /></>}</Button><Button variant="ghost" className="mt-2 w-full justify-center text-sm" onClick={() => pay("fail")} disabled={busy}>模拟支付失败</Button>{order.order_type !== "seckill" && <Button variant="danger" className="mt-5 w-full justify-center" onClick={cancel} disabled={busy}>取消订单</Button>}</div>
             )}
-            {order.status === "paid" && user?.role === "admin" && <div className="payment-panel mt-8"><p className="eyebrow text-smoke">管理员操作</p><h2 className="mt-3 font-nantes text-3xl">推进配送</h2><p className="mt-3 text-sm leading-6 text-smoke">当前账号是管理员，使用后台发货接口推进演示订单。</p><Button className="mt-6 w-full justify-center" onClick={() => shipMutation.mutate()} disabled={busy}>{shipMutation.isPending ? <Spinner label="正在发货" /> : <>模拟发货 <Icon name="arrow-right" size={17} /></>}</Button></div>}
-            {order.status === "paid" && user?.role !== "admin" && <div className="waiting-panel mt-8"><p className="eyebrow text-smoke">配送中</p><h2 className="mt-3 font-nantes text-3xl">等待发货</h2><p className="mt-3 text-sm leading-6 text-smoke">订单已支付，等待后台完成发货。</p></div>}
+            {order.status === "paid" && <div className="waiting-panel mt-8"><p className="eyebrow text-smoke">配送中</p><h2 className="mt-3 font-nantes text-3xl">等待发货</h2><p className="mt-3 text-sm leading-6 text-smoke">订单已支付，等待后台完成发货。</p></div>}
             {order.status === "shipped" && <div className="payment-panel mt-8"><p className="eyebrow text-smoke">确认收货</p><h2 className="mt-3 font-nantes text-3xl">东西到了吗？</h2><p className="mt-3 text-sm leading-6 text-smoke">确认后订单会进入已完成状态。</p><Button className="mt-6 w-full justify-center" onClick={() => confirmMutation.mutate()} disabled={busy}>{confirmMutation.isPending ? <Spinner label="正在确认" /> : <>确认收货 <Icon name="check" size={17} /></>}</Button></div>}
             {order.status === "completed" && <div className="waiting-panel mt-8"><p className="eyebrow text-smoke">订单已完成</p><h2 className="mt-3 font-nantes text-3xl">谢谢你的选择。</h2><p className="mt-3 text-sm leading-6 text-smoke">这笔订单的生命周期已经结束。</p></div>}
             {order.status === "cancelled" && <div className="waiting-panel mt-8"><p className="eyebrow text-smoke">订单已取消</p><h2 className="mt-3 font-nantes text-3xl">这次先到这里。</h2><p className="mt-3 text-sm leading-6 text-smoke">如果需要，可以重新回到商品目录。</p><Link to="/" className="button button-secondary mt-6 w-full justify-center">返回目录 <Icon name="arrow-right" size={16} /></Link></div>}

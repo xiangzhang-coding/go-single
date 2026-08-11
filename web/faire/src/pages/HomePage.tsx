@@ -10,8 +10,8 @@ export function HomePage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = Math.max(1, Number(searchParams.get("page")) || 1);
   const categoryValue = searchParams.get("category");
-  const categoryId = categoryValue ? Number(categoryValue) : undefined;
-  const search = searchParams.get("q")?.trim().toLowerCase() || "";
+  const parsedCategoryId = categoryValue ? Number(categoryValue) : NaN;
+  const categoryId = Number.isSafeInteger(parsedCategoryId) && parsedCategoryId > 0 ? parsedCategoryId : undefined;
   const categoriesQuery = useQuery({
     queryKey: ["categories"],
     queryFn: getCategories,
@@ -22,12 +22,7 @@ export function HomePage() {
     queryFn: () => getProducts({ categoryId, page, pageSize: 12 }),
   });
 
-  const products = productsQuery.data?.items.filter((product) => {
-    if (!search) {
-      return true;
-    }
-    return `${product.title} ${product.description}`.toLowerCase().includes(search);
-  }) || [];
+  const products = productsQuery.data?.items || [];
   const total = productsQuery.data?.total || 0;
   const totalPages = Math.max(1, Math.ceil(total / 12));
 
@@ -64,7 +59,7 @@ export function HomePage() {
               日常用品，<br /><span className="hero-underlined">值得慢慢挑。</span>
             </h1>
             <p className="mt-6 max-w-lg text-base leading-7 text-charcoal">
-              从一件好用的物品开始，把生活里真正需要的东西收进同一张清单。
+              从一件好用的商品开始，把生活里真正需要的东西收进同一张清单。
             </p>
             <Link to="#catalog" className="button button-primary mt-8 inline-flex">
               浏览商品 <Icon name="arrow-down" size={17} />
@@ -103,16 +98,6 @@ export function HomePage() {
             </button>
           ))}
         </div>
-
-        {search && (
-          <div className="catalog-query mt-6">
-            <span>正在目录中查找</span>
-            <strong>“{searchParams.get("q")}”</strong>
-            <button type="button" onClick={() => { const next = new URLSearchParams(searchParams); next.delete("q"); setSearchParams(next); }}>
-              清除
-            </button>
-          </div>
-        )}
 
         {productsQuery.isPending ? (
           <LoadingBlock label="正在读取商品目录" />

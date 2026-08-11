@@ -77,7 +77,7 @@ export function ProductDetailPage() {
         <div className="product-detail-copy">
           <p className="eyebrow text-smoke">商品详情 / {product.status === "on_sale" ? "在售" : "暂不可售"}</p>
           <h1 className="mt-4 font-nantes text-5xl leading-[1.08]">{product.title}</h1>
-          <p className="mt-6 max-w-xl text-base leading-7 text-charcoal">{product.description || "一件适合被认真使用的日常物品。"}</p>
+          <p className="mt-6 max-w-xl text-base leading-7 text-charcoal">{product.description || "一件适合被认真使用的日常商品。"}</p>
 
           <div className="detail-divider my-8" />
 

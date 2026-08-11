@@ -209,18 +209,3 @@ export function StatusBadge({ status }: { status: OrderStatus | "" }) {
   }
   return <span className={`status-badge status-${status}`}>{statusLabels[status]}</span>;
 }
-
-export function SectionHeading({ eyebrow, title, description }: {
-  eyebrow?: string;
-  title: string;
-  description?: string;
-}) {
-  return (
-    <div className="section-heading">
-      {eyebrow && <p className="eyebrow text-smoke">{eyebrow}</p>}
-      <span className="accent-rule" aria-hidden="true" />
-      <h1 className="font-nantes text-4xl leading-tight text-ink-black">{title}</h1>
-      {description && <p className="mt-3 max-w-2xl text-sm leading-6 text-smoke">{description}</p>}
-    </div>
-  );
-}

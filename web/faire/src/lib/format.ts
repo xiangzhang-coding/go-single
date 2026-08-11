@@ -47,7 +47,7 @@ export function parseSpecs(value: unknown): Array<[string, string]> {
   return Object.entries(parsed).map(([key, item]) => [key, String(item)]);
 }
 
-export function makeId() {
+export function makeClientRequestID() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();
   }
