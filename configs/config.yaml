@@ -46,3 +46,10 @@ flashsale:
   # 按用户限流：Redis 固定窗口计数（INCR+TTL，跨请求状态）。
   per_user_max: 5
   per_user_window: 1s
+
+ws:
+  # WebSocket 长连接心跳保活：Ping 间隔（pong_wait = 2× 间隔）与单条写超时。
+  heartbeat_interval: 30s
+  write_wait: 10s
+  # 握手 Origin 白名单；空 = 允许所有（演示取舍，生产配置前端域名）。
+  allow_origins: []

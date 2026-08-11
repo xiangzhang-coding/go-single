@@ -2,7 +2,8 @@
 // （复用 ADR-0003 仓储接口 seam），覆盖发送校验（类型/长度/自加）、
 // 跨模块校验（接收方存在、好友关系）、幂等重放、会话键有序、
 // 会话列表（未读数/预览/对方用户名）、消息游标分页（after/before/缺省 + has_more）、
-// 会话 owner 校验（防 IDOR）、已读游标只进不退。
+// 会话 owner 校验（防 IDOR）、已读游标只进不退、T18 实时推送端口
+// （落库成功推给接收方、幂等重放不重复推、notifier 为 nil 不推送）。
 package service
 
 import (
@@ -292,26 +293,48 @@ func (fakeTx) WithinTx(_ context.Context, fn func(tx *gorm.DB) error) error { re
 
 var _ repository.TxRunner = fakeTx{}
 
+// ---- fake 实时推送端口（T18）----
+
+type fakeNotifier struct {
+	mu   sync.Mutex
+	sent []*model.Message
+}
+
+func (f *fakeNotifier) NotifyMessageSent(_ context.Context, msg *model.Message) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, msg)
+}
+
+func (f *fakeNotifier) snapshot() []*model.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*model.Message(nil), f.sent...)
+}
+
+var _ MessageNotifier = (*fakeNotifier)(nil)
+
 // ---- 测试环境 ----
 
 type env struct {
-	svc    Service
-	users  *fakeUsers
-	social *fakeSocial
-	conv   *fakeConversations
-	msgs   *fakeMessages
-	reads  *fakeReads
+	svc      Service
+	users    *fakeUsers
+	social   *fakeSocial
+	conv     *fakeConversations
+	msgs     *fakeMessages
+	reads    *fakeReads
+	notifier *fakeNotifier
 }
 
 func newEnv() *env {
-	e := &env{users: newFakeUsers(), social: newFakeSocial(), conv: newFakeConversations(), msgs: newFakeMessages()}
+	e := &env{users: newFakeUsers(), social: newFakeSocial(), conv: newFakeConversations(), msgs: newFakeMessages(), notifier: &fakeNotifier{}}
 	e.reads = newFakeReads(e.msgs)
 	e.svc = New(repository.Store{
 		Conversations: e.conv,
 		Messages:      e.msgs,
 		Reads:         e.reads,
 		Tx:            fakeTx{},
-	}, e.users, e.social)
+	}, e.users, e.social, e.notifier)
 	return e
 }
 
@@ -466,6 +489,58 @@ func TestSendIdempotentReplay(t *testing.T) {
 		}
 	}
 	require.Equal(t, 3, total)
+}
+
+// ---- T18 实时推送端口 ----
+
+func TestSendNotifierPushesToRecipient(t *testing.T) {
+	e := newEnv()
+	e.seed()
+	ctx := context.Background()
+
+	// alice→bob：推送携带落库后的完整消息（含 id），接收方为 bob。
+	res, err := e.svc.Send(ctx, 1, SendParams{ToUserID: 2, Type: "text", Content: "在吗"})
+	require.NoError(t, err)
+	sent := e.notifier.snapshot()
+	require.Len(t, sent, 1)
+	require.Equal(t, res.Message.ID, sent[0].ID, "推送的是落库后同一消息")
+	require.Equal(t, int64(2), sent[0].RecipientID)
+	require.Equal(t, "在吗", sent[0].Content)
+
+	// 反向（bob→alice）同样推送。
+	_, err = e.svc.Send(ctx, 2, SendParams{ToUserID: 1, Type: "text", Content: "在"})
+	require.NoError(t, err)
+	require.Len(t, e.notifier.snapshot(), 2)
+}
+
+func TestSendNotifierSkipsIdempotentReplay(t *testing.T) {
+	e := newEnv()
+	e.seed()
+	ctx := context.Background()
+
+	_, err := e.svc.Send(ctx, 1, SendParams{ToUserID: 2, Type: "text", Content: "hi", ClientRequestID: "req-1"})
+	require.NoError(t, err)
+	replay, err := e.svc.Send(ctx, 1, SendParams{ToUserID: 2, Type: "text", Content: "hi", ClientRequestID: "req-1"})
+	require.NoError(t, err)
+	require.True(t, replay.Idempotent)
+
+	require.Len(t, e.notifier.snapshot(), 1, "幂等重放不重复推送")
+}
+
+func TestSendWithoutNotifier(t *testing.T) {
+	e := newEnv()
+	e.seed()
+	// notifier 为 nil：发送不受影响、不推送。
+	e.svc = New(repository.Store{
+		Conversations: e.conv,
+		Messages:      e.msgs,
+		Reads:         e.reads,
+		Tx:            fakeTx{},
+	}, e.users, e.social, nil)
+
+	res, err := e.svc.Send(context.Background(), 1, SendParams{ToUserID: 2, Type: "text", Content: "hi"})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), res.Message.SenderID)
 }
 
 // ---- 会话列表 ----

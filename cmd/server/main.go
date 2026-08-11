@@ -25,6 +25,7 @@ import (
 	cartrepo "github.com/xiangzhang-coding/go-single/internal/cart/repository"
 	cartsvc "github.com/xiangzhang-coding/go-single/internal/cart/service"
 	chathandler "github.com/xiangzhang-coding/go-single/internal/chat/handler"
+	chatmodel "github.com/xiangzhang-coding/go-single/internal/chat/model"
 	chatrepo "github.com/xiangzhang-coding/go-single/internal/chat/repository"
 	chatsvc "github.com/xiangzhang-coding/go-single/internal/chat/service"
 	couponhandler "github.com/xiangzhang-coding/go-single/internal/coupon/handler"
@@ -50,6 +51,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
+	"github.com/xiangzhang-coding/go-single/internal/platform/ws"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
@@ -121,7 +123,15 @@ func run() error {
 		return err
 	}
 
-	router, cronRegistry := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient, fileSvc)
+	// WebSocket 实时通道（T18）：连接管理 + 心跳保活；握手经 query token 鉴权
+	// （token 进访问日志的风险为演示取舍）；关闭在 HTTP 优雅关闭之后执行。
+	wsHub := ws.New(ws.Config{
+		HeartbeatInterval: cfg.WS.HeartbeatInterval,
+		WriteWait:         cfg.WS.WriteWait,
+		AllowOrigins:      cfg.WS.AllowOrigins,
+	}, log)
+
+	router, cronRegistry := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient, fileSvc, wsHub)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
@@ -129,6 +139,8 @@ func run() error {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
+	// WebSocket 连接经 hijack 脱离 http.Server 超时管理，需显式关闭（优雅关闭最后一步）。
+	defer wsHub.Close()
 
 	go func() {
 		log.Info("HTTP 服务启动", zap.Int("port", cfg.Server.Port))
@@ -194,7 +206,7 @@ func runMigrations(cfg *config.Config, log *zap.Logger) error {
 	return nil
 }
 
-func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Cache, mqClient mq.MQ, fileSvc *file.MinIO) (*gin.Engine, *platformcron.Registry) {
+func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Cache, mqClient mq.MQ, fileSvc *file.MinIO, wsHub *ws.Hub) (*gin.Engine, *platformcron.Registry) {
 	gin.SetMode(cfg.Server.Mode)
 
 	r := gin.New()
@@ -276,6 +288,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// chat 模块（T17 REST 通道）：发送消息（text/image/file，client_request_id 幂等）、
 	// 会话列表（最近消息 + 未读数）与消息列表（游标分页）、已读推进（离线消息上线可拉取）；
 	// 仅好友可单聊（跨模块经 socialSvc.AreFriends）、仅会话双方可访问（owner 校验）。
+	// T18 实时通道：落库成功经 wsMessageNotifier 推送给在线接收方（断线不丢由落库+REST 兜底）。
 	chatConversationRepo := chatrepo.NewGORMConversation(db)
 	chatStore := chatrepo.Store{
 		Conversations: chatConversationRepo,
@@ -283,7 +296,8 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		Reads:         chatrepo.NewGORMReadState(db),
 		Tx:            chatConversationRepo,
 	}
-	chatHandler := chathandler.New(chatsvc.New(chatStore, userSvc, socialSvc), verifier)
+	chatSvc := chatsvc.New(chatStore, userSvc, socialSvc, wsMessageNotifier{hub: wsHub})
+	chatHandler := chathandler.New(chatSvc, verifier)
 
 	// T12 秒杀异步落单消费者：订阅"抢购成功"消息 → 查活动/默认地址 →
 	// order 服务幂等建单 + 同事务扣活动库存；瞬时失败 Nack 重投、
@@ -320,6 +334,9 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
 	fileHandler := file.NewHandler(fileSvc, verifier)
 
+	// WebSocket 实时通道（T18）：GET /ws?token=<jwt>（token 进日志风险为演示取舍）。
+	r.GET("/ws", wsHub.Handler(verifier))
+
 	api := r.Group("/api")
 	userHandler.RegisterRoutes(api)
 	addressHandler.RegisterRoutes(api)
@@ -346,6 +363,18 @@ func healthHandler(checker *health.Checker) gin.HandlerFunc {
 		c.JSON(code, res)
 	}
 }
+
+// wsMessageNotifier 将 chat 服务"消息已落库"事件接入 WS Hub（T18）：
+// 向在线接收方推送 new_message 事件；离线为无操作（落库 + 上线 REST 补拉兜底）。
+type wsMessageNotifier struct {
+	hub *ws.Hub
+}
+
+func (n wsMessageNotifier) NotifyMessageSent(_ context.Context, msg *chatmodel.Message) {
+	n.hub.PushToUser(msg.RecipientID, ws.EventNewMessage, msg)
+}
+
+var _ chatsvc.MessageNotifier = wsMessageNotifier{}
 
 // registerCron 注册全部定时任务并返回调度器（Start 由调用方执行）。
 // 后续任务（如库存对账）在此追加。

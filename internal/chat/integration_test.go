@@ -1,11 +1,11 @@
 // 消息与会话集成测试（主 seam）：真实 MySQL + httptest 起完整路由
-// （user + social + chat），覆盖 T17 四项验收：
+// （user + social + chat + /ws），覆盖 T17 四项验收：
 // ① A→B 发送消息成功（text/image/file）；
 // ② 会话列表与消息列表正确（游标分页）；
 // ③ 离线后上线可拉取到未读消息（未读数 + after_id 拉新 + 已读推进）；
 // ④ 非会话双方不可访问（owner 校验，防 IDOR）。
 // 另覆盖：幂等重放（同 client_request_id 返回原消息）、非好友发送被拒、
-// 自加被拒、鉴权与参数校验。
+// 自加被拒、鉴权与参数校验；T18 WS 通道见 ws_integration_test.go（同 env）。
 package chat_test
 
 import (
@@ -27,14 +27,17 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/mysql"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
 	chathandler "github.com/xiangzhang-coding/go-single/internal/chat/handler"
+	chatmodel "github.com/xiangzhang-coding/go-single/internal/chat/model"
 	chatrepo "github.com/xiangzhang-coding/go-single/internal/chat/repository"
 	chatsvc "github.com/xiangzhang-coding/go-single/internal/chat/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/ws"
 	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
 	socialrepo "github.com/xiangzhang-coding/go-single/internal/social/repository"
 	socialsvc "github.com/xiangzhang-coding/go-single/internal/social/service"
@@ -47,12 +50,15 @@ const (
 	testDBName    = "go_shop_test"
 	testSecret    = "integration-test-secret"
 	migrationsDir = "../../migrations"
+	// wsHeartbeat WS 集成测试心跳间隔（短间隔使保活/死连接检测快速收敛）。
+	wsHeartbeat = 40 * time.Millisecond
 )
 
 // testEnv 每个测试包只构建一次；MySQL 不可达时测试整体跳过。
 type testEnv struct {
 	router   http.Handler
 	verifier auth.TokenVerifier
+	hub      *ws.Hub
 }
 
 var (
@@ -123,21 +129,32 @@ func buildEnv() (*testEnv, error) {
 	postSvc := socialsvc.NewPosts(socialStore, userSvc, stubOrders{})
 
 	chatConversationRepo := chatrepo.NewGORMConversation(gdb)
+	wsHub := ws.New(ws.Config{HeartbeatInterval: wsHeartbeat, WriteWait: 2 * time.Second}, zap.NewNop())
 	chatSvc := chatsvc.New(chatrepo.Store{
 		Conversations: chatConversationRepo,
 		Messages:      chatrepo.NewGORMMessage(gdb),
 		Reads:         chatrepo.NewGORMReadState(gdb),
 		Tx:            chatConversationRepo,
-	}, userSvc, socialSvc)
+	}, userSvc, socialSvc, wsNotifier{hub: wsHub})
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	r.GET("/ws", wsHub.Handler(verifier))
 	api := r.Group("/api")
 	userhandler.New(userSvc, verifier).RegisterRoutes(api)
 	socialhandler.New(socialSvc, postSvc, verifier).RegisterRoutes(api)
 	chathandler.New(chatSvc, verifier).RegisterRoutes(api)
-	return &testEnv{router: r, verifier: verifier}, nil
+	return &testEnv{router: r, verifier: verifier, hub: wsHub}, nil
 }
+
+// wsNotifier 测试侧的消息实时推送适配器（与 cmd/server 组装一致）。
+type wsNotifier struct{ hub *ws.Hub }
+
+func (n wsNotifier) NotifyMessageSent(_ context.Context, msg *chatmodel.Message) {
+	n.hub.PushToUser(msg.RecipientID, ws.EventNewMessage, msg)
+}
+
+var _ chatsvc.MessageNotifier = wsNotifier{}
 
 // stubOrders 好友圈动态的购买校验端口替身（本包不触达分享功能）。
 type stubOrders struct{}

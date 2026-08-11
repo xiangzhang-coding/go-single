@@ -8,6 +8,7 @@ require (
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/golang-migrate/migrate/v4 v4.19.1
+	github.com/gorilla/websocket v1.5.3
 	github.com/minio/minio-go/v7 v7.0.100
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2

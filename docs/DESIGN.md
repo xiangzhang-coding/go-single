@@ -18,6 +18,7 @@ DDD 风格的模块化单体：单一部署单元承载商城、秒杀、后台�
 | 层 | 主选 | Backlog 备选 |
 |---|---|---|
 | Web | Gin | stdlib 路由 |
+| WebSocket | gorilla/websocket（platform/ws，单向推送 + 心跳） | stdlib HTTP/2 WebSocket |
 | ORM | GORM（之上包仓储接口） | sqlc |
 | 数据库 | MySQL 8 | PostgreSQL |
 | 缓存 | go-redis/v9 + Lua 脚本 | — |
@@ -207,7 +208,7 @@ go_single/
 - 消息类型：`text` / `image` / `file`（image/file 经 MinIO 上传，消息引用 URL）
 - 会话标识：`conversation_key = min(uidA, uidB):max(uidA, uidB)` 有序用户对，消息表含会话键
 - **三通道**：发送走 REST（`POST /api/messages`，可幂等重试）；实时接收走 WebSocket 推送；离线消息落库，上线 REST 按会话游标分页拉取
-- 连接：WebSocket 长连接 + 心跳保活（参数实现期定）
+- 连接：WebSocket 长连接 + 心跳保活（`ws.heartbeat_interval` 默认 30s，pong_wait = 2× 间隔；写超时 `ws.write_wait` 默认 10s）
 
 ## 限流与幂等
 

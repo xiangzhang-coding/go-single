@@ -23,6 +23,18 @@ type Config struct {
 	Auth       Auth
 	Snowflake  Snowflake
 	FlashSale  FlashSale
+	WS         WS
+}
+
+// WS WebSocket 实时通道配置（T18）：长连接心跳保活与写超时参数。
+type WS struct {
+	// HeartbeatInterval 心跳 Ping 间隔（保活；客户端 pong_wait = 2× 间隔内
+	// 未收到任何帧即判定断开）。
+	HeartbeatInterval time.Duration `mapstructure:"heartbeat_interval"`
+	// WriteWait 单条写（业务消息/Ping）超时。
+	WriteWait time.Duration `mapstructure:"write_wait"`
+	// AllowOrigins 握手 Origin 白名单；空 = 允许所有（演示取舍，生产应配置前端域名）。
+	AllowOrigins []string `mapstructure:"allow_origins"`
 }
 
 // FlashSale 秒杀配置：抢购接口限流参数。
@@ -158,4 +170,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("flashsale.burst", 100)
 	v.SetDefault("flashsale.per_user_max", 5)
 	v.SetDefault("flashsale.per_user_window", "1s")
+	v.SetDefault("ws.heartbeat_interval", "30s")
+	v.SetDefault("ws.write_wait", "10s")
+	v.SetDefault("ws.allow_origins", []string{})
 }

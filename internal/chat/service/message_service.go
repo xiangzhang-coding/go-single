@@ -2,6 +2,8 @@
 // 可幂等重试）、会话列表与消息列表（游标分页）、已读游标推进（离线消息上线可拉取）。
 // 跨模块：接收方存在性经 user 服务、好友关系经 social 服务校验（仅好友可单聊）；
 // 仅会话双方可访问会话与消息（owner 校验，防 IDOR）。
+// 实时通道（T18）：Send 落库成功后经 MessageNotifier 端口通知（实现为 WS Hub，
+// 在 cmd/server 组装），向在线接收方推送；断线消息不丢由落库 + REST 补拉兜底。
 package service
 
 import (
@@ -52,6 +54,13 @@ type SocialService interface {
 	AreFriends(ctx context.Context, userID, friendID int64) (bool, error)
 }
 
+// MessageNotifier 消息落库成功后的实时推送端口（T18 WS 通道）：
+// 实现方为 platform/ws Hub（cmd/server 组装适配器），nil 表示不推送。
+// 调用不阻塞发送链路：实现方须异步/非阻塞投递（缓冲满关闭连接，客户端 REST 补拉）。
+type MessageNotifier interface {
+	NotifyMessageSent(ctx context.Context, msg *model.Message)
+}
+
 // SendParams 发送消息参数。
 type SendParams struct {
 	ToUserID        int64
@@ -64,14 +73,15 @@ type SendParams struct {
 // SendResult 发送结果；Idempotent=true 表示命中幂等键（同 client_request_id 重放），
 // Message 为既有消息（与首次发送同一 id）。
 type SendResult struct {
-	Message   *model.Message
+	Message    *model.Message
 	Idempotent bool
 }
 
 // Service chat 模块业务接口。
 type Service interface {
 	// Send 发送消息：校验接收方存在与好友关系 → 单事务（会话存在性 + 消息落库 +
-	// 会话最近消息推进）；client_request_id 幂等重放返回原消息。
+	// 会话最近消息推进）；client_request_id 幂等重放返回原消息；
+	// 落库成功后（非幂等重放）经 MessageNotifier 实时推送在线接收方（T18）。
 	Send(ctx context.Context, senderID int64, p SendParams) (*SendResult, error)
 	// ListConversations 我的会话列表（游标分页，latest_message_id 倒序）：
 	// 最近消息预览 + 对方用户名 + 未读数；返回列表与是否有更多。
@@ -85,14 +95,15 @@ type Service interface {
 }
 
 type messageService struct {
-	store  repository.Store
-	users  UserService
-	social SocialService
+	store    repository.Store
+	users    UserService
+	social   SocialService
+	notifier MessageNotifier // nil = 不推送（调用方未接实时通道）
 }
 
-// New 构造消息服务。
-func New(store repository.Store, users UserService, social SocialService) Service {
-	return &messageService{store: store, users: users, social: social}
+// New 构造消息服务；notifier 可传 nil（跳过实时推送）。
+func New(store repository.Store, users UserService, social SocialService, notifier MessageNotifier) Service {
+	return &messageService{store: store, users: users, social: social, notifier: notifier}
 }
 
 // Send 发送流程：参数校验 → 接收方存在校验（跨模块）→ 好友关系校验（跨模块）→
@@ -168,6 +179,11 @@ func (s *messageService) Send(ctx context.Context, senderID int64, p SendParams)
 			return &SendResult{Message: existing, Idempotent: true}, nil
 		}
 		return nil, err
+	}
+	// T18 实时通道：仅首次落库推送（幂等重放不重复推）；实现方为 WS Hub，
+	// 非阻塞投递；接收方离线时为无操作（消息已落库，上线 REST 补拉）。
+	if s.notifier != nil {
+		s.notifier.NotifyMessageSent(ctx, msg)
 	}
 	return &SendResult{Message: msg, Idempotent: false}, nil
 }
