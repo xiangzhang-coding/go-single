@@ -171,6 +171,17 @@ func (s *GORMOrderItemStore) ListByOrders(ctx context.Context, orderNos []string
 	return result, nil
 }
 
+// HasPurchased 存在 已支付/已发货/已完成 订单含该 SKU（join 订单表校验归属与状态）。
+func (s *GORMOrderItemStore) HasPurchased(ctx context.Context, userID, skuID int64) (bool, error) {
+	var cnt int64
+	err := s.db.WithContext(ctx).Table("order_items").
+		Joins("JOIN orders ON orders.order_no = order_items.order_no").
+		Where("orders.user_id = ? AND order_items.sku_id = ? AND orders.status IN (?, ?, ?)",
+			userID, skuID, model.OrderStatusPaid, model.OrderStatusShipped, model.OrderStatusCompleted).
+		Count(&cnt).Error
+	return cnt > 0, err
+}
+
 // 编译期断言：GORM 实现满足仓储接口。
 var _ OrderRepository = (*GORMOrderStore)(nil)
 var _ OrderItemRepository = (*GORMOrderItemStore)(nil)

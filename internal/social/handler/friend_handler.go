@@ -1,5 +1,5 @@
-// Package handler 暴露 social 模块好友的 HTTP 接口：发起申请、处理申请（通过/拒绝）、
-// 我的申请列表与好友列表。
+// Package handler 暴露 social 模块的 HTTP 接口：好友申请/好友列表与
+// 好友圈动态（分享/时间线/删除）。
 package handler
 
 import (
@@ -16,21 +16,25 @@ import (
 // Handler social 模块的 HTTP 处理器。
 type Handler struct {
 	svc      service.Service
+	posts    service.PostService
 	verifier auth.TokenVerifier
 }
 
 // New 构造处理器。
-func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
-	return &Handler{svc: svc, verifier: verifier}
+func New(svc service.Service, posts service.PostService, verifier auth.TokenVerifier) *Handler {
+	return &Handler{svc: svc, posts: posts, verifier: verifier}
 }
 
-// RegisterRoutes 注册好友路由（Bearer）。
+// RegisterRoutes 注册好友与动态路由（Bearer）。
 //
 //	POST /api/friend-requests              发起申请 {to_user_id}
 //	GET  /api/friend-requests              我的申请（scope=incoming|outgoing，status 筛选）
 //	POST /api/friend-requests/:id/accept   通过申请（仅被申请人）
 //	POST /api/friend-requests/:id/reject   拒绝申请（仅被申请人）
 //	GET  /api/friends                      我的好友列表（双向）
+//	POST /api/posts                        分享动态 {sku_id, content?, image_url?}
+//	GET  /api/posts/feed                   好友圈时间线（仅好友，page/page_size 分页）
+//	DELETE /api/posts/:id                  删除自己的动态
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	protected := rg.Group("", auth.Middleware(h.verifier))
 	protected.POST("/friend-requests", h.SendRequest)
@@ -38,6 +42,9 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	protected.POST("/friend-requests/:id/accept", h.Accept)
 	protected.POST("/friend-requests/:id/reject", h.Reject)
 	protected.GET("/friends", h.ListFriends)
+	protected.POST("/posts", h.SharePost)
+	protected.GET("/posts/feed", h.FeedPosts)
+	protected.DELETE("/posts/:id", h.DeletePost)
 }
 
 type sendRequestRequest struct {
@@ -146,14 +153,14 @@ func idParam(c *gin.Context) (int64, bool) {
 	return id, true
 }
 
-// writeError 好友业务错误 → HTTP 状态码。
+// writeError 好友与动态业务错误 → HTTP 状态码（两套错误共用单一映射，新增错误单点维护）。
 func writeError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, service.ErrSelfRequest):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrTargetUserNotFound), errors.Is(err, service.ErrRequestNotFound):
+	case errors.Is(err, service.ErrTargetUserNotFound), errors.Is(err, service.ErrRequestNotFound), errors.Is(err, service.ErrPostNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrRequestForbidden):
+	case errors.Is(err, service.ErrRequestForbidden), errors.Is(err, service.ErrNotPurchased), errors.Is(err, service.ErrPostForbidden):
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrAlreadyFriends), errors.Is(err, service.ErrDuplicateRequest), errors.Is(err, service.ErrRequestNotPending):
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})

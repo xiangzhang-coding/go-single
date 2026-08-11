@@ -191,7 +191,7 @@ func (s *friendService) ListRequests(ctx context.Context, userID int64, scope, s
 		}
 		peers = append(peers, peerID)
 	}
-	usernames, err := s.usernames(ctx, peers)
+	usernames, err := usernames(ctx, s.users, peers)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +219,7 @@ func (s *friendService) ListFriends(ctx context.Context, userID int64) ([]model.
 	for i := range list {
 		friendIDs = append(friendIDs, list[i].FriendID)
 	}
-	usernames, err := s.usernames(ctx, friendIDs)
+	usernames, err := usernames(ctx, s.users, friendIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -235,13 +235,14 @@ func (s *friendService) ListFriends(ctx context.Context, userID int64) ([]model.
 }
 
 // usernames 批量取用户名：去重后逐个跨模块查询（用户不存在兜底空串）。
-func (s *friendService) usernames(ctx context.Context, ids []int64) (map[int64]string, error) {
+// 好友服务与动态服务共用（动态时间线补作者用户名）。
+func usernames(ctx context.Context, users UserService, ids []int64) (map[int64]string, error) {
 	out := make(map[int64]string, len(ids))
 	for _, id := range ids {
 		if _, done := out[id]; done {
 			continue
 		}
-		u, err := s.users.GetByID(ctx, id)
+		u, err := users.GetByID(ctx, id)
 		if err != nil {
 			if errors.Is(err, usersvc.ErrUserNotFound) {
 				out[id] = ""

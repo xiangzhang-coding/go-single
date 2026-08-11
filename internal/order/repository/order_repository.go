@@ -55,6 +55,9 @@ type OrderItemRepository interface {
 	ListByOrder(ctx context.Context, orderNo string) ([]model.OrderItem, error)
 	// ListByOrders 订单列表：按订单号分组返回全部订单项（一次查询避免 N+1）。
 	ListByOrders(ctx context.Context, orderNos []string) (map[string][]model.OrderItem, error)
+	// HasPurchased 用户是否已购某 SKU：存在 已支付/已发货/已完成 订单含该 SKU
+	// （好友圈分享校验；待支付/已取消不算已购）。
+	HasPurchased(ctx context.Context, userID, skuID int64) (bool, error)
 }
 
 // Store 聚合仓储，作为 service 的构造入参。

@@ -188,6 +188,9 @@ type Service interface {
 	Ship(ctx context.Context, orderNo string) error
 	// ConfirmReceipt 确认收货：已发货 → 已完成（owner 校验）。
 	ConfirmReceipt(ctx context.Context, userID int64, orderNo string) error
+	// HasPurchasedSKU 用户是否已购某 SKU（已支付/已发货/已完成订单含该 SKU），
+	// 好友圈分享的购买校验端口（social 模块进程内调用）。
+	HasPurchasedSKU(ctx context.Context, userID, skuID int64) (bool, error)
 }
 
 // orderLine 下单行（购物车条目或直购项统一形态）。
@@ -877,6 +880,11 @@ func (s *orderService) ConfirmReceipt(ctx context.Context, userID int64, orderNo
 		return ErrOrderChanged
 	}
 	return nil
+}
+
+// HasPurchasedSKU 好友圈分享校验：存在 已支付/已发货/已完成 订单含该 SKU。
+func (s *orderService) HasPurchasedSKU(ctx context.Context, userID, skuID int64) (bool, error) {
+	return s.store.Items.HasPurchased(ctx, userID, skuID)
 }
 
 // ---- 内部 ----

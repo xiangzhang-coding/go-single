@@ -45,4 +45,5 @@ type FriendshipRepository interface {
 type Store struct {
 	Requests    FriendRequestRepository
 	Friendships FriendshipRepository
+	Posts       PostRepository
 }

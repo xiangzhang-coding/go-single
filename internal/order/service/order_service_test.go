@@ -140,9 +140,13 @@ func (fakeTx) WithinTx(_ context.Context, fn func(tx *gorm.DB) error) error { re
 
 type fakeItems struct {
 	byOrder map[string][]model.OrderItem
+	// purchased 好友圈分享校验：存在该 SKU 的已购订单（测试直控）。
+	purchased map[int64]bool
 }
 
-func newFakeItems() *fakeItems { return &fakeItems{byOrder: map[string][]model.OrderItem{}} }
+func newFakeItems() *fakeItems {
+	return &fakeItems{byOrder: map[string][]model.OrderItem{}, purchased: map[int64]bool{}}
+}
 
 func (f *fakeItems) Create(_ context.Context, _ *gorm.DB, item *model.OrderItem) error {
 	f.byOrder[item.OrderNo] = append(f.byOrder[item.OrderNo], *item)
@@ -159,6 +163,10 @@ func (f *fakeItems) ListByOrders(_ context.Context, orderNos []string) (map[stri
 		out[no] = f.byOrder[no]
 	}
 	return out, nil
+}
+
+func (f *fakeItems) HasPurchased(_ context.Context, _ int64, skuID int64) (bool, error) {
+	return f.purchased[skuID], nil
 }
 
 // ---- fake 幂等缓存（镜像 SETNX+EX 语义）----
@@ -1322,4 +1330,20 @@ func TestCreateSeckillSKUMissing(t *testing.T) {
 
 	err := fx.svc.CreateSeckill(context.Background(), p)
 	require.ErrorIs(t, err, ErrSKUNotFound)
+}
+
+// ---- 好友圈分享的购买校验端口 ----
+
+func TestHasPurchasedSKU(t *testing.T) {
+	fx := newFixture()
+
+	// 未购：false 且无错误。
+	fx.items.purchased[10] = true
+	purchased, err := fx.svc.HasPurchasedSKU(context.Background(), 1, 10)
+	require.NoError(t, err)
+	require.True(t, purchased)
+
+	purchased, err = fx.svc.HasPurchasedSKU(context.Background(), 1, 11)
+	require.NoError(t, err)
+	require.False(t, purchased)
 }

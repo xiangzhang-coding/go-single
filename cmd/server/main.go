@@ -251,12 +251,6 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		mqClient, orderNoGen)
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
 
-	// social 模块：好友申请/通过/拒绝与好友列表；用户名经 userSvc 跨模块进程内调用补齐。
-	socialHandler := socialhandler.New(
-		socialsvc.New(socialrepo.Store{Requests: socialrepo.NewGORMRequest(db), Friendships: socialrepo.NewGORMFriendship(db)}, userSvc),
-		verifier,
-	)
-
 	// order 模块：购物车结算/直购下单（单事务：订单+订单项+库存+地址快照+券核销+
 	// 删除购物车条目）、client_request_id 幂等（Redis SETNX）、雪花订单号、
 	// 订单列表/详情、取消（回补库存+回退券）、确认收货与 admin 发货；
@@ -265,6 +259,15 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc)
 	orderHandler := orderhandler.New(orderSvc, verifier)
+
+	// social 模块：好友申请/通过/拒绝与好友列表；用户名经 userSvc 跨模块进程内调用补齐。
+	// 好友圈动态：分享购买校验经 orderSvc（已支付/已发货/已完成订单含该 SKU）。
+	socialStore := socialrepo.Store{Requests: socialrepo.NewGORMRequest(db), Friendships: socialrepo.NewGORMFriendship(db), Posts: socialrepo.NewGORMPost(db)}
+	socialHandler := socialhandler.New(
+		socialsvc.New(socialStore, userSvc),
+		socialsvc.NewPosts(socialStore, userSvc, orderSvc),
+		verifier,
+	)
 
 	// T12 秒杀异步落单消费者：订阅"抢购成功"消息 → 查活动/默认地址 →
 	// order 服务幂等建单 + 同事务扣活动库存；瞬时失败 Nack 重投、

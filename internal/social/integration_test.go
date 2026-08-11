@@ -1,6 +1,8 @@
-// 好友关系集成测试（主 seam）：真实 MySQL + httptest 起完整路由，
+// 好友关系与好友圈集成测试（主 seam）：真实 MySQL + httptest 起完整路由，
 // 覆盖 申请→通过→好友（双向列表）、拒绝不建关系、重复申请/自加被拒、
-// owner 校验（仅被申请人可处理申请）、鉴权与参数校验。
+// owner 校验（仅被申请人可处理申请）、鉴权与参数校验；
+// 好友圈：分享购买校验（未购买 403）、仅好友可见（非好友不可见）、
+// 时间线分页、删除自己的动态（他人 403）。
 package social_test
 
 import (
@@ -26,7 +28,14 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	cartmodel "github.com/xiangzhang-coding/go-single/internal/cart/model"
+	couponmodel "github.com/xiangzhang-coding/go-single/internal/coupon/model"
+	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
+	orderrepo "github.com/xiangzhang-coding/go-single/internal/order/repository"
+	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
 	socialrepo "github.com/xiangzhang-coding/go-single/internal/social/repository"
 	socialsvc "github.com/xiangzhang-coding/go-single/internal/social/service"
@@ -108,17 +117,78 @@ func buildEnv() (*testEnv, error) {
 
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
 	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier)
-	socialSvc := socialsvc.New(
-		socialrepo.Store{Requests: socialrepo.NewGORMRequest(gdb), Friendships: socialrepo.NewGORMFriendship(gdb)},
-		userSvc,
-	)
+
+	// order 服务：好友圈分享的购买校验端口（HasPurchasedSKU）走真实订单仓储；
+	// 其余跨模块依赖（下单/支付路径本包不触达）用替身，避免拉起 Redis 与全部模块。
+	orderStore := orderrepo.NewGORMOrder(gdb)
+	orderSvc := ordersvc.New(
+		orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
+		noopCache{}, stubOrderNoGen{}, stubProducts{}, stubCoupons{}, stubCart{}, userSvc, stubActivity{})
+
+	socialStore := socialrepo.Store{
+		Requests:    socialrepo.NewGORMRequest(gdb),
+		Friendships: socialrepo.NewGORMFriendship(gdb),
+		Posts:       socialrepo.NewGORMPost(gdb),
+	}
+	socialSvc := socialsvc.New(socialStore, userSvc)
+	postSvc := socialsvc.NewPosts(socialStore, userSvc, orderSvc)
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	api := r.Group("/api")
 	userhandler.New(userSvc, verifier).RegisterRoutes(api)
-	socialhandler.New(socialSvc, verifier).RegisterRoutes(api)
+	socialhandler.New(socialSvc, postSvc, verifier).RegisterRoutes(api)
 	return &testEnv{router: r, verifier: verifier, gdb: gdb}, nil
+}
+
+// ---- order 服务跨模块替身（本包只触达 HasPurchasedSKU） ----
+
+type noopCache struct{}
+
+func (noopCache) Ping(context.Context) error                                    { return nil }
+func (noopCache) Close() error                                                  { return nil }
+func (noopCache) Get(context.Context, string) (string, error)                   { return "", cache.ErrMiss }
+func (noopCache) Set(context.Context, string, string, time.Duration) error      { return nil }
+func (noopCache) Del(context.Context, string) error                             { return nil }
+func (noopCache) Eval(context.Context, string, []string, ...any) (int64, error) { return 0, nil }
+
+type stubOrderNoGen struct{}
+
+func (stubOrderNoGen) Next() (int64, error) { return 0, nil }
+
+type stubProducts struct{}
+
+func (stubProducts) GetSKU(context.Context, int64) (*productmodel.SKU, error) { return nil, nil }
+func (stubProducts) GetSKUForUpdate(context.Context, *gorm.DB, int64) (*productmodel.SKU, error) {
+	return nil, nil
+}
+func (stubProducts) GetDetail(context.Context, int64) (*productmodel.ProductDetail, error) {
+	return nil, nil
+}
+func (stubProducts) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
+	return true, nil
+}
+func (stubProducts) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
+
+type stubCoupons struct{}
+
+func (stubCoupons) GetUsable(context.Context, int64, int64) (*couponmodel.UserCouponView, error) {
+	return nil, nil
+}
+func (stubCoupons) UseCoupon(context.Context, *gorm.DB, int64, int64) error      { return nil }
+func (stubCoupons) RollbackCoupon(context.Context, *gorm.DB, int64, int64) error { return nil }
+
+type stubCart struct{}
+
+func (stubCart) LockItems(context.Context, *gorm.DB, int64) ([]cartmodel.CartItem, error) {
+	return nil, nil
+}
+func (stubCart) DeletePurchased(context.Context, *gorm.DB, int64, []int64) error { return nil }
+
+type stubActivity struct{}
+
+func (stubActivity) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
+	return true, nil
 }
 
 func testDSN(dbName string) string {
@@ -352,4 +422,209 @@ func TestFriendRequestAuthAndValidation(t *testing.T) {
 	require.NoError(t, env.gdb.Table("friend_requests").
 		Where("from_user_id = ? OR to_user_id = ?", aliceID, aliceID).Count(&cnt).Error)
 	require.Zero(t, cnt, "校验失败不应落库")
+}
+
+// ---- 好友圈：种子数据助手 ----
+
+// seedProductSKU 直接落库一个商品与 SKU（好友圈测试不走完整下单闭环，
+// 已购状态由 seedPurchase 直插订单模拟），返回 (productID, skuID)。
+func seedProductSKU(t *testing.T, env *testEnv, prefix string) (int64, int64) {
+	t.Helper()
+	catName := fmt.Sprintf("cat_%s_%d", prefix, time.Now().UnixNano())
+	require.NoError(t, env.gdb.Exec("INSERT INTO categories (name) VALUES (?)", catName).Error)
+	var catID int64
+	require.NoError(t, env.gdb.Table("categories").Select("id").Where("name = ?", catName).Scan(&catID).Error)
+
+	require.NoError(t, env.gdb.Exec(
+		"INSERT INTO products (category_id, title, status) VALUES (?, ?, 'on_sale')", catID, "测试商品").Error)
+	var productID int64
+	require.NoError(t, env.gdb.Table("products").Select("id").Where("category_id = ?", catID).Scan(&productID).Error)
+
+	require.NoError(t, env.gdb.Exec(
+		"INSERT INTO skus (product_id, specs, price, stock) VALUES (?, '{}', 1000, 100)", productID).Error)
+	var skuID int64
+	require.NoError(t, env.gdb.Table("skus").Select("id").Where("product_id = ?", productID).Scan(&skuID).Error)
+	return productID, skuID
+}
+
+// seedPurchase 直插一条指定状态的订单与订单项，模拟该用户的已购/未购历史。
+// 时间经 Go 时钟写入（与全项目时钟约定一致，不依赖 MySQL NOW()）。
+func seedPurchase(t *testing.T, env *testEnv, userID, productID, skuID int64, status string) {
+	t.Helper()
+	orderNo := fmt.Sprintf("%d", time.Now().UnixNano())
+	expireAt := time.Now().Add(15 * time.Minute)
+	require.NoError(t, env.gdb.Exec(`
+		INSERT INTO orders (order_no, user_id, order_type, status, total_amount, discount_amount, pay_amount,
+			receiver, phone, province, city, district, detail, expire_at)
+		VALUES (?, ?, 'normal', ?, 1000, 0, 1000, '张三', '13800000000', '省', '市', '区', '地址', ?)`,
+		orderNo, userID, status, expireAt).Error)
+	require.NoError(t, env.gdb.Exec(`
+		INSERT INTO order_items (order_no, sku_id, product_id, title, specs, price, quantity, subtotal)
+		VALUES (?, ?, ?, '测试商品', '{}', 1000, 1, 1000)`,
+		orderNo, skuID, productID).Error)
+}
+
+// befriend alice 发起申请 → bob 通过，返回好友关系。
+func befriend(t *testing.T, env *testEnv, aliceToken string, bobID int64, bobToken string) {
+	t.Helper()
+	req := sendRequest(t, env, aliceToken, bobID)
+	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/accept", int64(req["id"].(float64))), "", bobToken)
+	require.Equal(t, http.StatusNoContent, w.Code)
+}
+
+func sharePost(t *testing.T, env *testEnv, token string, skuID int64, content string) map[string]any {
+	t.Helper()
+	w, body := doJSON(t, env, http.MethodPost, "/api/posts",
+		fmt.Sprintf(`{"sku_id":%d,"content":%q}`, skuID, content), token)
+	require.Equal(t, http.StatusCreated, w.Code, "分享失败: %s", w.Body.String())
+	return body
+}
+
+func feedOf(t *testing.T, env *testEnv, token, query string) ([]any, int64) {
+	t.Helper()
+	w, body := doJSON(t, env, http.MethodGet, "/api/posts/feed"+query, "", token)
+	require.Equal(t, http.StatusOK, w.Code)
+	items, _ := body["items"].([]any)
+	total, _ := body["total"].(float64)
+	return items, int64(total)
+}
+
+// ---- 分享：购买校验（未购买不可分享） ----
+
+func TestPostSharePurchaseValidation(t *testing.T) {
+	env := requireEnv(t)
+	aliceID, aliceToken := register(t, env, "ava_ps")
+	productID, skuID := seedProductSKU(t, env, "ps")
+
+	// 未购买 → 403；待支付/已取消不算已购 → 403。
+	w, _ := doJSON(t, env, http.MethodPost, "/api/posts",
+		fmt.Sprintf(`{"sku_id":%d,"content":"种草"}`, skuID), aliceToken)
+	require.Equal(t, http.StatusForbidden, w.Code)
+
+	seedPurchase(t, env, aliceID, productID, skuID, ordermodel.OrderStatusPendingPayment)
+	w, _ = doJSON(t, env, http.MethodPost, "/api/posts",
+		fmt.Sprintf(`{"sku_id":%d}`, skuID), aliceToken)
+	require.Equal(t, http.StatusForbidden, w.Code, "待支付订单不算已购")
+
+	// 已支付 → 201。
+	seedPurchase(t, env, aliceID, productID, skuID, ordermodel.OrderStatusPaid)
+	w, body := doJSON(t, env, http.MethodPost, "/api/posts",
+		fmt.Sprintf(`{"sku_id":%d,"content":"好好用","image_url":"https://minio.example/x.png"}`, skuID), aliceToken)
+	require.Equal(t, http.StatusCreated, w.Code, "已购分享应成功: %s", w.Body.String())
+	require.Equal(t, float64(skuID), body["sku_id"])
+	require.Equal(t, "好好用", body["content"])
+
+	// 参数校验：缺 sku_id → 400。
+	w, _ = doJSON(t, env, http.MethodPost, "/api/posts", `{"content":"x"}`, aliceToken)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	// 未带 token → 401。
+	w, _ = doJSON(t, env, http.MethodPost, "/api/posts", `{"sku_id":1}`, "")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+// ---- 时间线：仅好友可见 ----
+
+func TestPostFeedFriendsOnly(t *testing.T) {
+	env := requireEnv(t)
+	aliceID, aliceToken := register(t, env, "ava_pf")
+	bobID, bobToken := register(t, env, "bob_pf")
+	carolID, carolToken := register(t, env, "carol_pf")
+
+	// alice ↔ bob 好友；carol 与两人均非好友。
+	befriend(t, env, aliceToken, bobID, bobToken)
+
+	bobProductID, bobSKU := seedProductSKU(t, env, "pf")
+	carolProductID, carolSKU := seedProductSKU(t, env, "pf")
+	seedPurchase(t, env, bobID, bobProductID, bobSKU, ordermodel.OrderStatusPaid)
+	seedPurchase(t, env, carolID, carolProductID, carolSKU, ordermodel.OrderStatusPaid)
+	seedPurchase(t, env, aliceID, bobProductID, bobSKU, ordermodel.OrderStatusPaid)
+
+	sharePost(t, env, bobToken, bobSKU, "bob 的分享")
+	sharePost(t, env, carolToken, carolSKU, "carol 的分享")
+	sharePost(t, env, aliceToken, bobSKU, "alice 自己的")
+
+	// alice 的时间线只含好友 bob 的动态，不含自己与非好友 carol 的。
+	items, total := feedOf(t, env, aliceToken, "")
+	require.Equal(t, int64(1), total)
+	require.Len(t, items, 1)
+	post := items[0].(map[string]any)
+	require.Equal(t, float64(bobID), post["user_id"])
+	require.Equal(t, "bob 的分享", post["content"])
+	require.True(t, strings.HasPrefix(post["author_username"].(string), "bob_"), "作者用户名经跨模块补齐")
+
+	// carol（非好友）看不到任何人的动态。
+	carolItems, carolTotal := feedOf(t, env, carolToken, "")
+	require.Zero(t, carolTotal, "非好友动态不可见")
+	require.Empty(t, carolItems)
+
+	// bob 的时间线只有好友 alice 的动态，看不到非好友 carol 的。
+	bobItems, bobTotal := feedOf(t, env, bobToken, "")
+	require.Equal(t, int64(1), bobTotal)
+	require.Len(t, bobItems, 1)
+	require.Equal(t, float64(aliceID), bobItems[0].(map[string]any)["user_id"])
+}
+
+// ---- 时间线：分页与删除 ----
+
+func TestPostFeedPagination(t *testing.T) {
+	env := requireEnv(t)
+	_, aliceToken := register(t, env, "ava_pg")
+	bobID, bobToken := register(t, env, "bob_pg")
+	befriend(t, env, aliceToken, bobID, bobToken)
+
+	productID, skuID := seedProductSKU(t, env, "pg")
+	seedPurchase(t, env, bobID, productID, skuID, ordermodel.OrderStatusShipped)
+	for i := 0; i < 5; i++ {
+		sharePost(t, env, bobToken, skuID, fmt.Sprintf("第 %d 条", i))
+	}
+
+	// 第 1 页 2 条（最新在前），total 为全部 5 条。
+	page1, total := feedOf(t, env, aliceToken, "?page=1&page_size=2")
+	require.Equal(t, int64(5), total)
+	require.Len(t, page1, 2)
+	require.Equal(t, "第 4 条", page1[0].(map[string]any)["content"], "最新在前")
+
+	// 第 2 页 2 条、第 3 页 1 条，各页无重复。
+	page2, _ := feedOf(t, env, aliceToken, "?page=2&page_size=2")
+	require.Len(t, page2, 2)
+	page3, _ := feedOf(t, env, aliceToken, "?page=3&page_size=2")
+	require.Len(t, page3, 1)
+	require.Equal(t, "第 0 条", page3[0].(map[string]any)["content"], "第 3 页剩最早一条")
+
+	// 越界页：空列表，total 不变。
+	page4, total4 := feedOf(t, env, aliceToken, "?page=99&page_size=2")
+	require.Empty(t, page4)
+	require.Equal(t, int64(5), total4)
+}
+
+func TestPostDeleteOwn(t *testing.T) {
+	env := requireEnv(t)
+	aliceID, aliceToken := register(t, env, "ava_pd")
+	bobID, bobToken := register(t, env, "bob_pd")
+	befriend(t, env, aliceToken, bobID, bobToken)
+
+	productID, skuID := seedProductSKU(t, env, "pd")
+	seedPurchase(t, env, aliceID, productID, skuID, ordermodel.OrderStatusCompleted)
+	post := sharePost(t, env, aliceToken, skuID, "alice 的")
+	postID := int64(post["id"].(float64))
+
+	// 他人（bob）删除 → 403。
+	w, _ := doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/posts/%d", postID), "", bobToken)
+	require.Equal(t, http.StatusForbidden, w.Code)
+
+	// 删除不存在 → 404。
+	w, _ = doJSON(t, env, http.MethodDelete, "/api/posts/999999", "", aliceToken)
+	require.Equal(t, http.StatusNotFound, w.Code)
+
+	// 本人删除 → 204；时间线中消失。
+	w, _ = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/posts/%d", postID), "", aliceToken)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	items, total := feedOf(t, env, bobToken, "")
+	require.Zero(t, total, "删除后时间线不再包含该动态")
+	require.Empty(t, items)
+
+	// 未带 token → 401。
+	w, _ = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/posts/%d", postID), "", "")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
 }
