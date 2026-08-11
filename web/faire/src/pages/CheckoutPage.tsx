@@ -11,7 +11,7 @@ import {
 } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import type { Address, CreateAddressRequest, UserCouponView } from "../api/types";
-import { formatAddress, formatMoney, isCouponUsable, makeClientRequestID, parseSpecs } from "../lib/format";
+import { formatAddress, formatMoney, formatSpecs, isCouponUsable, makeClientRequestID } from "../lib/format";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, Spinner } from "../components/ui";
 
 const emptyDraft: CreateAddressRequest = {
@@ -176,7 +176,7 @@ export function CheckoutPage() {
           <section className="checkout-section">
             <div className="checkout-section-heading"><div><p className="eyebrow text-smoke">03 / 商品</p><h2 className="mt-2 font-nantes text-3xl">确认这几件。</h2></div></div>
             <div className="checkout-items mt-6">
-              {items.map((item) => <div className="checkout-item" key={item.id}><div><strong>{item.title}</strong><p>{parseSpecs(item.specs).map(([key, value]) => `${key}: ${value}`).join(" · ") || "标准规格"} × {item.quantity}</p></div><strong>{formatMoney(item.price * item.quantity)}</strong></div>)}
+              {items.map((item) => <div className="checkout-item" key={item.id}><div><strong>{item.title}</strong><p>{formatSpecs(item.specs)} × {item.quantity}</p></div><strong>{formatMoney(item.price * item.quantity)}</strong></div>)}
             </div>
           </section>
         </div>

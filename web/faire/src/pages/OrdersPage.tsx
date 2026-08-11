@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { getOrders } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import type { OrderStatus, OrderView } from "../api/types";
-import { formatDate, formatMoney, parseSpecs } from "../lib/format";
+import { formatDate, formatMoney, formatSpecs } from "../lib/format";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, ProductVisual, StatusBadge } from "../components/ui";
 
 const tabs: Array<{ value: "all" | OrderStatus; label: string }> = [
@@ -91,7 +91,7 @@ function OrderCard({ order }: { order: OrderView }) {
       </div>
       <div className="order-card-body">
         {firstItem && <ProductVisual seed={firstItem.product_id} title={firstItem.title} />}
-        <div className="min-w-0 flex-1"><h2 className="text-lg">{firstItem?.title || "订单商品"}</h2><p className="mt-2 text-sm text-smoke">{firstItem ? `${parseSpecs(firstItem.specs).map(([key, value]) => `${key}: ${value}`).join(" · ") || "标准规格"} × ${firstItem.quantity}` : "订单正在准备中"}{remaining > 0 && ` · 另有 ${remaining} 件商品`}</p></div>
+        <div className="min-w-0 flex-1"><h2 className="text-lg">{firstItem?.title || "订单商品"}</h2><p className="mt-2 text-sm text-smoke">{firstItem ? `${formatSpecs(firstItem.specs)} × ${firstItem.quantity}` : "订单正在准备中"}{remaining > 0 && ` · 另有 ${remaining} 件商品`}</p></div>
         <div className="order-card-money"><span>应付金额</span><strong>{formatMoney(order.pay_amount)}</strong></div>
       </div>
       <div className="order-card-bottom"><span className="text-sm text-smoke">{order.order_type === "seckill" ? "秒杀订单" : "普通订单"}</span><Link to={`/orders/${order.order_no}`} className="button button-secondary button-small">查看订单 <Icon name="arrow-right" size={15} /></Link></div>

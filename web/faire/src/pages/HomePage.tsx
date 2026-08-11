@@ -107,7 +107,7 @@ export function HomePage() {
           <div className="empty-state border border-ash bg-white mt-8">
             <p className="eyebrow text-smoke">目录暂空</p>
             <h2 className="mt-3 font-nantes text-3xl">还没有匹配的商品。</h2>
-            <p className="mt-2 text-sm text-smoke">换一个关键词，或回到全部类目看看。</p>
+            <p className="mt-2 text-sm text-smoke">换一个类目，或回到全部商品看看。</p>
             <Button variant="secondary" className="mt-6" onClick={() => chooseCategory()}>
               回到全部商品 <Icon name="arrow-right" size={16} />
             </Button>
@@ -133,7 +133,7 @@ export function HomePage() {
 
       <section className="inverted-section mt-20 sm:mt-28">
         <div className="site-container inverted-section-inner">
-          <p className="eyebrow text-butter-highlight">FAIRE / 选择的理由</p>
+          <p className="eyebrow text-white/70">FAIRE / 选择的理由</p>
           <h2 className="mt-5 max-w-3xl font-nantes text-4xl leading-tight text-white sm:text-5xl">
             不急着填满购物车，<br />先留下真正合适的东西。
           </h2>

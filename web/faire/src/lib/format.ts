@@ -47,6 +47,10 @@ export function parseSpecs(value: unknown): Array<[string, string]> {
   return Object.entries(parsed).map(([key, item]) => [key, String(item)]);
 }
 
+export function formatSpecs(value: unknown) {
+  return parseSpecs(value).map(([key, item]) => `${key}: ${item}`).join(" · ") || "标准规格";
+}
+
 export function makeClientRequestID() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();

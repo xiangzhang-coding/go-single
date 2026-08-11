@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { deleteCartItem, getCart, updateCartItem } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
-import { formatMoney, parseSpecs } from "../lib/format";
+import { formatMoney, formatSpecs } from "../lib/format";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, ProductVisual, QuantityStepper } from "../components/ui";
 
 export function CartPage() {
@@ -77,7 +77,7 @@ export function CartPage() {
                       <div>
                         <p className="eyebrow text-smoke">SKU / {item.sku_id}</p>
                         <Link to={`/products/${item.product_id}`} className="mt-2 block text-lg text-ink-black hover:underline underline-offset-4">{item.title}</Link>
-                        <p className="mt-2 text-sm text-smoke">{parseSpecs(item.specs).map(([key, value]) => `${key}: ${value}`).join(" · ") || "标准规格"}</p>
+                        <p className="mt-2 text-sm text-smoke">{formatSpecs(item.specs)}</p>
                       </div>
                       <button type="button" className="icon-button icon-button-subtle" aria-label={`删除 ${item.title}`} onClick={() => deleteMutation.mutate(item.id)} disabled={isMutating}>
                         <Icon name="trash" size={17} />

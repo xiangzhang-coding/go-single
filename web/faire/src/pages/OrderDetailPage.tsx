@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { cancelOrder, confirmOrder, getOrder, mockPay } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
-import { formatAddress, formatDate, formatMoney, parseSpecs } from "../lib/format";
+import { formatAddress, formatDate, formatMoney, formatSpecs } from "../lib/format";
 import { Button, ErrorState, Icon, LoadingBlock, ProductVisual, Spinner, StatusBadge } from "../components/ui";
 
 export function OrderDetailPage() {
@@ -93,7 +93,7 @@ export function OrderDetailPage() {
           <div className="order-detail-main">
             <section className="detail-panel">
               <div className="detail-panel-heading"><div><p className="eyebrow text-smoke">商品明细</p><h2 className="mt-2 font-nantes text-3xl">你选择的东西</h2></div><span className="text-sm text-smoke">{order.items.length} 件</span></div>
-              <div className="order-items mt-6">{order.items.map((item) => <div className="order-item" key={item.id}><ProductVisual seed={item.product_id} title={item.title} /><div className="min-w-0 flex-1"><h3 className="text-base">{item.title}</h3><p className="mt-2 text-sm text-smoke">{parseSpecs(item.specs).map(([key, value]) => `${key}: ${value}`).join(" · ") || "标准规格"} × {item.quantity}</p></div><strong>{formatMoney(item.subtotal)}</strong></div>)}</div>
+              <div className="order-items mt-6">{order.items.map((item) => <div className="order-item" key={item.id}><ProductVisual seed={item.product_id} title={item.title} /><div className="min-w-0 flex-1"><h3 className="text-base">{item.title}</h3><p className="mt-2 text-sm text-smoke">{formatSpecs(item.specs)} × {item.quantity}</p></div><strong>{formatMoney(item.subtotal)}</strong></div>)}</div>
             </section>
             <section className="detail-panel mt-8"><div className="detail-panel-heading"><div><p className="eyebrow text-smoke">地址快照</p><h2 className="mt-2 font-nantes text-3xl">寄到这里</h2></div><Icon name="pin" size={20} /></div><div className="saved-address mt-6"><strong>{order.receiver}</strong><span>{order.phone}</span><p>{formatAddress(order)}</p></div></section>
           </div>
