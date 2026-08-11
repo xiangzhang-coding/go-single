@@ -47,8 +47,10 @@ const (
 // mqEnv 秒杀异步落单测试环境：真实 MQ 发布 + 常驻消费者 + 完整路由。
 // 复用 integration_test.go 的 testEnv（MySQL/Redis/verifier/product 等）。
 type mqEnv struct {
-	router   http.Handler
-	mqClient mq.MQ
+	router    http.Handler
+	mqClient  mq.MQ
+	orderSvc  ordersvc.Service
+	reconcile flashsalesvc.Reconciliation
 }
 
 var (
@@ -115,8 +117,11 @@ func buildMQEnv() (*mqEnv, error) {
 	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(gdb), UserCoupon: couponrepo.NewGORMUserCoupon(gdb)}, cacheClient)
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc)
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc)
 	orderHandler := orderhandler.New(orderSvc, verifier)
+
+	// T13 秒杀库存对账：有效订单数经 order 服务端口统计。
+	reconcile := flashsalesvc.NewReconciliation(flashsaleStore, cacheClient, orderSvc)
 
 	// 常驻消费者：订阅"抢购成功"队列异步落单；连接中断自动重连（at-least-once）。
 	log := zap.NewNop()
@@ -140,7 +145,7 @@ func buildMQEnv() (*mqEnv, error) {
 	flashsaleHandler.RegisterRoutes(api, allowAll)
 	orderHandler.RegisterRoutes(api)
 
-	return &mqEnv{router: r, mqClient: mqClient}, nil
+	return &mqEnv{router: r, mqClient: mqClient, orderSvc: orderSvc, reconcile: reconcile}, nil
 }
 
 // ---- 请求助手（复用 integration_test.go 的 doJSONOn）----

@@ -22,6 +22,9 @@ type ActivityRepository interface {
 	// 返回是否扣减成功（库存不足返回 (false, nil)）。供秒杀异步落单在订单
 	// 事务内扣减（MySQL 为落单事实源，与 Redis 预扣对账）。
 	DeductStock(ctx context.Context, tx *gorm.DB, id int64, quantity int) (bool, error)
+	// RestoreStock 事务内回补活动库存（stock + quantity）。供秒杀订单取消
+	// 在订单事务内回补（与状态迁移同事务，MySQL 为落单事实源）。
+	RestoreStock(ctx context.Context, tx *gorm.DB, id int64, quantity int) error
 }
 
 // Store 聚合活动仓储，作为 service 的构造入参。

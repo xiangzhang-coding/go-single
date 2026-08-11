@@ -94,6 +94,44 @@ func (f *fakeOrders) ListExpiredPending(_ context.Context, now time.Time, limit 
 	return out, nil
 }
 
+// ListExpiredSeckillPending 与 ListExpiredPending 同规则，仅订单类型为秒杀。
+func (f *fakeOrders) ListExpiredSeckillPending(_ context.Context, now time.Time, limit int) ([]model.Order, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	var out []model.Order
+	for _, o := range f.byID {
+		if o.Status == model.OrderStatusPendingPayment &&
+			o.OrderType == model.OrderTypeSeckill && o.ExpireAt.Before(now) {
+			out = append(out, *o)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].ExpireAt.Equal(out[j].ExpireAt) {
+			return out[i].ExpireAt.Before(out[j].ExpireAt)
+		}
+		return out[i].OrderNo < out[j].OrderNo
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// CountValidByActivity 非取消订单数（对账端口）。
+func (f *fakeOrders) CountValidByActivity(_ context.Context, activityID int64) (int, error) {
+	if f.getErr != nil {
+		return 0, f.getErr
+	}
+	n := 0
+	for _, o := range f.byID {
+		if o.ActivityID != nil && *o.ActivityID == activityID && o.Status != model.OrderStatusCancelled {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (f *fakeOrders) Cancel(_ context.Context, tx *gorm.DB, orderNo string) (bool, error) {
 	if f.skipCancel[orderNo] {
 		return false, nil
@@ -103,6 +141,7 @@ func (f *fakeOrders) Cancel(_ context.Context, tx *gorm.DB, orderNo string) (boo
 		return false, nil
 	}
 	o.Status = model.OrderStatusCancelled
+	o.UserActivityKey = nil // 镜像仓储：取消同事务置空秒杀去重键
 	return true, nil
 }
 
@@ -431,11 +470,15 @@ func (f *fakeUsers) GetAddress(_ context.Context, userID, id int64) (*usermodel.
 	return a, nil
 }
 
-// fakeActivities 模拟 flashsale 侧 ActivityStock 端口（订单事务内扣活动库存）。
+// fakeActivities 模拟 flashsale 侧 ActivityStock + SeckillRestore 端口
+// （订单事务内扣/回补活动库存；事务提交后回补 Redis）。
 type fakeActivities struct {
-	stocks    map[int64]int
-	deductErr error
-	deducted  []int64 // 扣减流水（活动ID），供断言幂等不重复扣
+	stocks      map[int64]int
+	deductErr   error
+	deducted    []int64 // 扣减流水（活动ID），供断言幂等不重复扣
+	restored    []int64 // MySQL 回补流水（活动ID）
+	redisFailed error   // RestoreRedis 失败注入：模拟 Redis 故障
+	redisLog    []string
 }
 
 func newFakeActivities() *fakeActivities {
@@ -459,6 +502,24 @@ func (f *fakeActivities) DeductStock(_ context.Context, _ *gorm.DB, activityID i
 	f.deducted = append(f.deducted, activityID)
 	return true, nil
 }
+
+// RestoreStock 模拟事务内回补活动库存（SeckillRestore 端口）。
+func (f *fakeActivities) RestoreStock(_ context.Context, _ *gorm.DB, activityID int64, quantity int) error {
+	f.stocks[activityID] += quantity
+	f.restored = append(f.restored, activityID)
+	return nil
+}
+
+// RestoreRedis 模拟事务提交后的 Redis 回补（SeckillRestore 端口）；redisFailed 注入故障。
+func (f *fakeActivities) RestoreRedis(_ context.Context, activityID, userID int64, quantity int) error {
+	if f.redisFailed != nil {
+		return f.redisFailed
+	}
+	f.redisLog = append(f.redisLog, fmt.Sprintf("%d:%d:%d", activityID, userID, quantity))
+	return nil
+}
+
+var _ SeckillRestore = (*fakeActivities)(nil)
 
 // fakeNos 序列号生成器：1, 2, 3, ...
 type fakeNos struct{ next int64 }
@@ -488,7 +549,7 @@ func newFixture() *fixture {
 	activities := newFakeActivities()
 	svc := New(
 		repository.Store{Orders: orders, Items: items, Tx: fakeTx{}},
-		cache, &fakeNos{}, prods, coupons, cart, users, activities,
+		cache, &fakeNos{}, prods, coupons, cart, users, activities, activities,
 	)
 	return &fixture{svc: svc, orders: orders, items: items, cache: cache, prods: prods,
 		coupons: coupons, cart: cart, users: users, activities: activities}
@@ -812,8 +873,9 @@ func TestCancelRestoresStockAndCoupon(t *testing.T) {
 	require.Equal(t, 10, fx.prods.skus[1].Stock, "重复取消不得重复回补")
 }
 
-// 秒杀订单禁止用户取消（T12 守卫）：回补路径（活动库存/Redis/用户计数）未实现，
-// 走普通订单回补会错补 SKU 库存；取消由后续秒杀取消任务负责。
+// 秒杀订单禁止用户主动取消（T12 守卫，T13 保留）：回补路径（活动库存 + Redis +
+// 用户计数）仅由超时取消触发（CancelExpiredSeckill）；用户取消走普通订单回补
+// 会错补 SKU 库存，故仍拒绝。
 func TestCancelRejectsSeckillOrders(t *testing.T) {
 	fx := newFixture()
 	fx.seed(t)
@@ -826,7 +888,7 @@ func TestCancelRejectsSeckillOrders(t *testing.T) {
 	o := fx.orders.byID["SK1"]
 	require.Equal(t, model.OrderStatusPendingPayment, o.Status, "状态不得被改写")
 	require.Equal(t, 10, fx.prods.skus[1].Stock, "不得错补 SKU 库存")
-	require.Equal(t, 9, fx.activities.stocks[100], "活动库存不得被回补（回补任务未实现）")
+	require.Equal(t, 9, fx.activities.stocks[100], "用户取消不得回补活动库存（超时取消才回补）")
 }
 
 // 超时取消：仅取消已过 expire_at 的待支付普通订单，回补库存并回退券；
@@ -921,6 +983,136 @@ func TestCancelExpiredPropagatesScanError(t *testing.T) {
 
 	_, _, err := fx.svc.CancelExpired(context.Background())
 	require.Error(t, err)
+}
+
+// ---- 秒杀订单超时取消（T13）----
+
+// 秒杀超时取消：事务内 状态→已取消 + 回补活动库存（MySQL），
+// 事务提交后回补 Redis（库存 + 用户计数 + 幂等键）——允许再次抢购。
+func TestCancelExpiredSeckillRestoresStockAndRedis(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("SK1")))
+	o := fx.orders.byID["SK1"]
+	o.ExpireAt = time.Now().Add(-time.Minute)
+	require.Equal(t, 9, fx.activities.stocks[100], "落单应扣活动库存")
+
+	n, failed, redisFailed, err := fx.svc.CancelExpiredSeckill(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, failed)
+	require.Zero(t, redisFailed)
+	require.Equal(t, 1, n)
+
+	require.Equal(t, model.OrderStatusCancelled, o.Status, "状态应迁移为已取消")
+	require.Equal(t, 10, fx.activities.stocks[100], "应回补活动库存（MySQL）")
+	require.Equal(t, []string{"100:42:1"}, fx.activities.redisLog, "应回补 Redis（活动:用户:数量）")
+}
+
+// 秒杀超时取消只处理秒杀订单：超时普通订单不在本任务范围（由 CancelExpired 处理）。
+func TestCancelExpiredSeckillSkipsNormalOrders(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("SK1")))
+	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("n1", 1, 1))
+	require.NoError(t, err)
+	fx.orders.byID["SK1"].ExpireAt = time.Now().Add(-time.Minute)
+	fx.orders.byID[res.Order.OrderNo].ExpireAt = time.Now().Add(-time.Minute)
+
+	n, failed, redisFailed, err := fx.svc.CancelExpiredSeckill(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, failed)
+	require.Zero(t, redisFailed)
+	require.Equal(t, 1, n, "仅超时秒杀订单应被取消")
+	require.Equal(t, model.OrderStatusPendingPayment, fx.orders.byID[res.Order.OrderNo].Status,
+		"普通订单不受本任务影响")
+	require.Equal(t, 9, fx.prods.skus[1].Stock, "普通订单库存不得被回补")
+}
+
+// 秒杀超时取消并发兜底：扫描后订单已被支付（条件更新 RowsAffected=0）时
+// 跳过并计入失败，活动库存与 Redis 均不回补（不重复回补）。
+func TestCancelExpiredSeckillSkipsConcurrentPaidOrder(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("SK1")))
+	fx.orders.byID["SK1"].ExpireAt = time.Now().Add(-time.Minute)
+	fx.orders.skipCancel["SK1"] = true
+
+	n, failed, redisFailed, err := fx.svc.CancelExpiredSeckill(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, n)
+	require.Equal(t, 1, failed, "状态已变的订单计入失败（跳过不阻断）")
+	require.Zero(t, redisFailed)
+	require.Empty(t, fx.activities.restored, "跳过不得回补活动库存")
+	require.Empty(t, fx.activities.redisLog, "跳过不得回补 Redis")
+	require.Equal(t, 9, fx.activities.stocks[100])
+}
+
+// 秒杀超时取消：Redis 回补失败（基础设施故障）计入 redisFailed 且订单仍取消；
+// 不重试（订单已落取消态，重试将命中状态已变），由对账 cron 兜底。
+func TestCancelExpiredSeckillRedisFailureCounted(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("SK1")))
+	fx.orders.byID["SK1"].ExpireAt = time.Now().Add(-time.Minute)
+	fx.activities.redisFailed = errors.New("redis down")
+
+	n, failed, redisFailed, err := fx.svc.CancelExpiredSeckill(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, failed)
+	require.Equal(t, 1, n, "Redis 回补失败不阻断取消（MySQL 事实源已一致）")
+	require.Equal(t, 1, redisFailed, "Redis 回补失败应计数供 cron 告警")
+	require.Equal(t, model.OrderStatusCancelled, fx.orders.byID["SK1"].Status)
+	require.Equal(t, 10, fx.activities.stocks[100], "MySQL 回补不受 Redis 失败影响")
+}
+
+// 秒杀超时取消：单订单事务失败不阻断整轮（其余订单继续取消）。
+func TestCancelExpiredSeckillContinuesAfterDBFailure(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("SK1")))
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("SK2")))
+	fx.orders.byID["SK1"].ExpireAt = time.Now().Add(-time.Minute)
+	fx.orders.byID["SK2"].ExpireAt = time.Now().Add(-time.Minute)
+	fx.orders.skipCancel["SK1"] = true // SK1 状态已变（如并发支付）
+
+	n, failed, _, err := fx.svc.CancelExpiredSeckill(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "SK2 应正常取消")
+	require.Equal(t, 1, failed, "SK1 失败不影响 SK2")
+	require.Equal(t, model.OrderStatusCancelled, fx.orders.byID["SK2"].Status)
+}
+
+// 秒杀超时扫描仓储故障：错误向上传播（cron 记录日志，下个 tick 重试）。
+func TestCancelExpiredSeckillPropagatesScanError(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.orders.getErr = errors.New("db down")
+
+	_, _, _, err := fx.svc.CancelExpiredSeckill(context.Background())
+	require.Error(t, err)
+}
+
+// 数据异常兜底：秒杀订单缺活动引用时跳过不取消（避免错补），计失败供排查。
+func TestCancelExpiredSeckillSkipsOrderWithoutActivity(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.activities.seed(100, 10)
+	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("SK1")))
+	o := fx.orders.byID["SK1"]
+	o.ExpireAt = time.Now().Add(-time.Minute)
+	o.ActivityID = nil // 模拟数据异常
+
+	n, failed, _, err := fx.svc.CancelExpiredSeckill(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, n)
+	require.Equal(t, 1, failed)
+	require.Equal(t, model.OrderStatusPendingPayment, o.Status, "缺活动引用不得取消")
+	require.Empty(t, fx.activities.redisLog)
 }
 
 // 状态机：待支付不可确认收货/发货；已支付不可取消。

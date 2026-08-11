@@ -57,6 +57,11 @@ type Order struct {
 	ExpireAt       time.Time  `json:"expire_at" gorm:"column:expire_at"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
+	// UserActivityKey 秒杀订单去重键（T13）：落单写 "user_id:activity_id"，
+	// 取消/超时取消同事务置 NULL（MySQL 唯一索引允许多个 NULL——取消后允许
+	// 再次抢购，不再占 (user, activity) 去重位）；非取消订单仍唯一挡重复落单。
+	// 普通订单恒 NULL（JSON 不暴露内部键）。
+	UserActivityKey *string `json:"-" gorm:"column:user_activity_key"`
 }
 
 // OrderItem 订单项：下单时固化的商品快照（标题/规格/成交单价），

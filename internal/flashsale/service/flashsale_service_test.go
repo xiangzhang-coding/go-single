@@ -82,6 +82,16 @@ func (f *fakeActivities) DeductStock(_ context.Context, _ *gorm.DB, id int64, qu
 	return true, nil
 }
 
+// RestoreStock 模拟事务内回补活动库存。
+func (f *fakeActivities) RestoreStock(_ context.Context, _ *gorm.DB, id int64, quantity int) error {
+	v, ok := f.byID[id]
+	if !ok {
+		return nil
+	}
+	v.Stock += quantity
+	return nil
+}
+
 // ---- fake product 服务 ----
 
 type fakeProducts struct {
@@ -167,6 +177,7 @@ func (f *fakeCache) Del(_ context.Context, key string) error {
 // （加锁模拟单线程原子执行）：
 //   - flashsale:idem: → idemScript（SETNX + EXPIRE）；
 //   - flashsale:rl: → countScript（固定窗口计数 INCR）；
+//   - 3 个 key = restoreScript：库存 INCR + 用户计数 DECR + 释放幂等键；
 //   - 2 参 = prewarmScript：key 缺失写入；配置库存更低才覆盖（只减不增）；
 //   - 5 参 = preDeductScript：status → 时间窗口 → 库存 → 每人限购 → DECR + INCR。
 func (f *fakeCache) Eval(_ context.Context, _ string, keys []string, args ...any) (int64, error) {
@@ -185,6 +196,17 @@ func (f *fakeCache) Eval(_ context.Context, _ string, keys []string, args ...any
 	case strings.HasPrefix(keys[0], "flashsale:rl:"):
 		f.rl[keys[0]]++
 		return int64(f.rl[keys[0]]), nil
+	case len(keys) == 3:
+		// restoreScript：镜像 EXISTS 守卫（key 缺失不重建）。
+		qty := args[0].(int)
+		if _, ok := f.stock[keys[0]]; ok {
+			f.stock[keys[0]] += qty
+		}
+		if _, ok := f.count[keys[1]]; ok {
+			f.count[keys[1]] -= qty
+		}
+		delete(f.idem, keys[2])
+		return 1, nil
 	case len(args) == 2:
 		stock := args[0].(int)
 		if cur, ok := f.stock[keys[0]]; !ok || stock < cur {

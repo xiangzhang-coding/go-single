@@ -123,7 +123,7 @@ func buildEnv() (*testEnv, error) {
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(
 		orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
-		noopCache{}, stubOrderNoGen{}, stubProducts{}, stubCoupons{}, stubCart{}, userSvc, stubActivity{})
+		noopCache{}, stubOrderNoGen{}, stubProducts{}, stubCoupons{}, stubCart{}, userSvc, stubActivity{}, stubActivity{})
 
 	socialStore := socialrepo.Store{
 		Requests:    socialrepo.NewGORMRequest(gdb),
@@ -190,6 +190,9 @@ type stubActivity struct{}
 func (stubActivity) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
 	return true, nil
 }
+
+func (stubActivity) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
+func (stubActivity) RestoreRedis(context.Context, int64, int64, int) error    { return nil }
 
 func testDSN(dbName string) string {
 	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=Local",

@@ -269,11 +269,16 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// order 模块：购物车结算/直购下单（单事务：订单+订单项+库存+地址快照+券核销+
 	// 删除购物车条目）、client_request_id 幂等（Redis SETNX）、雪花订单号、
 	// 订单列表/详情、取消（回补库存+回退券）、确认收货与 admin 发货；
-	// CreateSeckill（T12）：秒杀异步落单单事务 + 扣活动库存（flashsale 实现端口）。
+	// CreateSeckill（T12）：秒杀异步落单单事务 + 扣活动库存（flashsale 实现端口）；
+	// CancelExpiredSeckill（T13）：秒杀超时取消回补（flashsale 实现 SeckillRestore 端口）。
 	orderStore := orderrepo.NewGORMOrder(db)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc)
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc)
 	orderHandler := orderhandler.New(orderSvc, verifier)
+
+	// 秒杀库存对账（T13）：进行中只比对告警（补单信号），收尾以 MySQL 对齐 Redis；
+	// 有效订单数经 order 服务端口统计（进程内调用，flashsale → order 单向依赖）。
+	reconcile := flashsalesvc.NewReconciliation(flashsaleStore, cacheClient, orderSvc)
 
 	// social 模块：好友申请/通过/拒绝与好友列表；用户名经 userSvc 跨模块进程内调用补齐。
 	// 好友圈动态：分享购买校验经 orderSvc（已支付/已发货/已完成订单含该 SKU）。
@@ -328,7 +333,10 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// cron 定时任务：平台级注册机制（platform/cron），单实例调度；
 	// T09 订单超时取消——每分钟扫描已过 expire_at 的待支付普通订单，
 	// 事务内取消 + 回补库存 + 回退券；单订单失败跳过（失败数记日志，下个 tick 重试）。
-	cronRegistry := registerCron(log, orderSvc)
+	// T13 秒杀超时取消——每分钟扫描待支付秒杀订单，回补活动库存 + Redis 库存 +
+	// 用户计数（允许再次抢购）；对账——每小时进行中只比对告警（补单信号）、
+	// 每分钟收尾以 MySQL 对齐刚结束活动的 Redis 库存。
+	cronRegistry := registerCron(log, orderSvc, reconcile)
 	cronRegistry.Start()
 
 	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
@@ -377,8 +385,7 @@ func (n wsMessageNotifier) NotifyMessageSent(_ context.Context, msg *chatmodel.M
 var _ chatsvc.MessageNotifier = wsMessageNotifier{}
 
 // registerCron 注册全部定时任务并返回调度器（Start 由调用方执行）。
-// 后续任务（如库存对账）在此追加。
-func registerCron(log *zap.Logger, orderSvc ordersvc.Service) *platformcron.Registry {
+func registerCron(log *zap.Logger, orderSvc ordersvc.Service, reconcile flashsalesvc.Reconciliation) *platformcron.Registry {
 	registry := platformcron.New(log, 5*time.Minute)
 	if err := registry.Register(platformcron.Job{
 		Name: "order-timeout-cancel",
@@ -393,6 +400,59 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service) *platformcron.Regi
 		},
 	}); err != nil {
 		log.Fatal("注册超时取消任务失败", zap.Error(err))
+	}
+	if err := registry.Register(platformcron.Job{
+		Name: "seckill-timeout-cancel",
+		Spec: "* * * * *",
+		Fn: func(ctx context.Context) error {
+			cancelled, failed, redisFailed, err := orderSvc.CancelExpiredSeckill(ctx)
+			if err != nil {
+				return err
+			}
+			log.Info("秒杀订单超时取消完成",
+				zap.Int("cancelled", cancelled), zap.Int("failed", failed), zap.Int("redis_failed", redisFailed))
+			return nil
+		},
+	}); err != nil {
+		log.Fatal("注册秒杀超时取消任务失败", zap.Error(err))
+	}
+	if err := registry.Register(platformcron.Job{
+		Name: "flashsale-reconcile-active",
+		Spec: "0 * * * *",
+		Fn: func(ctx context.Context) error {
+			warnings, err := reconcile.ReconcileActive(ctx)
+			if err != nil {
+				return err
+			}
+			for _, w := range warnings {
+				log.Warn("秒杀库存对账差异（进行中，仅告警不写回）",
+					zap.Int64("activity_id", w.ActivityID), zap.String("title", w.Title),
+					zap.Int("redis_stock", w.RedisStock), zap.Int("mysql_stock", w.MySQLStock),
+					zap.Int("order_count", w.OrderCount), zap.String("detail", w.Detail))
+			}
+			if len(warnings) == 0 {
+				log.Info("秒杀库存对账无差异")
+			}
+			return nil
+		},
+	}); err != nil {
+		log.Fatal("注册秒杀对账任务失败", zap.Error(err))
+	}
+	if err := registry.Register(platformcron.Job{
+		Name: "flashsale-reconcile-ended",
+		Spec: "* * * * *",
+		Fn: func(ctx context.Context) error {
+			aligned, err := reconcile.ReconcileEnded(ctx)
+			if err != nil {
+				return err
+			}
+			if aligned > 0 {
+				log.Warn("秒杀收尾对账已对齐", zap.Int("aligned", aligned))
+			}
+			return nil
+		},
+	}); err != nil {
+		log.Fatal("注册秒杀收尾对账任务失败", zap.Error(err))
 	}
 	return registry
 }

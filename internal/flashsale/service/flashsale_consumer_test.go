@@ -215,5 +215,6 @@ func (failingActivities) UpdateStatus(context.Context, int64, string) error {
 func (failingActivities) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
 	return true, nil
 }
+func (failingActivities) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
 
 var _ repository.ActivityRepository = (*failingActivities)(nil)

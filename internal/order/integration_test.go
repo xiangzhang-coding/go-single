@@ -68,6 +68,9 @@ func (noopActivity) DeductStock(context.Context, *gorm.DB, int64, int) (bool, er
 	return true, nil
 }
 
+func (noopActivity) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
+func (noopActivity) RestoreRedis(context.Context, int64, int64, int) error    { return nil }
+
 // testEnv 每个测试包只构建一次；MySQL 或 Redis 不可达时整体跳过。
 type testEnv struct {
 	router   http.Handler
@@ -171,7 +174,7 @@ func buildEnv() (*testEnv, error) {
 	}
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, noopActivity{})
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, noopActivity{}, noopActivity{})
 	orderHandler := orderhandler.New(orderSvc, verifier)
 	paymentStore := paymentrepo.NewGORMPayment(gdb)
 	paymentHandler := paymenthandler.New(

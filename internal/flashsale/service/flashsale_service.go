@@ -124,6 +124,27 @@ end
 return 0
 `
 
+// restoreScript Lua 原子回补（秒杀订单取消/超时取消后，允许再次抢购，T13）：
+//   - 库存 key 存在才 INCR 回补（预热 TTL 过期自清理后不回建僵尸 key）；
+//   - 用户计数 key 存在才 DECR（计数仅作限购判定，抢购前必 INCR）；
+//   - 释放幂等键（30min TTL 内用户可立即重抢）。
+//
+// 一次调用避免与预扣 DECR/INCR 竞态（与 preDeductScript 同模式）。
+// 已知取舍：与"再次抢购"的幂等键抢占（SETNX）存在毫秒级竞态——用户重抢
+// 先于脚本执行时，DEL 会释放新抢购的幂等键。可接受：重复落单仍由
+// user_activity_key 唯一约束（DB 幂等段）兜底，Redis 差额由对账 cron 收敛。
+// KEYS[1] 库存 key；KEYS[2] 用户计数 key；KEYS[3] 幂等键；ARGV[1] 回补数量。
+const restoreScript = `
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    redis.call('INCRBY', KEYS[1], ARGV[1])
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+    redis.call('DECRBY', KEYS[2], ARGV[1])
+end
+redis.call('DEL', KEYS[3])
+return 1
+`
+
 // ActivityParams 活动参数（创建/编辑共用；状态经 上架/下架 端点变更）。
 type ActivityParams struct {
 	SKUID        int64
@@ -164,6 +185,13 @@ type Service interface {
 	// DeductStock 事务内条件扣减活动库存（MySQL 落单事实源）；实现 order 侧
 	// ActivityStock 端口，返回是否扣减成功（库存不足返回 (false, nil)）。
 	DeductStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) (bool, error)
+
+	// ---- 取消回补（T13，order 模块超时取消调用）----
+	// RestoreStock 事务内回补活动库存（MySQL，与订单状态迁移同事务）；
+	// RestoreRedis 事务提交后回补 Redis 库存 + 用户计数并释放幂等键
+	// （允许再次抢购）；两者共同实现 order 侧 SeckillRestore 端口。
+	RestoreStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) error
+	RestoreRedis(ctx context.Context, activityID, userID int64, quantity int) error
 }
 
 // ProductService product 模块暴露的最小查询接口（跨模块进程内调用，面向接口非 HTTP；
@@ -396,6 +424,24 @@ func isBusinessReject(err error) bool {
 	return errors.Is(err, ErrSoldOut) || errors.Is(err, ErrNotInWindow) ||
 		errors.Is(err, ErrLimitReached) || errors.Is(err, ErrOffline) ||
 		errors.Is(err, ErrActivityNotFound)
+}
+
+// ---- 取消回补（T13）----
+
+// RestoreStock 事务内回补活动库存（MySQL，对账事实源）：秒杀订单取消在
+// 订单事务内调用，与状态迁移同事务（实现 order 侧 SeckillRestore 端口）。
+func (s *flashsaleService) RestoreStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) error {
+	return s.store.Activities.RestoreStock(ctx, tx, activityID, quantity)
+}
+
+// RestoreRedis 事务提交后回补 Redis（best-effort，允许再次抢购）：
+// Lua 原子 INCR 库存 + DECR 用户计数 + 释放幂等键；key 不存在不重建
+// （预热过期自清理）。失败由对账 cron 兜底（Redis 有扣减但无对应订单信号）。
+func (s *flashsaleService) RestoreRedis(ctx context.Context, activityID, userID int64, quantity int) error {
+	_, err := s.cache.Eval(ctx, restoreScript,
+		[]string{stockKey(activityID), countKey(activityID, userID), idemKey(activityID, userID)},
+		quantity)
+	return err
 }
 
 // ---- 抢购预扣 ----

@@ -66,5 +66,17 @@ func (r *GORMActivityRepository) DeductStock(ctx context.Context, tx *gorm.DB, i
 	return res.RowsAffected == 1, nil
 }
 
+// RestoreStock 回补库存：UPDATE ... SET stock = stock + ? WHERE id = ?
+// （秒杀订单取消/超时取消回补；活动存在由订单外键 RESTRICT 保证）。
+func (r *GORMActivityRepository) RestoreStock(ctx context.Context, tx *gorm.DB, id int64, quantity int) error {
+	exec := tx
+	if exec == nil {
+		exec = r.db.WithContext(ctx)
+	}
+	return exec.Model(&model.Activity{}).
+		Where("id = ?", id).
+		Update("stock", gorm.Expr("stock + ?", quantity)).Error
+}
+
 // 编译期断言：GORM 实现满足仓储接口。
 var _ ActivityRepository = (*GORMActivityRepository)(nil)

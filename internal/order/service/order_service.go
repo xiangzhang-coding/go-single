@@ -119,6 +119,17 @@ type ActivityStock interface {
 	DeductStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) (bool, error)
 }
 
+// SeckillRestore 秒杀订单取消回补端口（跨模块端口，实现方为 flashsale 模块，
+// 与 ActivityStock 同模式）：超时取消时回补活动库存与 Redis 预扣态，
+// 允许用户再次抢购（T13）。
+type SeckillRestore interface {
+	// RestoreStock 事务内回补活动库存（与取消状态迁移同事务，MySQL 为对账事实源）。
+	RestoreStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) error
+	// RestoreRedis 事务提交后回补 Redis（库存 + 用户计数 + 释放幂等键）。
+	// best-effort：失败不阻断取消（订单已落取消态），由对账 cron 兜底。
+	RestoreRedis(ctx context.Context, activityID, userID int64, quantity int) error
+}
+
 // OrderNoGenerator 订单号生成器（雪花 ID 手写实现，见 platform/snowflake）。
 type OrderNoGenerator interface {
 	Next() (int64, error)
@@ -167,8 +178,9 @@ type Service interface {
 	Create(ctx context.Context, userID int64, p CreateParams) (*CreateResult, error)
 	// CreateSeckill 秒杀异步落单（T12，MQ 消费者回调）：
 	// 单事务创建秒杀订单（order_type=seckill，不使用券）+ 订单项 +
-	// 条件扣减活动库存（ActivityStock）；(user_id, activity_id) 唯一约束与
-	// order_no 主键命中重复（重复投递/并发消费）视为成功（幂等，不重复扣库存）。
+	// 条件扣减活动库存（ActivityStock）；user_activity_key 唯一约束（T13，
+	// 取消置 NULL 后不再占位）与 order_no 主键命中重复（重复投递/并发消费）
+	// 视为成功（幂等，不重复扣库存）。
 	// 活动库存不足返回 ErrSeckillStockInsufficient（永久失败，死信 + 对账兜底）。
 	CreateSeckill(ctx context.Context, p SeckillCreateParams) error
 	// List 我的订单（状态筛选 + 分页）。
@@ -181,6 +193,15 @@ type Service interface {
 	// 普通订单，逐个事务内取消（条件更新 + 回补库存 + 回退券）；
 	// 返回 (取消数, 失败数)。并发下已被支付/取消的订单跳过（条件更新兜底）。
 	CancelExpired(ctx context.Context) (cancelled, failed int, err error)
+	// CancelExpiredSeckill 秒杀订单超时取消（cron 任务回调，T13）：扫描待支付
+	// 且已过 expire_at 的秒杀订单，逐个事务内取消（条件更新 + 回补活动库存），
+	// 事务提交后回补 Redis（库存 + 用户计数 + 释放幂等键，允许再次抢购）。
+	// 返回 (取消数, DB 失败数, Redis 回补失败数)：DB 失败下个 tick 重试；
+	// Redis 失败不重试（订单已取消，重试将命中状态已变），由对账 cron 兜底。
+	CancelExpiredSeckill(ctx context.Context) (cancelled, failed, redisFailed int, err error)
+	// CountValidSeckill 活动的秒杀有效订单数（非取消），对账端口
+	// （flashsale 模块 ReconcileActive 进程内调用）。
+	CountValidSeckill(ctx context.Context, activityID int64) (int, error)
 	// MarkPaid 支付成功状态迁移：待支付 → 已支付（支付模块事务内条件更新；
 	// WHERE 同时校验 status 与 pay_amount，false = 状态已变或金额不符）。
 	MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error)
@@ -218,14 +239,15 @@ type orderService struct {
 	coupons    CouponService
 	cart       CartService
 	users      UserService
-	activities ActivityStock // 秒杀活动库存（跨模块端口，flashsale 实现）
+	activities ActivityStock  // 秒杀活动库存（跨模块端口，flashsale 实现）
+	seckill    SeckillRestore // 秒杀订单取消回补（跨模块端口，flashsale 实现，T13）
 }
 
 // New 构造订单服务。
 func New(store repository.Store, c cache.Cache, nos OrderNoGenerator,
 	products ProductService, coupons CouponService, cart CartService, users UserService,
-	activities ActivityStock) Service {
-	return &orderService{store: store, cache: c, nos: nos, products: products, coupons: coupons, cart: cart, users: users, activities: activities}
+	activities ActivityStock, seckill SeckillRestore) Service {
+	return &orderService{store: store, cache: c, nos: nos, products: products, coupons: coupons, cart: cart, users: users, activities: activities, seckill: seckill}
 }
 
 // ---- 下单 ----
@@ -349,7 +371,7 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 // CreateSeckill 秒杀异步落单（T12，MQ 消费者回调）：
 //  1. 读取 SKU 快照（specs/product_id 与商品标题；不锁 SKU 行——秒杀只扣活动库存）
 //  2. 单事务：建秒杀订单（10min 超时）+ 订单项 + 条件扣减活动库存
-//  3. 重复键（order_no 主键 / (user_id, activity_id) 唯一约束）→ 幂等成功
+//  3. 重复键（order_no 主键 / user_activity_key 唯一约束）→ 幂等成功
 //     （重复投递或并发消费，订单已存在，不重复扣库存）
 //  4. 活动库存不足 → ErrSeckillStockInsufficient（永久失败，死信 + 对账兜底）
 func (s *orderService) CreateSeckill(ctx context.Context, p SeckillCreateParams) error {
@@ -376,21 +398,25 @@ func (s *orderService) CreateSeckill(ctx context.Context, p SeckillCreateParams)
 
 	now := time.Now()
 	activityID := p.ActivityID
+	// 秒杀去重键（T13）：写 "user_id:activity_id"，唯一约束挡重复落单；
+	// 取消时同事务置 NULL，允许同一用户取消后再次抢购。
+	dedupKey := fmt.Sprintf("%d:%d", p.UserID, activityID)
 	order := &model.Order{
-		OrderNo:     p.OrderNo,
-		UserID:      p.UserID,
-		OrderType:   model.OrderTypeSeckill,
-		Status:      model.OrderStatusPendingPayment,
-		ActivityID:  &activityID,
-		TotalAmount: p.Price * int64(p.Quantity),
-		PayAmount:   p.Price * int64(p.Quantity),
-		Receiver:    p.Address.Receiver,
-		Phone:       p.Address.Phone,
-		Province:    p.Address.Province,
-		City:        p.Address.City,
-		District:    p.Address.District,
-		Detail:      p.Address.Detail,
-		ExpireAt:    now.Add(seckillExpire),
+		OrderNo:         p.OrderNo,
+		UserID:          p.UserID,
+		OrderType:       model.OrderTypeSeckill,
+		Status:          model.OrderStatusPendingPayment,
+		ActivityID:      &activityID,
+		TotalAmount:     p.Price * int64(p.Quantity),
+		PayAmount:       p.Price * int64(p.Quantity),
+		Receiver:        p.Address.Receiver,
+		Phone:           p.Address.Phone,
+		Province:        p.Address.Province,
+		City:            p.Address.City,
+		District:        p.Address.District,
+		Detail:          p.Address.Detail,
+		ExpireAt:        now.Add(seckillExpire),
+		UserActivityKey: &dedupKey,
 	}
 	item := model.OrderItem{
 		OrderNo:   p.OrderNo,
@@ -748,8 +774,8 @@ func (s *orderService) GetDetail(ctx context.Context, userID int64, orderNo stri
 
 // Cancel 取消待支付订单：事务内 条件更新 待支付→已取消 + 回补库存 + 回退券。
 // 重复取消（或状态已变）由条件更新 RowsAffected=0 兜底，不重复回补。
-// 秒杀订单拒绝取消：其回补路径（活动库存 + Redis 库存 + 用户计数）尚未实现，
-// 禁止走普通订单的 SKU 回补以免错补库存（秒杀取消见后续任务）。
+// 秒杀订单拒绝用户主动取消（其取消路径为超时取消，见 CancelExpiredSeckill——
+// 回补活动库存 + Redis 库存 + 用户计数；禁止走普通订单的 SKU 回补以免错补库存）。
 func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string) error {
 	view, err := s.loadOwned(ctx, userID, orderNo)
 	if err != nil {
@@ -809,6 +835,81 @@ func (s *orderService) CancelExpired(ctx context.Context) (cancelled, failed int
 		cancelled++
 	}
 	return cancelled, failed, nil
+}
+
+// CancelExpiredSeckill 秒杀订单超时取消（cron 每分钟扫描调用，T13）：
+//  1. 扫描待支付、秒杀且已过 expire_at 的订单（分批上限 cancelExpiredBatch）
+//  2. 逐个事务内取消：条件更新 待支付→已取消 → 回补活动库存（MySQL，
+//     SeckillRestore.RestoreStock——订单存在即活动存在，外键 RESTRICT 保证）
+//  3. 事务提交后回补 Redis：库存 INCR + 用户计数 DECR + 释放幂等键
+//     （SeckillRestore.RestoreRedis，允许再次抢购）
+//
+// 单订单失败不阻断整轮（与普通订单 CancelExpired 同取舍）。DB 失败（含并发
+// 已支付/已取消）计入 failed，下个 tick 重试或自然跳过；Redis 回补失败计入
+// redisFailed 但不重试——订单已落取消态，重试将命中状态已变，且库存差额由
+// 对账 cron（进行中告警 + 收尾对齐）兜底。
+func (s *orderService) CancelExpiredSeckill(ctx context.Context) (cancelled, failed, redisFailed int, err error) {
+	orders, err := s.store.Orders.ListExpiredSeckillPending(ctx, time.Now(), cancelExpiredBatch)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if len(orders) == 0 {
+		return 0, 0, 0, nil
+	}
+	orderNos := make([]string, 0, len(orders))
+	for _, o := range orders {
+		orderNos = append(orderNos, o.OrderNo)
+	}
+	itemsByOrder, err := s.store.Items.ListByOrders(ctx, orderNos)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	for _, o := range orders {
+		quantity := sumItemQuantity(itemsByOrder[o.OrderNo])
+		// 秒杀订单必有 activity_id 与订单项（CreateSeckill 保证）；数据异常
+		// 跳过不取消（避免错补），计失败供日志排查。
+		if o.ActivityID == nil || quantity < 1 {
+			failed++
+			continue
+		}
+		dbErr := s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+			ok, err := s.store.Orders.Cancel(ctx, tx, o.OrderNo)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return ErrOrderChanged
+			}
+			return s.seckill.RestoreStock(ctx, tx, *o.ActivityID, quantity)
+		})
+		if dbErr != nil {
+			failed++
+			continue
+		}
+		cancelled++
+		// 事务已提交：回补 Redis（best-effort；失败由对账 cron 兜底）。
+		if err := s.seckill.RestoreRedis(ctx, *o.ActivityID, o.UserID, quantity); err != nil {
+			redisFailed++
+		}
+	}
+	return cancelled, failed, redisFailed, nil
+}
+
+// CountValidSeckill 活动的秒杀有效订单数（非取消），对账端口实现
+// （flashsale ReconcileActive 以此解释 Redis/MySQL 库存差额）。
+func (s *orderService) CountValidSeckill(ctx context.Context, activityID int64) (int, error) {
+	return s.store.Orders.CountValidByActivity(ctx, activityID)
+}
+
+// sumItemQuantity 订单项数量合计（秒杀订单固定单条订单项 Quantity=1，
+// 求和以数量维度正确回补，防未来多数量秒杀扩展）。
+func sumItemQuantity(items []model.OrderItem) int {
+	n := 0
+	for _, it := range items {
+		n += it.Quantity
+	}
+	return n
 }
 
 // cancelInTx 事务内取消：条件更新 待支付→已取消 + 回补库存 + 回退券；

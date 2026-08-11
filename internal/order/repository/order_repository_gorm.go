@@ -36,8 +36,9 @@ func (s *GORMOrderStore) WithinTx(ctx context.Context, fn func(tx *gorm.DB) erro
 	return s.db.WithContext(ctx).Transaction(fn)
 }
 
-// Create 创建订单；MySQL 1062（order_no 主键 / (user_id, activity_id) 唯一约束）
-// 映射为 ErrOrderDuplicate（秒杀落单幂等命中），其余错误原样返回。
+// Create 创建订单；MySQL 1062（order_no 主键 / user_activity_key 唯一约束，
+// 后者仅秒杀订单非取消态）映射为 ErrOrderDuplicate（秒杀落单幂等命中），
+// 其余错误原样返回。
 func (s *GORMOrderStore) Create(ctx context.Context, tx *gorm.DB, order *model.Order) error {
 	err := tx.WithContext(ctx).Create(order).Error
 	if err == nil {
@@ -93,9 +94,47 @@ func (s *GORMOrderStore) ListExpiredPending(ctx context.Context, now time.Time, 
 	return list, nil
 }
 
-// Cancel 条件更新 待支付→已取消；RowsAffected=0 表示状态已变（并发/非法跃迁）。
+// ListExpiredSeckillPending 超时扫描：待支付、秒杀订单且已过 expire_at
+// （T13 秒杀超时取消，扫描规则与普通订单同）。
+func (s *GORMOrderStore) ListExpiredSeckillPending(ctx context.Context, now time.Time, limit int) ([]model.Order, error) {
+	var list []model.Order
+	if err := s.db.WithContext(ctx).
+		Where("status = ? AND order_type = ? AND expire_at < ?",
+			model.OrderStatusPendingPayment, model.OrderTypeSeckill, now).
+		Order("expire_at ASC, order_no ASC").
+		Limit(limit).
+		Find(&list).Error; err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// CountValidByActivity 秒杀有效订单数：非取消（待支付/已支付/已发货/已完成）。
+func (s *GORMOrderStore) CountValidByActivity(ctx context.Context, activityID int64) (int, error) {
+	var n int64
+	if err := s.db.WithContext(ctx).Model(&model.Order{}).
+		Where("activity_id = ? AND status <> ?", activityID, model.OrderStatusCancelled).
+		Count(&n).Error; err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// Cancel 条件更新 待支付→已取消，并同事务置空秒杀去重键 user_activity_key
+// （取消后允许再次抢购：MySQL 唯一索引允许多个 NULL，不占 (user, activity)
+// 去重位）；RowsAffected=0 表示状态已变（并发/非法跃迁）。
 func (s *GORMOrderStore) Cancel(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error) {
-	return s.transition(ctx, tx, orderNo, model.OrderStatusPendingPayment, model.OrderStatusCancelled, "cancelled_at")
+	exec := tx
+	if exec == nil {
+		exec = s.db.WithContext(ctx)
+	}
+	res := exec.Model(&model.Order{}).
+		Where("order_no = ? AND status = ?", orderNo, model.OrderStatusPendingPayment).
+		Updates(map[string]any{"status": model.OrderStatusCancelled, "cancelled_at": time.Now(), "user_activity_key": nil})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
 }
 
 // MarkPaid 条件更新 待支付→已支付（支付回调）；WHERE 同时校验 status 与

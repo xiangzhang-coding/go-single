@@ -13,7 +13,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
 )
 
-// ErrOrderDuplicate 重复键（MySQL 1062）：order_no 主键或 (user_id, activity_id)
+// ErrOrderDuplicate 重复键（MySQL 1062）：order_no 主键或 user_activity_key
 // 唯一约束命中——秒杀异步落单的幂等命中（重复投递/并发消费），视为成功。
 var ErrOrderDuplicate = errors.New("order duplicate")
 
@@ -26,16 +26,22 @@ type TxRunner interface {
 // OrderRepository 订单数据访问接口。
 type OrderRepository interface {
 	// Create 事务内创建订单（order_no 为主键，雪花 ID）。
-	// 重复键（order_no 或 (user_id, activity_id)）返回 ErrOrderDuplicate。
+	// 重复键（order_no 或秒杀 user_activity_key）返回 ErrOrderDuplicate。
 	Create(ctx context.Context, tx *gorm.DB, order *model.Order) error
 	// GetByNo 按订单号读取（不含归属过滤，归属校验在 service 层）。
 	GetByNo(ctx context.Context, orderNo string) (*model.Order, error)
 	// List 我的订单：状态筛选（空 = 全部）+ 分页，返回条目与总数。
 	List(ctx context.Context, userID int64, status string, offset, limit int) ([]model.Order, int64, error)
 	// ListExpiredPending 超时扫描：待支付且已过 expire_at 的普通订单
-	// （超时取消仅针对普通订单；秒杀订单取消需回补 Redis，由秒杀模块另行处理）。
+	// （超时取消仅针对普通订单；秒杀订单见 ListExpiredSeckillPending）。
 	// now 由调用方传入（Go 时钟），limit 分批上限，供 cron 每分钟扫描。
 	ListExpiredPending(ctx context.Context, now time.Time, limit int) ([]model.Order, error)
+	// ListExpiredSeckillPending 超时扫描：待支付、秒杀且已过 expire_at 的订单
+	// （T13 秒杀超时取消：回补活动库存 + Redis 库存 + 用户计数，允许再次抢购）。
+	ListExpiredSeckillPending(ctx context.Context, now time.Time, limit int) ([]model.Order, error)
+	// CountValidByActivity 活动的秒杀有效订单数（非取消：待支付/已支付/已发货/
+	// 已完成），对账用（Redis 活动库存 vs flashsale.stock vs 秒杀有效订单数）。
+	CountValidByActivity(ctx context.Context, activityID int64) (int, error)
 	// Cancel 事务内条件更新 待支付→已取消；返回是否更新成功。
 	Cancel(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error)
 	// MarkPaid 事务内条件更新 待支付→已支付（支付回调）；WHERE 同时校验
