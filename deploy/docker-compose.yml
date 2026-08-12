@@ -74,7 +74,8 @@ services:
       # 后端以宿主机进程运行，容器内经该主机名访问宿主 :8080（与 prometheus 同法）。
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      # 经 /api 反代探活：后端宕机时 nginx 回 502 → unhealthy（验证反代联通而非仅静态文件）。
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/api/products"]
       interval: 10s
       timeout: 3s
       retries: 5

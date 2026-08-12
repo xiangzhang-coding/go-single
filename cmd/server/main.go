@@ -214,8 +214,9 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// metrics 在最外层：panic 被 Recovery 恢复为 500 后仍能完成计数。
 	metricRegistry := metrics.New()
 	// CORS（T26）：跨源场景（云端前端独立部署）按配置白名单放行；
-	// 放在最前使预检 OPTIONS 在路由匹配前即返回（204/403）。
-	r.Use(metricRegistry.GinMiddleware(), platformcors.Middleware(cfg.CORS.AllowOrigins), gin.Recovery(), requestLogger(log))
+	// 置于 requestLogger 之后，使预检 OPTIONS 也进入访问日志（排障可见），
+	// 同时仍先于路由匹配（Use 中间件均在 handler 前执行）。
+	r.Use(metricRegistry.GinMiddleware(), gin.Recovery(), requestLogger(log), platformcors.Middleware(cfg.CORS.AllowOrigins))
 
 	r.GET("/metrics", gin.WrapH(metricRegistry.Handler()))
 
