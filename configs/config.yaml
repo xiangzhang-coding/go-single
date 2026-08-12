@@ -4,6 +4,8 @@ server:
 
 log:
   level: info
+  # 日志文件镜像（promtail 采集进 Loki）；留空 = 仅 stdout。
+  file: ./logs/app.log
 
 mysql:
   host: 127.0.0.1

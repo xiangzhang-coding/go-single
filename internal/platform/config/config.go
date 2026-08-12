@@ -67,8 +67,12 @@ type Server struct {
 	Mode string
 }
 
+// Log 日志配置：zap 结构化 JSON 输出。
 type Log struct {
+	// Level 日志级别（debug/info/warn/error）。
 	Level string
+	// File 非空时把日志行镜像写入该文件（供 promtail 采集进 Loki）；空 = 仅 stdout。
+	File string
 }
 
 type MySQL struct {

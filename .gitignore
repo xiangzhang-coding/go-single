@@ -5,6 +5,9 @@ bin/
 *.out
 coverage.out
 
+# 运行期日志（后端 log.file 镜像，供 promtail 采集）
+logs/
+
 # Env
 .env
 .env.local

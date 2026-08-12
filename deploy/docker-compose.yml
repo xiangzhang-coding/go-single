@@ -94,14 +94,49 @@ services:
     depends_on:
       prometheus:
         condition: service_healthy
+      loki:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
       interval: 5s
       timeout: 3s
       retries: 20
 
+  loki:
+    image: grafana/loki:3.4.2
+    container_name: go_single_loki
+    command:
+      - -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki/config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3100/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  promtail:
+    image: grafana/promtail:3.4.2
+    container_name: go_single_promtail
+    command:
+      - -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./monitoring/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # 宿主后端进程日志（go run ./cmd/server → ./logs/app.log）。
+      - ../logs:/var/log/go-single:ro
+      - promtail_data:/tmp/promtail
+    depends_on:
+      loki:
+        condition: service_healthy
+
 volumes:
   mysql_data:
   minio_data:
   prometheus_data:
   grafana_data:
+  loki_data:
+  promtail_data:

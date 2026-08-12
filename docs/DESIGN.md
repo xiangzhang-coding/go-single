@@ -226,7 +226,7 @@ go_single/
   - MQ：发布/消费/消费失败计数
   - 优惠券：发放/核销计数
 - **大盘**：Grafana 预配置 datasource（prometheus/loki）+ 项目仪表盘（HTTP 三件套、秒杀指标、订单指标）
-- **日志**：zap 输出结构化 JSON（stdout）；promtail 抓取容器日志 → Loki → Grafana 查询
+- **日志**：zap 输出结构化 JSON（stdout，可选 `log.file` 镜像到 `./logs/app.log`）；promtail 采集 docker 容器日志 + 宿主后端日志文件 → Loki → Grafana 查询
 - **部署**：prometheus/grafana/loki/promtail 直接进 docker-compose（默认开启）
 
 ## 容错与降级

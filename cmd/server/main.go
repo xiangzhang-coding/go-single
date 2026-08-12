@@ -76,7 +76,7 @@ func run() error {
 		return err
 	}
 
-	log, err := logger.New(cfg.Log.Level)
+	log, err := logger.New(cfg.Log.Level, cfg.Log.File)
 	if err != nil {
 		return err
 	}

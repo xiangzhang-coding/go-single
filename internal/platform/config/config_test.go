@@ -23,6 +23,7 @@ func TestLoad(t *testing.T) {
 
 	require.Equal(t, 8080, cfg.Server.Port)
 	require.Equal(t, "info", cfg.Log.Level)
+	require.Equal(t, "./logs/app.log", cfg.Log.File)
 	require.Equal(t, "127.0.0.1", cfg.MySQL.Host)
 	require.Equal(t, 3306, cfg.MySQL.Port)
 	require.Equal(t, "go_shop", cfg.MySQL.Database)

@@ -1,0 +1,32 @@
+# Promtail 采集配置：两条链路——
+# 1) docker 容器日志（mysql/redis/rabbitmq/minio 等，经 docker.sock 服务发现）；
+# 2) 宿主后端进程日志（go run ./cmd/server → ../logs/app.log 文件镜像，挂载只读）。
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/promtail/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container
+      - source_labels: ["__meta_docker_container_log_stream"]
+        target_label: logstream
+    pipeline_stages:
+      - docker: {}
+
+  - job_name: go-single
+    static_configs:
+      - targets: ["localhost"]
+        labels:
+          app: go-single
+          __path__: /var/log/go-single/*.log
