@@ -32,7 +32,8 @@ type CouponTemplate struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// CouponTemplateView 可领券列表项：模板 + 当前用户视角状态。
+// CouponTemplateView 券模板视图：模板 + 已领数（admin 列表与可领券列表共用；
+// 可领券列表额外叠加当前用户视角状态 State）。
 // State 取值：claimable / not_started / ended / sold_out / limit_reached。
 type CouponTemplateView struct {
 	CouponTemplate

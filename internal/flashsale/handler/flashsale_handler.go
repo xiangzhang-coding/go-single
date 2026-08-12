@@ -32,7 +32,7 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 //
 //	POST /api/admin/flashsales             创建活动
 //	PUT  /api/admin/flashsales/:id         编辑活动
-//	GET  /api/admin/flashsales             活动列表
+//	GET  /api/admin/flashsales             活动列表（全状态 + SKU/商品摘要 + 派生状态）
 //	POST /api/admin/flashsales/:id/publish   上架（预热库存）
 //	POST /api/admin/flashsales/:id/unpublish 下架
 //

@@ -36,7 +36,8 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 //
 // admin（Bearer + admin 角色）：
 //
-//	POST   /api/admin/orders/:order_no/ship  后台发货（已支付 → 已发货）
+//	GET    /api/admin/orders                   后台订单列表（全量，status 筛选 + 分页）
+//	POST   /api/admin/orders/:order_no/ship    后台发货（已支付 → 已发货）
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	protected := rg.Group("", auth.Middleware(h.verifier))
 	protected.POST("/orders", h.Create)
@@ -46,6 +47,7 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	protected.POST("/orders/:order_no/confirm", h.ConfirmReceipt)
 
 	admin := rg.Group("/admin", auth.Middleware(h.verifier), auth.RequireAdmin())
+	admin.GET("/orders", h.ListAll)
 	admin.POST("/orders/:order_no/ship", h.Ship)
 }
 
@@ -164,6 +166,19 @@ func (h *Handler) ConfirmReceipt(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// ListAll 后台订单列表（T25）：全量订单（跨用户），status 筛选 + 分页，
+// 响应 {orders, total} 与用户订单列表同构；仅供 admin（路由组鉴权）。
+func (h *Handler) ListAll(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	list, total, err := h.svc.ListAll(c.Request.Context(), c.Query("status"), page, pageSize)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"orders": list, "total": total})
 }
 
 func (h *Handler) Ship(c *gin.Context) {

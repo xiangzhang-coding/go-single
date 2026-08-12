@@ -110,7 +110,7 @@ func (f *fakeProducts) List(_ context.Context, categoryID *int64, status string,
 	var total int64
 	var matched []model.Product
 	for _, v := range f.byID {
-		if v.Status != status {
+		if status != "" && v.Status != status {
 			continue
 		}
 		if categoryID != nil && v.CategoryID != *categoryID {
@@ -472,6 +472,45 @@ func TestListProductsOnlyOnSaleAndFiltered(t *testing.T) {
 
 	// 分页：page=2, page_size=1 取第 2 条。
 	page2, total, err := fx.svc.ListProducts(context.Background(), nil, 2, 1)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), total)
+	assert.Equal(t, 1, len(page2))
+}
+
+// 后台列表：status 空 = 全部状态（含草稿/下架），可按状态/类目筛选、分页。
+func TestListAllProductsIncludesDrafts(t *testing.T) {
+	fx := newFixture()
+	digital := fx.category(t, "数码")
+	home := fx.category(t, "家电")
+
+	fx.publishedProduct(t, digital.ID, "手机")
+	offline, err := fx.svc.CreateProduct(context.Background(), digital.ID, "草稿手机", "")
+	require.NoError(t, err)
+	fx.publishedProduct(t, home.ID, "冰箱")
+
+	// 全部状态：3 件都可见（含草稿）。
+	all, total, err := fx.svc.ListAllProducts(context.Background(), nil, "", 1, 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), total)
+	assert.Equal(t, 3, len(all))
+
+	// 按状态筛选：仅下架 1 件。
+	offlineList, total, err := fx.svc.ListAllProducts(context.Background(), nil, model.ProductStatusOffSale, 1, 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), total)
+	assert.Equal(t, offline.ID, offlineList[0].ID)
+
+	// 按类目筛选：数码 2 件（含草稿）。
+	_, total, err = fx.svc.ListAllProducts(context.Background(), &digital.ID, "", 1, 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), total)
+
+	// 非法状态 → 400。
+	_, _, err = fx.svc.ListAllProducts(context.Background(), nil, "bogus", 1, 10)
+	require.ErrorIs(t, err, ErrInvalidInput)
+
+	// 分页：page=2, page_size=2 取第 2 条。
+	page2, total, err := fx.svc.ListAllProducts(context.Background(), nil, "", 2, 2)
 	require.NoError(t, err)
 	assert.Equal(t, int64(3), total)
 	assert.Equal(t, 1, len(page2))

@@ -37,7 +37,7 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 //
 //	POST /api/admin/coupons       发布券模板
 //	PUT  /api/admin/coupons/:id   编辑券模板
-//	GET  /api/admin/coupons       模板列表
+//	GET  /api/admin/coupons       模板列表（含已领数）
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	protected := rg.Group("", auth.Middleware(h.verifier))
 	protected.GET("/coupons", h.ListClaimable)

@@ -10,7 +10,13 @@ import type {
   CouponTemplateListResponse,
   CouponTemplateView,
   CreateAddressRequest,
+  CreateCouponTemplateRequest,
+  CreateFlashSaleRequest,
   CreateOrderRequest,
+  CreateProductRequest,
+  CreateSKURequest,
+  FlashSaleActivity,
+  FlashSaleAdminListResponse,
   FlashSaleListResponse,
   FriendRequest,
   FriendRequestView,
@@ -23,10 +29,12 @@ import type {
   Payment,
   Post,
   PostListResponse,
+  Product,
   ProductDetail,
   ProductListResponse,
   SendMessageRequest,
   SharePostRequest,
+  SKU,
   User,
   UserCouponView,
   UserSearchResult,
@@ -270,3 +278,107 @@ export async function uploadFile(file: File) {
   });
   return data.url;
 }
+
+// ---- 后台管理（T25，admin 角色；后端 RequireAdmin 兜底）----
+
+export const adminApi = {
+  // ---- 商品 ----
+  async getCategories() {
+    const { data } = await api.get<{ items: Category[] }>("/categories");
+    return data.items;
+  },
+  async createCategory(name: string) {
+    const { data } = await api.post<Category>("/admin/categories", { name });
+    return data;
+  },
+  async updateCategory(id: number, name: string) {
+    await api.put(`/admin/categories/${id}`, { name });
+  },
+  async deleteCategory(id: number) {
+    await api.delete(`/admin/categories/${id}`);
+  },
+  async getProducts(params: { status?: string; page: number; pageSize?: number }) {
+    const { data } = await api.get<ProductListResponse>("/admin/products", {
+      params: {
+        status: params.status || undefined,
+        page: params.page,
+        page_size: params.pageSize || 20,
+      },
+    });
+    return data;
+  },
+  async createProduct(request: CreateProductRequest) {
+    const { data } = await api.post<Product>("/admin/products", request);
+    return data;
+  },
+  async updateProduct(id: number, request: CreateProductRequest) {
+    await api.put(`/admin/products/${id}`, request);
+  },
+  async publishProduct(id: number) {
+    await api.post(`/admin/products/${id}/publish`);
+  },
+  async unpublishProduct(id: number) {
+    await api.post(`/admin/products/${id}/unpublish`);
+  },
+  async getProductDetail(productId: number) {
+    const { data } = await api.get<ProductDetail>(`/products/${productId}`);
+    return data;
+  },
+  async createSKU(productId: number, request: CreateSKURequest) {
+    const { data } = await api.post<SKU>(`/admin/products/${productId}/skus`, request);
+    return data;
+  },
+  async updateSKU(id: number, request: CreateSKURequest) {
+    await api.put(`/admin/skus/${id}`, request);
+  },
+  async deleteSKU(id: number) {
+    await api.delete(`/admin/skus/${id}`);
+  },
+
+  // ---- 订单 ----
+  async getOrders(params: { status?: string; page: number; pageSize?: number }) {
+    const { data } = await api.get<OrderListResponse>("/admin/orders", {
+      params: {
+        status: params.status || undefined,
+        page: params.page,
+        page_size: params.pageSize || 20,
+      },
+    });
+    return data;
+  },
+  async shipOrder(orderNo: string) {
+    await api.post(`/admin/orders/${orderNo}/ship`);
+  },
+
+  // ---- 秒杀活动 ----
+  async getFlashSales() {
+    const { data } = await api.get<FlashSaleAdminListResponse>("/admin/flashsales");
+    return data.items;
+  },
+  async createFlashSale(request: CreateFlashSaleRequest) {
+    const { data } = await api.post<FlashSaleActivity>("/admin/flashsales", request);
+    return data;
+  },
+  async updateFlashSale(id: number, request: CreateFlashSaleRequest) {
+    await api.put(`/admin/flashsales/${id}`, request);
+  },
+  async publishFlashSale(id: number) {
+    await api.post(`/admin/flashsales/${id}/publish`);
+  },
+  async unpublishFlashSale(id: number) {
+    await api.post(`/admin/flashsales/${id}/unpublish`);
+  },
+
+  // ---- 券模板 ----
+  async getCouponTemplates() {
+    const { data } = await api.get<CouponTemplateListResponse>("/admin/coupons");
+    return data.items;
+  },
+  async createCouponTemplate(request: CreateCouponTemplateRequest) {
+    const { data } = await api.post<CouponTemplateView>("/admin/coupons", request);
+    return data;
+  },
+  async updateCouponTemplate(id: number, request: CreateCouponTemplateRequest) {
+    await api.put(`/admin/coupons/${id}`, request);
+  },
+};

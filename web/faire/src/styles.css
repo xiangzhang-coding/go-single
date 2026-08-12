@@ -1539,3 +1539,31 @@
   .chat-thread { min-height: 460px; max-height: none; }
   .chat-message { max-width: 86%; }
 }
+
+/* ---- 后台管理（T25）---- */
+
+.admin-tabs { display: flex; align-items: center; gap: 4px; border-bottom: 1px solid var(--color-ash); }
+.admin-tabs a, .admin-tabs button { display: inline-flex; align-items: center; padding: 10px 14px; border: 1px solid transparent; border-bottom-color: var(--color-ash); border-radius: var(--radius-sm) var(--radius-sm) 0 0; background: transparent; color: var(--color-smoke); font-size: 13px; text-decoration: none; cursor: pointer; }
+.admin-tabs a:hover, .admin-tabs button:hover { color: var(--color-ink-black); }
+.admin-tabs a.active, .admin-tabs button.active { border-color: var(--color-ash); border-bottom-color: var(--color-pure-white); background: var(--color-pure-white); color: var(--color-ink-black); }
+.admin-tabs .admin-back-link { margin-left: auto; }
+.admin-tabs-small { display: inline-flex; border-bottom: 0; }
+.admin-tabs-small a, .admin-tabs-small button { border-bottom: 0; border-radius: var(--radius-badges); }
+.admin-tabs-small a.active, .admin-tabs-small button.active { border-color: var(--color-ink-black); background: var(--color-cream-paper); }
+
+.admin-list { display: grid; gap: 14px; }
+.admin-card { border: 1px solid var(--color-ash); border-radius: var(--radius-cards); background: var(--color-pure-white); }
+.admin-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 18px 20px; }
+.admin-card-body { display: flex; gap: 20px; padding: 0 20px 18px; }
+.admin-form-panel { padding: 22px; border: 1px solid var(--color-ink-black); border-radius: var(--radius-cards); background: var(--color-pure-white); }
+
+.admin-sku-panel { padding: 18px 20px 20px; border-top: 1px solid var(--color-ash); background: var(--color-cream-paper); }
+.admin-sku-table { display: grid; gap: 6px; }
+.admin-sku-row { display: grid; grid-template-columns: minmax(0, 2fr) 1fr 0.7fr 1.2fr; align-items: center; gap: 12px; padding: 8px 10px; border: 1px solid var(--color-ash); border-radius: var(--radius-md); background: var(--color-pure-white); font-size: 13px; }
+.admin-sku-head { border: 0; background: transparent; color: var(--color-smoke); font-size: 11px; }
+.admin-sku-form { display: grid; grid-template-columns: minmax(0, 2fr) 1fr 0.7fr auto; align-items: end; gap: 12px; }
+
+/* admin 专用状态徽章：不复用订单状态语义色 */
+.admin-badge-on, .admin-badge-in_progress { border-color: var(--faire-success-border); background: var(--faire-success-surface); }
+.admin-badge-off, .admin-badge-ended { color: var(--color-smoke); }
+.admin-badge-not_started { border-color: var(--color-ink-black); background: var(--color-cream-paper); }

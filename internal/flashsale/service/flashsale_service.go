@@ -161,7 +161,9 @@ type Service interface {
 	// ---- admin ----
 	CreateActivity(ctx context.Context, p ActivityParams) (*model.Activity, error)
 	UpdateActivity(ctx context.Context, id int64, p ActivityParams) error
-	ListActivities(ctx context.Context) ([]model.Activity, error)
+	// ListActivities 后台活动列表（T25 富化）：全状态（含下架/已结束），
+	// 每项携带派生状态（off_sale/not_started/in_progress/ended）与 SKU/商品摘要。
+	ListActivities(ctx context.Context) ([]model.ActivityView, error)
 	// PublishActivity 上架：预热库存进 Redis（未开始可覆盖 DEL+SET，进行中原子只减不增）。
 	PublishActivity(ctx context.Context, id int64) error
 	// UnpublishActivity 下架：清除预热库存，后续抢购被拒。
@@ -316,8 +318,30 @@ func (s *flashsaleService) UpdateActivity(ctx context.Context, id int64, p Activ
 	return nil
 }
 
-func (s *flashsaleService) ListActivities(ctx context.Context) ([]model.Activity, error) {
-	return s.store.Activities.List(ctx)
+func (s *flashsaleService) ListActivities(ctx context.Context) ([]model.ActivityView, error) {
+	all, err := s.store.Activities.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	views := make([]model.ActivityView, 0, len(all))
+	for i := range all {
+		a := all[i]
+		v := model.ActivityView{Activity: a}
+		switch {
+		case !a.IsOnSale():
+			v.State = model.ActivityStateOffSale
+		case now.Before(a.StartAt):
+			v.State = model.ActivityStateNotStarted
+		case now.After(a.EndAt):
+			v.State = model.ActivityStateEnded
+		default:
+			v.State = model.ActivityStateInProgress
+		}
+		s.attachSKU(ctx, &v)
+		views = append(views, v)
+	}
+	return views, nil
 }
 
 // ListUserActivities 秒杀页活动列表（T23）：过滤 已上架 && 未结束，
@@ -348,21 +372,28 @@ func (s *flashsaleService) ListUserActivities(ctx context.Context) ([]model.Acti
 				v.Stock = n
 			}
 		}
-		sku, skuErr := s.products.GetSKU(ctx, a.SKUID)
-		if skuErr == nil {
-			v.SKU = model.SKUView{
-				ID:        sku.ID,
-				ProductID: sku.ProductID,
-				Specs:     sku.Specs,
-				Price:     sku.Price,
-			}
-			if p, pErr := s.products.GetProduct(ctx, sku.ProductID); pErr == nil {
-				v.ProductTitle = p.Title
-			}
-		}
+		s.attachSKU(ctx, &v)
 		views = append(views, v)
 	}
 	return views, nil
+}
+
+// attachSKU 拼接 SKU 规格/原价与商品标题到活动视图（admin 列表与秒杀页共用）；
+// 单个 SKU/商品读取失败仅留空摘要（活动仍展示，摘要缺失不影响抢购/管理）。
+func (s *flashsaleService) attachSKU(ctx context.Context, v *model.ActivityView) {
+	sku, skuErr := s.products.GetSKU(ctx, v.SKUID)
+	if skuErr != nil {
+		return
+	}
+	v.SKU = model.SKUView{
+		ID:        sku.ID,
+		ProductID: sku.ProductID,
+		Specs:     sku.Specs,
+		Price:     sku.Price,
+	}
+	if p, pErr := s.products.GetProduct(ctx, sku.ProductID); pErr == nil {
+		v.ProductTitle = p.Title
+	}
 }
 
 // PublishActivity 上架：先预热 Redis 库存、后写状态——预热失败时活动保持下架，

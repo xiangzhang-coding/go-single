@@ -93,6 +93,11 @@ export function AppShell() {
             <NavLink to="/cart" className={({ isActive }) => (isActive ? "active" : "")}>
               购物车{cartCount > 0 && <span className="nav-count">{cartCount}</span>}
             </NavLink>
+            {user?.role === "admin" && (
+              <NavLink to="/admin" className={({ isActive }) => (isActive ? "active" : "")}>
+                后台
+              </NavLink>
+            )}
           </nav>
           <span className="nav-note">安静浏览，认真下单</span>
         </div>

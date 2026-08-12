@@ -100,7 +100,7 @@ export interface CouponTemplateView {
   state: CouponTemplateState;
 }
 
-export type FlashSaleState = "not_started" | "in_progress";
+export type FlashSaleState = "not_started" | "in_progress" | "off_sale" | "ended";
 
 export interface FlashSaleSKU {
   id: number;
@@ -214,6 +214,45 @@ export interface CouponTemplateListResponse {
 export interface LoginResponse {
   token: string;
   user: User;
+}
+
+// ---- 后台管理（T25）----
+
+export interface CreateProductRequest {
+  category_id: number;
+  title: string;
+  description?: string;
+}
+
+export interface CreateSKURequest {
+  specs: unknown;
+  price: number;
+  stock: number;
+}
+
+export interface CreateFlashSaleRequest {
+  sku_id: number;
+  title: string;
+  price: number;
+  stock: number;
+  per_user_limit?: number;
+  start_at: string;
+  end_at: string;
+}
+
+export interface CreateCouponTemplateRequest {
+  name: string;
+  type: "direct" | "threshold";
+  value: number;
+  min_amount: number;
+  total: number;
+  per_user_limit: number;
+  valid_from: string;
+  valid_until: string;
+}
+
+export interface FlashSaleAdminListResponse {
+  items: FlashSaleActivity[];
 }
 
 export interface CreateOrderRequest {

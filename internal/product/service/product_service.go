@@ -52,6 +52,9 @@ type Service interface {
 	CreateSKU(ctx context.Context, productID int64, specs json.RawMessage, price int64, stock int) (*model.SKU, error)
 	UpdateSKU(ctx context.Context, id int64, specs json.RawMessage, price int64, stock int) error
 	DeleteSKU(ctx context.Context, id int64) error
+	// ListAllProducts 后台商品列表（T25）：可选类目/状态筛选 + 分页，
+	// 与 ListProducts 的区别是不过滤上架状态（admin 需管理草稿/下架商品）。
+	ListAllProducts(ctx context.Context, categoryID *int64, status string, page, pageSize int) ([]model.Product, int64, error)
 
 	// ---- 游客浏览 ----
 	ListCategories(ctx context.Context) ([]model.Category, error)
@@ -266,6 +269,23 @@ func (s *productService) ListProducts(ctx context.Context, categoryID *int64, pa
 		pageSize = maxPageSize
 	}
 	return s.store.Product.List(ctx, categoryID, model.ProductStatusOnSale, (page-1)*pageSize, pageSize)
+}
+
+// ListAllProducts 后台商品列表：status 空 = 全部状态（含草稿/下架）。
+func (s *productService) ListAllProducts(ctx context.Context, categoryID *int64, status string, page, pageSize int) ([]model.Product, int64, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = defaultPageSize
+	}
+	if pageSize > maxPageSize {
+		pageSize = maxPageSize
+	}
+	if status != "" && status != model.ProductStatusOnSale && status != model.ProductStatusOffSale {
+		return nil, 0, fmt.Errorf("%w: invalid status", ErrInvalidInput)
+	}
+	return s.store.Product.List(ctx, categoryID, status, (page-1)*pageSize, pageSize)
 }
 
 // GetDetail 缓存优先（product:detail:{id}，TTL 5min）；未命中直查 DB 并回填；

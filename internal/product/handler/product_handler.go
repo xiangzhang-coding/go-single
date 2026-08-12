@@ -38,6 +38,7 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 //	PUT    /api/admin/categories/:id     编辑类目
 //	DELETE /api/admin/categories/:id     删除类目（类目下无商品时）
 //	POST   /api/admin/products           新建商品（默认下架）
+//	GET    /api/admin/products           后台商品列表（status 筛选，含草稿/下架）
 //	PUT    /api/admin/products/:id       编辑商品
 //	POST   /api/admin/products/:id/publish     上架
 //	POST   /api/admin/products/:id/unpublish   下架
@@ -55,6 +56,7 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	admin.DELETE("/categories/:id", h.DeleteCategory)
 
 	admin.POST("/products", h.CreateProduct)
+	admin.GET("/products", h.ListAdminProducts)
 	admin.PUT("/products/:id", h.UpdateProduct)
 	admin.POST("/products/:id/publish", h.PublishProduct)
 	admin.POST("/products/:id/unpublish", h.UnpublishProduct)
@@ -260,6 +262,31 @@ func (h *Handler) GetDetail(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, d)
+}
+
+// ListAdminProducts 后台商品列表：status 空 = 全部（含草稿/下架），
+// 支持 category_id 筛选与分页；返回 {items, total} 与游客列表同构。
+func (h *Handler) ListAdminProducts(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	status := c.Query("status")
+
+	var categoryID *int64
+	if raw := c.Query("category_id"); raw != "" {
+		id, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || id <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category_id"})
+			return
+		}
+		categoryID = &id
+	}
+
+	items, total, err := h.svc.ListAllProducts(c.Request.Context(), categoryID, status, page, pageSize)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": total})
 }
 
 func bindJSON(c *gin.Context, req any) bool {

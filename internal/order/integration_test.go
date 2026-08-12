@@ -684,9 +684,69 @@ func TestOrderShipAndConfirmLifecycle(t *testing.T) {
 	require.Equal(t, http.StatusConflict, w.Code)
 }
 
-// 对象级授权（防 IDOR）：他人订单详情 403、取消 403、列表互不可见。
-func TestOrderCrossUserForbidden(t *testing.T) {
+// 后台订单列表（T25）：跨用户可见 + status 筛选 + 权限（游客 401 / 普通用户 403）。
+func TestAdminOrderListAll(t *testing.T) {
 	env := requireEnv(t)
+	alice := registerAndToken(t, env, uniqueName("admin_alice"))
+	bob := registerAndToken(t, env, uniqueName("admin_bob"))
+	addrA := address(t, env, alice)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+	admin := adminToken(t, env)
+
+	// alice 两单（第二单取消）；bob 一单。
+	_, bodyA := createOrder(t, env, alice, uniqueName("req"), addrA, skuID, 1, 0)
+	orderA := bodyA["order_no"].(string)
+	_, bodyA2 := createOrder(t, env, alice, uniqueName("req"), addrA, skuID, 1, 0)
+	orderA2 := bodyA2["order_no"].(string)
+	w, _ := doJSON(t, env, http.MethodPost, "/api/orders/"+orderA2+"/cancel", "", alice)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	addrB := address(t, env, bob)
+	_, bodyB := createOrder(t, env, bob, uniqueName("req"), addrB, skuID, 1, 0)
+	orderB := bodyB["order_no"].(string)
+
+	// 权限：游客 401，普通用户（bob）403。
+	w, _ = doJSON(t, env, http.MethodGet, "/api/admin/orders", "", "")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	w, _ = doJSON(t, env, http.MethodGet, "/api/admin/orders", "", bob)
+	require.Equal(t, http.StatusForbidden, w.Code)
+
+	// 全量列表（跨用户，最多翻 5 页找齐 3 单）。
+	found := map[string]bool{}
+	for page := 1; page <= 5 && len(found) < 3; page++ {
+		w, list := doJSON(t, env, http.MethodGet, fmt.Sprintf("/api/admin/orders?page=%d&page_size=50", page), "", admin)
+		require.Equal(t, http.StatusOK, w.Code)
+		for _, item := range list["orders"].([]any) {
+			no := item.(map[string]any)["order_no"].(string)
+			if no == orderA || no == orderA2 || no == orderB {
+				found[no] = true
+			}
+			require.Contains(t, item.(map[string]any), "items", "后台列表项应随附订单项")
+		}
+	}
+	require.Equal(t, 3, len(found), "后台列表应跨用户看到 alice/bob 全部订单")
+
+	// 状态筛选 cancelled：alice 的取消单可见、bob 的待支付单不可见。
+	w, list := doJSON(t, env, http.MethodGet, "/api/admin/orders?status=cancelled&page_size=50", "", admin)
+	require.Equal(t, http.StatusOK, w.Code)
+	seenCancel, seenPending := false, false
+	for _, item := range list["orders"].([]any) {
+		switch item.(map[string]any)["order_no"].(string) {
+		case orderA2:
+			seenCancel = true
+		case orderB:
+			seenPending = true
+		}
+	}
+	require.True(t, seenCancel, "已取消订单应出现在 cancelled 筛选中")
+	require.False(t, seenPending, "待支付订单不应出现在 cancelled 筛选中")
+
+	// 非法状态 400。
+	w, _ = doJSON(t, env, http.MethodGet, "/api/admin/orders?status=bogus", "", admin)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// 对象级授权（防 IDOR）：他人订单详情 403、取消 403、列表互不可见。
+func TestOrderCrossUserForbidden(t *testing.T) {	env := requireEnv(t)
 	alice := registerAndToken(t, env, uniqueName("alice"))
 	bob := registerAndToken(t, env, uniqueName("bob"))
 	addrA := address(t, env, alice)

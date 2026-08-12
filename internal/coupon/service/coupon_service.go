@@ -94,7 +94,9 @@ type Service interface {
 	// ---- admin ----
 	CreateTemplate(ctx context.Context, p TemplateParams) (*model.CouponTemplate, error)
 	UpdateTemplate(ctx context.Context, id int64, p TemplateParams) error
-	ListTemplates(ctx context.Context) ([]model.CouponTemplate, error)
+	// ListTemplates 后台券模板列表（T25 富化）：全量模板 + 已领数（claimed_count，
+	// 供后台展示 已领/总量 核销进度）。
+	ListTemplates(ctx context.Context) ([]model.CouponTemplateView, error)
 
 	// ---- 用户 ----
 	// ListClaimable 可领券列表（含当前用户视角的领取状态）。
@@ -168,8 +170,21 @@ func (s *couponService) UpdateTemplate(ctx context.Context, id int64, p Template
 	})
 }
 
-func (s *couponService) ListTemplates(ctx context.Context) ([]model.CouponTemplate, error) {
-	return s.store.Template.List(ctx)
+func (s *couponService) ListTemplates(ctx context.Context) ([]model.CouponTemplateView, error) {
+	templates, err := s.store.Template.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]model.CouponTemplateView, 0, len(templates))
+	for i := range templates {
+		t := &templates[i]
+		claimed, err := s.store.UserCoupon.CountByTemplate(ctx, t.ID)
+		if err != nil {
+			return nil, err
+		}
+		views = append(views, model.CouponTemplateView{CouponTemplate: *t, ClaimedCount: claimed})
+	}
+	return views, nil
 }
 
 // ---- 用户 ----

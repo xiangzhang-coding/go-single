@@ -347,6 +347,53 @@ func TestAdminProductSKUCRUD(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
+// 后台商品列表：含草稿/下架（游客列表不可见），status 筛选 + 分页 + 权限。
+func TestAdminProductListIncludesDrafts(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+
+	catID := createCategory(t, env, admin, uniqueName("后台列表"))
+	p1 := createProduct(t, env, admin, catID, uniqueName("已上架"))
+	p2 := createProduct(t, env, admin, catID, uniqueName("草稿"))
+	publish(t, env, admin, p1, true)
+
+	// 全部状态：本类目 2 件可见（含草稿）。
+	path := fmt.Sprintf("/api/admin/products?category_id=%d", catID)
+	w, list := doJSON(t, env, http.MethodGet, path, "", admin)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, float64(2), list["total"])
+	require.Equal(t, 2, len(list["items"].([]any)))
+
+	// 按状态筛选：仅下架 1 件；仅上架 1 件。
+	w, list = doJSON(t, env, http.MethodGet, path+"&status=off_sale", "", admin)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, float64(1), list["total"])
+	require.Equal(t, float64(p2), list["items"].([]any)[0].(map[string]any)["id"])
+
+	w, list = doJSON(t, env, http.MethodGet, path+"&status=on_sale", "", admin)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, float64(1), list["total"])
+	require.Equal(t, float64(p1), list["items"].([]any)[0].(map[string]any)["id"])
+
+	// 非法状态 → 400。
+	w, _ = doJSON(t, env, http.MethodGet, "/api/admin/products?status=bogus", "", admin)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	// 权限：游客 401，普通用户 403。
+	w, _ = doJSON(t, env, http.MethodGet, "/api/admin/products", "", "")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	userToken := registerAndToken(t, env, uniqueName("mallory"))
+	w, _ = doJSON(t, env, http.MethodGet, "/api/admin/products", "", userToken)
+	require.Equal(t, http.StatusForbidden, w.Code)
+
+	// 同一商品在游客列表不可见（草稿通道隔离）。
+	w, visitorList := doJSON(t, env, http.MethodGet, "/api/products", "", "")
+	require.Equal(t, http.StatusOK, w.Code)
+	for _, item := range visitorList["items"].([]any) {
+		require.NotEqual(t, float64(p2), item.(map[string]any)["id"])
+	}
+}
+
 // 游客列表：按类目筛选 + 分页 + 下架不可见。
 func TestVisitorListFilterPagination(t *testing.T) {
 	env := requireEnv(t)

@@ -71,6 +71,17 @@ func (f *fakeOrders) List(_ context.Context, userID int64, status string, offset
 	return slicePage(out, offset, limit), int64(len(out)), nil
 }
 
+func (f *fakeOrders) ListAll(_ context.Context, status string, offset, limit int) ([]model.Order, int64, error) {
+	var out []model.Order
+	for _, o := range f.byID {
+		if status != "" && o.Status != status {
+			continue
+		}
+		out = append(out, *o)
+	}
+	return slicePage(out, offset, limit), int64(len(out)), nil
+}
+
 func (f *fakeOrders) ListExpiredPending(_ context.Context, now time.Time, limit int) ([]model.Order, error) {
 	if f.getErr != nil {
 		return nil, f.getErr
@@ -1233,6 +1244,53 @@ func TestListWithStatusFilterAndPagination(t *testing.T) {
 
 	// 非法状态 400。
 	_, _, err = fx.svc.List(context.Background(), 42, "unknown", 1, 10)
+	require.ErrorIs(t, err, ErrInvalidInput)
+}
+
+// 后台全量列表（T25）：跨用户可见、状态筛选、分页、随附订单项。
+func TestListAllCrossUser(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.users.seed(2, 43)
+
+	// 用户 42 两单（一单取消）；用户 43 一单。
+	u1a, err := fx.svc.Create(context.Background(), 42, fx.directParams("admin-r1", 1, 1))
+	require.NoError(t, err)
+	u1b, err := fx.svc.Create(context.Background(), 42, fx.directParams("admin-r2", 1, 1))
+	require.NoError(t, err)
+	require.NoError(t, fx.svc.Cancel(context.Background(), 42, u1b.Order.OrderNo))
+	u2, err := fx.svc.Create(context.Background(), 43, CreateParams{
+		ClientRequestID: "admin-r3", AddressID: 2, Items: []ItemParams{{SKUID: 2, Quantity: 1}},
+	})
+	require.NoError(t, err)
+
+	// 全部：3 单（跨用户）。
+	all, total, err := fx.svc.ListAll(context.Background(), "", 1, 10)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), total)
+	require.Len(t, all, 3)
+	for _, v := range all {
+		require.Len(t, v.Items, 1, "后台列表项应随附订单项")
+	}
+	orderNos := map[string]bool{}
+	for _, v := range all {
+		orderNos[v.OrderNo] = true
+	}
+	require.True(t, orderNos[u1a.Order.OrderNo] && orderNos[u1b.Order.OrderNo] && orderNos[u2.Order.OrderNo])
+
+	// 状态筛选 cancelled：仅 1 单（用户 42 的）。
+	_, total, err = fx.svc.ListAll(context.Background(), model.OrderStatusCancelled, 1, 10)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+
+	// 分页 page_size=2：第 2 页 1 单。
+	page2, total, err := fx.svc.ListAll(context.Background(), "", 2, 2)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), total)
+	require.Len(t, page2, 1)
+
+	// 非法状态 400。
+	_, _, err = fx.svc.ListAll(context.Background(), "unknown", 1, 10)
 	require.ErrorIs(t, err, ErrInvalidInput)
 }
 

@@ -78,6 +78,23 @@ func (s *GORMOrderStore) List(ctx context.Context, userID int64, status string, 
 	return list, total, nil
 }
 
+// ListAll 后台全量订单：跨用户（T25，admin 订单管理），其余与 List 同构。
+func (s *GORMOrderStore) ListAll(ctx context.Context, status string, offset, limit int) ([]model.Order, int64, error) {
+	q := s.db.WithContext(ctx).Model(&model.Order{})
+	if status != "" {
+		q = q.Where("status = ?", status)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var list []model.Order
+	if err := q.Order("created_at DESC, order_no DESC").Offset(offset).Limit(limit).Find(&list).Error; err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
+}
+
 // ListExpiredPending 超时扫描：待支付、普通订单且已过 expire_at，
 // 按过期时间升序（最早过期先处理），limit 分批（每 tick 处理上限，
 // 余量下个 tick 续扫，避免单次长时间占用）。

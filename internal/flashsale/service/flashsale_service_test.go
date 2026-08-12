@@ -663,14 +663,33 @@ func TestPreDeductConcurrentNoOversell(t *testing.T) {
 func TestListActivities(t *testing.T) {
 	fx := newFixture()
 	a1 := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a1.ID))
 	a2 := fx.createActivity(t, func(p *ActivityParams) { p.Title = "第二场" })
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a2.ID))
+	// 一场下架（手动）与一场已结束（先以有效窗口上架，再把仓储时间改到过去）。
+	offSale := fx.createActivity(t, func(p *ActivityParams) { p.Title = "已下架" })
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), offSale.ID))
+	require.NoError(t, fx.svc.UnpublishActivity(context.Background(), offSale.ID))
+	ended := fx.createActivity(t, func(p *ActivityParams) { p.Title = "已结束" })
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), ended.ID))
+	stored, err := fx.acts.GetByID(context.Background(), ended.ID)
+	require.NoError(t, err)
+	stored.StartAt, stored.EndAt = time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour)
 
 	list, err := fx.svc.ListActivities(context.Background())
 	require.NoError(t, err)
-	require.Len(t, list, 2)
-	require.Equal(t, a2.ID, list[0].ID)
-	require.Equal(t, a1.ID, list[1].ID)
-	require.Equal(t, model.ActivityStatusOffSale, list[0].Status)
+	require.Len(t, list, 4, "后台列表应含全状态活动（含下架与已结束）")
+
+	stateByID := map[int64]string{}
+	for _, v := range list {
+		stateByID[v.ID] = v.State
+		require.Equal(t, "秒杀商品", v.ProductTitle, "后台列表应携带商品标题摘要")
+		require.Equal(t, int64(1), v.SKU.ID, "后台列表应携带 SKU 摘要")
+	}
+	require.Equal(t, model.ActivityStateInProgress, stateByID[a1.ID])
+	require.Equal(t, model.ActivityStateInProgress, stateByID[a2.ID])
+	require.Equal(t, model.ActivityStateOffSale, stateByID[offSale.ID])
+	require.Equal(t, model.ActivityStateEnded, stateByID[ended.ID])
 }
 
 // ---- 抢购（T11：限流 → 幂等键 → Lua 预扣）----

@@ -20,8 +20,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: go_single_redis
-    # 集成测试按包隔离 Redis 库（15-20），需 20+ 个逻辑库（默认 16）。
-    command: ["redis-server", "--databases", "20"]
+    # 集成测试按包隔离 Redis 库（15-20），需 21 个逻辑库（默认 16）。
+    command: ["redis-server", "--databases", "21"]
     ports:
       - "6379:6379"
     healthcheck:

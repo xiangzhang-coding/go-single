@@ -350,6 +350,14 @@ func TestUpdateTemplate(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, "改名券", got[0].Name)
 	assert.Equal(t, 2, got[0].PerUserLimit)
+	assert.Equal(t, int64(0), got[0].ClaimedCount, "后台列表应携带已领数")
+
+	// 领券后后台列表已领数随之更新。
+	_, err = fx.svc.Claim(context.Background(), 42, tmpl.ID)
+	require.NoError(t, err)
+	got, err = fx.svc.ListTemplates(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), got[0].ClaimedCount)
 
 	// 不存在的模板 → 404 语义。
 	require.ErrorIs(t, fx.svc.UpdateTemplate(context.Background(), 999, p), ErrTemplateNotFound)

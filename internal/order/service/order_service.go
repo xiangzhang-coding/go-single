@@ -185,6 +185,8 @@ type Service interface {
 	CreateSeckill(ctx context.Context, p SeckillCreateParams) error
 	// List 我的订单（状态筛选 + 分页）。
 	List(ctx context.Context, userID int64, status string, page, pageSize int) ([]model.OrderView, int64, error)
+	// ListAll 后台全量订单（admin，T25）：跨用户，状态筛选 + 分页，订单项随列表一次取出。
+	ListAll(ctx context.Context, status string, page, pageSize int) ([]model.OrderView, int64, error)
 	// GetDetail 订单详情（owner 校验，防 IDOR）。
 	GetDetail(ctx context.Context, userID int64, orderNo string) (*model.OrderView, error)
 	// Cancel 取消待支付订单：回补库存 + 回退券；状态机非法跃迁拒绝。
@@ -746,6 +748,41 @@ func (s *orderService) List(ctx context.Context, userID int64, status string, pa
 	}
 
 	orders, total, err := s.store.Orders.List(ctx, userID, status, (page-1)*pageSize, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	orderNos := make([]string, 0, len(orders))
+	for _, o := range orders {
+		orderNos = append(orderNos, o.OrderNo)
+	}
+	itemsByOrder, err := s.store.Items.ListByOrders(ctx, orderNos)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	views := make([]model.OrderView, 0, len(orders))
+	for _, o := range orders {
+		views = append(views, model.OrderView{Order: o, Items: itemsByOrder[o.OrderNo]})
+	}
+	return views, total, nil
+}
+
+// ListAll 后台全量订单（T25）：跨用户，状态筛选 + 分页；与 List 同构。
+func (s *orderService) ListAll(ctx context.Context, status string, page, pageSize int) ([]model.OrderView, int64, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = defaultPageSize
+	}
+	if pageSize > maxPageSize {
+		pageSize = maxPageSize
+	}
+	if status != "" && !validStatus(status) {
+		return nil, 0, fmt.Errorf("%w: invalid status", ErrInvalidInput)
+	}
+
+	orders, total, err := s.store.Orders.ListAll(ctx, status, (page-1)*pageSize, pageSize)
 	if err != nil {
 		return nil, 0, err
 	}

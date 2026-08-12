@@ -82,14 +82,17 @@ export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
 }
 
 type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
+type ButtonSize = "normal" | "small";
 
 export function Button({
   children,
   variant = "primary",
+  size = "normal",
   className = "",
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: ButtonVariant;
+  size?: ButtonSize;
   children: ReactNode;
 }) {
   const variants: Record<ButtonVariant, string> = {
@@ -98,9 +101,13 @@ export function Button({
     ghost: "button button-ghost",
     danger: "button button-danger",
   };
+  const sizes: Record<ButtonSize, string> = {
+    normal: "",
+    small: "button-small",
+  };
 
   return (
-    <button className={`${variants[variant]} ${className}`} {...props}>
+    <button className={`${variants[variant]} ${sizes[size]} ${className}`} {...props}>
       {children}
     </button>
   );

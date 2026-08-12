@@ -21,6 +21,11 @@ import { NotFoundPage } from "./pages/NotFoundPage";
 import { OrderDetailPage } from "./pages/OrderDetailPage";
 import { OrdersPage } from "./pages/OrdersPage";
 import { ProductDetailPage } from "./pages/ProductDetailPage";
+import { AdminCouponsPage } from "./pages/admin/AdminCouponsPage";
+import { AdminFlashSalesPage } from "./pages/admin/AdminFlashSalesPage";
+import { AdminLayout } from "./pages/admin/AdminLayout";
+import { AdminOrdersPage } from "./pages/admin/AdminOrdersPage";
+import { AdminProductsPage } from "./pages/admin/AdminProductsPage";
 import { useChatRealtime } from "./lib/chat-hooks";
 import { useAuthStore } from "./store/auth";
 
@@ -31,6 +36,22 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
   if (!token || !user) {
     const returnTo = `${location.pathname}${location.search}`;
     return <Navigate to={`/login?returnTo=${encodeURIComponent(returnTo)}`} replace />;
+  }
+  return children;
+}
+
+// AdminRoute 后台路由守卫（T25）：已登录 + admin 角色才放行；
+// 普通用户重定向回首页（前端隐藏，后端 RequireAdmin 另有 403 兜底）。
+function AdminRoute({ children }: { children: ReactNode }) {
+  const { token, user } = useAuthStore();
+  const location = useLocation();
+
+  if (!token || !user) {
+    const returnTo = `${location.pathname}${location.search}`;
+    return <Navigate to={`/login?returnTo=${encodeURIComponent(returnTo)}`} replace />;
+  }
+  if (user.role !== "admin") {
+    return <Navigate to="/" replace />;
   }
   return children;
 }
@@ -153,6 +174,19 @@ export function App() {
               </ProtectedRoute>
             }
           />
+          <Route
+            path="admin"
+            element={
+              <AdminRoute>
+                <AdminLayout />
+              </AdminRoute>
+            }
+          >
+            <Route index element={<AdminProductsPage />} />
+            <Route path="orders" element={<AdminOrdersPage />} />
+            <Route path="flashsales" element={<AdminFlashSalesPage />} />
+            <Route path="coupons" element={<AdminCouponsPage />} />
+          </Route>
           <Route path="*" element={<NotFoundPage />} />
         </Route>
       </Routes>

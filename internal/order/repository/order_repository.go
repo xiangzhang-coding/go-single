@@ -32,6 +32,8 @@ type OrderRepository interface {
 	GetByNo(ctx context.Context, orderNo string) (*model.Order, error)
 	// List 我的订单：状态筛选（空 = 全部）+ 分页，返回条目与总数。
 	List(ctx context.Context, userID int64, status string, offset, limit int) ([]model.Order, int64, error)
+	// ListAll 全量订单（后台 T25）：跨用户，状态筛选（空 = 全部）+ 分页。
+	ListAll(ctx context.Context, status string, offset, limit int) ([]model.Order, int64, error)
 	// ListExpiredPending 超时扫描：待支付且已过 expire_at 的普通订单
 	// （超时取消仅针对普通订单；秒杀订单见 ListExpiredSeckillPending）。
 	// now 由调用方传入（Go 时钟），limit 分批上限，供 cron 每分钟扫描。

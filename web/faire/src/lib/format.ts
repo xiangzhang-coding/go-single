@@ -51,6 +51,16 @@ export function formatSpecs(value: unknown) {
   return parseSpecs(value).map(([key, item]) => `${key}: ${item}`).join(" · ") || "标准规格";
 }
 
+// toLocalInput 服务端 RFC3339 时间 → datetime-local 输入值（本地时区）。
+export function toLocalInput(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 export function makeClientRequestID() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();

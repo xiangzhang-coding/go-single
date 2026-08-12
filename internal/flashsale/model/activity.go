@@ -47,6 +47,13 @@ const (
 	ActivityStateInProgress = "in_progress" // 进行中
 )
 
+// 后台管理视角的补充状态（T25 admin 列表派生）：在用户视角状态之外
+// 覆盖全部活动——下架（off_sale，status 的手动下架语义）与已结束（ended）。
+const (
+	ActivityStateOffSale = "off_sale" // 手动下架
+	ActivityStateEnded   = "ended"    // 时间窗口已结束
+)
+
 // SKUView 秒杀页 SKU 摘要：规格与原价（与秒杀价对照展示）。
 type SKUView struct {
 	ID        int64           `json:"id"`
