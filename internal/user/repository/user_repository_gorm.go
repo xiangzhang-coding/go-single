@@ -39,6 +39,18 @@ func (r *GORMUserRepository) GetByID(ctx context.Context, id int64) (*model.User
 	return r.findOne(ctx, "id = ?", id)
 }
 
+// SearchByUsername 前缀搜索：username LIKE 'prefix%'，id 升序限量返回。
+func (r *GORMUserRepository) SearchByUsername(ctx context.Context, prefix string, limit int) ([]model.User, error) {
+	if prefix == "" || limit <= 0 {
+		return []model.User{}, nil
+	}
+	var users []model.User
+	if err := r.db.WithContext(ctx).Where("username LIKE ?", prefix+"%").Order("id ASC").Limit(limit).Find(&users).Error; err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
 func (r *GORMUserRepository) findOne(ctx context.Context, query string, args ...any) (*model.User, error) {
 	var u model.User
 	if err := r.db.WithContext(ctx).Where(query, args...).First(&u).Error; err != nil {

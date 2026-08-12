@@ -50,6 +50,8 @@ type PostService interface {
 	// Feed 好友圈时间线：仅好友动态（不含自己），时间倒序分页，
 	// 返回条目（含作者用户名）与总数。
 	Feed(ctx context.Context, userID int64, page, pageSize int) ([]model.PostView, int64, error)
+	// MyPosts 我的动态：时间倒序分页（feed 不含自己，个人页单独展示）。
+	MyPosts(ctx context.Context, userID int64, page, pageSize int) ([]model.PostView, int64, error)
 	// Delete 删除自己的动态（owner 校验，防 IDOR）。
 	Delete(ctx context.Context, userID, postID int64) error
 }
@@ -124,6 +126,39 @@ func (s *postService) Feed(ctx context.Context, userID int64, page, pageSize int
 		friendIDs = append(friendIDs, friends[i].FriendID)
 	}
 	posts, total, err := s.store.Posts.ListByUsers(ctx, friendIDs, (page-1)*pageSize, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	names, err := usernames(ctx, s.users, authorIDs(posts))
+	if err != nil {
+		return nil, 0, err
+	}
+	views := make([]model.PostView, 0, len(posts))
+	for i := range posts {
+		views = append(views, model.PostView{
+			Post:           posts[i],
+			AuthorUsername: names[posts[i].UserID],
+		})
+	}
+	return views, total, nil
+}
+
+// MyPosts 我的动态：分页规则与 Feed 一致（默认 20 / 上限 50），
+// 补作者用户名（即自己）。feed 时间线不含自己的动态，个人页展示用。
+func (s *postService) MyPosts(ctx context.Context, userID int64, page, pageSize int) ([]model.PostView, int64, error) {
+	if userID <= 0 {
+		return nil, 0, fmt.Errorf("%w: invalid user id", ErrInvalidInput)
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = defaultFeedPageSize
+	}
+	if pageSize > maxFeedPageSize {
+		pageSize = maxFeedPageSize
+	}
+	posts, total, err := s.store.Posts.ListByUser(ctx, userID, (page-1)*pageSize, pageSize)
 	if err != nil {
 		return nil, 0, err
 	}

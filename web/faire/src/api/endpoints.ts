@@ -4,20 +4,32 @@ import type {
   Category,
   CartItem,
   CartItemView,
+  ConversationListResponse,
+  ConversationView,
   CouponListResponse,
   CouponTemplateListResponse,
   CouponTemplateView,
   CreateAddressRequest,
   CreateOrderRequest,
   FlashSaleListResponse,
+  FriendRequest,
+  FriendRequestView,
+  FriendView,
   LoginResponse,
+  Message,
+  MessageListResponse,
   OrderListResponse,
   OrderView,
   Payment,
+  Post,
+  PostListResponse,
   ProductDetail,
   ProductListResponse,
+  SendMessageRequest,
+  SharePostRequest,
   User,
   UserCouponView,
+  UserSearchResult,
 } from "./types";
 
 export const authApi = {
@@ -155,4 +167,106 @@ export async function mockPay(orderNo: string, amount: number, result: "success"
     result,
   });
   return data;
+}
+
+// ---- 好友 ----
+
+export async function searchUsers(username: string) {
+  const { data } = await api.get<{ items: UserSearchResult[] }>("/users", {
+    params: { username, limit: 10 },
+  });
+  return data.items;
+}
+
+export async function sendFriendRequest(toUserId: number) {
+  const { data } = await api.post<FriendRequest>("/friend-requests", { to_user_id: toUserId });
+  return data;
+}
+
+export async function getFriendRequests(params: { scope: "incoming" | "outgoing"; status?: string }) {
+  const { data } = await api.get<{ items: FriendRequestView[] }>("/friend-requests", {
+    params: { scope: params.scope, status: params.status || undefined },
+  });
+  return data.items;
+}
+
+export async function acceptFriendRequest(requestId: number) {
+  await api.post(`/friend-requests/${requestId}/accept`);
+}
+
+export async function rejectFriendRequest(requestId: number) {
+  await api.post(`/friend-requests/${requestId}/reject`);
+}
+
+export async function getFriends() {
+  const { data } = await api.get<{ items: FriendView[] }>("/friends");
+  return data.items;
+}
+
+// ---- 好友圈 ----
+
+export async function getFeed(params: { page: number; pageSize?: number }) {
+  const { data } = await api.get<PostListResponse>("/posts/feed", {
+    params: { page: params.page, page_size: params.pageSize || 20 },
+  });
+  return data;
+}
+
+export async function getMyPosts(params: { page: number; pageSize?: number }) {
+  const { data } = await api.get<PostListResponse>("/posts/mine", {
+    params: { page: params.page, page_size: params.pageSize || 20 },
+  });
+  return data;
+}
+
+export async function sharePost(request: SharePostRequest) {
+  const { data } = await api.post<Post>("/posts", request);
+  return data;
+}
+
+export async function deletePost(postId: number) {
+  await api.delete(`/posts/${postId}`);
+}
+
+// ---- 聊天 ----
+
+export async function getConversations(params: { beforeId?: number; limit?: number }) {
+  const { data } = await api.get<ConversationListResponse>("/conversations", {
+    params: { before_id: params.beforeId || undefined, limit: params.limit || 20 },
+  });
+  return data;
+}
+
+export async function getMessages(
+  conversationKey: string,
+  params: { afterId?: number; beforeId?: number; limit?: number },
+) {
+  const { data } = await api.get<MessageListResponse>(`/conversations/${conversationKey}/messages`, {
+    params: {
+      after_id: params.afterId || undefined,
+      before_id: params.beforeId || undefined,
+      limit: params.limit || 30,
+    },
+  });
+  return data;
+}
+
+export async function sendMessage(request: SendMessageRequest) {
+  const { data } = await api.post<Message>("/messages", request);
+  return data;
+}
+
+export async function markConversationRead(conversationKey: string, lastMessageId: number) {
+  await api.post(`/conversations/${conversationKey}/read`, { last_message_id: lastMessageId });
+}
+
+// ---- 文件上传（图片消息 / 动态配图）----
+
+export async function uploadFile(file: File) {
+  const form = new FormData();
+  form.append("file", file);
+  const { data } = await api.post<{ url: string }>("/files", form, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+  return data.url;
 }

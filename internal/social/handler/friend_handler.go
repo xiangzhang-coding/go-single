@@ -34,6 +34,7 @@ func New(svc service.Service, posts service.PostService, verifier auth.TokenVeri
 //	GET  /api/friends                      我的好友列表（双向）
 //	POST /api/posts                        分享动态 {sku_id, content?, image_url?}
 //	GET  /api/posts/feed                   好友圈时间线（仅好友，page/page_size 分页）
+//	GET  /api/posts/mine                   我的动态（page/page_size 分页）
 //	DELETE /api/posts/:id                  删除自己的动态
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	protected := rg.Group("", auth.Middleware(h.verifier))
@@ -44,6 +45,7 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 	protected.GET("/friends", h.ListFriends)
 	protected.POST("/posts", h.SharePost)
 	protected.GET("/posts/feed", h.FeedPosts)
+	protected.GET("/posts/mine", h.MyPosts)
 	protected.DELETE("/posts/:id", h.DeletePost)
 }
 

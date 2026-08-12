@@ -292,3 +292,46 @@ func TestRegisterValidation(t *testing.T) {
 	w, _ = doJSON(t, env, http.MethodPost, "/api/auth/register", `{"username":""}`, "")
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
+
+// 用户名前缀搜索：命中、排除自己、鉴权与校验。
+func TestUserSearchByPrefix(t *testing.T) {
+	env := requireEnv(t)
+	uid := time.Now().UnixNano()
+
+	prefix := fmt.Sprintf("sea_%d", uid%1_000_000)
+	userA := prefix + "_a"
+	userB := prefix + "_b"
+	other := "zz_" + fmt.Sprint(uid)
+	registerUser(t, env, userA, "secret123")
+	registerUser(t, env, userB, "secret123")
+	registerUser(t, env, other, "secret123")
+
+	_, loginA := login(t, env, userA, "secret123")
+	tokenA := tokenOf(t, loginA)
+
+	// 前缀命中：返回 a 与 b，且不含自己（登录账号自身）。
+	w, body := doJSON(t, env, http.MethodGet, "/api/users?username="+prefix, "", tokenA)
+	require.Equal(t, http.StatusOK, w.Code)
+	items, ok := body["items"].([]any)
+	require.True(t, ok)
+	usernames := make([]string, 0, len(items))
+	for _, it := range items {
+		m := it.(map[string]any)
+		usernames = append(usernames, m["username"].(string))
+	}
+	require.Contains(t, usernames, userB)
+	require.NotContains(t, usernames, userA)
+
+	// 无匹配：空列表。
+	w, body = doJSON(t, env, http.MethodGet, "/api/users?username=nomatch_zz_"+fmt.Sprint(uid), "", tokenA)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Empty(t, body["items"])
+
+	// 未携带 token → 401。
+	w, _ = doJSON(t, env, http.MethodGet, "/api/users?username="+prefix, "", "")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+
+	// 空前缀 → 400。
+	w, _ = doJSON(t, env, http.MethodGet, "/api/users?username=", "", tokenA)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}

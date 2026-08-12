@@ -11,14 +11,18 @@ export type IconName =
   | "chevron-down"
   | "clock"
   | "close"
+  | "image"
   | "login"
   | "logout"
+  | "message"
   | "minus"
   | "pin"
   | "plus"
   | "refresh"
   | "search"
-  | "trash";
+  | "send"
+  | "trash"
+  | "user-plus";
 
 export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const common = {
@@ -50,6 +54,14 @@ export function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
       return <svg {...common}><circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" /></svg>;
     case "close":
       return <svg {...common}><path d="m6 6 12 12M18 6 6 18" /></svg>;
+    case "image":
+      return <svg {...common}><rect x="3.5" y="5" width="17" height="14" rx="1" /><circle cx="9" cy="10" r="1.6" /><path d="m5 18 5-5 3 3 3-3 3 3" /></svg>;
+    case "message":
+      return <svg {...common}><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v10a1.5 1.5 0 0 1-1.5 1.5H10l-4.5 3.8V17H5.5A1.5 1.5 0 0 1 4 15.5v-10Z" /></svg>;
+    case "send":
+      return <svg {...common}><path d="M4 11.5 20 4l-6.5 16-3-6.5L4 11.5Z" /><path d="M10.5 13.5 20 4" /></svg>;
+    case "user-plus":
+      return <svg {...common}><circle cx="9.5" cy="8" r="3.2" /><path d="M3.5 20c.6-3.2 3-5 6-5s5.4 1.8 6 5" /><path d="M18 9v5M15.5 11.5h5" /></svg>;
     case "login":
       return <svg {...common}><path d="M10 5H6a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h4" /><path d="m14 8 4 4-4 4M9 12h9" /></svg>;
     case "logout":

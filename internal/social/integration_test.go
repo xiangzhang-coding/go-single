@@ -631,3 +631,44 @@ func TestPostDeleteOwn(t *testing.T) {
 	w, _ = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/posts/%d", postID), "", "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 }
+
+// ---- 我的动态（T24 前端个人页）----
+
+func TestPostMine(t *testing.T) {
+	env := requireEnv(t)
+	aliceID, aliceToken := register(t, env, "ava_pm")
+	bobID, bobToken := register(t, env, "bob_pm")
+	befriend(t, env, aliceToken, bobID, bobToken)
+
+	productID, skuID := seedProductSKU(t, env, "pm")
+	seedPurchase(t, env, aliceID, productID, skuID, ordermodel.OrderStatusPaid)
+	seedPurchase(t, env, bobID, productID, skuID, ordermodel.OrderStatusPaid)
+	sharePost(t, env, aliceToken, skuID, "alice 第一条")
+	sharePost(t, env, aliceToken, skuID, "alice 第二条")
+	sharePost(t, env, bobToken, skuID, "bob 的") // 他人动态不混入
+
+	// 我的动态：仅自己的两条，最新在前。
+	w, body := doJSON(t, env, http.MethodGet, "/api/posts/mine?page=1&page_size=10", "", aliceToken)
+	require.Equal(t, http.StatusOK, w.Code)
+	items := body["items"].([]any)
+	require.Len(t, items, 2)
+	require.Equal(t, float64(2), body["total"])
+	require.Equal(t, "alice 第二条", items[0].(map[string]any)["content"], "最新在前")
+	require.Equal(t, float64(aliceID), items[0].(map[string]any)["user_id"])
+	require.True(t, strings.HasPrefix(items[0].(map[string]any)["author_username"].(string), "ava_pm_"))
+
+	// 分页：page_size=1 时第一页 1 条，total 仍为 2。
+	w, body = doJSON(t, env, http.MethodGet, "/api/posts/mine?page=2&page_size=1", "", aliceToken)
+	require.Equal(t, http.StatusOK, w.Code)
+	items = body["items"].([]any)
+	require.Len(t, items, 1)
+	require.Equal(t, "alice 第一条", items[0].(map[string]any)["content"], "第二页为最早一条")
+
+	// bob 的 mine 不含 alice 的动态。
+	_, body = doJSON(t, env, http.MethodGet, "/api/posts/mine", "", bobToken)
+	require.Equal(t, float64(1), body["total"])
+
+	// 未带 token → 401。
+	w, _ = doJSON(t, env, http.MethodGet, "/api/posts/mine", "", "")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}

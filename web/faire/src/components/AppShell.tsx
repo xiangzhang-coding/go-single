@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getCart } from "../api/endpoints";
 import { Icon } from "./ui";
 import { useAuthStore } from "../store/auth";
+import { totalUnread, useChatStore } from "../store/chat";
 
 export function AppShell() {
   const navigate = useNavigate();
@@ -16,6 +17,7 @@ export function AppShell() {
     staleTime: 15_000,
   });
   const cartCount = cartQuery.data?.items.reduce((sum, item) => sum + item.quantity, 0) || 0;
+  const unreadCount = totalUnread(useChatStore((state) => state.conversations));
 
   function signOut() {
     logout();
@@ -78,6 +80,15 @@ export function AppShell() {
             </NavLink>
             <NavLink to="/orders" className={({ isActive }) => (isActive ? "active" : "")}>
               我的订单
+            </NavLink>
+            <NavLink to="/friends" className={({ isActive }) => (isActive ? "active" : "")}>
+              好友
+            </NavLink>
+            <NavLink to="/feed" className={({ isActive }) => (isActive ? "active" : "")}>
+              好友圈
+            </NavLink>
+            <NavLink to="/chat" className={({ isActive }) => (isActive ? "active" : "")}>
+              聊天{unreadCount > 0 && <span className="nav-count">{unreadCount}</span>}
             </NavLink>
             <NavLink to="/cart" className={({ isActive }) => (isActive ? "active" : "")}>
               购物车{cartCount > 0 && <span className="nav-count">{cartCount}</span>}

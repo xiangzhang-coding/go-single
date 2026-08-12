@@ -52,6 +52,20 @@ func (r *GORMPostRepository) ListByUsers(ctx context.Context, userIDs []int64, o
 	return list, total, nil
 }
 
+// ListByUser 我的动态：与时间线同序（created_at DESC, id DESC），个人页展示用。
+func (r *GORMPostRepository) ListByUser(ctx context.Context, userID int64, offset, limit int) ([]model.Post, int64, error) {
+	var total int64
+	q := r.db.WithContext(ctx).Model(&model.Post{}).Where("user_id = ?", userID)
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var list []model.Post
+	if err := q.Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&list).Error; err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
+}
+
 func (r *GORMPostRepository) Delete(ctx context.Context, id int64) (bool, error) {
 	res := r.db.WithContext(ctx).Delete(&model.Post{}, "id = ?", id)
 	return res.RowsAffected == 1, res.Error

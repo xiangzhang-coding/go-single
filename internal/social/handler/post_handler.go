@@ -41,6 +41,23 @@ func (h *Handler) SharePost(c *gin.Context) {
 	c.JSON(http.StatusCreated, post)
 }
 
+// MyPosts 我的动态：时间倒序分页（feed 不含自己，个人页单独展示）。
+func (h *Handler) MyPosts(c *gin.Context) {
+	claims, ok := auth.ClaimsFrom(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		return
+	}
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	items, total, err := h.posts.MyPosts(c.Request.Context(), claims.UserID, page, pageSize)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": total})
+}
+
 // FeedPosts 好友圈时间线：仅好友动态，时间倒序分页。
 func (h *Handler) FeedPosts(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)

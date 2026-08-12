@@ -51,6 +51,9 @@ type Service interface {
 	Register(ctx context.Context, username, password string) (*model.User, error)
 	Login(ctx context.Context, username, password string) (*model.User, string, error)
 	GetByID(ctx context.Context, id int64) (*model.User, error)
+	// Search 按用户名前缀搜索用户（社交"加好友"发现入口）：
+	// 前缀须非空且 ≤32 字符（与注册同名规则），limit 截断到 [1, maxSearchLimit]。
+	Search(ctx context.Context, username string, limit int) ([]*model.User, error)
 
 	// ---- 地址簿 ----
 	// CreateAddress 新增地址：首条自动设为默认；IsDefault=true 时显式设为默认。
@@ -127,6 +130,34 @@ func (s *userService) GetByID(ctx context.Context, id int64) (*model.User, error
 		return nil, ErrUserNotFound
 	}
 	return u, nil
+}
+
+// 搜索默认条数与上限（演示页一次展示数量有限）。
+const (
+	defaultSearchLimit = 10
+	maxSearchLimit     = 20
+)
+
+// Search 前缀搜索：校验 → 限量查询（≤maxSearchLimit，非法 limit 用默认值）。
+func (s *userService) Search(ctx context.Context, username string, limit int) ([]*model.User, error) {
+	if username == "" || len(username) > 32 {
+		return nil, ErrInvalidUsername
+	}
+	if limit < 1 {
+		limit = defaultSearchLimit
+	}
+	if limit > maxSearchLimit {
+		limit = maxSearchLimit
+	}
+	users, err := s.store.Users.SearchByUsername(ctx, username, limit)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]*model.User, 0, len(users))
+	for i := range users {
+		items = append(items, &users[i])
+	}
+	return items, nil
 }
 
 // ---- 地址簿 ----

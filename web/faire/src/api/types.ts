@@ -233,3 +233,102 @@ export interface CreateAddressRequest {
   detail: string;
   is_default: boolean;
 }
+
+// ---- 社交：好友 ----
+
+export type FriendRequestStatus = "pending" | "accepted" | "rejected";
+
+export interface FriendRequest {
+  id: number;
+  from_user_id: number;
+  to_user_id: number;
+  status: FriendRequestStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FriendRequestView extends FriendRequest {
+  peer_username: string;
+}
+
+export interface FriendView {
+  user_id: number;
+  username: string;
+  since: string;
+}
+
+export interface UserSearchResult {
+  id: number;
+  username: string;
+  role: "user" | "admin";
+  created_at: string;
+  updated_at: string;
+}
+
+// ---- 社交：好友圈动态 ----
+
+export interface Post {
+  id: number;
+  user_id: number;
+  sku_id: number;
+  content?: string;
+  image_url?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PostView extends Post {
+  author_username: string;
+}
+
+export interface PostListResponse {
+  items: PostView[];
+  total: number;
+}
+
+export interface SharePostRequest {
+  sku_id: number;
+  content?: string;
+  image_url?: string;
+}
+
+// ---- 聊天 ----
+
+export type MessageType = "text" | "image" | "file";
+
+export interface Message {
+  id: number;
+  conversation_key: string;
+  sender_id: number;
+  recipient_id: number;
+  type: MessageType;
+  content?: string;
+  url?: string;
+  created_at: string;
+}
+
+export interface ConversationView {
+  conversation_key: string;
+  peer_user_id: number;
+  peer_username: string;
+  last_message?: Message;
+  unread_count: number;
+}
+
+export interface ConversationListResponse {
+  items: ConversationView[];
+  has_more: boolean;
+}
+
+export interface MessageListResponse {
+  items: Message[];
+  has_more: boolean;
+}
+
+export interface SendMessageRequest {
+  to_user_id: number;
+  type: MessageType;
+  content?: string;
+  url?: string;
+  client_request_id: string;
+}

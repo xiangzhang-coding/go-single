@@ -10,14 +10,18 @@ import {
 import { AppShell } from "./components/AppShell";
 import { AuthPage } from "./pages/AuthPage";
 import { CartPage } from "./pages/CartPage";
+import { ChatPage } from "./pages/ChatPage";
 import { CheckoutPage } from "./pages/CheckoutPage";
 import { CouponsPage } from "./pages/CouponsPage";
+import { FeedPage } from "./pages/FeedPage";
 import { FlashSalePage } from "./pages/FlashSalePage";
+import { FriendsPage } from "./pages/FriendsPage";
 import { HomePage } from "./pages/HomePage";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { OrderDetailPage } from "./pages/OrderDetailPage";
 import { OrdersPage } from "./pages/OrdersPage";
 import { ProductDetailPage } from "./pages/ProductDetailPage";
+import { useChatRealtime } from "./lib/chat-hooks";
 import { useAuthStore } from "./store/auth";
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -52,6 +56,8 @@ function SessionEvents() {
 }
 
 export function App() {
+  useChatRealtime();
+
   return (
     <BrowserRouter>
       <SessionEvents />
@@ -120,6 +126,30 @@ export function App() {
             element={
               <ProtectedRoute>
                 <CouponsPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="friends"
+            element={
+              <ProtectedRoute>
+                <FriendsPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="feed"
+            element={
+              <ProtectedRoute>
+                <FeedPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="chat"
+            element={
+              <ProtectedRoute>
+                <ChatPage />
               </ProtectedRoute>
             }
           />

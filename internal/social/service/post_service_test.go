@@ -86,6 +86,28 @@ func (f *fakePosts) ListByUsers(_ context.Context, userIDs []int64, offset, limi
 	return all[offset:end], total, nil
 }
 
+func (f *fakePosts) ListByUser(_ context.Context, userID int64, offset, limit int) ([]model.Post, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var all []model.Post
+	for _, p := range f.byID {
+		if p.UserID == userID {
+			all = append(all, *p)
+		}
+	}
+	// 与 ListByUsers 同序：时间倒序（id 单调即时间单调）。
+	sort.Slice(all, func(i, j int) bool { return all[i].ID > all[j].ID })
+	total := int64(len(all))
+	if offset >= len(all) {
+		return []model.Post{}, total, nil
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[offset:end], total, nil
+}
+
 func (f *fakePosts) Delete(_ context.Context, id int64) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -246,6 +268,54 @@ func TestFeedNoFriends(t *testing.T) {
 	items, _, err = fx.svc.Feed(context.Background(), 1, 1, 9999)
 	require.NoError(t, err)
 	require.Empty(t, items)
+}
+
+// ---- 我的动态 ----
+
+func TestMyPostsShowsOwnOnly(t *testing.T) {
+	fx := newPostFixture()
+	fx.orders.purchased[10] = true
+	fx.orders.purchased[20] = true
+	fx.share(t, 1, 10, "alice 第一条")
+	fx.share(t, 1, 20, "alice 第二条")
+	fx.share(t, 2, 10, "bob 的") // 他人动态不混入
+
+	items, total, err := fx.svc.MyPosts(context.Background(), 1, 1, 20)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), total)
+	require.Len(t, items, 2)
+	// 时间倒序：后分享的在前；作者用户名即自己。
+	require.Equal(t, "alice 第二条", items[0].Content)
+	require.Equal(t, "alice 第一条", items[1].Content)
+	require.Equal(t, "alice", items[0].AuthorUsername)
+	require.Equal(t, "alice", items[1].AuthorUsername)
+}
+
+func TestMyPostsPagination(t *testing.T) {
+	fx := newPostFixture()
+	fx.orders.purchased[10] = true
+	for i := 0; i < 3; i++ {
+		fx.share(t, 1, 10, "")
+	}
+
+	// 每页 2 条：第一页 2 条 + 总数 3；第二页 1 条。
+	page1, total, err := fx.svc.MyPosts(context.Background(), 1, 1, 2)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), total)
+	require.Len(t, page1, 2)
+
+	page2, _, err := fx.svc.MyPosts(context.Background(), 1, 2, 2)
+	require.NoError(t, err)
+	require.Len(t, page2, 1)
+
+	// 越界页：空列表但总数不变。
+	page3, _, err := fx.svc.MyPosts(context.Background(), 1, 9, 2)
+	require.NoError(t, err)
+	require.Empty(t, page3)
+
+	// 非法 user id 被拒。
+	_, _, err = fx.svc.MyPosts(context.Background(), 0, 1, 20)
+	require.ErrorIs(t, err, ErrInvalidInput)
 }
 
 // ---- 删除自己的动态 ----

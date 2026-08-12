@@ -16,6 +16,8 @@ type PostRepository interface {
 	// 时间倒序（created_at DESC, id DESC 稳定分页），返回条目与总数。
 	// userIDs 为空返回空列表（总数为 0），不触达数据库。
 	ListByUsers(ctx context.Context, userIDs []int64, offset, limit int) ([]model.Post, int64, error)
+	// ListByUser 我的动态：时间倒序分页，返回条目与总数。
+	ListByUser(ctx context.Context, userID int64, offset, limit int) ([]model.Post, int64, error)
 	// Delete 删除一条动态，返回是否实际删除（RowsAffected；
 	// 归属校验在 service 层，false = 读取后已被并发删除）。
 	Delete(ctx context.Context, id int64) (bool, error)
