@@ -60,6 +60,25 @@ services:
       timeout: 3s
       retries: 20
 
+  # 前端本地部署（T26）：托管 web/faire 构建产物 + /api、/ws 反代后端（同源路径）。
+  # 不含前端构建——宿主先 bun build（web/faire），dist 以只读挂载进容器。
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: go_single_nginx
+    ports:
+      - "8081:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../web/faire/dist:/usr/share/nginx/html:ro
+    extra_hosts:
+      # 后端以宿主机进程运行，容器内经该主机名访问宿主 :8080（与 prometheus 同法）。
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   prometheus:
     image: prom/prometheus:v2.55.1
     container_name: go_single_prometheus

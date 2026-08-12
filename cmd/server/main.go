@@ -43,6 +43,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/config"
+	platformcors "github.com/xiangzhang-coding/go-single/internal/platform/cors"
 	platformcron "github.com/xiangzhang-coding/go-single/internal/platform/cron"
 	"github.com/xiangzhang-coding/go-single/internal/platform/file"
 	"github.com/xiangzhang-coding/go-single/internal/platform/health"
@@ -212,7 +213,9 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	r := gin.New()
 	// metrics 在最外层：panic 被 Recovery 恢复为 500 后仍能完成计数。
 	metricRegistry := metrics.New()
-	r.Use(metricRegistry.GinMiddleware(), gin.Recovery(), requestLogger(log))
+	// CORS（T26）：跨源场景（云端前端独立部署）按配置白名单放行；
+	// 放在最前使预检 OPTIONS 在路由匹配前即返回（204/403）。
+	r.Use(metricRegistry.GinMiddleware(), platformcors.Middleware(cfg.CORS.AllowOrigins), gin.Recovery(), requestLogger(log))
 
 	r.GET("/metrics", gin.WrapH(metricRegistry.Handler()))
 

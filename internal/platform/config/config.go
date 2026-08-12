@@ -24,6 +24,15 @@ type Config struct {
 	Snowflake  Snowflake
 	FlashSale  FlashSale
 	WS         WS
+	CORS       CORS
+}
+
+// CORS HTTP 跨源配置（T26 部署双路径）：云端前端与后端不同源时，
+// 中间件按该白名单放行（platform/cors）。
+type CORS struct {
+	// AllowOrigins 允许跨源访问的前端 Origin 白名单；空 = 允许所有
+	// （演示取舍，与 ws.allow_origins 语义一致，生产应配置前端域名）。
+	AllowOrigins []string `mapstructure:"allow_origins"`
 }
 
 // WS WebSocket 实时通道配置（T18）：长连接心跳保活与写超时参数。
@@ -177,4 +186,5 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ws.heartbeat_interval", "30s")
 	v.SetDefault("ws.write_wait", "10s")
 	v.SetDefault("ws.allow_origins", []string{})
+	v.SetDefault("cors.allow_origins", []string{})
 }

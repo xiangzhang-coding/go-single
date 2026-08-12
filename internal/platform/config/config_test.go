@@ -35,6 +35,8 @@ func TestLoad(t *testing.T) {
 	require.Equal(t, "http://127.0.0.1:19000", cfg.MinIO.PublicURL)
 	require.Equal(t, "./migrations", cfg.Migrations.Path)
 	require.Equal(t, int64(1), cfg.Snowflake.WorkerID)
+	require.Empty(t, cfg.WS.AllowOrigins)
+	require.Empty(t, cfg.CORS.AllowOrigins)
 }
 
 func TestMySQLDSN(t *testing.T) {

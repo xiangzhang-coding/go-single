@@ -55,3 +55,8 @@ ws:
   write_wait: 10s
   # 握手 Origin 白名单；空 = 允许所有（演示取舍，生产配置前端域名）。
   allow_origins: []
+
+cors:
+  # HTTP 接口允许跨源访问的前端 Origin 白名单（云端独立部署场景）；
+  # 空 = 允许所有（演示取舍，生产配置前端域名，如 https://shop.example.com）。
+  allow_origins: []
