@@ -35,7 +35,7 @@ export function CheckoutPage() {
 
   const cartQuery = useQuery({ queryKey: ["cart"], queryFn: getCart });
   const addressesQuery = useQuery({ queryKey: ["addresses"], queryFn: getAddresses });
-  const couponsQuery = useQuery({ queryKey: ["coupons", "unused"], queryFn: getMyCoupons });
+  const couponsQuery = useQuery({ queryKey: ["coupons", "unused"], queryFn: () => getMyCoupons("unused") });
 
   useEffect(() => {
     if (selectedAddressId !== null || !addressesQuery.data?.length) {

@@ -82,6 +82,55 @@ export interface UserCouponView {
   created_at: string;
 }
 
+export type CouponTemplateState = "claimable" | "not_started" | "ended" | "sold_out" | "limit_reached";
+
+export interface CouponTemplateView {
+  id: number;
+  name: string;
+  type: "direct" | "threshold" | string;
+  value: number;
+  min_amount: number;
+  total: number;
+  per_user_limit: number;
+  valid_from: string;
+  valid_until: string;
+  created_at: string;
+  updated_at: string;
+  claimed_count: number;
+  state: CouponTemplateState;
+}
+
+export type FlashSaleState = "not_started" | "in_progress";
+
+export interface FlashSaleSKU {
+  id: number;
+  product_id: number;
+  specs: Record<string, string> | string | unknown;
+  price: number;
+}
+
+export interface FlashSaleActivity {
+  id: number;
+  sku_id: number;
+  title: string;
+  price: number;
+  stock: number;
+  per_user_limit: number;
+  status: string;
+  start_at: string;
+  end_at: string;
+  created_at: string;
+  updated_at: string;
+  state: FlashSaleState;
+  product_title: string;
+  sku: FlashSaleSKU;
+}
+
+export interface FlashSaleListResponse {
+  server_time: string;
+  items: FlashSaleActivity[];
+}
+
 export type OrderStatus =
   | "pending_payment"
   | "paid"
@@ -156,6 +205,10 @@ export interface OrderListResponse {
 export interface CouponListResponse {
   items: UserCouponView[];
   total: number;
+}
+
+export interface CouponTemplateListResponse {
+  items: CouponTemplateView[];
 }
 
 export interface LoginResponse {

@@ -60,6 +60,8 @@ type Service interface {
 	GetDetail(ctx context.Context, id int64) (*model.ProductDetail, error)
 	// GetSKU 供后续模块（购物车）校验 SKU 存在/上架。
 	GetSKU(ctx context.Context, id int64) (*model.SKU, error)
+	// GetProduct 供后续模块（秒杀页）读取 SPU 标题等摘要信息。
+	GetProduct(ctx context.Context, id int64) (*model.Product, error)
 	// GetSKUForUpdate 在订单事务内锁定 SKU 并校验商品仍上架，供订单固化成交价。
 	GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.SKU, error)
 	// DeductStock 事务内条件扣减库存（stock>=N 防超卖），供 order 模块下单调用；
@@ -320,6 +322,18 @@ func (s *productService) GetSKU(ctx context.Context, id int64) (*model.SKU, erro
 		return nil, ErrSKUNotFound
 	}
 	return sku, nil
+}
+
+// GetProduct 读取 SPU；不存在返回 ErrProductNotFound。
+func (s *productService) GetProduct(ctx context.Context, id int64) (*model.Product, error) {
+	p, err := s.store.Product.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, ErrProductNotFound
+	}
+	return p, nil
 }
 
 // GetSKUForUpdate 锁定 SKU 行，并读取商品状态；库存扣减随后仍会在 SQL

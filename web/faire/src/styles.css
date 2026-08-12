@@ -928,3 +928,221 @@
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
+
+/* ---- T23 秒杀页 ---- */
+
+.flash-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 22px;
+}
+
+.flash-card {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: 20px;
+  padding: 18px;
+  border: 1px solid var(--color-ash);
+  border-radius: var(--radius-cards);
+  background: var(--color-pure-white);
+  transition: border-color 0.18s ease;
+}
+
+.flash-card.is-queued {
+  border-color: var(--color-ink-black);
+}
+
+.flash-card-visual {
+  display: block;
+}
+
+.flash-card-visual .product-visual {
+  width: 100%;
+  height: 100%;
+  min-height: 168px;
+}
+
+.flash-card-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.flash-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tag-live {
+  border-color: var(--faire-fern);
+  background: var(--faire-success-surface);
+}
+
+.flash-card-price {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.flash-card-price strong {
+  font-family: var(--font-nantes);
+  font-size: 30px;
+  font-weight: 400;
+}
+
+.flash-card-price del {
+  color: var(--color-smoke);
+  font-size: 13px;
+}
+
+.flash-card-meta {
+  color: var(--color-smoke);
+  font-size: 13px;
+}
+
+.flash-card-meta strong {
+  color: var(--color-ink-black);
+  font-weight: 400;
+}
+
+.flash-card-countdown {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  align-self: flex-start;
+  padding: 7px 12px;
+  border: 1px solid var(--color-ink-black);
+  border-radius: var(--radius-md);
+  background: var(--color-cream-paper);
+  color: var(--color-smoke);
+  font-size: 12px;
+}
+
+.flash-card-countdown strong {
+  color: var(--color-ink-black);
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: 0.03em;
+}
+
+.flash-card-action {
+  margin-top: auto;
+}
+
+.flash-card-action .button {
+  width: 100%;
+}
+
+.processing-panel-sm {
+  gap: 14px;
+  padding: 16px;
+}
+
+.processing-panel-sm .processing-mark {
+  width: 40px;
+  height: 40px;
+}
+
+.processing-panel-sm > .spinner {
+  margin-left: auto;
+}
+
+/* ---- T23 优惠券中心 ---- */
+
+.coupon-center-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.coupon-center-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid var(--color-ash);
+  border-radius: var(--radius-cards);
+  background: var(--color-pure-white);
+}
+
+.coupon-center-value strong {
+  display: block;
+  font-family: var(--font-nantes);
+  font-size: 34px;
+  font-weight: 400;
+}
+
+.coupon-center-value span {
+  display: block;
+  margin-top: 4px;
+  color: var(--color-smoke);
+  font-size: 12px;
+}
+
+.coupon-center-copy {
+  min-width: 0;
+}
+
+.coupon-center-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-ash);
+}
+
+.coupon-mine-list {
+  display: grid;
+  gap: 10px;
+}
+
+.coupon-mine-row {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 16px 18px;
+  border: 1px solid var(--color-ash);
+  border-radius: var(--radius-md);
+  background: var(--color-pure-white);
+}
+
+.coupon-mine-row.status-used {
+  opacity: 0.62;
+}
+
+.coupon-mine-value {
+  flex: none;
+  min-width: 96px;
+  padding-right: 18px;
+  border-right: 1px solid var(--color-ash);
+}
+
+.coupon-mine-value strong {
+  font-family: var(--font-nantes);
+  font-size: 26px;
+  font-weight: 400;
+}
+
+@media (max-width: 1000px) {
+  .flash-grid { grid-template-columns: 1fr; }
+  .coupon-center-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  .flash-card { grid-template-columns: 112px minmax(0, 1fr); gap: 14px; padding: 14px; }
+  .flash-card-visual .product-visual { min-height: 112px; }
+  .flash-card-price strong { font-size: 26px; }
+  .coupon-center-grid { grid-template-columns: 1fr; }
+  .processing-panel-sm { align-items: flex-start; flex-wrap: wrap; }
+  .processing-panel-sm > .spinner { width: 100%; margin-left: 54px; }
+}
+
+@media (max-width: 480px) {
+  .coupon-mine-row { flex-wrap: wrap; }
+  .coupon-mine-value { padding-right: 0; border-right: 0; }
+}

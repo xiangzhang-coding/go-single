@@ -95,15 +95,17 @@ func (f *fakeActivities) RestoreStock(_ context.Context, _ *gorm.DB, id int64, q
 // ---- fake product 服务 ----
 
 type fakeProducts struct {
-	skus map[int64]*productmodel.SKU
+	skus     map[int64]*productmodel.SKU
+	products map[int64]*productmodel.Product
 }
 
 func newFakeProducts() *fakeProducts {
-	return &fakeProducts{skus: map[int64]*productmodel.SKU{}}
+	return &fakeProducts{skus: map[int64]*productmodel.SKU{}, products: map[int64]*productmodel.Product{}}
 }
 
 func (f *fakeProducts) seed(skuID int64) {
-	f.skus[skuID] = &productmodel.SKU{ID: skuID, ProductID: 1, Price: 100, Stock: 5}
+	f.skus[skuID] = &productmodel.SKU{ID: skuID, ProductID: 1, Price: 100, Stock: 5, Specs: json.RawMessage(`{"color":"红"}`)}
+	f.products[1] = &productmodel.Product{ID: 1, Title: "秒杀商品", Status: "on_sale"}
 }
 
 func (f *fakeProducts) GetSKU(_ context.Context, id int64) (*productmodel.SKU, error) {
@@ -111,6 +113,13 @@ func (f *fakeProducts) GetSKU(_ context.Context, id int64) (*productmodel.SKU, e
 		return s, nil
 	}
 	return nil, productsvc.ErrSKUNotFound
+}
+
+func (f *fakeProducts) GetProduct(_ context.Context, id int64) (*productmodel.Product, error) {
+	if p, ok := f.products[id]; ok {
+		return p, nil
+	}
+	return nil, productsvc.ErrProductNotFound
 }
 
 // ---- fake 缓存（互斥锁模拟 Lua 原子预扣）----
@@ -846,4 +855,84 @@ func TestSeckillConcurrentNoOversell(t *testing.T) {
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), dup.ID))
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 1, dup.ID))
 	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 1, dup.ID), ErrDuplicateRequest)
+}
+
+// ---- 秒杀页活动列表（T23）----
+
+func TestListUserActivitiesFiltersAndState(t *testing.T) {
+	fx := newFixture()
+	// 进行中（1 分钟前开始）。
+	inProgress := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), inProgress.ID))
+	// 即将开始（1 小时后开始）。
+	notStarted := fx.createActivity(t, func(p *ActivityParams) {
+		p.StartAt = time.Now().Add(time.Hour)
+		p.EndAt = time.Now().Add(2 * time.Hour)
+	})
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), notStarted.ID))
+	// 已结束：先以有效窗口上架，再把仓储时间改到过去模拟窗口流逝。
+	ended := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), ended.ID))
+	stored, err := fx.acts.GetByID(context.Background(), ended.ID)
+	require.NoError(t, err)
+	stored.StartAt, stored.EndAt = time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour)
+	// 已下架：发布后下架。
+	offSale := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), offSale.ID))
+	require.NoError(t, fx.svc.UnpublishActivity(context.Background(), offSale.ID))
+
+	views, err := fx.svc.ListUserActivities(context.Background())
+	require.NoError(t, err)
+	require.Len(t, views, 2, "仅返回已上架且未结束的活动")
+
+	byID := map[int64]model.ActivityView{}
+	for _, v := range views {
+		byID[v.ID] = v
+	}
+	require.Equal(t, model.ActivityStateInProgress, byID[inProgress.ID].State)
+	require.Equal(t, model.ActivityStateNotStarted, byID[notStarted.ID].State)
+	_, hasEnded := byID[ended.ID]
+	require.False(t, hasEnded, "已结束活动不返回")
+	_, hasOffSale := byID[offSale.ID]
+	require.False(t, hasOffSale, "下架活动不返回")
+}
+
+func TestListUserActivitiesRemainingStockAndSummary(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	// 模拟预扣：Redis 余量 37（配置库存 100）。
+	fx.cache.Set(context.Background(), stockKey(a.ID), "37", 0)
+	// 预扣部分用户计数，验证摘要拼接不依赖计数。
+
+	views, err := fx.svc.ListUserActivities(context.Background())
+	require.NoError(t, err)
+	require.Len(t, views, 1)
+	v := views[0]
+	require.Equal(t, 37, v.Stock, "剩余库存以 Redis 预扣余量为准")
+	require.Equal(t, "秒杀商品", v.ProductTitle)
+	require.Equal(t, int64(1), v.SKU.ProductID)
+	require.Equal(t, int64(100), v.SKU.Price, "SKU 原价")
+	require.NotEmpty(t, v.SKU.Specs)
+
+	// Redis 缺失（如预热 TTL 过期）时降级配置库存。
+	fx.cache.Del(context.Background(), stockKey(a.ID))
+	views, err = fx.svc.ListUserActivities(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 100, views[0].Stock, "缓存缺失降级 DB 配置库存")
+}
+
+func TestListUserActivitiesSkipsBrokenSummary(t *testing.T) {
+	fx := newFixture()
+	// SKU 不存在的活动（如 SKU 被删除）：活动仍返回，摘要为空。
+	a := fx.createActivity(t, nil)
+	delete(fx.products.skus, 1)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+
+	views, err := fx.svc.ListUserActivities(context.Background())
+	require.NoError(t, err)
+	require.Len(t, views, 1)
+	require.Equal(t, "", views[0].ProductTitle)
+	require.Zero(t, views[0].SKU.ID)
+	require.Equal(t, 100, views[0].Stock, "摘要失败不影响活动与库存展示")
 }

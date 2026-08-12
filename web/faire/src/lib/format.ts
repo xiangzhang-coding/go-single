@@ -72,3 +72,7 @@ export function isCouponUsable(coupon: {
     new Date(coupon.valid_until).getTime() >= now
   );
 }
+
+export function describeCouponRule(type: string, minAmount: number) {
+  return type === "threshold" ? `满 ${formatMoney(minAmount)} 可用` : "无门槛直减";
+}

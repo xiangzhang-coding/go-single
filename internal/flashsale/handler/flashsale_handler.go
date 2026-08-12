@@ -38,6 +38,8 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 //
 // 用户（Bearer）：
 //
+//	GET  /api/flashsales             秒杀页活动列表（进行中/即将开始，携带 server_time
+//	                                  供前端对齐倒计时；状态/剩余库存服务端派生）
 //	POST /api/flashsales/:id/purchase      抢购（seckillTokenBucket 全局令牌桶限流，
 //	                                        成功返回 202 排队中 + order_no，异步落单见 T12）
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup, seckillTokenBucket gin.HandlerFunc) {
@@ -48,8 +50,9 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup, seckillTokenBucket gin.Han
 	admin.POST("/flashsales/:id/publish", h.PublishActivity)
 	admin.POST("/flashsales/:id/unpublish", h.UnpublishActivity)
 
-	purchase := rg.Group("/flashsales", auth.Middleware(h.verifier))
-	purchase.POST("/:id/purchase", seckillTokenBucket, h.Purchase)
+	protected := rg.Group("", auth.Middleware(h.verifier))
+	protected.GET("/flashsales", h.ListUserActivities)
+	protected.POST("/flashsales/:id/purchase", seckillTokenBucket, h.Purchase)
 }
 
 type activityRequest struct {
@@ -98,6 +101,17 @@ func (h *Handler) ListActivities(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"items": list})
+}
+
+// ListUserActivities 秒杀页活动列表：响应携带 server_time（RFC3339），
+// 前端据此计算本地与服务端时钟偏移，倒计时与服务端对齐。
+func (h *Handler) ListUserActivities(c *gin.Context) {
+	list, err := h.svc.ListUserActivities(c.Request.Context())
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"server_time": time.Now().Format(time.RFC3339), "items": list})
 }
 
 func (h *Handler) PublishActivity(c *gin.Context) {

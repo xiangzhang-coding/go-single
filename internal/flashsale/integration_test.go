@@ -49,7 +49,7 @@ const (
 	redisAddr     = "127.0.0.1:6379"
 	// redisTestDB 各测试包独占一个 Redis DB（15-20），避免 go test ./... 并行时
 	// 彼此 FlushDB 清掉对方的秒杀库存/幂等键等测试数据（跨包污染）。
-	redisTestDB   = 17
+	redisTestDB = 17
 )
 
 // testEnv 每个测试包只构建一次；MySQL 或 Redis 不可达时整体跳过。
@@ -548,4 +548,74 @@ func TestActivityEdgeCases(t *testing.T) {
 
 	w, _ = doJSON(t, env, http.MethodPost, "/api/admin/flashsales/999999/publish", "", admin)
 	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// T23 秒杀页活动列表（用户视角）：仅返回已上架且未结束的活动，
+// 携带 server_time（倒计时对齐）、剩余库存（Redis 预扣余量）、
+// 派生状态与 SKU/商品摘要。
+func TestFlashSaleUserActivityList(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	skuID := seedSKU(t, env, admin)
+	user := registerAndToken(t, env, uniqueName("shopper"))
+
+	// 进行中 + 即将开始各一个，上架；下架一个；已结束一个（上架后改窗口到过去）。
+	inProgress := createActivity(t, env, admin, skuID, 100, 2, -time.Minute, time.Hour)
+	notStarted := createActivity(t, env, admin, skuID, 50, 1, time.Hour, 2*time.Hour)
+	offSale := createActivity(t, env, admin, skuID, 30, 1, -time.Minute, time.Hour)
+	ended := createActivity(t, env, admin, skuID, 20, 1, -time.Minute, time.Hour)
+	for _, id := range []int64{inProgress, notStarted, ended} {
+		w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", id), "", admin)
+		require.Equal(t, http.StatusNoContent, w.Code)
+	}
+	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/unpublish", offSale), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	require.NoError(t, env.gdb.Exec("UPDATE flashsale_activities SET start_at = DATE_SUB(NOW(), INTERVAL 2 HOUR), end_at = DATE_SUB(NOW(), INTERVAL 1 HOUR) WHERE id = ?", ended).Error)
+
+	// 游客无权访问；普通用户可访问。
+	w, _ = doJSON(t, env, http.MethodGet, "/api/flashsales", "", "")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+
+	w, body := doJSON(t, env, http.MethodGet, "/api/flashsales", "", user)
+	require.Equal(t, http.StatusOK, w.Code, "秒杀页列表失败: %s", w.Body.String())
+
+	serverTime, ok := body["server_time"].(string)
+	require.True(t, ok, "列表应携带 server_time")
+	_, parseErr := time.Parse(time.RFC3339, serverTime)
+	require.NoError(t, parseErr, "server_time 应为 RFC3339")
+
+	items := body["items"].([]any)
+	byID := map[int64]map[string]any{}
+	for _, it := range items {
+		m := it.(map[string]any)
+		require.NotEqual(t, float64(offSale), m["id"], "下架活动不应出现")
+		require.NotEqual(t, float64(ended), m["id"], "已结束活动不应出现")
+		byID[int64(m["id"].(float64))] = m
+	}
+	ip, hasInProgress := byID[inProgress]
+	require.True(t, hasInProgress)
+	require.Equal(t, "in_progress", ip["state"])
+	require.Equal(t, float64(2), ip["per_user_limit"])
+	require.Equal(t, float64(100), ip["stock"], "剩余库存与预热一致")
+	require.Equal(t, float64(19900), ip["sku"].(map[string]any)["price"], "SKU 原价")
+	require.NotEmpty(t, ip["product_title"])
+
+	ns, hasNotStarted := byID[notStarted]
+	require.True(t, hasNotStarted)
+	require.Equal(t, "not_started", ns["state"])
+
+	// 预扣后列表反映 Redis 余量（95），而非配置库存。
+	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 7, inProgress))
+	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 8, inProgress))
+	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 9, inProgress))
+	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 10, inProgress))
+	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 11, inProgress))
+	w, body = doJSON(t, env, http.MethodGet, "/api/flashsales", "", user)
+	require.Equal(t, http.StatusOK, w.Code)
+	for _, it := range body["items"].([]any) {
+		m := it.(map[string]any)
+		if int64(m["id"].(float64)) == inProgress {
+			require.Equal(t, float64(95), m["stock"], "列表剩余库存应取 Redis 预扣余量")
+		}
+	}
 }

@@ -11,6 +11,8 @@ import { AppShell } from "./components/AppShell";
 import { AuthPage } from "./pages/AuthPage";
 import { CartPage } from "./pages/CartPage";
 import { CheckoutPage } from "./pages/CheckoutPage";
+import { CouponsPage } from "./pages/CouponsPage";
+import { FlashSalePage } from "./pages/FlashSalePage";
 import { HomePage } from "./pages/HomePage";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { OrderDetailPage } from "./pages/OrderDetailPage";
@@ -102,6 +104,22 @@ export function App() {
             element={
               <ProtectedRoute>
                 <OrderDetailPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="flash-sale"
+            element={
+              <ProtectedRoute>
+                <FlashSalePage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="coupons"
+            element={
+              <ProtectedRoute>
+                <CouponsPage />
               </ProtectedRoute>
             }
           />

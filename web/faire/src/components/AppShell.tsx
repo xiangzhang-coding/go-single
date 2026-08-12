@@ -70,6 +70,12 @@ export function AppShell() {
             <NavLink to="/" end className={({ isActive }) => (isActive ? "active" : "")}>
               目录
             </NavLink>
+            <NavLink to="/flash-sale" className={({ isActive }) => (isActive ? "active" : "")}>
+              秒杀
+            </NavLink>
+            <NavLink to="/coupons" className={({ isActive }) => (isActive ? "active" : "")}>
+              优惠券
+            </NavLink>
             <NavLink to="/orders" className={({ isActive }) => (isActive ? "active" : "")}>
               我的订单
             </NavLink>

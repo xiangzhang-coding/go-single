@@ -167,6 +167,13 @@ type Service interface {
 	// UnpublishActivity 下架：清除预热库存，后续抢购被拒。
 	UnpublishActivity(ctx context.Context, id int64) error
 
+	// ---- 秒杀页（T23）----
+	// ListUserActivities 秒杀页活动列表：仅返回已上架且未结束的活动
+	// （进行中 + 即将开始），每项携带剩余库存（Redis 预扣余量，缺失降级配置库存）、
+	// 派生状态（not_started/in_progress）与 SKU/商品摘要；状态按服务端时间派生，
+	// 倒计时对齐由调用方在响应中附加 server_time。
+	ListUserActivities(ctx context.Context) ([]model.ActivityView, error)
+
 	// ---- 抢购（T11/T12）----
 	// Seckill 抢购全流程：按用户限流（Redis 固定窗口计数）→ 幂等键
 	// （用户+活动，TTL 30min，挡预扣请求重复提交）→ Lua 原子预扣 →
@@ -199,6 +206,8 @@ type Service interface {
 type ProductService interface {
 	// GetSKU 校验 SKU 存在。
 	GetSKU(ctx context.Context, id int64) (*productmodel.SKU, error)
+	// GetProduct 读取 SPU（秒杀页展示商品标题）。
+	GetProduct(ctx context.Context, id int64) (*productmodel.Product, error)
 }
 
 // MessagePublisher MQ 发布端口（platform/mq 实现）：秒杀预扣成功后
@@ -309,6 +318,51 @@ func (s *flashsaleService) UpdateActivity(ctx context.Context, id int64, p Activ
 
 func (s *flashsaleService) ListActivities(ctx context.Context) ([]model.Activity, error) {
 	return s.store.Activities.List(ctx)
+}
+
+// ListUserActivities 秒杀页活动列表（T23）：过滤 已上架 && 未结束，
+// 剩余库存读 Redis 预扣余量（key 缺失/读失败降级配置库存，规格"缓存挂直查 DB"），
+// 派生状态与服务端时间对齐（进行中 / 即将开始），并拼接 SKU 规格/原价与商品标题。
+// 单个 SKU/商品读取失败仅留空摘要（活动仍展示，摘要缺失不影响抢购）。
+func (s *flashsaleService) ListUserActivities(ctx context.Context) ([]model.ActivityView, error) {
+	all, err := s.store.Activities.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	views := make([]model.ActivityView, 0, len(all))
+	for i := range all {
+		a := all[i]
+		if !a.IsOnSale() || now.After(a.EndAt) {
+			continue
+		}
+		v := model.ActivityView{Activity: a}
+		switch {
+		case now.Before(a.StartAt):
+			v.State = model.ActivityStateNotStarted
+		default:
+			v.State = model.ActivityStateInProgress
+		}
+		if remaining, err := s.cache.Get(ctx, stockKey(a.ID)); err == nil {
+			if n, convErr := strconv.Atoi(remaining); convErr == nil {
+				v.Stock = n
+			}
+		}
+		sku, skuErr := s.products.GetSKU(ctx, a.SKUID)
+		if skuErr == nil {
+			v.SKU = model.SKUView{
+				ID:        sku.ID,
+				ProductID: sku.ProductID,
+				Specs:     sku.Specs,
+				Price:     sku.Price,
+			}
+			if p, pErr := s.products.GetProduct(ctx, sku.ProductID); pErr == nil {
+				v.ProductTitle = p.Title
+			}
+		}
+		views = append(views, v)
+	}
+	return views, nil
 }
 
 // PublishActivity 上架：先预热 Redis 库存、后写状态——预热失败时活动保持下架，

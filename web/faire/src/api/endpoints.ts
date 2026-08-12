@@ -5,8 +5,11 @@ import type {
   CartItem,
   CartItemView,
   CouponListResponse,
+  CouponTemplateListResponse,
+  CouponTemplateView,
   CreateAddressRequest,
   CreateOrderRequest,
+  FlashSaleListResponse,
   LoginResponse,
   OrderListResponse,
   OrderView,
@@ -14,6 +17,7 @@ import type {
   ProductDetail,
   ProductListResponse,
   User,
+  UserCouponView,
 } from "./types";
 
 export const authApi = {
@@ -85,10 +89,32 @@ export async function createAddress(request: CreateAddressRequest) {
   return data;
 }
 
-export async function getMyCoupons() {
+export async function getMyCoupons(status?: string) {
   const { data } = await api.get<CouponListResponse>("/coupons/mine", {
-    params: { status: "unused", page: 1, page_size: 50 },
+    params: { status: status || "", page: 1, page_size: 50 },
   });
+  return data;
+}
+
+export async function getClaimableCoupons() {
+  const { data } = await api.get<CouponTemplateListResponse>("/coupons");
+  return data.items;
+}
+
+export async function claimCoupon(templateId: number) {
+  const { data } = await api.post<UserCouponView>(`/coupons/${templateId}/claim`);
+  return data;
+}
+
+export async function getFlashSales() {
+  const { data } = await api.get<FlashSaleListResponse>("/flashsales");
+  return data;
+}
+
+export async function purchaseFlashSale(activityId: number) {
+  const { data } = await api.post<{ status: "queued"; order_no: string; message: string }>(
+    `/flashsales/${activityId}/purchase`,
+  );
   return data;
 }
 
