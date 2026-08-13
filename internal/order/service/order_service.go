@@ -29,6 +29,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/order/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -245,25 +246,47 @@ type orderService struct {
 	activities ActivityStock  // 秒杀活动库存（跨模块端口，flashsale 实现）
 	seckill    SeckillRestore // 秒杀订单取消回补（跨模块端口，flashsale 实现，T13）
 	metrics    *metrics.Business
+	retryCfg   retry.Config // 幂等操作有限重试（T20）：仅普通下单 Create
 }
 
-// New 构造订单服务。
+// New 构造订单服务；retryCfg 为下单重试配置（T20 有限重试；省略 = 不重试）。
 func New(store repository.Store, c cache.Cache, nos OrderNoGenerator,
 	products ProductService, coupons CouponService, cart CartService, users UserService,
-	activities ActivityStock, seckill SeckillRestore, m *metrics.Business) Service {
-	return &orderService{store: store, cache: c, nos: nos, products: products, coupons: coupons, cart: cart, users: users, activities: activities, seckill: seckill, metrics: m}
+	activities ActivityStock, seckill SeckillRestore, m *metrics.Business, retryCfg ...retry.Config) Service {
+	cfg := retry.Config{}
+	if len(retryCfg) > 0 {
+		cfg = retryCfg[0]
+	}
+	return &orderService{store: store, cache: c, nos: nos, products: products, coupons: coupons, cart: cart, users: users, activities: activities, seckill: seckill, metrics: m, retryCfg: cfg}
 }
 
 // ---- 下单 ----
 
-// Create 下单流程：
+// Create 下单（幂等接口有限重试，T20）：client_request_id 幂等 + 单事务原子性，
+// 基础设施瞬时故障（DB/Redis 抖动）重试 + 退避；业务拒绝（校验类错误）经
+// retry.Stop 立即返回不重试。真实执行见 createOrder。
+func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams) (*CreateResult, error) {
+	var result *CreateResult
+	err := retry.Do(ctx, s.retryCfg, func(ctx context.Context) error {
+		var attemptErr error
+		result, attemptErr = s.createOrder(ctx, userID, p)
+		if attemptErr != nil && !isValidationError(attemptErr) {
+			return attemptErr // 基础设施/未知错误：可重试
+		}
+		return retry.Stop(attemptErr) // 业务拒绝：重试无意义
+	})
+	return result, err
+}
+
+// createOrder 下单流程：
 //  1. 生成雪花订单号并原子抢占幂等键（SETNX client_request_id，重复请求返回同一订单号）
 //  2. 读取地址（固化为快照）→ 组装订单项（购物车/直购）→ 校验券可用
 //  3. 读取 SKU 价格与上架状态，累计商品总额，计算券额与应付
 //  4. 单事务：条件扣减库存 → 核销券 → 建订单+订单项 → 删除已购购物车条目
 //
 // 任一校验失败（库存不足/券不可用等）删除幂等键，允许修正后重试。
-func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams) (result *CreateResult, err error) {
+// 幂等语义保证重试安全：事务原子回滚 + 幂等键重复请求返回同一订单号。
+func (s *orderService) createOrder(ctx context.Context, userID int64, p CreateParams) (result *CreateResult, err error) {
 	if userID <= 0 || p.AddressID <= 0 {
 		return nil, fmt.Errorf("%w: invalid user or address id", ErrInvalidInput)
 	}

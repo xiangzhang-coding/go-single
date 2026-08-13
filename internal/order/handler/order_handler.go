@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -207,6 +208,8 @@ func orderNoParam(c *gin.Context) (string, bool) {
 // writeError 订单业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
 	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
 	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, service.ErrCartEmpty):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrOrderNotFound), errors.Is(err, service.ErrSKUNotFound),

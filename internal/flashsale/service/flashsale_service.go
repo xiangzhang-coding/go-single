@@ -19,6 +19,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 )
@@ -232,14 +233,20 @@ type flashsaleService struct {
 	publisher MessagePublisher
 	nos       OrderNoGenerator
 	metrics   *metrics.Business // 业务指标打点（T19c）
+	retryCfg  retry.Config      // 幂等操作有限重试（T20）：仅"抢购成功"消息发布
 }
 
 // New 构造秒杀服务。userLimiter 为按用户限流配置（Max<=0 不启用）；
 // publisher 为 MQ 发布端口（预扣成功后发"抢购成功"消息，T12）；
 // nos 为雪花订单号生成器（与 order 模块共用，抢购即生成订单号供前端轮询）；
-// m 为业务指标（平台注册器创建，秒杀预扣/库存余量打点）。
+// m 为业务指标（平台注册器创建，秒杀预扣/库存余量打点）；
+// retryCfg 为 MQ 发布重试配置（T20 有限重试；省略 = 不重试，消息由对账兜底）。
 func New(store repository.Store, products ProductService, c cache.Cache, userLimiter limiter.RedisCounterConfig,
-	publisher MessagePublisher, nos OrderNoGenerator, m *metrics.Business) Service {
+	publisher MessagePublisher, nos OrderNoGenerator, m *metrics.Business, retryCfg ...retry.Config) Service {
+	cfg := retry.Config{}
+	if len(retryCfg) > 0 {
+		cfg = retryCfg[0]
+	}
 	return &flashsaleService{
 		store:     store,
 		products:  products,
@@ -248,6 +255,7 @@ func New(store repository.Store, products ProductService, c cache.Cache, userLim
 		publisher: publisher,
 		nos:       nos,
 		metrics:   m,
+		retryCfg:  cfg,
 	}
 }
 
@@ -494,7 +502,9 @@ func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64
 }
 
 // publishSeckillSuccess 生成雪花订单号并发布"抢购成功"消息（异步落单队列）。
-// 失败返回错误（保留幂等键；对账 cron 识别"有预扣无订单"补单）。
+// 发布为幂等操作（消费者按 (user_id, activity_id) 唯一约束去重），瞬时失败
+// 有限重试 + 退避（T20）；重试耗尽仍失败则返回错误（保留幂等键；
+// 对账 cron 识别"有预扣无订单"补单）。
 func (s *flashsaleService) publishSeckillSuccess(ctx context.Context, userID, activityID int64) (string, error) {
 	no, err := s.nos.Next()
 	if err != nil {
@@ -509,7 +519,10 @@ func (s *flashsaleService) publishSeckillSuccess(ctx context.Context, userID, ac
 	if err != nil {
 		return "", fmt.Errorf("marshal seckill message: %w", err)
 	}
-	if err := s.publisher.Publish(ctx, SeckillOrderQueue, body); err != nil {
+	// 重试复用同一 order_no 与消息体：重复投递由消费侧唯一约束幂等。
+	if err := retry.Do(ctx, s.retryCfg, func(ctx context.Context) error {
+		return s.publisher.Publish(ctx, SeckillOrderQueue, body)
+	}); err != nil {
 		return "", fmt.Errorf("publish seckill success message: %w", err)
 	}
 	return orderNo, nil

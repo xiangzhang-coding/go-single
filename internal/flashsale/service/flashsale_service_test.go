@@ -22,6 +22,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 )
@@ -263,16 +264,24 @@ func discardSeckill(svc Service, ctx context.Context, userID, activityID int64) 
 
 // ---- 测试夹具 ----
 
-// fakePublisher 记录发布的消息；err 模拟 MQ 发布失败。
+// fakePublisher 记录发布的消息；err 模拟 MQ 发布失败（恒定失败，legacy 语义）；
+// fails > 0 时前 fails 次发布以瞬时错误失败、之后成功（供有限重试测试）。
 type fakePublisher struct {
-	queue string
-	body  []byte
-	err   error
+	queue    string
+	body     []byte
+	err      error
+	fails    int
+	attempts int
 }
 
 func (f *fakePublisher) Publish(_ context.Context, queue string, body []byte) error {
 	f.queue = queue
 	f.body = body
+	f.attempts++
+	if f.fails > 0 {
+		f.fails--
+		return errors.New("mq transient failure")
+	}
 	return f.err
 }
 
@@ -731,6 +740,51 @@ func TestSeckillPublishFailureKeepsIdemKey(t *testing.T) {
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)], "预扣已生效，库存不再变动")
 	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 7, a.ID), ErrDuplicateRequest,
 		"幂等键保留 → 重试被拦，不会二次预扣")
+}
+
+// T20 幂等操作有限重试：MQ 发布瞬时失败自动重试 + 退避（Attempts 次），
+// 重试成功后返回订单号；消息体全程复用同一 order_no（重复投递由消费侧去重）。
+func TestSeckillPublishRetriesOnTransientFailure(t *testing.T) {
+	fx := newFixtureWithRetry(t, 3)
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.pub.fails = 2 // 前两次失败，第三次成功
+
+	orderNo, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.NoError(t, err, "瞬时失败应重试成功")
+	require.Equal(t, 3, fx.pub.attempts, "重试次数受限：恰好 Attempts 次")
+	var msg SeckillSuccessMessage
+	require.NoError(t, json.Unmarshal(fx.pub.body, &msg))
+	require.Equal(t, orderNo, msg.OrderNo, "重试复用同一订单号（消息幂等）")
+}
+
+// T20 重试耗尽仍失败：有限重试后返回错误并保留幂等键（对账兜底语义不变）。
+func TestSeckillPublishRetryExhaustedKeepsIdemKey(t *testing.T) {
+	fx := newFixtureWithRetry(t, 3)
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.pub.fails = 99 // 持续失败，重试耗尽
+
+	_, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.Error(t, err)
+	require.Equal(t, 3, fx.pub.attempts, "重试耗尽即停止，次数受限")
+	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "重试耗尽仍失败 → 保留幂等键，对账兜底")
+}
+
+// newFixtureWithRetry 同 newFixture，但服务启用发布重试（退避极小，测试快速）。
+func newFixtureWithRetry(t *testing.T, attempts int) *fixture {
+	t.Helper()
+	acts := newFakeActivities()
+	products := newFakeProducts()
+	fc := newFakeCache()
+	pub := &fakePublisher{}
+	svc := New(repository.Store{Activities: acts}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{},
+		metrics.New().Business(), retry.Config{
+			Attempts:       attempts,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     2 * time.Millisecond,
+		})
+	return &fixture{svc: svc, acts: acts, products: products, cache: fc, pub: pub}
 }
 
 // 订单号生成失败（时钟回拨等）：保留幂等键，同发布失败语义。

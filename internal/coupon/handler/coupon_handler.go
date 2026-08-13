@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -196,6 +197,8 @@ func idParam(c *gin.Context) (int64, bool) {
 // writeError 业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
 	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
 	case errors.Is(err, service.ErrInvalidInput):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrTemplateNotFound):

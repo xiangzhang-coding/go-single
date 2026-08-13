@@ -19,6 +19,7 @@ import (
 	paymentmodel "github.com/xiangzhang-coding/go-single/internal/payment/model"
 	"github.com/xiangzhang-coding/go-single/internal/payment/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -56,24 +57,46 @@ type Service interface {
 }
 
 type paymentService struct {
-	store   repository.Store
-	orders  OrderService
-	metrics *metrics.Business
+	store    repository.Store
+	orders   OrderService
+	metrics  *metrics.Business
+	retryCfg retry.Config // 幂等操作有限重试（T20）：仅模拟支付回调 MockPay
 }
 
-// New 构造支付服务。
-func New(store repository.Store, orders OrderService, m *metrics.Business) Service {
-	return &paymentService{store: store, orders: orders, metrics: m}
+// New 构造支付服务；retryCfg 为回调处理重试配置（T20 有限重试；省略 = 不重试）。
+func New(store repository.Store, orders OrderService, m *metrics.Business, retryCfg ...retry.Config) Service {
+	cfg := retry.Config{}
+	if len(retryCfg) > 0 {
+		cfg = retryCfg[0]
+	}
+	return &paymentService{store: store, orders: orders, metrics: m, retryCfg: cfg}
 }
 
-// MockPay 支付回调流程：
+// MockPay 支付回调流程（幂等接口有限重试，T20）：
 //  1. 参数校验（order_no / payment_id / amount / result）
 //  2. 读取订单（owner 校验，防 IDOR——他人订单先于流水检查拒绝，不泄露流水信息）
 //  3. 幂等检查：payment_id 已存在 → 重复回调拒绝（唯一约束 + 落库 1062 兜底）
 //  4. 状态机校验：仅待支付订单可发起支付（成功/失败回调一致）；成功回调另做金额核对
 //  5. 单事务：创建支付流水 → 成功则条件更新订单 待支付→已支付（WHERE 同时
 //     校验 status 与 pay_amount，失败 = 并发状态已变，回滚整体拒绝）
+//
+// 回调幂等（payment_id 唯一约束）且事务原子：基础设施瞬时故障（DB 抖动）有限
+// 重试 + 退避吸收；业务拒绝（重复回调/金额不符/非法跃迁等）retry.Stop 不重试。
 func (s *paymentService) MockPay(ctx context.Context, userID int64, p PayParams) (*paymentmodel.Payment, error) {
+	var payment *paymentmodel.Payment
+	err := retry.Do(ctx, s.retryCfg, func(ctx context.Context) error {
+		var attemptErr error
+		payment, attemptErr = s.mockPay(ctx, userID, p)
+		if attemptErr != nil && isBusinessError(attemptErr) {
+			return retry.Stop(attemptErr)
+		}
+		return attemptErr
+	})
+	return payment, err
+}
+
+// mockPay 单次支付回调处理（真实执行体，见 MockPay 流程说明）。
+func (s *paymentService) mockPay(ctx context.Context, userID int64, p PayParams) (*paymentmodel.Payment, error) {
 	p.PaymentID = strings.TrimSpace(p.PaymentID)
 	if err := validateParams(userID, p); err != nil {
 		return nil, err
@@ -133,6 +156,19 @@ func (s *paymentService) MockPay(ctx context.Context, userID int64, p PayParams)
 	// 支付回调结果打点（T19c）：流水落库且事务提交后计数。
 	s.metrics.PaymentResult(p.Result == paymentmodel.PaymentResultSuccess)
 	return payment, nil
+}
+
+// isBusinessError 支付回调的业务拒绝分支：重试无法改变结果（参数/归属/重复/
+// 状态机/金额），不重试；其余（基础设施/未知）错误才可重试。
+func isBusinessError(err error) bool {
+	switch {
+	case errors.Is(err, ErrInvalidInput), errors.Is(err, ErrOrderNotFound),
+		errors.Is(err, ErrOrderForbidden), errors.Is(err, ErrPaymentDuplicate),
+		errors.Is(err, ErrAmountMismatch), errors.Is(err, ErrIllegalTransition),
+		errors.Is(err, ErrOrderChanged):
+		return true
+	}
+	return false
 }
 
 func validateParams(userID int64, p PayParams) error {

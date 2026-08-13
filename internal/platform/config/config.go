@@ -23,8 +23,20 @@ type Config struct {
 	Auth       Auth
 	Snowflake  Snowflake
 	FlashSale  FlashSale
+	Retry      Retry
 	WS         WS
 	CORS       CORS
+}
+
+// Retry 幂等操作有限重试配置（T20）：仅幂等操作启用（普通下单/模拟支付回调/
+// 秒杀 MQ 消息发布），非幂等操作不重试；与退避共同吸收瞬时基础设施故障。
+type Retry struct {
+	// Attempts 总尝试次数（含首次）；<=1 表示不重试（单次执行）。
+	Attempts int `mapstructure:"attempts"`
+	// InitialBackoff 首次重试前等待；每次翻倍。
+	InitialBackoff time.Duration `mapstructure:"initial_backoff"`
+	// MaxBackoff 退避上限（指数增长封顶）。
+	MaxBackoff time.Duration `mapstructure:"max_backoff"`
 }
 
 // CORS HTTP 跨源配置（T26 部署双路径）：云端前端与后端不同源时，
@@ -74,6 +86,9 @@ type Snowflake struct {
 type Server struct {
 	Port int
 	Mode string
+	// RequestTimeout 单请求全链路超时（T20）：HTTP handler → service → 存储/MQ
+	// 逐层传递同一 ctx，依赖超时时快速失败（504），不挂起连接。
+	RequestTimeout time.Duration `mapstructure:"request_timeout"`
 }
 
 // Log 日志配置：zap 结构化 JSON 输出。
@@ -105,6 +120,19 @@ type Redis struct {
 
 type MQ struct {
 	URL string
+	// Circuit MQ 消费者熔断（T20，gobreaker）：连续失败打开 → 快速失败，
+	// 冷却期后半开探活，恢复即闭合。仅包消费者，发布/进程内调用不包。
+	Circuit Circuit `mapstructure:"circuit"`
+}
+
+// Circuit 熔断器参数（gobreaker.Settings 映射）。
+type Circuit struct {
+	// MaxConsecutiveFailures 连续失败阈值：达到后熔断打开（ReadyToTrip）。
+	MaxConsecutiveFailures int `mapstructure:"max_consecutive_failures"`
+	// Interval 关闭态失败计数清零周期；<=0 表示不按时间清零。
+	Interval time.Duration `mapstructure:"interval"`
+	// Timeout 熔断打开后的冷却时长，到点进入半开（放行一次探活）。
+	Timeout time.Duration `mapstructure:"timeout"`
 }
 
 // MinIO 对象存储配置：私有桶 + 后端代理上传（前端不直连，presigned 不做）。
@@ -159,6 +187,7 @@ func LoadFrom(paths ...string) (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.mode", "debug")
+	v.SetDefault("server.request_timeout", "5s")
 	v.SetDefault("log.level", "info")
 	v.SetDefault("mysql.host", "127.0.0.1")
 	v.SetDefault("mysql.port", 3306)
@@ -169,6 +198,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("redis.password", "")
 	v.SetDefault("redis.db", 0)
 	v.SetDefault("mq.url", "amqp://guest:guest@127.0.0.1:5672/")
+	v.SetDefault("mq.circuit.max_consecutive_failures", 3)
+	v.SetDefault("mq.circuit.interval", "30s")
+	v.SetDefault("mq.circuit.timeout", "10s")
 	v.SetDefault("minio.endpoint", "127.0.0.1:19000")
 	v.SetDefault("minio.access_key", "minioadmin")
 	v.SetDefault("minio.secret_key", "minioadmin")
@@ -183,6 +215,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("flashsale.burst", 100)
 	v.SetDefault("flashsale.per_user_max", 5)
 	v.SetDefault("flashsale.per_user_window", "1s")
+	v.SetDefault("retry.attempts", 3)
+	v.SetDefault("retry.initial_backoff", "100ms")
+	v.SetDefault("retry.max_backoff", "1s")
 	v.SetDefault("ws.heartbeat_interval", "30s")
 	v.SetDefault("ws.write_wait", "10s")
 	v.SetDefault("ws.allow_origins", []string{})

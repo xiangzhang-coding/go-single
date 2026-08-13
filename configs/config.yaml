@@ -1,6 +1,8 @@
 server:
   port: 8080
   mode: debug
+  # 单请求全链路超时（HTTP → service → 存储/MQ）：依赖超时快速失败（504）。
+  request_timeout: 5s
 
 log:
   level: info
@@ -21,6 +23,11 @@ redis:
 
 mq:
   url: amqp://guest:guest@127.0.0.1:5672/
+  # 消费者熔断（gobreaker）：连续失败打开 → 快速失败，冷却后半开探活，恢复闭合。
+  circuit:
+    max_consecutive_failures: 3
+    interval: 30s
+    timeout: 10s
 
 minio:
   endpoint: 127.0.0.1:19000
@@ -48,6 +55,12 @@ flashsale:
   # 按用户限流：Redis 固定窗口计数（INCR+TTL，跨请求状态）。
   per_user_max: 5
   per_user_window: 1s
+
+retry:
+  # 幂等操作有限重试（下单/支付回调/秒杀消息发布；非幂等操作不重试）。
+  attempts: 3
+  initial_backoff: 100ms
+  max_backoff: 1s
 
 ws:
   # WebSocket 长连接心跳保活：Ping 间隔（pong_wait = 2× 间隔）与单条写超时。

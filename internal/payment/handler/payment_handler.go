@@ -2,6 +2,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
@@ -70,6 +71,8 @@ func (h *Handler) MockPay(c *gin.Context) {
 // writeError 支付业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
 	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
 	case errors.Is(err, service.ErrInvalidInput):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrOrderNotFound):

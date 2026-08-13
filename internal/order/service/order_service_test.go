@@ -24,6 +24,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/order/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
@@ -284,10 +285,12 @@ func (f *fakeIdemCache) Eval(_ context.Context, _ string, keys []string, args ..
 
 // fakeProducts 以 SKU 表模拟 product 模块：offSale 标记商品下架。
 type fakeProducts struct {
-	skus      map[int64]*productmodel.SKU
-	offSale   map[int64]bool
-	details   map[int64]*productmodel.ProductDetail
-	deductErr error // 模拟事务内基础设施故障（如 DB 超时）
+	skus        map[int64]*productmodel.SKU
+	offSale     map[int64]bool
+	details     map[int64]*productmodel.ProductDetail
+	deductErr   error // 模拟事务内基础设施故障（如 DB 超时）
+	deductFails int   // 前 N 次扣减以瞬时错误失败、之后成功（供有限重试测试）
+	deductCalls int
 }
 
 func newFakeProducts() *fakeProducts {
@@ -332,8 +335,13 @@ func (f *fakeProducts) GetDetail(_ context.Context, productID int64) (*productmo
 }
 
 func (f *fakeProducts) DeductStock(_ context.Context, _ *gorm.DB, skuID int64, quantity int) (bool, error) {
+	f.deductCalls++
 	if f.deductErr != nil {
 		return false, f.deductErr
+	}
+	if f.deductFails > 0 {
+		f.deductFails--
+		return false, errors.New("db timeout")
 	}
 	s, ok := f.skus[skuID]
 	if !ok || s.Stock < quantity {
@@ -568,6 +576,25 @@ func newFixture() *fixture {
 		coupons: coupons, cart: cart, users: users, activities: activities}
 }
 
+// newFixtureWithRetry 同 newFixture，但订单服务启用有限重试（退避极小，测试快速）。
+func newFixtureWithRetry(t *testing.T, attempts int) *fixture {
+	t.Helper()
+	orders, items, cache := newFakeOrders(), newFakeItems(), newFakeIdemCache()
+	prods, coupons, cart, users := newFakeProducts(), newFakeCoupons(), newFakeCart(), newFakeUsers()
+	activities := newFakeActivities()
+	svc := New(
+		repository.Store{Orders: orders, Items: items, Tx: fakeTx{}},
+		cache, &fakeNos{}, prods, coupons, cart, users, activities, activities,
+		metrics.New().Business(), retry.Config{
+			Attempts:       attempts,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     2 * time.Millisecond,
+		},
+	)
+	return &fixture{svc: svc, orders: orders, items: items, cache: cache, prods: prods,
+		coupons: coupons, cart: cart, users: users, activities: activities}
+}
+
 // seed 标准商品 + 地址 + 券：skuID=1 售价 100 分 库存 10。
 func (fx *fixture) seed(t *testing.T) {
 	t.Helper()
@@ -725,6 +752,43 @@ func TestCreateInfraFailureKeepsUnknownReservation(t *testing.T) {
 	require.True(t, res.Idempotent)
 	require.True(t, res.Processing)
 	require.Empty(t, fx.orders.byID, "未知状态下不得生成第二单")
+}
+
+// T20 幂等操作有限重试：下单瞬时失败（事务内 DB 超时）自动重试 + 退避；
+// 幂等键保证重试只产生一单（失败的尝试释放幂等键，重试重新抢占并成功）。
+func TestCreateRetriesOnTransientFailure(t *testing.T) {
+	fx := newFixtureWithRetry(t, 3)
+	fx.seed(t)
+	fx.prods.deductFails = 2 // 前两次事务内失败，第三次成功
+
+	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("t20retry", 1, 1))
+	require.NoError(t, err, "瞬时失败应重试成功")
+	require.Equal(t, 3, fx.prods.deductCalls, "重试次数受限：恰好 Attempts 次")
+	require.Len(t, fx.orders.byID, 1, "重试不得产生第二单（幂等保证）")
+	require.Equal(t, "3", res.Order.OrderNo, "首两次尝试回滚未落库，订单号为第三次尝试生成")
+}
+
+// T20 业务拒绝不重试：库存不足等校验类错误即使配置了重试也立即返回。
+func TestCreateBusinessRejectDoesNotRetry(t *testing.T) {
+	fx := newFixtureWithRetry(t, 3)
+	fx.seed(t)
+
+	_, err := fx.svc.Create(context.Background(), 42, fx.directParams("t20noretry", 2, 10))
+	require.ErrorIs(t, err, ErrInsufficientStock)
+	require.Equal(t, 1, fx.prods.deductCalls, "业务拒绝不重试")
+}
+
+// T20 重试耗尽仍失败：有限重试后返回错误（幂等键按未知/未提交语义释放）。
+func TestCreateRetryExhaustedFails(t *testing.T) {
+	fx := newFixtureWithRetry(t, 3)
+	fx.seed(t)
+	fx.prods.deductErr = errors.New("db timeout") // 持续失败
+
+	_, err := fx.svc.Create(context.Background(), 42, fx.directParams("t20exhaust", 1, 1))
+	require.Error(t, err)
+	require.Equal(t, 3, fx.prods.deductCalls, "重试耗尽即停止，次数受限")
+	require.Equal(t, 3, fx.cache.dels, "每次失败尝试均确认未落库并释放幂等键，允许后续重试")
+	require.Empty(t, fx.orders.byID, "失败尝试不得落库")
 }
 
 // 库存不足：条件扣减失败 → 下单拒绝，库存不变。

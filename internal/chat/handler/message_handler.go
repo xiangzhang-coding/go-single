@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -135,6 +136,8 @@ func (h *Handler) MarkRead(c *gin.Context) {
 // writeError 消息业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
 	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
 	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, service.ErrSelfMessage):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrRecipientNotFound), errors.Is(err, service.ErrConversationNotFound), errors.Is(err, service.ErrMessageNotFound):

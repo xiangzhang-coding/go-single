@@ -51,6 +51,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/logger"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
+	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
 	"github.com/xiangzhang-coding/go-single/internal/platform/ws"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
@@ -218,6 +219,15 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	businessMetrics := metricRegistry.Business()
 	// MQ 客户端装饰：发布/消费/消费失败打点（queue 维度，与业务指标同 registry）。
 	mqClient = metrics.WrapMQ(mqClient, businessMetrics)
+	// MQ 消费者熔断（T20，gobreaker）：连续失败打开 → 消息快速失败（不触下游），
+	// 冷却后半开探活、恢复即闭合；仅包消费者——Publish 直通（发布失败由
+	// 幂等操作的有限重试 + 对账兜底），进程内调用与本地 Redis/MySQL 不包。
+	mqClient = mq.WrapCircuitBreaker(mqClient, mq.BreakerSettings{
+		Name:                   "mq-consumer",
+		MaxConsecutiveFailures: cfg.MQ.Circuit.MaxConsecutiveFailures,
+		Interval:               cfg.MQ.Circuit.Interval,
+		Timeout:                cfg.MQ.Circuit.Timeout,
+	})
 	// CORS（T26）：跨源场景（云端前端独立部署）按配置白名单放行；
 	// 置于 requestLogger 之后，使预检 OPTIONS 也进入访问日志（排障可见），
 	// 同时仍先于路由匹配（Use 中间件均在 handler 前执行）。
@@ -258,6 +268,14 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		log.Fatal("初始化雪花订单号生成器失败", zap.Error(err))
 	}
 
+	// 幂等操作有限重试配置（T20）：仅下单/支付回调/秒杀消息发布启用，
+	// 非幂等操作不重试；与全链路超时（requestTimeout 中间件）配合容错。
+	retryCfg := retry.Config{
+		Attempts:       cfg.Retry.Attempts,
+		InitialBackoff: cfg.Retry.InitialBackoff,
+		MaxBackoff:     cfg.Retry.MaxBackoff,
+	}
+
 	// flashsale 模块：admin 秒杀活动管理（创建/编辑/上架/下架），
 	// 上架预热库存进 Redis（未开始可覆盖、进行中只减不增）；SKU 校验经 product 服务接口。
 	// 抢购（T11/T12）：全局令牌桶限流中间件 + 按用户 Redis 计数限流 + 幂等键 +
@@ -272,7 +290,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	flashsaleStore := flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(db)}
 	flashsaleSvc := flashsalesvc.New(flashsaleStore, productSvc, cacheClient,
 		limiter.RedisCounterConfig{Max: cfg.FlashSale.PerUserMax, Window: cfg.FlashSale.PerUserWindow},
-		mqClient, orderNoGen, businessMetrics)
+		mqClient, orderNoGen, businessMetrics, retryCfg)
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
 
 	// order 模块：购物车结算/直购下单（单事务：订单+订单项+库存+地址快照+券核销+
@@ -282,7 +300,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// CancelExpiredSeckill（T13）：秒杀超时取消回补（flashsale 实现 SeckillRestore 端口）。
 	orderStore := orderrepo.NewGORMOrder(db)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc, businessMetrics)
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc, businessMetrics, retryCfg)
 	orderHandler := orderhandler.New(orderSvc, verifier)
 
 	// 秒杀库存对账（T13）：进行中只比对告警（补单信号），收尾以 MySQL 对齐 Redis；
@@ -335,7 +353,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// 订单读取与状态迁移经 order 服务进程内调用。
 	paymentStore := paymentrepo.NewGORMPayment(db)
 	paymentHandler := paymenthandler.New(
-		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc, businessMetrics),
+		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc, businessMetrics, retryCfg),
 		verifier,
 	)
 
@@ -354,7 +372,11 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// WebSocket 实时通道（T18）：GET /ws?token=<jwt>（token 进日志风险为演示取舍）。
 	r.GET("/ws", wsHub.Handler(verifier))
 
+	// 业务 API 组：挂全链路请求超时（T20），超时快速失败（504）；
+	// /ws 长连接不适用请求超时（连接生命周期自行管理），/metrics、/healthz
+	// 为本地快速检查不挂超时（healthz 自带 2s 内部超时）。
 	api := r.Group("/api")
+	api.Use(requestTimeout(cfg.Server.RequestTimeout))
 	userHandler.RegisterRoutes(api)
 	addressHandler.RegisterRoutes(api)
 	productHandler.RegisterRoutes(api)
