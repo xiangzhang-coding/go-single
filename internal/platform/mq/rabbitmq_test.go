@@ -46,6 +46,27 @@ func uniqueQueue(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 }
 
+// cleanupQueue 测试结束删除随机队列（含死信队列），避免跨运行残留堆积；
+// 有消费者仍占用时 RabbitMQ 拒绝删除（无副作用，下次运行 uniqueQueue 不受影响）。
+func cleanupQueue(t *testing.T, queue string) {
+	t.Helper()
+	t.Cleanup(func() {
+		conn, err := amqp.Dial("amqp://guest:guest@127.0.0.1:5672/")
+		if err != nil {
+			return // broker 不可达时无残留可清
+		}
+		defer conn.Close()
+		ch, err := conn.Channel()
+		if err != nil {
+			return
+		}
+		defer ch.Close()
+		for _, q := range []string{queue, queue + ".dlq"} {
+			_, _ = ch.QueueDelete(q, false, false, false)
+		}
+	})
+}
+
 // receiveOne 从指定队列取一条消息（3s 超时）；不存在返回 nil。
 // 测试直连 amqp：Consume 为常驻循环，验收场景直接读队列更直接。
 func receiveOne(t *testing.T, queue string) []byte {
@@ -73,6 +94,7 @@ func receiveOne(t *testing.T, queue string) []byte {
 func TestRabbitMQPublishConsumeRoundtrip(t *testing.T) {
 	m := newTestMQ(t)
 	queue := uniqueQueue("mq.roundtrip")
+	cleanupQueue(t, queue)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -99,6 +121,7 @@ func TestRabbitMQPublishConsumeRoundtrip(t *testing.T) {
 func TestRabbitMQConsumeRequeuesOnTransientFailure(t *testing.T) {
 	m := newTestMQ(t)
 	queue := uniqueQueue("mq.retry")
+	cleanupQueue(t, queue)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -139,6 +162,7 @@ func TestRabbitMQConsumeRequeuesOnTransientFailure(t *testing.T) {
 func TestRabbitMQConsumeDeadLettersOnPermanentFailure(t *testing.T) {
 	m := newTestMQ(t)
 	queue := uniqueQueue("mq.dlq")
+	cleanupQueue(t, queue)
 	dlq := queue + dlqSuffix
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -160,6 +184,7 @@ func TestRabbitMQConsumeDeadLettersOnPermanentFailure(t *testing.T) {
 func TestRabbitMQConsumeStopsOnCancel(t *testing.T) {
 	m := newTestMQ(t)
 	queue := uniqueQueue("mq.cancel")
+	cleanupQueue(t, queue)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	done := make(chan error, 1)

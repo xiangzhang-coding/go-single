@@ -183,6 +183,7 @@ func TestCircuitBreakerRabbitMQFailRecover(t *testing.T) {
 	})
 
 	queue := uniqueQueue("mq.breaker")
+	cleanupQueue(t, queue)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 

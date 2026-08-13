@@ -2,6 +2,28 @@
 
 部署三件套：**本地 HTTPS 演示**（Nginx SSL 终止 + 安全头）、**云端静态资源**（Cloudflare Pages 接线 web/ 主题 + website/ 文档站）、**后端云平台选型**（VPS + Docker Compose，见 ADR-0005）。
 
+> 后端后台演示：`go run ./cmd/server` 建议**前台运行**（另开终端）。如需后台化，请用
+> `go build -o bin/server ./cmd/server && nohup ./bin/server &`——直接 `nohup go run ... &` 时
+> 杀掉 go 命令进程不会终止其编译产物子进程（孤儿进程仍监听 :8080 并消费 MQ 队列，
+> 会污染本地集成测试）。
+
+## 5. 上线前必改清单（安全收尾）
+
+| # | 项 | 本地默认 | 上线要求 |
+|---|---|---|---|
+| 1 | `auth.secret`（JWT 签名密钥） | `dev-secret-change-me` | **强随机**（≥32 字节）；泄露可伪造任意角色 token |
+| 2 | MySQL / RabbitMQ / MinIO 凭据 | `shop123` / `guest:guest` / `minioadmin` | 全部改强密码（compose 与 configs 同步） |
+| 3 | `cors.allow_origins` / `ws.allow_origins` | 空（允许所有 Origin） | 配置前端域名白名单 |
+| 4 | `server.trusted_proxies` | 127.0.0.1/::1（本地 Nginx） | 改为反代出口 IP（client_ip 日志/指标才真实） |
+| 5 | compose 端口暴露（MySQL 3306 / RabbitMQ 5672 / Redis 6379 / MinIO 19000） | 0.0.0.0 | ufw 只放 22/80/443 |
+| 6 | `server.mode` | `debug` | `release` |
+| 7 | Grafana/Prometheus 访问 | 无认证 | 加认证或内网隔离 |
+| 8 | 秒杀 `worker_id` | 1 | 多实例时每实例唯一（0-1023） |
+
+依赖版本安全：`go run golang.org/x/vuln/cmd/govulncheck@latest ./...`（CI 已内置）。
+已知项：`golang.org/x/crypto/openpgp` 为上游弃用包（无修复版，代码未调用，仅经依赖链引入）；
+website 构建链 `image-size` 漏洞上游无修复版（仅 CI 构建期执行，不进入产物）。
+
 ## 1. 本地 HTTPS 与安全头演示
 
 拓扑：`浏览器 → Nginx（443 SSL 终止 + 安全头 + 静态托管）→ 后端 :8080（宿主机进程）`；80 端口仅 301 跳转 HTTPS。

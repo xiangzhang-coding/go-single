@@ -89,6 +89,11 @@ type Server struct {
 	// RequestTimeout 单请求全链路超时（T20）：HTTP handler → service → 存储/MQ
 	// 逐层传递同一 ctx，依赖超时时快速失败（504），不挂起连接。
 	RequestTimeout time.Duration `mapstructure:"request_timeout"`
+	// TrustedProxies 可信反代 IP 白名单（gin SetTrustedProxies）：
+	// 命中才采信 X-Forwarded-For/X-Real-IP 得到真实客户端 IP（日志/指标）。
+	// 默认信任本机（Nginx 容器经 host-gateway 转发）；云部署时改为反代出口 IP。
+	// 空 = 不信任任何代理头（ClientIP 返回直连地址，日志失真但更安全）。
+	TrustedProxies []string `mapstructure:"trusted_proxies"`
 }
 
 // Log 日志配置：zap 结构化 JSON 输出。

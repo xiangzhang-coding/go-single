@@ -59,7 +59,7 @@ const (
 	redisAddr     = "127.0.0.1:6379"
 	// redisTestDB 各测试包独占一个 Redis DB（15-20），避免 go test ./... 并行时
 	// 彼此 FlushDB 清掉对方的秒杀库存/幂等键等测试数据（跨包污染）。
-	redisTestDB   = 18
+	redisTestDB = 18
 )
 
 // noopActivity 秒杀活动库存端口替身：本包不触达秒杀落单，恒成功即可。
@@ -747,7 +747,8 @@ func TestAdminOrderListAll(t *testing.T) {
 }
 
 // 对象级授权（防 IDOR）：他人订单详情 403、取消 403、列表互不可见。
-func TestOrderCrossUserForbidden(t *testing.T) {	env := requireEnv(t)
+func TestOrderCrossUserForbidden(t *testing.T) {
+	env := requireEnv(t)
 	alice := registerAndToken(t, env, uniqueName("alice"))
 	bob := registerAndToken(t, env, uniqueName("bob"))
 	addrA := address(t, env, alice)

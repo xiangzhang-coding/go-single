@@ -266,7 +266,9 @@ func discardSeckill(svc Service, ctx context.Context, userID, activityID int64) 
 
 // fakePublisher 记录发布的消息；err 模拟 MQ 发布失败（恒定失败，legacy 语义）；
 // fails > 0 时前 fails 次发布以瞬时错误失败、之后成功（供有限重试测试）。
+// 并发安全：并发抢购测试多 goroutine 共用同一实例。
 type fakePublisher struct {
+	mu       sync.Mutex
 	queue    string
 	body     []byte
 	err      error
@@ -275,6 +277,8 @@ type fakePublisher struct {
 }
 
 func (f *fakePublisher) Publish(_ context.Context, queue string, body []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.queue = queue
 	f.body = body
 	f.attempts++
@@ -285,10 +289,22 @@ func (f *fakePublisher) Publish(_ context.Context, queue string, body []byte) er
 	return f.err
 }
 
-// fakeNos 雪花订单号替身：1, 2, 3, ...
-type fakeNos struct{ next int64 }
+// attempts 读取发布次数（测试断言用）。
+func (f *fakePublisher) attemptsCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attempts
+}
+
+// fakeNos 雪花订单号替身：1, 2, 3, ...（并发安全：并发抢购测试多 goroutine 共用）。
+type fakeNos struct {
+	mu   sync.Mutex
+	next int64
+}
 
 func (f *fakeNos) Next() (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.next++
 	return f.next, nil
 }
@@ -752,7 +768,7 @@ func TestSeckillPublishRetriesOnTransientFailure(t *testing.T) {
 
 	orderNo, err := fx.svc.Seckill(context.Background(), 7, a.ID)
 	require.NoError(t, err, "瞬时失败应重试成功")
-	require.Equal(t, 3, fx.pub.attempts, "重试次数受限：恰好 Attempts 次")
+	require.Equal(t, 3, fx.pub.attemptsCount(), "重试次数受限：恰好 Attempts 次")
 	var msg SeckillSuccessMessage
 	require.NoError(t, json.Unmarshal(fx.pub.body, &msg))
 	require.Equal(t, orderNo, msg.OrderNo, "重试复用同一订单号（消息幂等）")
@@ -767,7 +783,7 @@ func TestSeckillPublishRetryExhaustedKeepsIdemKey(t *testing.T) {
 
 	_, err := fx.svc.Seckill(context.Background(), 7, a.ID)
 	require.Error(t, err)
-	require.Equal(t, 3, fx.pub.attempts, "重试耗尽即停止，次数受限")
+	require.Equal(t, 3, fx.pub.attemptsCount(), "重试耗尽即停止，次数受限")
 	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "重试耗尽仍失败 → 保留幂等键，对账兜底")
 }
 

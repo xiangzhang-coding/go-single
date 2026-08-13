@@ -46,7 +46,7 @@ const (
 	redisAddr     = "127.0.0.1:6379"
 	// redisTestDB 各测试包独占一个 Redis DB（15-20），避免 go test ./... 并行时
 	// 彼此 FlushDB 清掉对方的秒杀库存/幂等键等测试数据（跨包污染）。
-	redisTestDB   = 15
+	redisTestDB = 15
 )
 
 // testEnv 每个测试包只构建一次；MySQL 或 Redis 不可达时整体跳过。

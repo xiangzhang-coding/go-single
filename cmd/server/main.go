@@ -212,6 +212,13 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	gin.SetMode(cfg.Server.Mode)
 
 	r := gin.New()
+	// 可信反代白名单（安全收尾）：命中才采信 X-Forwarded-For/X-Real-IP，
+	// 还原 Nginx 反代后的真实客户端 IP（requestLogger 的 client_ip 与指标维度）。
+	if len(cfg.Server.TrustedProxies) > 0 {
+		if err := r.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+			log.Error("设置可信反代白名单失败（继续按不采信代理头运行）", zap.Error(err))
+		}
+	}
 	// metrics 在最外层：panic 被 Recovery 恢复为 500 后仍能完成计数。
 	metricRegistry := metrics.New()
 	// 业务指标（T19c）：秒杀预扣/库存余量、订单创建/状态/支付、MQ 发布消费、

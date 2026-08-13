@@ -3,6 +3,12 @@ server:
   mode: debug
   # 单请求全链路超时（HTTP → service → 存储/MQ）：依赖超时快速失败（504）。
   request_timeout: 5s
+  # 可信反代 IP 白名单（gin TrustedProxies）：Nginx 容器经 host-gateway 转发，
+  # 命中后采信 X-Forwarded-For/X-Real-IP 还原客户端 IP（日志/指标）；
+  # 云端部署改为反代出口 IP，直连部署留空（不采信代理头）。
+  trusted_proxies:
+    - 127.0.0.1
+    - ::1
 
 log:
   level: info

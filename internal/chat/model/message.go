@@ -25,15 +25,15 @@ func ConversationKey(uidA, uidB int64) string {
 // Message 单条用户间消息：落库并支持离线拉取（游标分页）。
 // 字段约定：text 用 Content，image/file 用 URL（URL 为空串表示未填）。
 type Message struct {
-	ID              int64      `json:"id"`
-	ConversationKey string     `json:"conversation_key" gorm:"column:conversation_key"`
-	SenderID        int64      `json:"sender_id"`
-	RecipientID     int64      `json:"recipient_id"`
-	Type            string     `json:"type"`
-	Content         string     `json:"content,omitempty"`
-	URL             string     `json:"url,omitempty"`
-	ClientRequestID *string    `json:"-" gorm:"column:client_request_id"`
-	CreatedAt       time.Time  `json:"created_at"`
+	ID              int64     `json:"id"`
+	ConversationKey string    `json:"conversation_key" gorm:"column:conversation_key"`
+	SenderID        int64     `json:"sender_id"`
+	RecipientID     int64     `json:"recipient_id"`
+	Type            string    `json:"type"`
+	Content         string    `json:"content,omitempty"`
+	URL             string    `json:"url,omitempty"`
+	ClientRequestID *string   `json:"-" gorm:"column:client_request_id"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Conversation 会话：有序用户对 + 最近消息指针（列表排序与预览）。
@@ -50,9 +50,9 @@ type Conversation struct {
 // ConversationView 会话列表条目：对方用户（id + 用户名跨模块补齐）+
 // 最近消息 + 我的未读数（recipient = 我 且 id > 已读游标）。
 type ConversationView struct {
-	ConversationKey string    `json:"conversation_key"`
-	PeerUserID      int64     `json:"peer_user_id"`
-	PeerUsername    string    `json:"peer_username"`
-	LastMessage     *Message  `json:"last_message,omitempty"`
-	UnreadCount     int64     `json:"unread_count"`
+	ConversationKey string   `json:"conversation_key"`
+	PeerUserID      int64    `json:"peer_user_id"`
+	PeerUsername    string   `json:"peer_username"`
+	LastMessage     *Message `json:"last_message,omitempty"`
+	UnreadCount     int64    `json:"unread_count"`
 }

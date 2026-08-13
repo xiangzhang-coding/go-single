@@ -1,0 +1,83 @@
+# 质量门禁 CI（安全收尾）：gofmt / go vet / 全量测试 / race 关键包 / 供应链漏洞扫描。
+# 集成测试需要 MySQL/Redis/RabbitMQ/MinIO——复用 deploy/docker-compose.yml。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root123
+          MYSQL_DATABASE: go_shop
+          MYSQL_USER: shop
+          MYSQL_PASSWORD: shop123
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot123"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+        command: ["redis-server", "--databases", "21"]
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports: ["5672:5672", "15672:15672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      minio:
+        image: minio/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports: ["19000:9000", "19001:9001"]
+        options: >-
+          --health-cmd "mc ready local"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+        command: server /data --console-address ":9001"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: gofmt 检查（仓库标准：全量格式化）
+        run: |
+          unformatted=$(gofmt -l internal cmd)
+          if [ -n "$unformatted" ]; then
+            echo "未通过 gofmt："; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: 全量单元 + 集成测试（真实 MySQL/Redis/RabbitMQ/MinIO）
+        run: go test ./... -count=1
+
+      - name: race 检测（并发敏感包：秒杀 / WS / MQ / 聊天）
+        run: go test -race -count=1 ./internal/flashsale/... ./internal/platform/ws/... ./internal/platform/mq/... ./internal/chat/...
+
+      - name: 供应链漏洞扫描（govulncheck）
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: 前端构建（web/faire + website）
+        run: |
+          cd web/faire && bun install --frozen-lockfile && bun run build
+          cd ../../website && bun install --frozen-lockfile && bun run build
