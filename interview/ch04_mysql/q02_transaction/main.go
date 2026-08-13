@@ -9,7 +9,7 @@ import (
 
 // 极简内存"数据库"：操作记录可以提交或回滚。
 type memDB struct {
-	ops  []string
+	ops       []string
 	committed bool
 }
 
@@ -27,12 +27,12 @@ func (db *memDB) rollback() {
 }
 
 func main() {
-	// 下单事务 = 订单 + 订单项 + 扣库存 + 地址快照 + 券核销 + 清购物车（全在一个事务）。
+	// 下单事务 = 订单 + 订单项 + 扣减库存 + 地址快照 + 券核销 + 清购物车（全在一个事务）。
 	db := &memDB{}
 	db.begin()
 	_ = db.exec("INSERT orders ...")
 	_ = db.exec("UPDATE skus SET stock = stock - 1 ...")
-	if errors.New("扣库存失败") != nil { // 模拟任一步失败
+	if errors.New("扣减库存失败") != nil { // 模拟任一步失败
 		db.rollback()
 		fmt.Println("任一步失败 → 全部回滚，无部分写入")
 		return

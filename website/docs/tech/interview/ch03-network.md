@@ -52,6 +52,7 @@ func main() {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/products", nil))
 	fmt.Println("状态码:", rec.Code)
 }
+
 ```
 
 **项目位置**：`cmd/server/main.go` 装配链——`metricRegistry.GinMiddleware() → gin.Recovery() → requestLogger → platformcors.Middleware`；`/api` 组再挂 `requestTimeout`；鉴权 `auth.Middleware`/`auth.RequireAdmin()` 按路由挂载。
@@ -99,6 +100,7 @@ func main() {
 		fmt.Printf("header %-18q → 通过，token=%s\n", h, t)
 	}
 }
+
 ```
 
 **项目位置**：`internal/platform/auth/middleware.go` 的 `bearerToken` 与 `Middleware`（失败 401）；验签 `Verify` 在 `internal/platform/auth/jwt.go`。
@@ -147,6 +149,7 @@ func main() {
 		fmt.Println("其他错误:", err)
 	}
 }
+
 ```
 
 **项目位置**：`cmd/server/middleware.go` 的 `requestTimeout`；`internal/flashsale/handler/flashsale_handler.go` 的 `writeError` 把 `context.DeadlineExceeded` 映射 504。
@@ -214,6 +217,7 @@ func main() {
 	h.ServeHTTP(rec2, evil)
 	fmt.Printf("非白名单跨源 → %d\n", rec2.Code)
 }
+
 ```
 
 **项目位置**：`internal/platform/cors/cors.go`（白名单 + 预检 403/204 + max-age 86400），白名单来自配置 `server.cors.allow_origins`；nginx 层另有安全头（`deploy/nginx/nginx.conf`）。
@@ -273,6 +277,7 @@ func main() {
 	close(c.done) // 触发写泵退出
 	time.Sleep(10 * time.Millisecond)
 }
+
 ```
 
 **项目位置**：`internal/platform/ws/hub.go`——`client.send` 缓冲 64、`writePump` 心跳 Ping、慢消费者缓冲满断开；实时推送链路：chat service → `wsMessageNotifier` → `hub.PushToUser`（`cmd/server/main.go`）。
@@ -321,6 +326,7 @@ func main() {
 	}
 	fmt.Println("在途请求已处理完，服务退出")
 }
+
 ```
 
 **项目位置**：`cmd/server/main.go`——`cronRegistry.Stop(5s)` → `srv.Shutdown(ctx 10s)` → `defer wsHub.Close()`；MQ 消费者经 ctx 取消退出。
@@ -366,6 +372,7 @@ func main() {
 	// 下单/支付等其他语义：201 创建成功、404 订单不存在、403 越权访问。
 	fmt.Println("202 = 异步受理；204 = 预检/删除无内容；409 = 状态冲突；429 = 限流；504 = 网关超时")
 }
+
 ```
 
-**项目位置**：`internal/flashsale/handler/flashsale_handler.go` 的 `purchase` 返回 202 `{"status":"queued","order_no":...}`；`writeError` 统一映射（flashsale_handler.go / order_handler.go）；限流 429 在 limiter 中间件。
+**项目位置**：`internal/flashsale/handler/flashsale_handler.go` 的 `Purchase` 返回 202 `{"status":"queued","order_no":...}`；`writeError` 统一映射（flashsale_handler.go / order_handler.go）；限流 429 在 limiter 中间件。

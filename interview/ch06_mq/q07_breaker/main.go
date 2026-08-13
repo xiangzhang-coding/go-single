@@ -11,17 +11,17 @@ import (
 type state int
 
 const (
-	stClosed state = iota // 正常：全部放行
-	stOpen                // 熔断：直接拒绝
-	stHalfOpen            // 试探：放行一个，成功即恢复
+	stClosed   state = iota // 正常：全部放行
+	stOpen                  // 熔断：直接拒绝
+	stHalfOpen              // 试探：放行一个，成功即恢复
 )
 
 type breaker struct {
-	state    state
-	failures int
+	state     state
+	failures  int
 	threshold int
-	openedAt time.Time
-	cooldown time.Duration
+	openedAt  time.Time
+	cooldown  time.Duration
 }
 
 func (b *breaker) allow() bool {

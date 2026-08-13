@@ -77,6 +77,7 @@ func main() {
 	// 防算法混淆：项目 jwt.WithValidMethods 固定 HS256（jwt.go）。
 	fmt.Println("要点：token 无状态、可被服务端验签；泄漏=冒充，因此 TTL 2h + 妥善保管")
 }
+
 ```
 
 **项目位置**：`internal/platform/auth/jwt.go`——`NewJWT({Secret,TTL})`、`Issue(userID, role)`、`Verify`（`WithValidMethods` 固定 HS256）；TTL 2h 默认（`configs/config.yaml` auth.ttl）。
@@ -118,6 +119,7 @@ func main() {
 	err = bcrypt.CompareHashAndPassword(hash, []byte("wrong"))
 	fmt.Println("错误密码比对:", err != nil)
 }
+
 ```
 
 **项目位置**：`internal/user/service/user_service.go`——`Register` 用 `GenerateFromPassword`、`Login` 用 `CompareHashAndPassword`（90、113 行）；users 表只存 `password_hash`（`migrations/000002_users.up.sql`，`json:"-"` 不外泄）。
@@ -165,6 +167,7 @@ func main() {
 	fmt.Println("  /api/admin/flashsales  /api/admin/products  /api/admin/orders  /api/admin/coupons")
 	fmt.Println("管理端 token 来自种子账号 admin/admin123（migrations/000002_users）")
 }
+
 ```
 
 **项目位置**：`internal/platform/auth/middleware.go` 的 `RequireAdmin`（43-56）；各模块 handler 管理路由组（flashsale/product/order/coupon）。
@@ -212,6 +215,7 @@ func main() {
 	}
 	fmt.Println("CSP 注意：内联脚本/外域资源需要放行（项目为 minio 图片与 /ws 加了例外）")
 }
+
 ```
 
 **项目位置**：`deploy/nginx/nginx.conf`——安全头在 server 与 `/assets` 两块重复声明；CSP 放行 self + minio + ws（T26 修订补充）。
@@ -263,6 +267,7 @@ func main() {
 		}
 	}
 }
+
 ```
 
 **项目位置**：`internal/platform/file/file.go` 的 `validate`——mimetype.Detect 魔数嗅探 + 白名单 png/jpeg/webp/gif + ≤5MB；handler `internal/platform/file/handler.go`（POST /api/files）；MinIO 桶私有 `ensurePrivate`（minio.go）。
@@ -314,6 +319,7 @@ func main() {
 		fmt.Println("访问他人订单 →", err)
 	}
 }
+
 ```
 
 **项目位置**：`internal/order/service/order_service.go` 的 `loadOwned`（1071-1083）；同模式遍布 user（`ensureOwned`）、cart、friend（`ensurePendingOwned`）、chat（`ensureAccessible`）。
@@ -359,6 +365,7 @@ func main() {
 	// 项目实践：全量 GORM（参数化） + 无任何字符串拼 SQL 的仓储。
 	fmt.Println("补充面：XSS（前端转义/受控 React 渲染）、CSRF（Bearer 头不在 cookie，风险低）")
 }
+
 ```
 
 **项目位置**：全仓储走 GORM 参数化（`internal/*/repository/*_gorm.go`）；前端统一 Authorization 头 + CORS 白名单（`internal/platform/cors`）；安全头在 nginx（Q4）。

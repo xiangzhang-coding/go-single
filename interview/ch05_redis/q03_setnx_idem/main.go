@@ -10,9 +10,9 @@ import (
 
 // 内存版 SETNX + EXPIRE（对应项目 idemScript）。
 type idemStore struct {
-	mu  sync.Mutex
+	mu   sync.Mutex
 	keys map[string]bool
-	ttl map[string]int
+	ttl  map[string]int
 }
 
 func (s *idemStore) setnx(key string, ttl int) bool {
@@ -26,7 +26,12 @@ func (s *idemStore) setnx(key string, ttl int) bool {
 	return true
 }
 
-func (s *idemStore) del(key string) { s.mu.Lock(); defer s.mu.Unlock(); delete(s.keys, key); delete(s.ttl, key) }
+func (s *idemStore) del(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.keys, key)
+	delete(s.ttl, key)
+}
 
 func main() {
 	idem := &idemStore{keys: map[string]bool{}, ttl: map[string]int{}}

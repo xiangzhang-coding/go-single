@@ -45,6 +45,7 @@ func main() {
 	}
 	time.Sleep(0)
 }
+
 ```
 
 **项目位置**：秒杀预扣成功 → 发布 `flashsale.order.create`（`SeckillOrderQueue`，flashsale_service.go）→ 消费者串行落单（`flashsale_consumer.go`、`cmd/server/main.go` 重连循环）。
@@ -95,6 +96,7 @@ func main() {
 		return
 	}
 }
+
 ```
 
 **项目位置**：`internal/platform/mq/rabbitmq.go` 的 `Publish`——`ch.Confirm(false)` + `PublishWithDeferredConfirm` + `conf.WaitContext(ctx)`；秒杀侧发布失败保留幂等键（`flashsale_service.go` publishSeckillSuccess）。
@@ -120,9 +122,9 @@ import (
 type ackKind int
 
 const (
-	ackOK     ackKind = iota // 成功：Ack
-	ackRetry                 // 瞬时失败：Nack(requeue=true) 重投
-	ackDead                  // 永久失败：Nack(requeue=false) 进死信
+	ackOK    ackKind = iota // 成功：Ack
+	ackRetry                // 瞬时失败：Nack(requeue=true) 重投
+	ackDead                 // 永久失败：Nack(requeue=false) 进死信
 )
 
 func process(body string) ackKind {
@@ -149,6 +151,7 @@ func main() {
 	}
 	fmt.Println("QoS 预取 1：单消费者一次只取一条，天然串行（秒杀落单不需要并发）")
 }
+
 ```
 
 **项目位置**：`internal/platform/mq/rabbitmq.go` 的 `consumeOne` 三态分类（nil→Ack、`ErrPermanent`→Nack(false,false)、其余→Nack(false,true)）；`Qos(1,0,false)` 在 `Consume`。
@@ -200,6 +203,7 @@ func main() {
 	fmt.Println("死信队列（供对账/人工补偿）:", q.dlq)
 	fmt.Println("死信消息处理成功后需手动清理，或由对账任务兜底")
 }
+
 ```
 
 **项目位置**：`internal/platform/mq/rabbitmq.go` 的 `declareQueue`；秒杀消费者把"活动不存在/无地址/库存不足"归为永久失败（`flashsale_consumer.go` 的 `permanent`）。
@@ -231,7 +235,7 @@ type orderRepo struct {
 
 func (r *orderRepo) createSeckill(orderNo string) error {
 	if r.created[orderNo] {
-		return fmt.Errorf("duplicate: %s（幂等成功，不重复扣库存）", orderNo)
+		return fmt.Errorf("duplicate: %s（幂等成功，不重复扣减库存）", orderNo)
 	}
 	r.created[orderNo] = true
 	r.stock--
@@ -252,6 +256,7 @@ func main() {
 	}
 	fmt.Println("库存只扣 1 次:", repo.stock == 4)
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_consumer.go` → `order.CreateSeckill`；唯一键 `uk_orders_user_activity_key`（`migrations/000014_seckill_repurchase.up.sql`）+ 1062 映射（`order_repository_gorm.go`）。
@@ -298,6 +303,7 @@ func main() {
 	}
 	fmt.Println("另：发布侧用 retry.Do 有限重试吸收瞬时故障；业务拒绝用 retry.Stop 终止重试")
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_consumer.go` 的 `classifyCreateError`（ErrInvalidInput/ErrSeckillStockInsufficient/ErrSKUNotFound/ErrSKUUnavailable → 永久）；`internal/platform/mq/mq.go` 定义 `ErrPermanent`。
@@ -325,17 +331,17 @@ import (
 type state int
 
 const (
-	stClosed state = iota // 正常：全部放行
-	stOpen                // 熔断：直接拒绝
-	stHalfOpen            // 试探：放行一个，成功即恢复
+	stClosed   state = iota // 正常：全部放行
+	stOpen                  // 熔断：直接拒绝
+	stHalfOpen              // 试探：放行一个，成功即恢复
 )
 
 type breaker struct {
-	state    state
-	failures int
+	state     state
+	failures  int
 	threshold int
-	openedAt time.Time
-	cooldown time.Duration
+	openedAt  time.Time
+	cooldown  time.Duration
 }
 
 func (b *breaker) allow() bool {
@@ -387,6 +393,9 @@ func main() {
 		fmt.Println("冷却期后半开试探：放行一个请求")
 	}
 }
+
+func consumeErr() error { return errors.New("rabbitmq channel closed") }
+
 ```
 
 **项目位置**：`internal/platform/mq/breaker.go` 的 `WrapCircuitBreaker`（gobreaker，配置 `mq.circuit.*`）；只包 Consume；`ErrCircuitOpen` 视为瞬时错误 requeue。

@@ -42,6 +42,7 @@ func main() {
 
 	fmt.Println("跨模块写怎么保证原子性？→ tx 参数汇入同一事务（见 q07）")
 }
+
 ```
 
 **项目位置**：`internal/order/service/order_service.go` 声明 `ActivityStock`/`SeckillRestore` 最小接口（119-133），flashsale 实现；装配在 `cmd/server/main.go`；依赖 DAG 见 `docs/DESIGN.md`。
@@ -91,6 +92,7 @@ func main() {
 	_ = svc.Deduct(1, 1)
 	fmt.Println("测试注入 fake，调用次数:", fake.Calls)
 }
+
 ```
 
 **项目位置**：各模块 `Repository`/`Cache`/`MQ` 均为接口 + 具体实现（`internal/*/repository/*_gorm.go`）；ADR-0003（`docs/adr/0003-port-seams.md`）。
@@ -118,7 +120,7 @@ import (
 // 项目用 viper（configs/config.yaml + GO_SINGLE_ 前缀环境变量覆盖），
 // 这里用标准库演示同款"默认值 → 环境变量"优先级。
 type config struct {
-	Server   serverConfig
+	Server                serverConfig
 	RequestTimeoutSeconds int
 }
 
@@ -149,6 +151,7 @@ func main() {
 	// AutomaticEnv 使未显式读的键也能被环境变量命中。
 	fmt.Println("12-factor：配置外置，不写死在代码里")
 }
+
 ```
 
 **项目位置**：`internal/platform/config/config.go`——`Load`/`LoadFrom`、`setDefaults`、env 前缀 + 点号替换 + `AutomaticEnv`（158-185）；配置文件 `configs/config.yaml`。
@@ -175,9 +178,9 @@ import (
 
 // model：数据结构（GORM 表映射）。
 type CartItem struct {
-	ID    int64
+	ID     int64
 	UserID int64
-	SKUID int64
+	SKUID  int64
 }
 
 // repository：数据访问。
@@ -215,6 +218,7 @@ func main() {
 	h.GET(0)
 	fmt.Println("各层只依赖相邻层：handler 不直接碰 DB，repo 不做业务判断")
 }
+
 ```
 
 **项目位置**：`internal/cart/{handler,service,repository,model}` 即此四层，全项目模块同构；跨模块只能经 service 接口。
@@ -261,6 +265,7 @@ func main() {
 		"duration_ms", 3.2,
 	)
 }
+
 ```
 
 **项目位置**：`internal/platform/logger/logger.go`（zap JSON + `log.file` 镜像 + 自动建目录）；访问日志 `cmd/server/middleware.go` 的 `requestLogger`；product 模块降级告警用 slog（`product_service.go`）；采集链 promtail → Loki。
@@ -321,6 +326,7 @@ func main() {
 		fmt.Printf("%-10s → err=%v wantErr=%v\n", c.name, err, c.wantErr)
 	}
 }
+
 ```
 
 配套测试 `main_test.go`（同目录，`go test ./interview/ch09_engineering/q06_testing -v` 运行）。
@@ -375,7 +381,7 @@ func (productModule) DeductStock(tx *Tx) error {
 }
 
 func main() {
-	// 下单事务：订单 + 订单项 + 扣库存 + 地址快照 + 券核销 + 清购物车。
+	// 下单事务：订单 + 订单项 + 扣减库存 + 地址快照 + 券核销 + 清购物车。
 	tx := (&Tx{}).begin()
 	coupon := couponModule{}
 	product := productModule{}
@@ -385,6 +391,7 @@ func main() {
 	tx.commit()
 	fmt.Printf("事务提交，ops=%d：跨模块写全部原子生效\n", len(tx.ops))
 }
+
 ```
 
 **项目位置**：`internal/order/repository/order_repository.go` 的 `TxRunner.WithinTx`；服务接口带 tx 参数（`GetSKUForUpdate`/`DeductStock`/`UseCoupon`/`RollbackCoupon`），见 `order_service.go` createOrder 事务体。

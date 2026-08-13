@@ -10,7 +10,7 @@ sidebar_position: 1
 2. **可运行 Go 代码**——独立程序，`go run ./interview/<章>/<题>` 即可运行（代码在仓库根目录 `interview/`，与文档一一对应，经 `go build ./...` 与抽样运行验证）；
 3. **项目位置**——关联本项目真实实现，面试时可指着仓库讲。
 
-| 章节 | 主题 | 运行目录 |
+| 章节 | 主题 | 代码目录（章，每题一个 `q*` 子目录） |
 | --- | --- | --- |
 | [01 Go 基础](./ch01-go-basics) | slice/接口/错误/JSON 等语言核心 | `interview/ch01_go_basics/` |
 | [02 并发](./ch02-concurrency) | goroutine/channel/锁/原子操作 | `interview/ch02_concurrency/` |
@@ -29,4 +29,5 @@ sidebar_position: 1
 
 - 先自己答，再看**答案要点**；代码只是演示语义，生产实现以 `internal/` 为准。
 - 每个"项目位置"都可 `grep` 定位：`rg -n "函数名" internal/`。
+- 章目录下每个 `q*` 子目录是一个独立可运行程序，例如 `go run ./interview/ch01_go_basics/q01_slice_growth`（完整清单见仓库根 `interview/README.md`）。
 - 配套业务文档：[技术文档·模块](../modules/)、[领域视图](../domains/)、[用户指南](../../user-guide/feature-guide)。

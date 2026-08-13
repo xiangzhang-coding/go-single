@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// 多 SKU 扣库存时按 (product_id, sku_id) 排序后加锁——
+// 多 SKU 扣减库存时按 (product_id, sku_id) 排序后加锁——
 // 两个事务都以相同顺序拿锁，就不会出现"我等你、你等我"的环形等待。
 type skuLock struct {
 	id  int64

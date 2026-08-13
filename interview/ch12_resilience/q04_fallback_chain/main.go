@@ -30,9 +30,9 @@ func stockLeft(cacheOK, dbOK bool) int {
 }
 
 func main() {
-	stockLeft(true, true)        // 正常
-	stockLeft(false, true)       // 缓存挂
-	stockLeft(false, false)      // 缓存 + DB 全挂
+	stockLeft(true, true)   // 正常
+	stockLeft(false, true)  // 缓存挂
+	stockLeft(false, false) // 缓存 + DB 全挂
 	_ = ErrCacheDown
 	_ = ErrDBDown
 }

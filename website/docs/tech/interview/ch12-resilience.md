@@ -42,6 +42,7 @@ func main() {
 		fmt.Printf("链路超时快速失败，耗时 %v\n", time.Since(start).Round(time.Millisecond))
 	}
 }
+
 ```
 
 **项目位置**：`cmd/server/middleware.go` 的 `requestTimeout`；`internal/platform/mq/rabbitmq.go` 的 `msgTimeout`；`internal/platform/cron/registry.go`；health 2s。
@@ -91,6 +92,7 @@ func main() {
 	}
 	fmt.Println("使用约束：只有幂等操作才允许重试（retry.Do 包注释）")
 }
+
 ```
 
 **项目位置**：`internal/platform/retry/retry.go`——`backoff`（86-102）+ 可取消 `sleep`（105-114）+ `retry.Stop`；启用点：order Create（265-276）、flashsale publishSeckillSuccess（520）、payment MockPay（84-92）。
@@ -112,10 +114,10 @@ package main
 import "fmt"
 
 type breakerSettings struct {
-	name                  string
+	name                   string
 	maxConsecutiveFailures int
-	interval              string
-	timeout               string
+	interval               string
+	timeout                string
 }
 
 func main() {
@@ -135,6 +137,7 @@ func main() {
 	fmt.Println("  ErrCircuitOpen 视为瞬时错误 → 消息 requeue 重投")
 	fmt.Println("  ErrPermanent 不计入失败（数据问题不该触发熔断）")
 }
+
 ```
 
 **项目位置**：`internal/platform/mq/breaker.go` 的 `WrapCircuitBreaker`（gobreaker）；装饰器栈 `cmd/server/main.go` 221-230；配置 `mq.circuit.*`。
@@ -181,12 +184,13 @@ func stockLeft(cacheOK, dbOK bool) int {
 }
 
 func main() {
-	stockLeft(true, true)        // 正常
-	stockLeft(false, true)       // 缓存挂
-	stockLeft(false, false)      // 缓存 + DB 全挂
+	stockLeft(true, true)   // 正常
+	stockLeft(false, true)  // 缓存挂
+	stockLeft(false, false) // 缓存 + DB 全挂
 	_ = ErrCacheDown
 	_ = ErrDBDown
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `ListUserActivities`（379-385 降级配置库存）；product `GetDetail` miss 回填、读失败直查 DB（`product_service.go`）。
@@ -236,6 +240,7 @@ func main() {
 		}
 	}
 }
+
 ```
 
 **项目位置**：`internal/flashsale/handler/flashsale_handler.go` 返回 202 + order_no；前端轮询见 `web/faire` 秒杀页；异步落单 `flashsale_consumer.go`。
@@ -272,6 +277,7 @@ func main() {
 	}
 	fmt.Println("原则：主链路只保证快速受理，最终一致由对账兜底（每小时/每分钟 cron）")
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/reconciliation.go`（`diffActive`/`ReconcileEnded`）、`cmd/server/main.go` 对账 cron（450-487）、`flashsale_consumer.go` 错误分类、`mq.go` 死信配置。
@@ -330,6 +336,7 @@ func main() {
 	fmt.Println("背压同理：MQ Qos(1) 预取 1 让消费端按自身节奏拉消息（不积压内存）")
 	fmt.Println("演进：关键路径 semaphore 并发池（BACKLOG 舱壁隔离）、Sentinel-golang")
 }
+
 ```
 
 **项目位置**：RabbitMQ 消费 `Qos(1,0,false)`（`internal/platform/mq/rabbitmq.go`）；WS 慢消费者缓冲 64 满即断开（`internal/platform/ws/hub.go`）；显式舱壁列 BACKLOG。

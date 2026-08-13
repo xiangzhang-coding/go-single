@@ -29,6 +29,6 @@ func main() {
 	fmt.Println("202 = 异步受理；204 = 预检/删除无内容；409 = 状态冲突；429 = 限流；504 = 网关超时")
 }
 
-// 项目位置：internal/flashsale/handler/flashsale_handler.go 的 purchase 返回 202
+// 项目位置：internal/flashsale/handler/flashsale_handler.go 的 Purchase 返回 202
 // {"status":"queued","order_no":...}；writeError 统一映射（flashsale_handler.go 197-217，
 // order_handler.go 209-228）；限流 429 在 limiter 中间件。

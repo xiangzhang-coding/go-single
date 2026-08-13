@@ -36,7 +36,7 @@ func (productModule) DeductStock(tx *Tx) error {
 }
 
 func main() {
-	// 下单事务：订单 + 订单项 + 扣库存 + 地址快照 + 券核销 + 清购物车。
+	// 下单事务：订单 + 订单项 + 扣减库存 + 地址快照 + 券核销 + 清购物车。
 	tx := (&Tx{}).begin()
 	coupon := couponModule{}
 	product := productModule{}

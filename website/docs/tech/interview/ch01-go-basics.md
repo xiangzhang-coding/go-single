@@ -38,6 +38,7 @@ func main() {
 	s3[0] = -1
 	fmt.Println("扩容后不共享:", s[0] == 100)
 }
+
 ```
 
 **项目位置**：slice 承载列表型数据（订单项、购物车条目等）；`internal/cart/service` 的条目列表、`internal/order/service` 的 `order_items []model.OrderItem` 均为典型用法。
@@ -96,6 +97,7 @@ func main() {
 	v, _ := hits.Load("hit")
 	fmt.Println("sync.Map 计数:", v)
 }
+
 ```
 
 **项目位置**：`internal/platform/ws/hub.go` 的 `Hub` 用 `sync.RWMutex` 保护 `clients map[int64]map[*client]struct{}`（写少读多）；高并发计数走 Prometheus Counter（自带原子），见 `internal/platform/metrics`。
@@ -140,6 +142,7 @@ func main() {
 	fmt.Println("命名返回值 defer 生效:", named())
 	fmt.Println("匿名返回值 defer 不生效:", anonymous())
 }
+
 ```
 
 **项目位置**：`internal/platform/mq/rabbitmq.go` 的 `Publish`/`Consume` 内 `defer ch.Close()`；WS `client.send` 通道关闭由 defer 保证（`internal/platform/ws/hub.go`）。
@@ -192,6 +195,7 @@ func main() {
 	}
 	fmt.Println(describe(123), describe("hi"), describe(1.5))
 }
+
 ```
 
 **项目位置**：order 侧声明最小接口 `ActivityStock`/`SeckillRestore`（`internal/order/service/order_service.go:119-133`），由 flashsale 实现；`var _ Repository = (*GORMRepo)(nil)` 断言遍布各模块 repository；ADR-0003 记录该约定。
@@ -239,6 +243,7 @@ func main() {
 	}
 	fmt.Println("json.Valid 校验合法:", string(out))
 }
+
 ```
 
 **项目位置**：`internal/product/model/product.go` 的 `SKU.Specs` 与 `internal/order/model/order.go` 订单项快照均用 `json.RawMessage`；`internal/product/service/product_service.go` 的 `validateSKU` 用 `json.Valid` 校验规格。
@@ -286,6 +291,7 @@ func main() {
 	truncated := string([]rune(s)[:4])
 	fmt.Println("按字符截断:", truncated)
 }
+
 ```
 
 **项目位置**：`internal/chat/service/message_service.go` 的 `validateMessage` 用 `utf8.RuneCountInString`；`internal/user/service/user_service.go` 的用户名长度校验、`phoneRe` 正则。
@@ -340,6 +346,7 @@ func main() {
 	broken := fmt.Errorf("下单失败: %v", ErrSoldOut)
 	fmt.Println("未包装无法 Is:", errors.Is(broken, ErrSoldOut))
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_service.go` 顶部哨兵错误族（`ErrActivityNotFound`/`ErrSoldOut`/`ErrLimitReached`/`ErrDuplicateRequest` 等）；`translateCouponError`/`translateProductError`（`internal/order/service/order_service.go`）；`retry.Stop` 在 `internal/platform/retry/retry.go`。

@@ -15,7 +15,7 @@ type orderRepo struct {
 
 func (r *orderRepo) createSeckill(orderNo string) error {
 	if r.created[orderNo] {
-		return fmt.Errorf("duplicate: %s（幂等成功，不重复扣库存）", orderNo)
+		return fmt.Errorf("duplicate: %s（幂等成功，不重复扣减库存）", orderNo)
 	}
 	r.created[orderNo] = true
 	r.stock--

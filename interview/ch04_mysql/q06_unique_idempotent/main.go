@@ -19,7 +19,7 @@ func saveOrder(no string) error {
 }
 
 func main() {
-	// 秒杀消费者：重复消息 → 幂等成功（不重复扣库存）。
+	// 秒杀消费者：重复消息 → 幂等成功（不重复扣减库存）。
 	// 项目做法：errors.As(err, &mysqlErr) 解析 1062 → ErrOrderDuplicate → 消费者 Ack。
 	no := "O20260813001"
 	if err := saveOrder(no); err != nil {

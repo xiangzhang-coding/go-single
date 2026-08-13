@@ -26,6 +26,6 @@ func main() {
 	fmt.Println("为什么拆两段：预扣在 Redis 扛峰值（微秒级），落单交给 DB 按自身节奏消费")
 }
 
-// 项目位置：internal/flashsale/handler/flashsale_handler.go 的 purchase（202 排队 +
+// 项目位置：internal/flashsale/handler/flashsale_handler.go 的 Purchase（202 排队 +
 // order_no）；internal/flashsale/service/flashsale_service.go 的 Seckill；
 // 消费者 internal/flashsale/service/flashsale_consumer.go；时序图 docs/DESIGN.md。

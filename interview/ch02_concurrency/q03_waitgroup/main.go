@@ -22,8 +22,8 @@ func main() {
 		}(d)
 	}
 
-	wg.Wait()        // 等全部探测完成
-	close(results)   // 关闭后 range 才会结束
+	wg.Wait()      // 等全部探测完成
+	close(results) // 关闭后 range 才会结束
 	for r := range results {
 		fmt.Println(r)
 	}

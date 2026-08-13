@@ -17,8 +17,8 @@ func timeoutCancel(s *state) {
 		return // 条件更新不命中：订单已支付，跳过
 	}
 	s.orderStatus = "cancelled"
-	s.mysqlStock++        // 事务内回补 MySQL（与订单取消同事务）
-	s.redisStock++        // 提交后 Lua：INCR 库存 + DECR 计数 + DEL 幂等键
+	s.mysqlStock++ // 事务内回补 MySQL（与订单取消同事务）
+	s.redisStock++ // 提交后 Lua：INCR 库存 + DECR 计数 + DEL 幂等键
 	s.orderPaid = false
 }
 

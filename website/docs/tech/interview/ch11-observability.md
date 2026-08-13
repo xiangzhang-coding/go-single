@@ -70,6 +70,7 @@ func main() {
 	}
 	fmt.Println("Histogram P95 延迟:", h.p95())
 }
+
 ```
 
 **项目位置**：`internal/platform/metrics/metrics.go`（http 四件套）+ `business.go`（业务指标）；Grafana 面板 `deploy/monitoring/grafana/dashboards`。
@@ -145,6 +146,7 @@ func main() {
 		fmt.Printf("%-70s → %v\n", m.label, m.v)
 	}
 }
+
 ```
 
 **项目位置**：`internal/platform/metrics/metrics.go` 的 `GinMiddleware`（75-101，排除 `/metrics`）；Grafana `http.json` 面板消费四类指标。
@@ -191,6 +193,7 @@ func main() {
 	fmt.Println("其他业务点：orders_created_total{order_type}、orders_payment_total{result}、")
 	fmt.Println("mq_consume_failed_total{reason=permanent|transient}、coupon_issued_total")
 }
+
 ```
 
 **项目位置**：`internal/platform/metrics/business.go`（44-94）；打点调用点：flashsale `preDeductSuccess/Failed`、order `OrderCreated/OrderStatusChanged`、payment `PaymentResult`、coupon `CouponIssued/Redeemed`。
@@ -215,12 +218,12 @@ import (
 )
 
 type logLine struct {
-	Ts          string `json:"ts"`
-	Level       string `json:"level"`
-	Msg         string `json:"msg"`
-	ActivityID  int64  `json:"activity_id,omitempty"`
-	OrderNo     string `json:"order_no,omitempty"`
-	Elapsed     string `json:"elapsed"`
+	Ts         string `json:"ts"`
+	Level      string `json:"level"`
+	Msg        string `json:"msg"`
+	ActivityID int64  `json:"activity_id,omitempty"`
+	OrderNo    string `json:"order_no,omitempty"`
+	Elapsed    string `json:"elapsed"`
 }
 
 func main() {
@@ -235,6 +238,7 @@ func main() {
 	fmt.Println("        → Loki（labels: job=go-single）→ Grafana 日志面板按 label + 关键词检索")
 	fmt.Println("检索示例：{job=\"go-single\"} |~ \"秒杀预扣成功\"")
 }
+
 ```
 
 **项目位置**：`internal/platform/logger/logger.go`；`deploy/monitoring/promtail/config.yml`、`loki/config.yml`、`grafana/dashboards/logs.json`。
@@ -292,6 +296,7 @@ func main() {
 		quantile(0.95, float64(total), buckets, counts))
 	_ = sort.SearchFloat64s
 }
+
 ```
 
 **项目位置**：Grafana 面板查询（`deploy/monitoring/grafana/dashboards/http.json`）；桶定义 `internal/platform/metrics/metrics.go`（.001~5 十档）。
@@ -344,6 +349,7 @@ func main() {
 	}
 	fmt.Println("整体 status:", map[bool]string{true: "ok(200)", false: "unavailable(503)"}[healthy])
 }
+
 ```
 
 **项目位置**：`internal/platform/health/health.go`（并发探测 + buffered channel + 2s 超时）、`cmd/server/main.go` 的 GET `/healthz`（395-404）。
@@ -413,6 +419,7 @@ func main() {
 	}
 	fmt.Println("打点对业务代码零侵入：业务不感知指标层存在")
 }
+
 ```
 
 **项目位置**：`internal/platform/metrics/business.go` 的 `WrapMQ` 装饰器（177-207）；装配套接在 `cmd/server/main.go`（221-230）。

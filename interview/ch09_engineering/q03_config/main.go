@@ -11,7 +11,7 @@ import (
 // 项目用 viper（configs/config.yaml + GO_SINGLE_ 前缀环境变量覆盖），
 // 这里用标准库演示同款"默认值 → 环境变量"优先级。
 type config struct {
-	Server   serverConfig
+	Server                serverConfig
 	RequestTimeoutSeconds int
 }
 

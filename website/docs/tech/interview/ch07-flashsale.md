@@ -42,9 +42,10 @@ func main() {
 	}
 	fmt.Println("为什么拆两段：预扣在 Redis 扛峰值（微秒级），落单交给 DB 按自身节奏消费")
 }
+
 ```
 
-**项目位置**：`internal/flashsale/handler/flashsale_handler.go` 的 `purchase`（202 排队 + order_no）；`internal/flashsale/service/flashsale_service.go` 的 `Seckill`；消费者 `flashsale_consumer.go`；时序图 `docs/DESIGN.md`。
+**项目位置**：`internal/flashsale/handler/flashsale_handler.go` 的 `Purchase`（202 排队 + order_no）；`internal/flashsale/service/flashsale_service.go` 的 `Seckill`；消费者 `flashsale_consumer.go`；时序图 `docs/DESIGN.md`。
 
 ## Q2. 令牌桶限流：平滑突发流量
 
@@ -106,6 +107,7 @@ func main() {
 	}
 	fmt.Printf("突发 5 个被桶接住，随后按 2/s 节奏放行（共放行 %d）\n", allowed)
 }
+
 ```
 
 **项目位置**：`internal/platform/limiter/limiter.go` 的 `NewTokenBucket`（x/time/rate）；挂在 `POST /api/flashsales/:id/purchase`（flashsale_handler.go）；QPS 配置 `configs/config.yaml` 的 `flashsale.token_bucket`。
@@ -164,6 +166,7 @@ func main() {
 		fmt.Printf("%-10s → %2d（%s）\n", c.name, code, msg)
 	}
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `preDeductScript`（91-109）与 `PreDeduct`（569-611）。
@@ -198,6 +201,7 @@ func main() {
 	fmt.Println()
 	fmt.Println("对比：下单幂等键 order:idem:{user}:{client_request_id} TTL 15min")
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `Seckill`（473-480 抢占、`isBusinessReject` 529-533 释放）；`restoreScript` 回补时 DEL 幂等键。
@@ -240,6 +244,7 @@ func main() {
 	}
 	fmt.Println("结束 30min 内：以 MySQL 为准 SET 对齐 Redis（key 缺失回建）；下架活动不回建")
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/reconciliation.go`——`diffActive`（96-132）、`ReconcileEnded`（141-177，`endedReconcileWindow`=30min）；cron 注册 `cmd/server/main.go`（每小时/每分钟）。
@@ -273,8 +278,8 @@ func timeoutCancel(s *state) {
 		return // 条件更新不命中：订单已支付，跳过
 	}
 	s.orderStatus = "cancelled"
-	s.mysqlStock++        // 事务内回补 MySQL（与订单取消同事务）
-	s.redisStock++        // 提交后 Lua：INCR 库存 + DECR 计数 + DEL 幂等键
+	s.mysqlStock++ // 事务内回补 MySQL（与订单取消同事务）
+	s.redisStock++ // 提交后 Lua：INCR 库存 + DECR 计数 + DEL 幂等键
 	s.orderPaid = false
 }
 
@@ -285,6 +290,7 @@ func main() {
 	fmt.Printf("取消后：订单=%s redis=%d mysql=%d（库存回补，用户可再次抢购）\n",
 		s.orderStatus, s.redisStock, s.mysqlStock)
 }
+
 ```
 
 **项目位置**：`internal/order/service/order_service.go` 的 `CancelExpiredSeckill`（920-968）——批量扫描 `ListExpiredSeckillPending` → 事务条件取消 + `RestoreStock` → 提交后 `RestoreRedis`；cron `seckill-timeout-cancel` 每分钟（`cmd/server/main.go` 435-449）。
@@ -360,6 +366,7 @@ func main() {
 	fmt.Printf("生成 %d 个 ID，全部唯一: %v\n", len(seen), len(seen) == 100)
 	fmt.Println("特性：趋势递增（利于索引）、可解码时间（取高 41bit）")
 }
+
 ```
 
 **项目位置**：`internal/platform/snowflake/snowflake.go`（41+10+12 布局、时钟回拨防御）；订单号/支付号由它生成（order/payment service）。

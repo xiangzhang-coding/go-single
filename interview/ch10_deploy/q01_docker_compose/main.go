@@ -13,11 +13,11 @@ import (
 
 type composeFile struct {
 	Services map[string]struct {
-		Image       string              `yaml:"image"`
-		Ports       []string            `yaml:"ports"`
-		Volumes     []string            `yaml:"volumes"`
-		Healthcheck map[string]any      `yaml:"healthcheck"`
-		Environment map[string]string   `yaml:"environment"`
+		Image       string            `yaml:"image"`
+		Ports       []string          `yaml:"ports"`
+		Volumes     []string          `yaml:"volumes"`
+		Healthcheck map[string]any    `yaml:"healthcheck"`
+		Environment map[string]string `yaml:"environment"`
 	} `yaml:"services"`
 }
 

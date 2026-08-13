@@ -8,12 +8,12 @@ import (
 )
 
 type logLine struct {
-	Ts          string `json:"ts"`
-	Level       string `json:"level"`
-	Msg         string `json:"msg"`
-	ActivityID  int64  `json:"activity_id,omitempty"`
-	OrderNo     string `json:"order_no,omitempty"`
-	Elapsed     string `json:"elapsed"`
+	Ts         string `json:"ts"`
+	Level      string `json:"level"`
+	Msg        string `json:"msg"`
+	ActivityID int64  `json:"activity_id,omitempty"`
+	OrderNo    string `json:"order_no,omitempty"`
+	Elapsed    string `json:"elapsed"`
 }
 
 func main() {

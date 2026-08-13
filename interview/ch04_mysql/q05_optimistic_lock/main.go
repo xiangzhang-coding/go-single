@@ -36,5 +36,5 @@ func main() {
 }
 
 // 项目位置：本项目主用"条件更新（CAS 语义）+ 行锁"，即悲观与条件更新结合
-//（activity_repository_gorm.go 条件扣库存、order_repository_gorm.go 的 MarkPaid
+//（activity_repository_gorm.go 条件扣减库存、order_repository_gorm.go 的 MarkPaid
 // 带金额断言 UPDATE ... WHERE amount=?）；乐观锁留作延伸讨论。

@@ -77,6 +77,7 @@ func main() {
 	fmt.Printf("10 个并发请求，DB 只回填 %d 次\n", loads)
 	fmt.Println("应对雪崩：过期时间加随机抖动，避免同一时刻集体过期")
 }
+
 ```
 
 **项目位置**：`internal/product/service/product_service.go` 的 `GetDetail`——缓存 miss 后查 DB 回填（`product:detail:{id}`，TTL 5min）；单飞留作演进（BACKLOG）。
@@ -101,10 +102,10 @@ import (
 )
 
 type store struct {
-	mu     sync.Mutex
-	db     map[string]string
-	cache  map[string]string
-	log    []string
+	mu    sync.Mutex
+	db    map[string]string
+	cache map[string]string
+	log   []string
 }
 
 func (s *store) writeThrough(id, v string) {
@@ -134,6 +135,7 @@ func main() {
 	fmt.Println("读:", s.read("p1"), "| 日志:", s.log)
 	fmt.Println("要点：Cache-Aside 下写路径 = 更新 DB + 删除缓存（而非更新缓存）")
 }
+
 ```
 
 **项目位置**：product 详情 Cache-Aside（`product_service.go` GetDetail）；秒杀库存 Redis 是事实源；对账回写见 `reconciliation.go`。
@@ -160,9 +162,9 @@ import (
 
 // 内存版 SETNX + EXPIRE（对应项目 idemScript）。
 type idemStore struct {
-	mu  sync.Mutex
+	mu   sync.Mutex
 	keys map[string]bool
-	ttl map[string]int
+	ttl  map[string]int
 }
 
 func (s *idemStore) setnx(key string, ttl int) bool {
@@ -176,7 +178,12 @@ func (s *idemStore) setnx(key string, ttl int) bool {
 	return true
 }
 
-func (s *idemStore) del(key string) { s.mu.Lock(); defer s.mu.Unlock(); delete(s.keys, key); delete(s.ttl, key) }
+func (s *idemStore) del(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.keys, key)
+	delete(s.ttl, key)
+}
 
 func main() {
 	idem := &idemStore{keys: map[string]bool{}, ttl: map[string]int{}}
@@ -194,6 +201,7 @@ func main() {
 	fmt.Println("业务拒绝释放后再次抢占:", idem.setnx(key, 1800))
 	_ = errors.New("unused")
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `idemScript`（SETNX+EX 30min）与 `isBusinessReject`；订单幂等键 `order:idem:{user}:{client_request_id}` TTL 15min。
@@ -255,6 +263,7 @@ func main() {
 	code := eval(&stock, &count, "on_sale", 100, 0, 200, 1, 1)
 	fmt.Printf("执行结果=%d stock=%d count=%d（校验→扣减→计数全在一个原子步骤内）\n", code, stock, count)
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `preDeductScript`/`prewarmScript`/`restoreScript`；`internal/coupon/service/coupon_service.go` 的 `claimScript`；`internal/platform/limiter/limiter.go` 的 `countScript`；统一经 `cache.Eval` 原子执行。
@@ -306,6 +315,7 @@ func main() {
 	}
 	fmt.Println("第 6 次被拒：固定窗口 60s 内最多 5 次")
 }
+
 ```
 
 **项目位置**：`internal/platform/limiter/limiter.go` 的 `countScript` 与 `RedisCounter.Allow`；调用点 `flashsale_service.go` 的 `Seckill`；演进"Redis 分布式限流"见 BACKLOG。
@@ -360,6 +370,7 @@ func main() {
 	fmt.Println("  order:idem:{user}:{req}    TTL 15min（下单幂等）")
 	fmt.Println("  product:detail:{id}        TTL 5min（详情缓存）")
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `remainingTTL`；幂等键 TTL 见 Seckill 流程；`product:detail` TTL 在 `internal/product/service`。
@@ -419,6 +430,7 @@ func main() {
 	degraded := listActivityStock(redisCache{down: true}, 100)
 	fmt.Println("降级路径剩余库存:", degraded)
 }
+
 ```
 
 **项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `ListUserActivities`（降级配置库存 379-385）；product `GetDetail` 缓存 miss 回填、读失败直查 DB（`product_service.go`，slog 降级日志）。

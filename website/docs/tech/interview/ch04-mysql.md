@@ -46,6 +46,7 @@ func main() {
 	// 项目映射：mysqlErr 1062 → ErrOrderDuplicate（order_repository_gorm.go）。
 	fmt.Println("唯一索引（DB 层）才是幂等兜底")
 }
+
 ```
 
 **项目位置**：`migrations/000014_seckill_repurchase.up.sql` 的 `uk_orders_user_activity_key`（可空）；`internal/order/repository/order_repository_gorm.go` 用 `errors.As(err, &mysqlErr)` 把 1062 映射为 `ErrOrderDuplicate` → 消费者按幂等成功处理。
@@ -55,7 +56,7 @@ func main() {
 **答案要点**
 
 - **A** 原子性：要么全提交要么全回滚；**C** 一致性：约束不变式；**I** 隔离性：并发互不可见中间态；**D** 持久性：提交后不丢。
-- 跨表/跨模块写必须同一事务：订单 + 订单项 + 扣库存 + 地址快照 + 券核销 + 清购物车。
+- 跨表/跨模块写必须同一事务：订单 + 订单项 + 扣减库存 + 地址快照 + 券核销 + 清购物车。
 - 事务要短：持有锁时间长 = 冲突面大；不在事务里做外部 IO（HTTP/RPC）。
 - 回滚不留中间态，出错即整链失败。
 
@@ -71,7 +72,7 @@ import (
 
 // 极简内存"数据库"：操作记录可以提交或回滚。
 type memDB struct {
-	ops  []string
+	ops       []string
 	committed bool
 }
 
@@ -89,12 +90,12 @@ func (db *memDB) rollback() {
 }
 
 func main() {
-	// 下单事务 = 订单 + 订单项 + 扣库存 + 地址快照 + 券核销 + 清购物车（全在一个事务）。
+	// 下单事务 = 订单 + 订单项 + 扣减库存 + 地址快照 + 券核销 + 清购物车（全在一个事务）。
 	db := &memDB{}
 	db.begin()
 	_ = db.exec("INSERT orders ...")
 	_ = db.exec("UPDATE skus SET stock = stock - 1 ...")
-	if errors.New("扣库存失败") != nil { // 模拟任一步失败
+	if errors.New("扣减库存失败") != nil { // 模拟任一步失败
 		db.rollback()
 		fmt.Println("任一步失败 → 全部回滚，无部分写入")
 		return
@@ -105,6 +106,7 @@ func main() {
 	// 关键点：ACID 的原子性保证"要么全有要么全无"，配合行锁避免并发串改。
 	fmt.Println("回滚后 ops 长度:", len(db.ops))
 }
+
 ```
 
 **项目位置**：`internal/order/service/order_service.go` 的 `createOrder`（286-396）与 `CreateSeckill`（404-487）；跨模块写经 `TxRunner.WithinTx` 汇入同一事务（`internal/order/repository/order_repository.go`）。
@@ -162,6 +164,7 @@ func main() {
 	wg.Wait()
 	fmt.Printf("并发 10 次扣减，成功 %d 次（库存 3，不会超卖）\n", succ)
 }
+
 ```
 
 **项目位置**：`internal/flashsale/repository/activity_repository_gorm.go` 的条件扣减；秒杀订单事务内 `DeductStock`（ActivityStock 端口）同样条件扣减；商品 SKU 同理（`internal/product`）。
@@ -186,7 +189,7 @@ import (
 	"sync"
 )
 
-// 多 SKU 扣库存时按 (product_id, sku_id) 排序后加锁——
+// 多 SKU 扣减库存时按 (product_id, sku_id) 排序后加锁——
 // 两个事务都以相同顺序拿锁，就不会出现"我等你、你等我"的环形等待。
 type skuLock struct {
 	id  int64
@@ -213,6 +216,7 @@ func main() {
 	}
 	fmt.Println("所有事务按相同排序拿锁 → 无死锁")
 }
+
 ```
 
 **项目位置**：`internal/order/service/order_service.go` 在锁商品/SKU 前 `sort.Slice` 统一排序（677-682）；加锁查询 `GetSKUForUpdate` 在 `internal/product/service/product_service.go`。
@@ -263,6 +267,7 @@ func main() {
 	_ = optimisticTransfer(acc, 100)
 	fmt.Printf("重试成功，余额=%d version=%d\n", acc.balance, acc.version)
 }
+
 ```
 
 **项目位置**：本项目主用"条件更新（CAS）+ 行锁"组合（`activity_repository_gorm.go`、`order_repository_gorm.go` 的 `MarkPaid` 带金额断言）；乐观锁留作延伸讨论。
@@ -274,7 +279,7 @@ func main() {
 - go-sql-driver 的 `*mysql.MySQLError` 携带 `Number`，`errors.As` 提取判 1062。
 - 把 1062 映射为**业务幂等成功**（消费者 Ack）而非报错：重复消息是常态不是异常。
 - 映射职责在 repository 层，service 只认业务错误（`ErrOrderDuplicate`）。
-- 幂等 + 库存条件扣减双保险：重复执行也不会重复扣库存。
+- 幂等 + 库存条件扣减双保险：重复执行也不会重复扣减库存。
 
 **可运行代码**
 
@@ -298,7 +303,7 @@ func saveOrder(no string) error {
 }
 
 func main() {
-	// 秒杀消费者：重复消息 → 幂等成功（不重复扣库存）。
+	// 秒杀消费者：重复消息 → 幂等成功（不重复扣减库存）。
 	// 项目做法：errors.As(err, &mysqlErr) 解析 1062 → ErrOrderDuplicate → 消费者 Ack。
 	no := "O20260813001"
 	if err := saveOrder(no); err != nil {
@@ -310,6 +315,12 @@ func main() {
 		fmt.Println("其他错误:", err)
 	}
 }
+
+// mySQLError 占位类型：真实项目直接用 go-sql-driver/mysql 的 *mysql.MySQLError。
+type mySQLError struct{ Number uint16 }
+
+func (e *mySQLError) Error() string { return "mysql error" }
+
 ```
 
 **项目位置**：`internal/order/repository/order_repository_gorm.go`（`errors.As` 判 1062 → `ErrOrderDuplicate`）；消费端视为幂等成功（`flashsale_consumer.go` 的 `classifyCreateError`）。
@@ -364,6 +375,7 @@ func main() {
 	// 慢查询：WHERE user_id=? 无索引 vs 有索引。
 	fmt.Println("orders 建 idx_orders_user_status 索引后，按用户查订单 O(log n) 而非全表扫")
 }
+
 ```
 
 **项目位置**：`cmd/server/main.go` 的 `openMySQL`（池参数 + `PingContext` 5s）；`migrations/000009_orders.up.sql` 建 `idx_orders_user_status`；GORM Warn 慢日志。

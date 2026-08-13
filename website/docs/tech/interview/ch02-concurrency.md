@@ -46,6 +46,7 @@ func main() {
 	wg.Wait()
 	fmt.Println("主流程结束")
 }
+
 ```
 
 **项目位置**：`internal/platform/health/health.go` 探测用 ctx 限时；`cmd/server/middleware.go` 的 `requestTimeout` 为请求建带 deadline 的 context 贯穿 service→repository；MQ 消费循环 `select ctx.Done()` 退出（`cmd/server/main.go`）。
@@ -94,6 +95,7 @@ func main() {
 	close(send)
 	time.Sleep(10 * time.Millisecond)
 }
+
 ```
 
 **项目位置**：`internal/platform/ws/hub.go` 的 `client.send chan []byte`（缓冲 64）——慢消费者由"缓冲满 → 断开连接"兜底；`writePump` 用 select 同时监听发送队列与退出信号。
@@ -132,13 +134,14 @@ func main() {
 		}(d)
 	}
 
-	wg.Wait()        // 等全部探测完成
-	close(results)   // 关闭后 range 才会结束
+	wg.Wait()      // 等全部探测完成
+	close(results) // 关闭后 range 才会结束
 	for r := range results {
 		fmt.Println(r)
 	}
 	fmt.Println("全部检查完成")
 }
+
 ```
 
 **项目位置**：`internal/platform/health/health.go` 的 `Check` 正是"goroutine 探测 + buffered channel 收集 + 超时兜底"；WS `Hub.Close` 也等写泵退出。
@@ -194,6 +197,7 @@ func main() {
 	wg.Wait()
 	fmt.Printf("完成 读=%d 写=%d 连接数=%d\n", reads.Load(), writes.Load(), len(conns))
 }
+
 ```
 
 **项目位置**：`internal/platform/ws/hub.go` 的 `Hub` 用 `sync.RWMutex` 保护 `clients` map（`PushToUser` 读、`register/unregister` 写）；雪花 ID 同毫秒序号自旋用 `sync.Mutex`（`internal/platform/snowflake/snowflake.go`）。
@@ -241,6 +245,7 @@ func main() {
 	wg.Wait()
 	fmt.Println("完成")
 }
+
 ```
 
 **项目位置**：`internal/platform/ws/hub.go` 用 `sync.Once` 保证 `client.send` 只被 `close` 一次（重复 close 会 panic）。
@@ -287,6 +292,7 @@ func main() {
 		fmt.Println("CAS 成功")
 	}
 }
+
 ```
 
 **项目位置**：令牌桶 `internal/platform/limiter/limiter.go`（x/time/rate，内部基于原子）；预扣成功/失败等业务计数落 Prometheus（`internal/platform/metrics/business.go`）。
@@ -350,6 +356,7 @@ func main() {
 	wg.Wait() // 等消费者退出，保证无泄漏
 	fmt.Println("优雅退出完成")
 }
+
 ```
 
 **项目位置**：`cmd/server/main.go` 消费者重连循环——`go func(){ for { mqClient.Consume(ctx,...); time.Sleep(3s) } }()`；RabbitMQ 侧 `Qos(1)` 天然串行（`internal/platform/mq/rabbitmq.go`）。

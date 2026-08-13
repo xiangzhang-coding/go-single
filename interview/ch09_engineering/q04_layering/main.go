@@ -9,9 +9,9 @@ import (
 
 // model：数据结构（GORM 表映射）。
 type CartItem struct {
-	ID    int64
+	ID     int64
 	UserID int64
-	SKUID int64
+	SKUID  int64
 }
 
 // repository：数据访问。

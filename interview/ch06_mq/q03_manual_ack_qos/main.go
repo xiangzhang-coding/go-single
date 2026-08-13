@@ -9,9 +9,9 @@ import (
 type ackKind int
 
 const (
-	ackOK     ackKind = iota // 成功：Ack
-	ackRetry                 // 瞬时失败：Nack(requeue=true) 重投
-	ackDead                  // 永久失败：Nack(requeue=false) 进死信
+	ackOK    ackKind = iota // 成功：Ack
+	ackRetry                // 瞬时失败：Nack(requeue=true) 重投
+	ackDead                 // 永久失败：Nack(requeue=false) 进死信
 )
 
 func process(body string) ackKind {

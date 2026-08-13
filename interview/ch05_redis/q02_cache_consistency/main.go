@@ -8,10 +8,10 @@ import (
 )
 
 type store struct {
-	mu     sync.Mutex
-	db     map[string]string
-	cache  map[string]string
-	log    []string
+	mu    sync.Mutex
+	db    map[string]string
+	cache map[string]string
+	log   []string
 }
 
 func (s *store) writeThrough(id, v string) {

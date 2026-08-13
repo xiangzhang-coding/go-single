@@ -29,11 +29,11 @@ import (
 
 type composeFile struct {
 	Services map[string]struct {
-		Image       string              `yaml:"image"`
-		Ports       []string            `yaml:"ports"`
-		Volumes     []string            `yaml:"volumes"`
-		Healthcheck map[string]any      `yaml:"healthcheck"`
-		Environment map[string]string   `yaml:"environment"`
+		Image       string            `yaml:"image"`
+		Ports       []string          `yaml:"ports"`
+		Volumes     []string          `yaml:"volumes"`
+		Healthcheck map[string]any    `yaml:"healthcheck"`
+		Environment map[string]string `yaml:"environment"`
 	} `yaml:"services"`
 }
 
@@ -68,6 +68,7 @@ func main() {
 	}
 	fmt.Println("未找到 compose 文件")
 }
+
 ```
 
 **项目位置**：`deploy/docker-compose.yml`（mysql/redis/rabbitmq/minio/nginx/prometheus/grafana/loki/promtail 全带 healthcheck）；根目录 `docker-compose.yml` 是 include 桥。
@@ -114,6 +115,7 @@ func main() {
 	fmt.Println("         location / { try_files $uri /index.html; }（SPA 回退）")
 	fmt.Println("         location /ws { proxy_http_version 1.1; Upgrade 头; }")
 }
+
 ```
 
 **项目位置**：`deploy/nginx/nginx.conf`——静态托管 `web/faire/dist` + `/api` 反代 + `/ws` upgrade（read_timeout 90s）+ try_files 回退；compose nginx 挂载 dist。
@@ -167,6 +169,7 @@ func main() {
 	}()
 	select {} // 用 Ctrl+C 发 SIGINT 结束演示
 }
+
 ```
 
 **项目位置**：`cmd/server/main.go`——SIGINT/SIGTERM → `cronRegistry.Stop(5s)` → `srv.Shutdown(10s)` → `wsHub.Close()`；compose healthcheck 探 `/healthz`。
@@ -244,6 +247,7 @@ func main() {
 	fmt.Printf("状态: %v → 探针返回 %v（任一依赖挂 → 503 从负载均衡摘除）\n", state, ok)
 	_ = errors.New("unused")
 }
+
 ```
 
 **项目位置**：`internal/platform/health/health.go` 的 `Check` + GET `/healthz`（main.go 395-404）；compose 各服务 healthcheck。
@@ -283,6 +287,7 @@ func main() {
 	_ = os.MkdirAll(backup, 0o755)
 	fmt.Printf("备份目录: %s（生产应异地 + 定期验证恢复）\n", backup)
 }
+
 ```
 
 **项目位置**：`deploy/docker-compose.yml` 的 volumes；日志持久化走 `log.file` 镜像（`configs/config.yaml`）+ promtail。
@@ -335,6 +340,7 @@ func main() {
 	fmt.Printf("schema 前进到版本 %d（当前 000014）\n", cur)
 	fmt.Println("要点：迁移只前移不修改旧文件；升级走 migrate up，回退走 migrate down")
 }
+
 ```
 
 **项目位置**：`migrations/000001_init.up.sql` ~ `000014_seckill_repurchase.up.sql`（up/down 成对）；启动执行 `runMigrations`（`cmd/server/main.go` 197-209）。
@@ -380,6 +386,7 @@ func main() {
 	}
 	fmt.Println("发布完成：healthcheck 通过后流量进入新版本")
 }
+
 ```
 
 **项目位置**：本仓库暂无 CI 文件（BACKLOG）；本地流程 = `docker compose up`（依赖）+ `go run ./cmd/server`；前端 `bun build`（web/faire、website/）；文档站可接 Cloudflare Pages。

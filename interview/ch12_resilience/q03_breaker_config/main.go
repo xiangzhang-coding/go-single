@@ -5,10 +5,10 @@ package main
 import "fmt"
 
 type breakerSettings struct {
-	name                  string
+	name                   string
 	maxConsecutiveFailures int
-	interval              string
-	timeout               string
+	interval               string
+	timeout                string
 }
 
 func main() {
