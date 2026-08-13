@@ -1,0 +1,60 @@
+# Cloudflare Pages 自动部署（T28 部署收尾·接线）：
+#   web/faire（SPA 主题）与 website/（Docusaurus 文档站）各一个 Pages 项目，push main 自动构建部署，
+#   也可 workflow_dispatch 手动触发。接线详见 docs/DEPLOYMENT.md。
+#
+# 所需仓库配置：
+#   - Secrets:   CLOUDFLARE_API_TOKEN（Pages:Edit 权限）、CLOUDFLARE_ACCOUNT_ID
+#   - Variables: VITE_API_BASE（后端地址，如 https://api.example.com，默认 /api 同源）、VITE_WS_BASE
+#   - 先建 Pages 项目：wrangler pages project create go-single-web-faire / go-single-website
+name: Deploy Cloudflare Pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "website/**"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-web-faire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Build web/faire
+        working-directory: web/faire
+        env:
+          VITE_API_BASE: ${{ vars.VITE_API_BASE }}
+          VITE_WS_BASE: ${{ vars.VITE_WS_BASE }}
+        run: bun install --frozen-lockfile && bun run build
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web/faire
+          command: pages deploy dist --project-name=go-single-web-faire --branch=main
+
+  deploy-website:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Build website
+        working-directory: website
+        run: bun install --frozen-lockfile && bun run build
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: website
+          command: pages deploy build --project-name=go-single-website --branch=main

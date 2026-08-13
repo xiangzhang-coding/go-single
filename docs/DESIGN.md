@@ -109,8 +109,9 @@ go_single/
 - **TS 类型**：api 层手写类型对齐 swagger 契约；openapi-typescript 自动生成进 backlog
 - 布局策略：桌面优先，不做移动端适配（演示项目）
 - **部署双路径**：
-  - 本地演示（同源）：Nginx 托管选定主题的构建产物（`web/<theme>/dist`）+ `location /api` 反代 :8080 + `try_files` SPA fallback
+  - 本地演示（同源）：Nginx 托管选定主题的构建产物（`web/<theme>/dist`）+ `location /api` 反代 :8080 + `try_files` SPA fallback；SSL 终止（自签证书）+ 安全头（T28，deploy/nginx/gen-certs.sh）
   - 云端（Cloudflare Pages，前端可独立部署）：静态 SPA + `_redirects`（`/* → /index.html 200`，置于 `public/`）+ `VITE_API_BASE` 跨源
+  - 接线与演示命令见 docs/DEPLOYMENT.md（部署指南），平台选型见 ADR-0005
 - 第二套主题以第一套为骨架克隆（api 层/路由/页面框架复用，设计层重写）；`web/shared/` 公共层等到出现第二套主题再抽（YAGNI）
 
 ## 订单状态机（普通/秒杀共用）

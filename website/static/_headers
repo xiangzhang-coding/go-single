@@ -1,0 +1,6 @@
+# Cloudflare Pages 响应头（T28 部署收尾）：文档站为静态 HTML 站点，CSP 留空以免误伤文档内嵌演示。
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Strict-Transport-Security: max-age=31536000; includeSubDomains

@@ -39,12 +39,6 @@
 - openapi-typescript（swagger → TS 类型自动生成——当前手写对齐）
 - JWT 存储方案讨论：cookie + CSRF 防护（当前 localStorage 取舍）
 
-## 部署演进
-
-- Cloudflare Pages 云端部署实操（web/ 各主题 + website/ 文档站：域名 / HTTPS / Pages 项目接线）
-- 后端云部署平台选型（VPS / 容器 / Fly / Railway 等）
-- 初始化 git 仓库（monorepo，含 web/ 与 website/）
-
 ## 明确不做（单体阶段）
 
 - 微服务拆分

@@ -187,7 +187,8 @@
 
 - docker-compose：mysql/redis/rabbitmq/minio/nginx/prometheus/grafana/loki/promtail（默认开启；不含前端构建——宿主 bun build 后挂载 dist）
 - Nginx 即网关：路由/SSL 终止/静态托管/入口限流/upstream 双实例示例；拆微服务时才引入独立 API 网关
-- Cloudflare Pages 部署（web/ 主题 + website/ 文档站）与后端云平台选型在实现后期完成
+- Cloudflare Pages 部署（web/ 主题 + website/ 文档站）：`_redirects` / `_headers` 接线、构建环境变量（VITE_API_BASE / VITE_WS_BASE）、域名与 HTTPS、GitHub Actions 自动部署（T28，详见 docs/DEPLOYMENT.md）
+- 后端云平台选型：VPS + Docker Compose 为主选，PaaS 备选（T28，ADR-0005）
 
 ## Testing Decisions
 
@@ -199,7 +200,7 @@
 
 ## Out of Scope
 
-- 所有 backlog 项：群聊、已读回执、退款/售后、免申请双向好友、JWT refresh、多实例 LB+灰度（upstream 权重+header/cookie）、OpenTelemetry 链路、指标点扩展、舱壁、Sentinel-golang、数据库读写分离、认证增强（登出黑名单/密码复杂度/双因素）、shadcn/ui、openapi-typescript、JWT cookie+CSRF 方案、RabbitMQ 延迟队列、Cloudflare 云端实操、后端云平台选型
+- 所有 backlog 项：群聊、已读回执、退款/售后、免申请双向好友、JWT refresh、多实例 LB+灰度（upstream 权重+header/cookie）、OpenTelemetry 链路、指标点扩展、舱壁、Sentinel-golang、数据库读写分离、认证增强（登出黑名单/密码复杂度/双因素）、shadcn/ui、openapi-typescript、JWT cookie+CSRF 方案、RabbitMQ 延迟队列
 - 明确不做：微服务拆分、API 网关（Kong/APISIX）、注册中心/服务网格、presigned 直传（前端直连 MinIO）、ELK 技术栈
 - 移动端适配、真实支付渠道、多语言站点
 

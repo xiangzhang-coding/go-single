@@ -60,22 +60,26 @@ services:
       timeout: 3s
       retries: 20
 
-  # 前端本地部署（T26）：托管 web/faire 构建产物 + /api、/ws 反代后端（同源路径）。
+  # 前端本地部署（T26 + T28）：托管 web/faire 构建产物 + /api、/ws 反代后端（同源路径）。
+  # SSL 终止：443 承载全部流量（自签证书 ./nginx/gen-certs.sh 生成），80 仅 301 跳转 HTTPS。
   # 不含前端构建——宿主先 bun build（web/faire），dist 以只读挂载进容器。
   nginx:
     image: nginx:1.27-alpine
     container_name: go_single_nginx
     ports:
       - "8081:80"
+      - "8443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
       - ../web/faire/dist:/usr/share/nginx/html:ro
     extra_hosts:
       # 后端以宿主机进程运行，容器内经该主机名访问宿主 :8080（与 prometheus 同法）。
       - "host.docker.internal:host-gateway"
     healthcheck:
-      # 经 /api 反代探活：后端宕机时 nginx 回 502 → unhealthy（验证反代联通而非仅静态文件）。
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/api/products"]
+      # 经 HTTPS /api 反代探活（--no-check-certificate：自签证书）：后端宕机时 nginx 回 502 → unhealthy
+      # （验证 SSL 终止 + 反代联通，而非仅静态文件）。
+      test: ["CMD", "wget", "-q", "--no-check-certificate", "-O", "/dev/null", "https://127.0.0.1/api/products"]
       interval: 10s
       timeout: 3s
       retries: 5

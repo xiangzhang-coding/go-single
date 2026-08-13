@@ -1,0 +1,3 @@
+# Cloudflare Pages 重定向（T28 部署收尾）。
+# Docusaurus 生成真实 HTML 路由并自带 404.html 处理，一般无需额外规则；
+# 如需整站级跳转（如旧路径迁移），在此追加：/old-path /new-path 301

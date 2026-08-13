@@ -26,6 +26,7 @@ sidebar_position: 1
 - 跨模块端口按"**调用方声明最小接口**"组织：如 order 侧声明 `ActivityStock` / `SeckillRestore`，由 flashsale 实现（flashsale → order 单向依赖，无环）
 - admin 管理入口按模块内嵌（product/order/flashsale/coupon 的 admin 路由 + role 鉴权），不单独成模块
 - 权威源：`docs/DESIGN.md` 与各模块实现（`internal/`），本目录只放摘要与链接
+- 部署（本地 Nginx SSL / Cloudflare Pages / 后端平台选型）见 [docs/DEPLOYMENT.md](https://github.com/xiangzhang-coding/go-single/blob/main/docs/DEPLOYMENT.md) 与 [ADR-0005](https://github.com/xiangzhang-coding/go-single/blob/main/docs/adr/0005-backend-deploy-vps.md)
 
 ## 相关
 

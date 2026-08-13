@@ -31,8 +31,13 @@ docker compose ps
 ```
 
 :::tip 可观测组件（可选）
-`docker compose up -d` 可一并启动 Prometheus(:9090) / Grafana(:3000，预置 Loki 数据源与服务日志面板) / Loki(:3100) / Promtail / Nginx(:8081，托管前端 dist 并反代 `/api`)。
+`docker compose up -d` 可一并启动 Prometheus(:9090) / Grafana(:3000，预置 Loki 数据源与服务日志面板) / Loki(:3100) / Promtail / Nginx(:8081→80，托管前端 dist 并反代 `/api`)。
 Nginx 需要先构建前端产物（`cd web/faire && bun install && bun run build`），否则容器健康检查会失败。
+:::
+
+:::tip 本地 HTTPS 演示（T28）
+Nginx 同时提供 SSL 终止：`https://localhost:8443`（自签证书需手动信任，`curl -k` 可验证安全头；80 端口仅 301 跳转 HTTPS）。
+生成证书与演示命令见 [docs/DEPLOYMENT.md](https://github.com/xiangzhang-coding/go-single/blob/main/docs/DEPLOYMENT.md)。
 :::
 
 ## 第 2 步：起后端
@@ -59,4 +64,4 @@ bun run dev
 
 - 浏览器可注册/登录（演示账号见[演示账号](./demo-accounts)）
 - 商品列表/详情可浏览，购物车与下单流程可走通
-- 可选：`docker compose up -d` 后访问 `http://localhost:8081` 查看 Nginx 托管形态
+- 可选：`docker compose up -d` 后访问 `https://localhost:8443`（或 `http://localhost:8081` 触发跳转）查看 Nginx 托管形态
