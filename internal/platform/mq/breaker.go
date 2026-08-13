@@ -24,6 +24,9 @@ import (
 // Nack 重投，消息保留，待熔断闭合后重新处理；对账兜底不受影响）。
 var ErrCircuitOpen = errors.New("mq circuit breaker open")
 
+// defaultMaxConsecutiveFailures 装配方未提供阈值时的兜底（config 默认值同为 3）。
+const defaultMaxConsecutiveFailures = 3
+
 // BreakerSettings 熔断参数：由装配方经 config 构建（mq.circuit.*）。
 type BreakerSettings struct {
 	// Name 熔断器名称（日志/状态变化事件标识）。
@@ -47,7 +50,7 @@ func WrapCircuitBreaker(inner MQ, settings BreakerSettings) MQ {
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			threshold := settings.MaxConsecutiveFailures
 			if threshold <= 0 {
-				threshold = 3
+				threshold = defaultMaxConsecutiveFailures
 			}
 			return counts.ConsecutiveFailures >= uint32(threshold)
 		},
@@ -73,19 +76,19 @@ func (b *breakerMQ) Publish(ctx context.Context, queue string, body []byte) erro
 // （ErrPermanent → 死信；其余 → 重投）；熔断打开时快速失败（不执行 handler）。
 func (b *breakerMQ) Consume(ctx context.Context, queue string, handler MessageHandler) error {
 	wrapped := func(hctx context.Context, body []byte) error {
-		return b.handle(queue, hctx, body, handler)
+		return b.runWithBreaker(queue, hctx, body, handler)
 	}
 	return b.inner.Consume(ctx, queue, wrapped)
 }
 
-// handle 单条消息经熔断器执行：
+// runWithBreaker 单条消息经熔断器执行：
 //   - handler 成功 → 熔断计成功，返回 nil（Ack）；
 //   - handler 返回 ErrPermanent → 业务拒绝视为"已处理"，熔断计成功，原样返回
 //     （mq 层 Nack 拒收进死信，不因个别毒消息误伤整个消费者）；
 //   - handler 返回普通错误 → 熔断计失败，原样返回（mq 层 Nack 重投）；
 //   - 熔断打开 → 不执行 handler，快速失败返回 ErrCircuitOpen（重投保留消息，
 //     半开探活成功即闭合）。
-func (b *breakerMQ) handle(queue string, ctx context.Context, body []byte, handler MessageHandler) error {
+func (b *breakerMQ) runWithBreaker(queue string, ctx context.Context, body []byte, handler MessageHandler) error {
 	var handledErr error
 	_, err := b.cb.Execute(func() (any, error) {
 		handleErr := handler(ctx, body)

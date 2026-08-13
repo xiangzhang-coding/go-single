@@ -253,10 +253,7 @@ type orderService struct {
 func New(store repository.Store, c cache.Cache, nos OrderNoGenerator,
 	products ProductService, coupons CouponService, cart CartService, users UserService,
 	activities ActivityStock, seckill SeckillRestore, m *metrics.Business, retryCfg ...retry.Config) Service {
-	cfg := retry.Config{}
-	if len(retryCfg) > 0 {
-		cfg = retryCfg[0]
-	}
+	cfg := retry.OrDefault(retryCfg...)
 	return &orderService{store: store, cache: c, nos: nos, products: products, coupons: coupons, cart: cart, users: users, activities: activities, seckill: seckill, metrics: m, retryCfg: cfg}
 }
 

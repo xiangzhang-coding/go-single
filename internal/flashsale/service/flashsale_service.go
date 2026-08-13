@@ -243,10 +243,7 @@ type flashsaleService struct {
 // retryCfg 为 MQ 发布重试配置（T20 有限重试；省略 = 不重试，消息由对账兜底）。
 func New(store repository.Store, products ProductService, c cache.Cache, userLimiter limiter.RedisCounterConfig,
 	publisher MessagePublisher, nos OrderNoGenerator, m *metrics.Business, retryCfg ...retry.Config) Service {
-	cfg := retry.Config{}
-	if len(retryCfg) > 0 {
-		cfg = retryCfg[0]
-	}
+	cfg := retry.OrDefault(retryCfg...)
 	return &flashsaleService{
 		store:     store,
 		products:  products,

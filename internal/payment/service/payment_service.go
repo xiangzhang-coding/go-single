@@ -65,10 +65,7 @@ type paymentService struct {
 
 // New 构造支付服务；retryCfg 为回调处理重试配置（T20 有限重试；省略 = 不重试）。
 func New(store repository.Store, orders OrderService, m *metrics.Business, retryCfg ...retry.Config) Service {
-	cfg := retry.Config{}
-	if len(retryCfg) > 0 {
-		cfg = retryCfg[0]
-	}
+	cfg := retry.OrDefault(retryCfg...)
 	return &paymentService{store: store, orders: orders, metrics: m, retryCfg: cfg}
 }
 

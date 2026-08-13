@@ -56,6 +56,15 @@ func Do(ctx context.Context, cfg Config, fn func(ctx context.Context) error) err
 	return err
 }
 
+// OrDefault 从可选变参中取配置：省略（或零值切片）时返回零值 Config
+// （单次执行不重试，供非幂等/未启用重试的调用方作为默认行为）。
+func OrDefault(cfgs ...Config) Config {
+	if len(cfgs) > 0 {
+		return cfgs[0]
+	}
+	return Config{}
+}
+
 // stopError 不可重试标记：Do 遇到时立即停止并还原原始错误。
 type stopError struct{ err error }
 
