@@ -34,6 +34,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
@@ -154,6 +155,7 @@ func buildEnv() (*testEnv, error) {
 		limiter.RedisCounterConfig{},
 		pub,
 		&fakeNos{next: 900000},
+		metrics.New().Business(),
 	)
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
 
@@ -218,6 +220,7 @@ func (e *testEnv) newFlashsaleRouter(t *testing.T, limitCfg limiter.TokenBucketC
 		rlCfg,
 		&fakePublisher{},
 		&fakeNos{next: 910000},
+		metrics.New().Business(),
 	)
 	h := flashsalehandler.New(svc, e.verifier)
 	limitMW, err := limiter.NewTokenBucket(limitCfg)

@@ -213,6 +213,11 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	r := gin.New()
 	// metrics 在最外层：panic 被 Recovery 恢复为 500 后仍能完成计数。
 	metricRegistry := metrics.New()
+	// 业务指标（T19c）：秒杀预扣/库存余量、订单创建/状态/支付、MQ 发布消费、
+	// 优惠券发放核销；注册于同一 registry，随 /metrics 抓取。
+	businessMetrics := metricRegistry.Business()
+	// MQ 客户端装饰：发布/消费/消费失败打点（queue 维度，与业务指标同 registry）。
+	mqClient = metrics.WrapMQ(mqClient, businessMetrics)
 	// CORS（T26）：跨源场景（云端前端独立部署）按配置白名单放行；
 	// 置于 requestLogger 之后，使预检 OPTIONS 也进入访问日志（排障可见），
 	// 同时仍先于路由匹配（Use 中间件均在 handler 前执行）。
@@ -244,7 +249,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	cartHandler := carthandler.New(cartSvc, verifier)
 
 	// coupon 模块：admin 发布券模板，用户领券（Lua 原子防超发）与我的券。
-	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(db), UserCoupon: couponrepo.NewGORMUserCoupon(db)}, cacheClient)
+	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(db), UserCoupon: couponrepo.NewGORMUserCoupon(db)}, cacheClient, businessMetrics)
 	couponHandler := couponhandler.New(couponSvc, verifier)
 
 	// 雪花订单号生成器：普通下单与秒杀抢购共用同一实例（worker_id 单实例唯一）。
@@ -267,7 +272,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	flashsaleStore := flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(db)}
 	flashsaleSvc := flashsalesvc.New(flashsaleStore, productSvc, cacheClient,
 		limiter.RedisCounterConfig{Max: cfg.FlashSale.PerUserMax, Window: cfg.FlashSale.PerUserWindow},
-		mqClient, orderNoGen)
+		mqClient, orderNoGen, businessMetrics)
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
 
 	// order 模块：购物车结算/直购下单（单事务：订单+订单项+库存+地址快照+券核销+
@@ -277,7 +282,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// CancelExpiredSeckill（T13）：秒杀超时取消回补（flashsale 实现 SeckillRestore 端口）。
 	orderStore := orderrepo.NewGORMOrder(db)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc)
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc, businessMetrics)
 	orderHandler := orderhandler.New(orderSvc, verifier)
 
 	// 秒杀库存对账（T13）：进行中只比对告警（补单信号），收尾以 MySQL 对齐 Redis；
@@ -330,7 +335,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// 订单读取与状态迁移经 order 服务进程内调用。
 	paymentStore := paymentrepo.NewGORMPayment(db)
 	paymentHandler := paymenthandler.New(
-		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc),
+		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc, businessMetrics),
 		verifier,
 	)
 

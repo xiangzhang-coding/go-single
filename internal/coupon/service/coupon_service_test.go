@@ -16,6 +16,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 	"github.com/xiangzhang-coding/go-single/internal/coupon/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 )
 
 // ---- fake 仓储 ----
@@ -272,7 +273,7 @@ func newFixture() *fixture {
 	tmpls := newFakeTemplates()
 	coups := newFakeUserCoupons(tmpls)
 	fc := newFakeClaimCache()
-	svc := New(repository.Store{Template: tmpls, UserCoupon: coups}, fc)
+	svc := New(repository.Store{Template: tmpls, UserCoupon: coups}, fc, metrics.New().Business())
 	return &fixture{svc: svc, tmpls: tmpls, coups: coups, cache: fc}
 }
 

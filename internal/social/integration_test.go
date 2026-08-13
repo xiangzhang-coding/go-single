@@ -35,6 +35,7 @@ import (
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
 	socialrepo "github.com/xiangzhang-coding/go-single/internal/social/repository"
@@ -123,7 +124,8 @@ func buildEnv() (*testEnv, error) {
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(
 		orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
-		noopCache{}, stubOrderNoGen{}, stubProducts{}, stubCoupons{}, stubCart{}, userSvc, stubActivity{}, stubActivity{})
+		noopCache{}, stubOrderNoGen{}, stubProducts{}, stubCoupons{}, stubCart{}, userSvc, stubActivity{}, stubActivity{},
+		metrics.New().Business())
 
 	socialStore := socialrepo.Store{
 		Requests:    socialrepo.NewGORMRequest(gdb),

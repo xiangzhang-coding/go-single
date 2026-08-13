@@ -28,6 +28,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
 	"github.com/xiangzhang-coding/go-single/internal/order/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -243,13 +244,14 @@ type orderService struct {
 	users      UserService
 	activities ActivityStock  // 秒杀活动库存（跨模块端口，flashsale 实现）
 	seckill    SeckillRestore // 秒杀订单取消回补（跨模块端口，flashsale 实现，T13）
+	metrics    *metrics.Business
 }
 
 // New 构造订单服务。
 func New(store repository.Store, c cache.Cache, nos OrderNoGenerator,
 	products ProductService, coupons CouponService, cart CartService, users UserService,
-	activities ActivityStock, seckill SeckillRestore) Service {
-	return &orderService{store: store, cache: c, nos: nos, products: products, coupons: coupons, cart: cart, users: users, activities: activities, seckill: seckill}
+	activities ActivityStock, seckill SeckillRestore, m *metrics.Business) Service {
+	return &orderService{store: store, cache: c, nos: nos, products: products, coupons: coupons, cart: cart, users: users, activities: activities, seckill: seckill, metrics: m}
 }
 
 // ---- 下单 ----
@@ -367,6 +369,9 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 		return nil, err
 	}
 
+	// 订单创建/状态流转打点（T19c）：事务提交后计数，幂等命中不重复计数。
+	s.metrics.OrderCreated(model.OrderTypeNormal)
+	s.metrics.OrderStatusChanged(model.OrderStatusPendingPayment)
 	return &CreateResult{Order: &model.OrderView{Order: *order, Items: items}}, nil
 }
 
@@ -455,6 +460,9 @@ func (s *orderService) CreateSeckill(ctx context.Context, p SeckillCreateParams)
 		}
 		return err
 	}
+	// 订单创建/状态流转打点（T19c）：重复键幂等命中不计数。
+	s.metrics.OrderCreated(model.OrderTypeSeckill)
+	s.metrics.OrderStatusChanged(model.OrderStatusPendingPayment)
 	return nil
 }
 
@@ -831,6 +839,8 @@ func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string)
 	if err != nil {
 		return err
 	}
+	// 状态流转打点（T19c）：事务提交后计数（回补失败回滚不计数）。
+	s.metrics.OrderStatusChanged(model.OrderStatusCancelled)
 	return nil
 }
 
@@ -870,6 +880,8 @@ func (s *orderService) CancelExpired(ctx context.Context) (cancelled, failed int
 			continue
 		}
 		cancelled++
+		// 状态流转打点（T19c）：事务提交后计数。
+		s.metrics.OrderStatusChanged(model.OrderStatusCancelled)
 	}
 	return cancelled, failed, nil
 }
@@ -925,6 +937,8 @@ func (s *orderService) CancelExpiredSeckill(ctx context.Context) (cancelled, fai
 			continue
 		}
 		cancelled++
+		// 状态流转打点（T19c）：事务提交后计数（Redis 回补失败仍计——订单已落取消态）。
+		s.metrics.OrderStatusChanged(model.OrderStatusCancelled)
 		// 事务已提交：回补 Redis（best-effort；失败由对账 cron 兜底）。
 		if err := s.seckill.RestoreRedis(ctx, *o.ActivityID, o.UserID, quantity); err != nil {
 			redisFailed++
@@ -976,7 +990,11 @@ func (s *orderService) cancelInTx(ctx context.Context, tx *gorm.DB, view *model.
 // 状态机（仅 待支付→已支付）与金额核对（pay_amount = 回调金额）由条件更新
 // WHERE 原子兜底；false 表示状态已变或金额不符，由支付模块区分错误。
 func (s *orderService) MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error) {
-	return s.store.Orders.MarkPaid(ctx, tx, orderNo, payAmount)
+	ok, err := s.store.Orders.MarkPaid(ctx, tx, orderNo, payAmount)
+	if ok {
+		s.metrics.OrderStatusChanged(model.OrderStatusPaid)
+	}
+	return ok, err
 }
 
 // Ship 后台发货：已支付 → 已发货（admin；发货不校验归属）。
@@ -998,6 +1016,7 @@ func (s *orderService) Ship(ctx context.Context, orderNo string) error {
 	if !ok {
 		return ErrOrderChanged
 	}
+	s.metrics.OrderStatusChanged(model.OrderStatusShipped)
 	return nil
 }
 
@@ -1017,6 +1036,7 @@ func (s *orderService) ConfirmReceipt(ctx context.Context, userID int64, orderNo
 	if !ok {
 		return ErrOrderChanged
 	}
+	s.metrics.OrderStatusChanged(model.OrderStatusCompleted)
 	return nil
 }
 

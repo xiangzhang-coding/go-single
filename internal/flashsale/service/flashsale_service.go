@@ -18,6 +18,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 )
@@ -230,13 +231,15 @@ type flashsaleService struct {
 	perUser   *limiter.RedisCounter
 	publisher MessagePublisher
 	nos       OrderNoGenerator
+	metrics   *metrics.Business // 业务指标打点（T19c）
 }
 
 // New 构造秒杀服务。userLimiter 为按用户限流配置（Max<=0 不启用）；
 // publisher 为 MQ 发布端口（预扣成功后发"抢购成功"消息，T12）；
-// nos 为雪花订单号生成器（与 order 模块共用，抢购即生成订单号供前端轮询）。
+// nos 为雪花订单号生成器（与 order 模块共用，抢购即生成订单号供前端轮询）；
+// m 为业务指标（平台注册器创建，秒杀预扣/库存余量打点）。
 func New(store repository.Store, products ProductService, c cache.Cache, userLimiter limiter.RedisCounterConfig,
-	publisher MessagePublisher, nos OrderNoGenerator) Service {
+	publisher MessagePublisher, nos OrderNoGenerator, m *metrics.Business) Service {
 	return &flashsaleService{
 		store:     store,
 		products:  products,
@@ -244,6 +247,7 @@ func New(store repository.Store, products ProductService, c cache.Cache, userLim
 		perUser:   limiter.NewRedisCounter(c, userLimiter),
 		publisher: publisher,
 		nos:       nos,
+		metrics:   m,
 	}
 }
 
@@ -370,6 +374,8 @@ func (s *flashsaleService) ListUserActivities(ctx context.Context) ([]model.Acti
 		if remaining, err := s.cache.Get(ctx, stockKey(a.ID)); err == nil {
 			if n, convErr := strconv.Atoi(remaining); convErr == nil {
 				v.Stock = n
+				// 库存余量 gauge 同步（T19c）：秒杀页浏览即刷新余量。
+				s.metrics.SetSeckillStock(a.ID, n)
 			}
 		}
 		s.attachSKU(ctx, &v)
@@ -429,7 +435,12 @@ func (s *flashsaleService) UnpublishActivity(ctx context.Context, id int64) erro
 		return err
 	}
 	// 清除预热库存：key 生命周期 = 上架时预热、下架时清理（再上架重新预热）。
-	return s.cache.Del(ctx, stockKey(id))
+	if err := s.cache.Del(ctx, stockKey(id)); err != nil {
+		return err
+	}
+	// 库存余量 gauge 同步移除（与 Redis key 生命周期一致，T19c）。
+	s.metrics.DeleteSeckillStock(id)
+	return nil
 }
 
 // ---- 抢购（T11）----
@@ -526,7 +537,21 @@ func (s *flashsaleService) RestoreRedis(ctx context.Context, activityID, userID 
 	_, err := s.cache.Eval(ctx, restoreScript,
 		[]string{stockKey(activityID), countKey(activityID, userID), idemKey(activityID, userID)},
 		quantity)
+	if err == nil {
+		// 库存余量 gauge 随回补刷新（best-effort 回读，T19c）。
+		s.refreshStockGauge(ctx, activityID)
+	}
 	return err
+}
+
+// refreshStockGauge 回读 Redis 库存余量并同步 gauge（best-effort：
+// key 缺失（预热过期自清理）或读失败时不更新，不影响业务）。
+func (s *flashsaleService) refreshStockGauge(ctx context.Context, activityID int64) {
+	if remaining, err := s.cache.Get(ctx, stockKey(activityID)); err == nil {
+		if n, convErr := strconv.Atoi(remaining); convErr == nil {
+			s.metrics.SetSeckillStock(activityID, n)
+		}
+	}
 }
 
 // ---- 抢购预扣 ----
@@ -534,9 +559,11 @@ func (s *flashsaleService) RestoreRedis(ctx context.Context, activityID, userID 
 func (s *flashsaleService) PreDeduct(ctx context.Context, userID, activityID int64) error {
 	a, err := s.store.Activities.GetByID(ctx, activityID)
 	if err != nil {
+		s.preDeductFailed()
 		return err
 	}
 	if a == nil {
+		s.preDeductFailed()
 		return ErrActivityNotFound
 	}
 
@@ -545,24 +572,38 @@ func (s *flashsaleService) PreDeduct(ctx context.Context, userID, activityID int
 		[]string{stockKey(a.ID), countKey(a.ID, userID)},
 		now.UnixMilli(), a.StartAt.UnixMilli(), a.EndAt.UnixMilli(), a.Status, a.PerUserLimit)
 	if err != nil {
+		s.preDeductFailed()
 		return err
 	}
 
 	switch code {
 	case preDeductOK:
+		s.preDeductSuccess()
+		// 库存余量 gauge 随预扣刷新（best-effort 回读，T19c）。
+		s.refreshStockGauge(ctx, a.ID)
 		return nil
 	case preDeductSoldOut:
+		s.preDeductFailed()
 		return ErrSoldOut
 	case preDeductNotInWindow:
+		s.preDeductFailed()
 		return ErrNotInWindow
 	case preDeductLimitReach:
+		s.preDeductFailed()
 		return ErrLimitReached
 	case preDeductOffline:
+		s.preDeductFailed()
 		return ErrOffline
 	default:
+		s.preDeductFailed()
 		return fmt.Errorf("%w: unexpected pre-deduct code %d", ErrInvalidInput, code)
 	}
 }
+
+// preDeductSuccess/preDeductFailed 预扣结果打点（T19c）。
+func (s *flashsaleService) preDeductSuccess() { s.metrics.SeckillPreDeduct(true) }
+
+func (s *flashsaleService) preDeductFailed() { s.metrics.SeckillPreDeduct(false) }
 
 // ---- 内部 ----
 
@@ -588,13 +629,21 @@ func (s *flashsaleService) syncStock(ctx context.Context, a *model.Activity, now
 		if err := s.cache.Del(ctx, key); err != nil {
 			return err
 		}
-		return s.cache.Set(ctx, key, strconv.Itoa(a.Stock), remainingTTL(a))
+		if err := s.cache.Set(ctx, key, strconv.Itoa(a.Stock), remainingTTL(a)); err != nil {
+			return err
+		}
+		s.metrics.SetSeckillStock(a.ID, a.Stock)
+		return nil
 	case now.After(a.EndAt): // 已结束：不预热
 		return nil
 	}
 	// 进行中：原子只减不增（prewarmScript 内含 SETNX 语义与存量保护）。
-	_, err := s.cache.Eval(ctx, prewarmScript, []string{key}, a.Stock, int(remainingTTL(a).Seconds()))
-	return err
+	if _, err := s.cache.Eval(ctx, prewarmScript, []string{key}, a.Stock, int(remainingTTL(a).Seconds())); err != nil {
+		return err
+	}
+	// 回读实际余量同步 gauge（进行中可能保留更低存量，T19c）。
+	s.refreshStockGauge(ctx, a.ID)
+	return nil
 }
 
 // remainingTTL 库存 key 存活时长：活动结束 + 1h 余量后自清理。

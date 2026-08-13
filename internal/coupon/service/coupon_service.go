@@ -14,6 +14,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 	"github.com/xiangzhang-coding/go-single/internal/coupon/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -115,13 +116,14 @@ type Service interface {
 }
 
 type couponService struct {
-	store repository.Store
-	cache cache.Cache
+	store   repository.Store
+	cache   cache.Cache
+	metrics *metrics.Business
 }
 
 // New 构造优惠券服务。
-func New(store repository.Store, c cache.Cache) Service {
-	return &couponService{store: store, cache: c}
+func New(store repository.Store, c cache.Cache, m *metrics.Business) Service {
+	return &couponService{store: store, cache: c, metrics: m}
 }
 
 // ---- admin ----
@@ -269,6 +271,8 @@ func (s *couponService) Claim(ctx context.Context, userID, templateID int64) (*m
 	if err := s.store.UserCoupon.Create(ctx, c); err != nil {
 		return nil, err
 	}
+	// 发放打点（T19c）：领取成功落库后计数。
+	s.metrics.CouponIssued()
 	return c, nil
 }
 
@@ -314,6 +318,8 @@ func (s *couponService) UseCoupon(ctx context.Context, tx *gorm.DB, userID, coup
 		return err
 	}
 	if ok {
+		// 核销打点（T19c）：条件更新命中即计数；调用方（order）事务回滚时乐观多计（可接受）。
+		s.metrics.CouponRedeemed()
 		return nil
 	}
 	v, err := s.store.UserCoupon.GetViewByID(ctx, userID, couponID)

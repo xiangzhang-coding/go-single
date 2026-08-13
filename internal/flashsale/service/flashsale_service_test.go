@@ -21,6 +21,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 )
@@ -296,7 +297,7 @@ func newFixture() *fixture {
 	products := newFakeProducts()
 	fc := newFakeCache()
 	pub := &fakePublisher{}
-	svc := New(repository.Store{Activities: acts}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{})
+	svc := New(repository.Store{Activities: acts}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{}, metrics.New().Business())
 	return &fixture{svc: svc, acts: acts, products: products, cache: fc, pub: pub}
 }
 
@@ -307,7 +308,7 @@ func newFixtureLimited(max int, window time.Duration) *fixture {
 	fc := newFakeCache()
 	pub := &fakePublisher{}
 	svc := New(repository.Store{Activities: acts}, products, fc, limiter.RedisCounterConfig{Max: max, Window: window},
-		pub, &fakeNos{})
+		pub, &fakeNos{}, metrics.New().Business())
 	return &fixture{svc: svc, acts: acts, products: products, cache: fc, pub: pub}
 }
 
@@ -738,7 +739,7 @@ func TestSeckillOrderNoFailureKeepsIdemKey(t *testing.T) {
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.svc = New(repository.Store{Activities: fx.acts}, fx.products, fx.cache,
-		limiter.RedisCounterConfig{}, fx.pub, &failingNos{})
+		limiter.RedisCounterConfig{}, fx.pub, &failingNos{}, metrics.New().Business())
 
 	_, err := fx.svc.Seckill(context.Background(), 7, a.ID)
 	require.Error(t, err)

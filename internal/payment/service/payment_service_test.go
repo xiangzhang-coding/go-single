@@ -16,6 +16,7 @@ import (
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	paymentmodel "github.com/xiangzhang-coding/go-single/internal/payment/model"
 	"github.com/xiangzhang-coding/go-single/internal/payment/repository"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 )
 
 // ---- fake 支付仓储 ----
@@ -97,7 +98,7 @@ type fixture struct {
 
 func newFixture() *fixture {
 	f := &fixture{pays: newFakePayments(), order: newFakeOrderSvc()}
-	f.svc = New(repository.Store{Payments: f.pays, Tx: fixtureTx{f}}, f.order)
+	f.svc = New(repository.Store{Payments: f.pays, Tx: fixtureTx{f}}, f.order, metrics.New().Business())
 	return f
 }
 

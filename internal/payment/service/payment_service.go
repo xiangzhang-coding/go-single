@@ -18,6 +18,7 @@ import (
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	paymentmodel "github.com/xiangzhang-coding/go-single/internal/payment/model"
 	"github.com/xiangzhang-coding/go-single/internal/payment/repository"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -55,13 +56,14 @@ type Service interface {
 }
 
 type paymentService struct {
-	store  repository.Store
-	orders OrderService
+	store   repository.Store
+	orders  OrderService
+	metrics *metrics.Business
 }
 
 // New 构造支付服务。
-func New(store repository.Store, orders OrderService) Service {
-	return &paymentService{store: store, orders: orders}
+func New(store repository.Store, orders OrderService, m *metrics.Business) Service {
+	return &paymentService{store: store, orders: orders, metrics: m}
 }
 
 // MockPay 支付回调流程：
@@ -128,6 +130,8 @@ func (s *paymentService) MockPay(ctx context.Context, userID int64, p PayParams)
 	if err != nil {
 		return nil, err
 	}
+	// 支付回调结果打点（T19c）：流水落库且事务提交后计数。
+	s.metrics.PaymentResult(p.Result == paymentmodel.PaymentResultSuccess)
 	return payment, nil
 }
 

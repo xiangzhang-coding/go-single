@@ -32,6 +32,7 @@ import (
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
@@ -110,14 +111,14 @@ func buildMQEnv() (*mqEnv, error) {
 	}
 	flashsaleStore := flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(gdb)}
 	flashsaleSvc := flashsalesvc.New(flashsaleStore, productSvc, cacheClient,
-		limiter.RedisCounterConfig{}, mqClient, orderNoGen)
+		limiter.RedisCounterConfig{}, mqClient, orderNoGen, metrics.New().Business())
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
 
 	cartSvc := cartsvc.New(cartrepo.Store{Items: cartrepo.NewGORMCartItem(gdb)}, productSvc)
-	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(gdb), UserCoupon: couponrepo.NewGORMUserCoupon(gdb)}, cacheClient)
+	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(gdb), UserCoupon: couponrepo.NewGORMUserCoupon(gdb)}, cacheClient, metrics.New().Business())
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc)
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc, metrics.New().Business())
 	orderHandler := orderhandler.New(orderSvc, verifier)
 
 	// T13 秒杀库存对账：有效订单数经 order 服务端口统计。

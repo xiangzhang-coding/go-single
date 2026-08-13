@@ -42,6 +42,7 @@ import (
 	paymentsvc "github.com/xiangzhang-coding/go-single/internal/payment/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
@@ -165,7 +166,7 @@ func buildEnv() (*testEnv, error) {
 	productHandler := producthandler.New(productSvc, verifier)
 	cartSvc := cartsvc.New(cartrepo.Store{Items: cartrepo.NewGORMCartItem(gdb)}, productSvc)
 	cartHandler := carthandler.New(cartSvc, verifier)
-	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(gdb), UserCoupon: couponrepo.NewGORMUserCoupon(gdb)}, cacheClient)
+	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(gdb), UserCoupon: couponrepo.NewGORMUserCoupon(gdb)}, cacheClient, metrics.New().Business())
 	couponHandler := couponhandler.New(couponSvc, verifier)
 
 	orderNoGen, err := snowflake.New(1)
@@ -174,11 +175,11 @@ func buildEnv() (*testEnv, error) {
 	}
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, noopActivity{}, noopActivity{})
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, noopActivity{}, noopActivity{}, metrics.New().Business())
 	orderHandler := orderhandler.New(orderSvc, verifier)
 	paymentStore := paymentrepo.NewGORMPayment(gdb)
 	paymentHandler := paymenthandler.New(
-		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc),
+		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc, metrics.New().Business()),
 		verifier,
 	)
 

@@ -23,6 +23,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
 	"github.com/xiangzhang-coding/go-single/internal/order/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
@@ -561,6 +562,7 @@ func newFixture() *fixture {
 	svc := New(
 		repository.Store{Orders: orders, Items: items, Tx: fakeTx{}},
 		cache, &fakeNos{}, prods, coupons, cart, users, activities, activities,
+		metrics.New().Business(),
 	)
 	return &fixture{svc: svc, orders: orders, items: items, cache: cache, prods: prods,
 		coupons: coupons, cart: cart, users: users, activities: activities}
