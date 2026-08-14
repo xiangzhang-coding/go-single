@@ -94,7 +94,7 @@ POST /api/flashsales/:id/purchase
   → 查活动（sku_id/秒杀价为订单快照来源；不存在 → 永久失败进死信）
   → 查默认地址（user.GetDefaultAddress，固化为地址快照；无地址 → 永久失败进死信）
   → order.CreateSeckill：单事务建秒杀订单（10min 超时）+ 订单项 + 条件扣活动库存
-      · 重复键（order_no 主键 / user_activity_key 唯一约束）→ 幂等成功（不重复扣库存）
+      · 重复键（order_no 主键 / user_activity_key 唯一约束）→ 幂等成功（不重复扣减库存）
       · 活动库存不足 → 永久失败（死信）
       · DB 瞬时故障 → 重投（Nack requeue，at-least-once）
 ```

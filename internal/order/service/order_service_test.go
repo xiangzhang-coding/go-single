@@ -1556,7 +1556,7 @@ func TestCreateSeckillHappyPath(t *testing.T) {
 	require.Equal(t, 10, fx.prods.skus[1].Stock, "秒杀不扣 SKU 库存（活动独立库存）")
 }
 
-// 重复 order_no（MQ 重投同一消息）：幂等成功，不重复扣库存。
+// 重复 order_no（MQ 重投同一消息）：幂等成功，不重复扣减库存。
 func TestCreateSeckillDuplicateOrderNoIdempotent(t *testing.T) {
 	fx := newFixture()
 	fx.seed(t)
@@ -1567,7 +1567,7 @@ func TestCreateSeckillDuplicateOrderNoIdempotent(t *testing.T) {
 	fx.orders.duplicate["S1"] = true
 	require.NoError(t, fx.svc.CreateSeckill(context.Background(), fx.seckillParams("S1")))
 
-	require.Equal(t, 9, fx.activities.stocks[100], "重复落单不得再次扣库存")
+	require.Equal(t, 9, fx.activities.stocks[100], "重复落单不得再次扣减库存")
 	require.Len(t, fx.items.byOrder["S1"], 1, "重复落单不得再插订单项")
 	require.Len(t, fx.orders.createLog, 2, "第二次为重复尝试（被唯一约束拦截）")
 }
@@ -1584,7 +1584,7 @@ func TestCreateSeckillDuplicateUserActivityIdempotent(t *testing.T) {
 	p2 := fx.seckillParams("S2")
 	require.NoError(t, fx.svc.CreateSeckill(context.Background(), p2))
 
-	require.Equal(t, 9, fx.activities.stocks[100], "仅首个消息扣库存")
+	require.Equal(t, 9, fx.activities.stocks[100], "仅首个消息扣减库存")
 	require.Nil(t, fx.orders.byID["S2"], "重复订单不得落库")
 }
 
@@ -1599,7 +1599,7 @@ func TestCreateSeckillStockInsufficient(t *testing.T) {
 	require.ErrorIs(t, err, ErrSeckillStockInsufficient)
 }
 
-// 活动扣库存基础设施故障：错误原样传播（瞬时 → 重投）。
+// 活动扣减库存基础设施故障：错误原样传播（瞬时 → 重投）。
 func TestCreateSeckillDeductInfraFailure(t *testing.T) {
 	fx := newFixture()
 	fx.seed(t)

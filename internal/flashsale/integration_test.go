@@ -514,7 +514,7 @@ func TestPreDeductBoundaries(t *testing.T) {
 	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 3, limited))
 	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 3, limited))
 	require.ErrorIs(t, env.flashsaleSvc.PreDeduct(context.Background(), 3, limited), flashsalesvc.ErrLimitReached)
-	require.Equal(t, 8, redisStock(t, env, limited), "超限购拒绝不应扣库存")
+	require.Equal(t, 8, redisStock(t, env, limited), "超限购拒绝不应扣减库存")
 
 	// 未开始：窗口外被拒。
 	notStarted := createActivity(t, env, admin, skuID, 10, 1, time.Hour, 2*time.Hour)

@@ -50,7 +50,7 @@ var (
 	ErrAddressNotFound       = errors.New("address not found")
 	ErrAddressForbidden      = errors.New("address does not belong to user")
 	// ErrSeckillStockInsufficient 秒杀落单时活动 MySQL 库存不足（条件扣减未命中）：
-	// 预扣成功但落单无法扣库存（如活动期间后台调低库存），永久失败进死信，对账兜底。
+	// 预扣成功但落单无法扣减库存（如活动期间后台调低库存），永久失败进死信，对账兜底。
 	ErrSeckillStockInsufficient = errors.New("seckill activity stock insufficient")
 )
 
@@ -182,7 +182,7 @@ type Service interface {
 	// 单事务创建秒杀订单（order_type=seckill，不使用券）+ 订单项 +
 	// 条件扣减活动库存（ActivityStock）；user_activity_key 唯一约束（T13，
 	// 取消置 NULL 后不再占位）与 order_no 主键命中重复（重复投递/并发消费）
-	// 视为成功（幂等，不重复扣库存）。
+	// 视为成功（幂等，不重复扣减库存）。
 	// 活动库存不足返回 ErrSeckillStockInsufficient（永久失败，死信 + 对账兜底）。
 	CreateSeckill(ctx context.Context, p SeckillCreateParams) error
 	// List 我的订单（状态筛选 + 分页）。
@@ -399,7 +399,7 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 //  1. 读取 SKU 快照（specs/product_id 与商品标题；不锁 SKU 行——秒杀只扣活动库存）
 //  2. 单事务：建秒杀订单（10min 超时）+ 订单项 + 条件扣减活动库存
 //  3. 重复键（order_no 主键 / user_activity_key 唯一约束）→ 幂等成功
-//     （重复投递或并发消费，订单已存在，不重复扣库存）
+//     （重复投递或并发消费，订单已存在，不重复扣减库存）
 //  4. 活动库存不足 → ErrSeckillStockInsufficient（永久失败，死信 + 对账兜底）
 func (s *orderService) CreateSeckill(ctx context.Context, p SeckillCreateParams) error {
 	if p.OrderNo == "" || p.UserID <= 0 || p.ActivityID <= 0 || p.SKUID <= 0 ||
@@ -474,7 +474,7 @@ func (s *orderService) CreateSeckill(ctx context.Context, p SeckillCreateParams)
 	})
 	if err != nil {
 		// 重复键 = 幂等命中（订单已存在，消费重投/并发建单成功路径），
-		// 事务整体回滚（不重复扣库存）后视为成功。
+		// 事务整体回滚（不重复扣减库存）后视为成功。
 		if errors.Is(err, repository.ErrOrderDuplicate) {
 			return nil
 		}

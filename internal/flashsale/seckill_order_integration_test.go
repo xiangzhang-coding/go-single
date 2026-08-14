@@ -310,7 +310,7 @@ func TestSeckillOrderConcurrentNoDuplicate(t *testing.T) {
 	require.Len(t, seen, 20, "恰 20 个预扣成功")
 }
 
-// 重复投递幂等：同一"抢购成功"消息发布两次 → 消费者只建一单（唯一约束 + 不重复扣库存）。
+// 重复投递幂等：同一"抢购成功"消息发布两次 → 消费者只建一单（唯一约束 + 不重复扣减库存）。
 func TestSeckillOrderRedeliveryIdempotent(t *testing.T) {
 	requireEnv(t) // 初始化共享 env（adminToken/seed 依赖）
 	e := requireMQEnv(t)
@@ -331,7 +331,7 @@ func TestSeckillOrderRedeliveryIdempotent(t *testing.T) {
 	waitSeckillOrders(t, e, id, 1, 5*time.Second)
 	time.Sleep(500 * time.Millisecond) // 给第二条（重复）消息处理时间
 	require.Equal(t, 1, countSeckillOrders(t, e, id), "重复投递不得重复建单")
-	require.Equal(t, 9, mysqlStock(t, e, id), "重复投递不得重复扣库存")
+	require.Equal(t, 9, mysqlStock(t, e, id), "重复投递不得重复扣减库存")
 }
 
 // 永久失败进死信：活动不存在的消息被消费者拒收 → 落入死信队列（对账兜底）。

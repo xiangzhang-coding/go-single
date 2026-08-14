@@ -49,7 +49,7 @@ func (r *Registry) Business() *Business {
 		}, []string{"result"}),
 		seckillStock: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "seckill_stock_remaining",
-			Help: "秒杀活动 Redis 预扣库存余量（gauge），按 activity_id 分桶；随秒杀页浏览/上架预热/下架更新",
+			Help: "秒杀活动 Redis 预扣后库存余量（gauge），按 activity_id 分桶；随秒杀页浏览/上架预热/下架更新",
 		}, []string{"activity_id"}),
 		ordersCreated: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "orders_created_total",
