@@ -39,6 +39,21 @@ func (r *GORMUserRepository) GetByID(ctx context.Context, id int64) (*model.User
 	return r.findOne(ctx, "id = ?", id)
 }
 
+// UpdateProfile 按主键更新个人资料字段；Select 限定列使零值（清空昵称/头像）也生效。
+func (r *GORMUserRepository) UpdateProfile(ctx context.Context, u *model.User) error {
+	res := r.db.WithContext(ctx).Model(&model.User{}).
+		Where("id = ?", u.ID).
+		Select("nickname", "avatar_url").
+		Updates(u)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
 // SearchByUsername 前缀搜索：username LIKE 'prefix%'，id 升序限量返回。
 func (r *GORMUserRepository) SearchByUsername(ctx context.Context, prefix string, limit int) ([]model.User, error) {
 	if prefix == "" || limit <= 0 {

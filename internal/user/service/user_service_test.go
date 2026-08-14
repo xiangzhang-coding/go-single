@@ -22,6 +22,7 @@ type fakeUsers struct {
 	byID       map[int64]*model.User
 	nextID     int64
 	createErr  error
+	updateErr  error
 }
 
 func newFakeUsers() *fakeUsers {
@@ -48,6 +49,19 @@ func (f *fakeUsers) GetByUsername(_ context.Context, username string) (*model.Us
 
 func (f *fakeUsers) GetByID(_ context.Context, id int64) (*model.User, error) {
 	return f.byID[id], nil
+}
+
+func (f *fakeUsers) UpdateProfile(_ context.Context, u *model.User) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	stored, ok := f.byID[u.ID]
+	if !ok {
+		return repository.ErrUserNotFound
+	}
+	stored.Nickname = u.Nickname
+	stored.AvatarURL = u.AvatarURL
+	return nil
 }
 
 func (f *fakeUsers) SearchByUsername(_ context.Context, prefix string, limit int) ([]model.User, error) {
@@ -220,4 +234,108 @@ func TestSearchUsersValidation(t *testing.T) {
 	got, err := svc.Search(context.Background(), "zzz", 10)
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+// ---- 个人资料（UpdateProfile）----
+
+func strPtr(s string) *string { return &s }
+
+func TestUpdateProfileNicknameAndAvatar(t *testing.T) {
+	repo := newFakeUsers()
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{token: "t"})
+
+	u, err := svc.Register(context.Background(), "erin", "secret123")
+	require.NoError(t, err)
+
+	avatar := "http://127.0.0.1:19000/go-shop/20260814/abc.png"
+	got, err := svc.UpdateProfile(context.Background(), u.ID, ProfileParams{
+		Nickname:  strPtr("  小艾  "),
+		AvatarURL: strPtr(avatar),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "小艾", got.Nickname, "昵称应 trim 后落库")
+	assert.Equal(t, avatar, got.AvatarURL)
+
+	// fake 与返回一致（落库生效）。
+	stored, err := svc.GetByID(context.Background(), u.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "小艾", stored.Nickname)
+	assert.Equal(t, avatar, stored.AvatarURL)
+}
+
+func TestUpdateProfilePartialAndClear(t *testing.T) {
+	repo := newFakeUsers()
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
+
+	u, err := svc.Register(context.Background(), "frank", "secret123")
+	require.NoError(t, err)
+
+	avatar := "https://cdn.example.com/a.jpg"
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{
+		Nickname:  strPtr("老王"),
+		AvatarURL: strPtr(avatar),
+	})
+	require.NoError(t, err)
+
+	// 只改昵称：头像不动（PATCH 语义）。
+	got, err := svc.UpdateProfile(context.Background(), u.ID, ProfileParams{Nickname: strPtr("王老")})
+	require.NoError(t, err)
+	assert.Equal(t, "王老", got.Nickname)
+	assert.Equal(t, avatar, got.AvatarURL)
+
+	// 空串清空头像：昵称不动。
+	got, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("")})
+	require.NoError(t, err)
+	assert.Equal(t, "王老", got.Nickname)
+	assert.Empty(t, got.AvatarURL)
+}
+
+func TestUpdateProfileValidation(t *testing.T) {
+	repo := newFakeUsers()
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
+
+	u, err := svc.Register(context.Background(), "grace", "secret123")
+	require.NoError(t, err)
+
+	// 空请求（无任何字段）被拒。
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{})
+	require.ErrorIs(t, err, ErrInvalidProfile)
+
+	// 昵称超 32 个字符被拒（rune 计数，中文合法）。
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{Nickname: strPtr(strings.Repeat("昵", 33))})
+	require.ErrorIs(t, err, ErrInvalidProfile)
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{Nickname: strPtr(strings.Repeat("昵", 32))})
+	require.NoError(t, err)
+
+	// 头像 URL 非 http(s) 被拒；协议合法但超长（>255 字节）被拒。
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("ftp://example.com/a.png")})
+	require.ErrorIs(t, err, ErrInvalidProfile)
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("javascript:alert(1)")})
+	require.ErrorIs(t, err, ErrInvalidProfile)
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("http://e.com/" + strings.Repeat("a", 248))})
+	require.ErrorIs(t, err, ErrInvalidProfile)
+	// 恰好 255 字节通过（前缀 "http://e.com/" 为 13 字节）。
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("http://e.com/" + strings.Repeat("a", 242))})
+	require.NoError(t, err)
+}
+
+func TestUpdateProfileUnknownUser(t *testing.T) {
+	repo := newFakeUsers()
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
+
+	_, err := svc.UpdateProfile(context.Background(), 999, ProfileParams{Nickname: strPtr("幽灵")})
+	require.ErrorIs(t, err, ErrUserNotFound)
+}
+
+func TestUpdateProfileRepoErrorPropagates(t *testing.T) {
+	repo := newFakeUsers()
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
+
+	u, err := svc.Register(context.Background(), "heidi", "secret123")
+	require.NoError(t, err)
+	repo.updateErr = fmt.Errorf("db down: %w", errors.New("connection refused"))
+
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{Nickname: strPtr("x")})
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrInvalidProfile)
 }

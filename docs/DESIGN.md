@@ -98,7 +98,7 @@ go_single/
   - 登录/注册 → user；首页（商品列表）→ product；商品详情 → product + cart；购物车 → cart + product
   - 结算（下单）→ order + user(地址簿) + coupon；订单列表/详情 → order；秒杀页 → flashsale
   - 优惠券中心 → coupon；好友列表/申请 → social；好友圈 → social；聊天 → chat
-  - 个人中心（地址簿）→ user；后台管理 → admin（role 鉴权）
+  - 个人中心（个人资料：昵称/头像，头像经 `POST /api/files` 上传 + `PATCH /api/users/me` 写入；地址簿）→ user；后台管理 → admin（role 鉴权）
 - **交互约定**：秒杀提交后返回"排队中"，前端轮询 `GET /api/orders/{order_no}`（1.5s×30 次上限）获取结果；秒杀页倒计时由轮询接口携带服务端时间；接口 401 时前端跳转登录；演示账号 admin/admin123（user-guide 同步写明）
 - **路由**：react-router v7；面向用户的页面与后台管理（admin）按角色分组，admin 路由加 role 守卫（前端隐藏 + 后端兜底）
 - **状态管理**：TanStack Query（服务端状态：API 数据缓存、秒杀轮询、好友圈分页）+ zustand（客户端状态：登录态、用户信息、聊天连接）

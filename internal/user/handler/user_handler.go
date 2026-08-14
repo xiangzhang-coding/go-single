@@ -30,6 +30,7 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 //	POST   /api/auth/register    注册
 //	POST   /api/auth/login       登录
 //	GET    /api/users/me         当前用户（受保护）
+//	PATCH  /api/users/me         修改个人资料：昵称/头像（受保护，仅本人）
 //	GET    /api/users            按用户名前缀搜索（受保护，"加好友"发现入口）
 //	GET    /api/users/:id        指定用户（受保护，本人或 admin）
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
@@ -38,6 +39,7 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 
 	protected := rg.Group("", auth.Middleware(h.verifier))
 	protected.GET("/users/me", h.Me)
+	protected.PATCH("/users/me", h.UpdateMe)
 	protected.GET("/users", h.SearchUsers)
 	protected.GET("/users/:id", h.GetUser)
 }
@@ -102,6 +104,43 @@ func (h *Handler) Me(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	c.JSON(http.StatusOK, u)
+}
+
+// updateProfileRequest 个人资料请求：指针区分"未提交"（不动）与"空串"（清空）。
+type updateProfileRequest struct {
+	Nickname  *string `json:"nickname"`
+	AvatarURL *string `json:"avatar_url"`
+}
+
+// UpdateMe 修改当前用户个人资料（昵称/头像）；归属校验内建于 userID 取自令牌
+// 而非请求体（防 IDOR）。头像先经 POST /api/files 上传取回 URL 再提交。
+func (h *Handler) UpdateMe(c *gin.Context) {
+	claims, ok := auth.ClaimsFrom(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		return
+	}
+	var req updateProfileRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	u, err := h.svc.UpdateProfile(c.Request.Context(), claims.UserID, service.ProfileParams{
+		Nickname:  req.Nickname,
+		AvatarURL: req.AvatarURL,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidProfile):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, service.ErrUserNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		}
 		return
 	}
 	c.JSON(http.StatusOK, u)

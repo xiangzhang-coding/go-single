@@ -25,6 +25,8 @@ var (
 	ErrAddressNotFound  = errors.New("address not found")
 	ErrAddressForbidden = errors.New("address does not belong to user")
 	ErrInvalidAddress   = errors.New("invalid address")
+
+	ErrInvalidProfile = errors.New("invalid profile")
 )
 
 // phoneRe 中国大陆手机号（学习点：字段级正则校验）。
@@ -46,11 +48,21 @@ type AddressParams struct {
 	IsDefault bool
 }
 
+// ProfileParams 个人资料参数（PATCH 语义）：nil 字段不改动，
+// 指向空字符串表示清空（数据库列可空，模型以空串表示）。
+type ProfileParams struct {
+	Nickname  *string
+	AvatarURL *string
+}
+
 // Service user 模块的业务接口。
 type Service interface {
 	Register(ctx context.Context, username, password string) (*model.User, error)
 	Login(ctx context.Context, username, password string) (*model.User, string, error)
 	GetByID(ctx context.Context, id int64) (*model.User, error)
+	// UpdateProfile 更新当前用户个人资料（昵称/头像，PATCH 语义见 ProfileParams）；
+	// userID 取自令牌声明，天然只有 owner 本人可改（防 IDOR）。
+	UpdateProfile(ctx context.Context, userID int64, p ProfileParams) (*model.User, error)
 	// Search 按用户名前缀搜索用户（社交"加好友"发现入口）：
 	// 前缀须非空且 ≤32 字符（与注册同名规则），limit 截断到 [1, maxSearchLimit]。
 	Search(ctx context.Context, username string, limit int) ([]*model.User, error)
@@ -128,6 +140,37 @@ func (s *userService) GetByID(ctx context.Context, id int64) (*model.User, error
 	}
 	if u == nil {
 		return nil, ErrUserNotFound
+	}
+	return u, nil
+}
+
+// UpdateProfile 更新当前用户个人资料：校验 → 读出本人 → 落库；nil 字段不动，空串清空。
+func (s *userService) UpdateProfile(ctx context.Context, userID int64, p ProfileParams) (*model.User, error) {
+	if p.Nickname == nil && p.AvatarURL == nil {
+		return nil, fmt.Errorf("%w: no fields to update", ErrInvalidProfile)
+	}
+	cleaned, err := validateProfile(p)
+	if err != nil {
+		return nil, err
+	}
+	u, err := s.store.Users.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if u == nil {
+		return nil, ErrUserNotFound
+	}
+	if cleaned.Nickname != nil {
+		u.Nickname = *cleaned.Nickname
+	}
+	if cleaned.AvatarURL != nil {
+		u.AvatarURL = *cleaned.AvatarURL
+	}
+	if err := s.store.Users.UpdateProfile(ctx, u); err != nil {
+		if errors.Is(err, repository.ErrUserNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
 	}
 	return u, nil
 }
@@ -284,6 +327,30 @@ func validateCredentials(username, password string) error {
 		return ErrInvalidPassword
 	}
 	return nil
+}
+
+// validateProfile 校验并返回清理后（trim）的个人资料参数（同 validateAddress 风格）：
+// 昵称非空时 ≤32 字符（rune 计数，支持中文）；头像 URL 为空（清空）或
+// http(s) 且 ≤255 字节（对齐列宽）。
+func validateProfile(p ProfileParams) (ProfileParams, error) {
+	if p.Nickname != nil {
+		nickname := strings.TrimSpace(*p.Nickname)
+		p.Nickname = &nickname
+		if len([]rune(nickname)) > 32 {
+			return p, fmt.Errorf("%w: invalid nickname", ErrInvalidProfile)
+		}
+	}
+	if p.AvatarURL != nil {
+		url := strings.TrimSpace(*p.AvatarURL)
+		p.AvatarURL = &url
+		if url != "" && !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			return p, fmt.Errorf("%w: invalid avatar_url", ErrInvalidProfile)
+		}
+		if len(url) > 255 {
+			return p, fmt.Errorf("%w: invalid avatar_url", ErrInvalidProfile)
+		}
+	}
+	return p, nil
 }
 
 // validateAddress 校验并返回清理后（trim）的参数；字段级规则见各 case。
