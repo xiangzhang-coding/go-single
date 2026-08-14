@@ -3,11 +3,11 @@ package handler
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 	"github.com/xiangzhang-coding/go-single/internal/social/service"
 )
 
@@ -48,9 +48,8 @@ func (h *Handler) MyPosts(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 		return
 	}
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	items, total, err := h.posts.MyPosts(c.Request.Context(), claims.UserID, page, pageSize)
+	p := pagination.FromQuery(c)
+	items, total, err := h.posts.MyPosts(c.Request.Context(), claims.UserID, p.Page, p.PageSize)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -65,9 +64,8 @@ func (h *Handler) FeedPosts(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 		return
 	}
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	items, total, err := h.posts.Feed(c.Request.Context(), claims.UserID, page, pageSize)
+	p := pagination.FromQuery(c)
+	items, total, err := h.posts.Feed(c.Request.Context(), claims.UserID, p.Page, p.PageSize)
 	if err != nil {
 		writeError(c, err)
 		return

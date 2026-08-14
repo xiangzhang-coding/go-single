@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 	"github.com/xiangzhang-coding/go-single/internal/product/service"
 )
 
@@ -231,8 +232,7 @@ func (h *Handler) ListCategories(c *gin.Context) {
 }
 
 func (h *Handler) ListProducts(c *gin.Context) {
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	p := pagination.FromQuery(c)
 
 	var categoryID *int64
 	if raw := c.Query("category_id"); raw != "" {
@@ -244,7 +244,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		categoryID = &id
 	}
 
-	items, total, err := h.svc.ListProducts(c.Request.Context(), categoryID, page, pageSize)
+	items, total, err := h.svc.ListProducts(c.Request.Context(), categoryID, p.Page, p.PageSize)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -268,8 +268,7 @@ func (h *Handler) GetDetail(c *gin.Context) {
 // ListAdminProducts 后台商品列表：status 空 = 全部（含草稿/下架），
 // 支持 category_id 筛选与分页；返回 {items, total} 与游客列表同构。
 func (h *Handler) ListAdminProducts(c *gin.Context) {
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	p := pagination.FromQuery(c)
 	status := c.Query("status")
 
 	var categoryID *int64
@@ -282,7 +281,7 @@ func (h *Handler) ListAdminProducts(c *gin.Context) {
 		categoryID = &id
 	}
 
-	items, total, err := h.svc.ListAllProducts(c.Request.Context(), categoryID, status, page, pageSize)
+	items, total, err := h.svc.ListAllProducts(c.Request.Context(), categoryID, status, p.Page, p.PageSize)
 	if err != nil {
 		writeError(c, err)
 		return

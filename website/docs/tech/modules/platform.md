@@ -26,6 +26,7 @@ sidebar_position: 11
 | snowflake | 手写雪花 ID（学习点） | 41bit 毫秒时间戳（纪元 2024-01-01）+ 10bit worker + 12bit 序列号 = 63bit int64；单实例单调递增；**时钟回拨拒绝生成**；同毫秒序列号耗尽自旋 |
 | retry | 有限重试 + 指数退避（T20） | **仅幂等操作可重试**（普通下单 / 支付回调 / 秒杀消息发布）；`retry.Stop` 标记业务拒绝不重试；退避可被 ctx 取消；默认 3 次、100ms 起、上限 1s |
 | health | 依赖连通性检查 | `/healthz`：并发探测 MySQL / Redis / MQ（2s 超时），全部正常返回 200 `ok`；任一失败返回 503 `degraded`（body 含各依赖明细） |
+| pagination | 统一分页参数解析（T05） | `pagination.FromQuery(c)` 解析 `page`/`page_size`：默认 1/20，非法或 <1 回退，page_size >50 钳制（page 不设上限）；4 模块 7 处 handler 复用；service 层钳制保留为非 HTTP 调用方的幂等防线 |
 
 ## 平台级端点
 

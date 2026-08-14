@@ -13,6 +13,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/coupon/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 )
 
 // Handler coupon 模块的 HTTP 处理器。
@@ -153,10 +154,8 @@ func (h *Handler) ListMine(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status"})
 		return
 	}
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-
-	items, total, err := h.svc.ListMine(c.Request.Context(), claims.UserID, status, page, pageSize)
+	p := pagination.FromQuery(c)
+	items, total, err := h.svc.ListMine(c.Request.Context(), claims.UserID, status, p.Page, p.PageSize)
 	if err != nil {
 		writeError(c, err)
 		return

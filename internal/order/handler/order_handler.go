@@ -12,6 +12,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 )
 
 // Handler order 模块的 HTTP 处理器。
@@ -107,9 +108,8 @@ func (h *Handler) List(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 		return
 	}
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	list, total, err := h.svc.List(c.Request.Context(), claims.UserID, c.Query("status"), page, pageSize)
+	p := pagination.FromQuery(c)
+	list, total, err := h.svc.List(c.Request.Context(), claims.UserID, c.Query("status"), p.Page, p.PageSize)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -172,9 +172,8 @@ func (h *Handler) ConfirmReceipt(c *gin.Context) {
 // ListAll 后台订单列表（T25）：全量订单（跨用户），status 筛选 + 分页，
 // 响应 {orders, total} 与用户订单列表同构；仅供 admin（路由组鉴权）。
 func (h *Handler) ListAll(c *gin.Context) {
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	list, total, err := h.svc.ListAll(c.Request.Context(), c.Query("status"), page, pageSize)
+	p := pagination.FromQuery(c)
+	list, total, err := h.svc.ListAll(c.Request.Context(), c.Query("status"), p.Page, p.PageSize)
 	if err != nil {
 		writeError(c, err)
 		return
