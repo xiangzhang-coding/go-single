@@ -154,11 +154,28 @@
 }
 
 .header-user {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   max-width: 100px;
   overflow: hidden;
   color: var(--color-charcoal);
   font-size: 13px;
   text-overflow: ellipsis;
+}
+
+.header-user:hover {
+  color: var(--color-ink-black);
+}
+
+/* 个人中心入口头像（无头像时仅展示昵称/用户名）。 */
+.header-avatar {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid var(--color-ash);
 }
 
 .text-link {

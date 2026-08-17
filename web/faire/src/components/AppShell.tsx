@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -18,6 +19,8 @@ export function AppShell() {
   });
   const cartCount = cartQuery.data?.items.reduce((sum, item) => sum + item.quantity, 0) || 0;
   const unreadCount = totalUnread(useChatStore((state) => state.conversations));
+  // 私有桶头像匿名不可直读，加载失败隐藏（保留文字昵称）。
+  const [avatarBroken, setAvatarBroken] = useState(false);
 
   function signOut() {
     logout();
@@ -45,9 +48,17 @@ export function AppShell() {
           <div className="header-actions">
             {user ? (
               <>
-                <span className="header-user" title={user.role === "admin" ? "管理员" : "已登录"}>
-                  {user.username}
-                </span>
+                <Link to="/profile" className="header-user" title="个人中心">
+                  {user.avatar_url && !avatarBroken ? (
+                    <img
+                      src={user.avatar_url}
+                      alt=""
+                      className="header-avatar"
+                      onError={() => setAvatarBroken(true)}
+                    />
+                  ) : null}
+                  {user.nickname || user.username}
+                </Link>
                 <button type="button" className="text-link" onClick={signOut}>
                   <Icon name="logout" size={15} />
                   退出
@@ -92,6 +103,9 @@ export function AppShell() {
             </NavLink>
             <NavLink to="/cart" className={({ isActive }) => (isActive ? "active" : "")}>
               购物车{cartCount > 0 && <span className="nav-count">{cartCount}</span>}
+            </NavLink>
+            <NavLink to="/profile" className={({ isActive }) => (isActive ? "active" : "")}>
+              个人中心
             </NavLink>
             {user?.role === "admin" && (
               <NavLink to="/admin" className={({ isActive }) => (isActive ? "active" : "")}>

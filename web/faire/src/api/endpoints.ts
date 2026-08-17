@@ -36,6 +36,7 @@ import type {
   SharePostRequest,
   SKU,
   User,
+  UpdateProfileRequest,
   UserCouponView,
   UserSearchResult,
 } from "./types";
@@ -53,6 +54,12 @@ export const authApi = {
 
   async me() {
     const { data } = await api.get<User>("/users/me");
+    return data;
+  },
+
+  // 个人资料：PATCH 部分更新（未提交字段不动、空串清空）。
+  async updateProfile(request: UpdateProfileRequest) {
+    const { data } = await api.patch<User>("/users/me", request);
     return data;
   },
 };
@@ -107,6 +114,19 @@ export async function getAddresses() {
 export async function createAddress(request: CreateAddressRequest) {
   const { data } = await api.post<Address>("/addresses", request);
   return data;
+}
+
+// 编辑地址（不触碰默认指向；后端返回 204 无 body）。
+export async function updateAddress(id: number, request: CreateAddressRequest) {
+  await api.put(`/addresses/${id}`, request);
+}
+
+export async function deleteAddress(id: number) {
+  await api.delete(`/addresses/${id}`);
+}
+
+export async function setDefaultAddress(id: number) {
+  await api.put(`/addresses/${id}/default`);
 }
 
 export async function getMyCoupons(status?: string) {

@@ -1,6 +1,8 @@
 export interface User {
   id: number;
   username: string;
+  nickname: string;
+  avatar_url: string;
   role: "user" | "admin";
   created_at: string;
   updated_at: string;
@@ -271,6 +273,12 @@ export interface CreateAddressRequest {
   district: string;
   detail: string;
   is_default: boolean;
+}
+
+// 个人资料（PATCH 语义：undefined = 不改动，空串 = 清空）。
+export interface UpdateProfileRequest {
+  nickname?: string;
+  avatar_url?: string;
 }
 
 // ---- 社交：好友 ----

@@ -21,6 +21,7 @@ import { NotFoundPage } from "./pages/NotFoundPage";
 import { OrderDetailPage } from "./pages/OrderDetailPage";
 import { OrdersPage } from "./pages/OrdersPage";
 import { ProductDetailPage } from "./pages/ProductDetailPage";
+import { ProfilePage } from "./pages/ProfilePage";
 import { AdminCouponsPage } from "./pages/admin/AdminCouponsPage";
 import { AdminFlashSalesPage } from "./pages/admin/AdminFlashSalesPage";
 import { AdminLayout } from "./pages/admin/AdminLayout";
@@ -171,6 +172,14 @@ export function App() {
             element={
               <ProtectedRoute>
                 <ChatPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="profile"
+            element={
+              <ProtectedRoute>
+                <ProfilePage />
               </ProtectedRoute>
             }
           />
