@@ -10,17 +10,29 @@ package flashsale_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
+	flashsalerepo "github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 
 	flashsalesvc "github.com/xiangzhang-coding/go-single/internal/flashsale/service"
 )
+
+type failingRestoreActivities struct {
+	flashsalerepo.ActivityRepository
+}
+
+func (failingRestoreActivities) RestoreStock(context.Context, *gorm.DB, int64, int) error {
+	return errors.New("restore activity stock")
+}
 
 // redisGet 读取 Redis key 值（nil = key 不存在）。
 func redisGet(t *testing.T, key string) *string {
@@ -98,6 +110,35 @@ func TestSeckillTimeoutCancelRestoresAndAllowsRepurchase(t *testing.T) {
 	require.Equal(t, "1", *redisGet(t, countKey))
 }
 
+func TestSeckillTimeoutTransactionRollsBackWhenActivityRestoreFails(t *testing.T) {
+	requireEnv(t)
+	e := requireMQEnv(t)
+	admin := adminToken(t, env)
+	id := seedPublishedOnSale(t, admin, 10)
+	token, _ := registerWithAddress(t, e, uniqueName("rbcancel"))
+	w, body := purchaseOn(t, e, id, token)
+	require.Equal(t, http.StatusAccepted, w.Code)
+	orderNo := body["order_no"].(string)
+	require.NotNil(t, pollOrder(t, e, orderNo, token))
+	require.Equal(t, 9, mysqlStock(t, e, id))
+	require.NoError(t, env.gdb.Exec(
+		"UPDATE orders SET expire_at = ? WHERE order_no = ?", time.Now().Add(-time.Minute), orderNo,
+	).Error)
+	timeout := flashsalesvc.NewSeckillTimeout(
+		e.tx, e.orderSvc, failingRestoreActivities{e.activities}, e.flashsaleSvc, metrics.New().Business(),
+	)
+
+	cancelled, failed, redisFailed, err := timeout.CancelExpired(context.Background())
+
+	require.NoError(t, err)
+	require.Zero(t, cancelled)
+	require.GreaterOrEqual(t, failed, 1)
+	require.Zero(t, redisFailed)
+	require.Equal(t, ordermodel.OrderStatusPendingPayment, orderStatus(t, orderNo),
+		"活动库存回补失败应回滚订单取消")
+	require.Equal(t, 9, mysqlStock(t, e, id), "活动库存回补失败不得改变 MySQL 库存")
+}
+
 // T13 进行中对账（验收标准 2/4）：Redis 有扣减但无对应订单 → 补单信号告警；
 // 只比对不写回——Redis 预扣不被覆盖。
 func TestSeckillReconcileActiveWarnsOnly(t *testing.T) {
@@ -106,9 +147,13 @@ func TestSeckillReconcileActiveWarnsOnly(t *testing.T) {
 	admin := adminToken(t, env)
 	id := seedPublishedOnSale(t, admin, 10)
 	stockKey := fmt.Sprintf("flashsale:stock:%d", id)
+	token, _ := registerWithAddress(t, e, uniqueName("reccount"))
+	w, body := purchaseOn(t, e, id, token)
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.NotNil(t, pollOrder(t, e, body["order_no"].(string), token))
 
-	// 人为制造"预扣成功但未落单"：Redis 扣 2（无对应订单）。
-	require.Equal(t, "10", *redisGet(t, stockKey))
+	// 已有 1 笔有效订单（Redis/MySQL 均剩 9），再人为制造额外预扣 2。
+	require.Equal(t, "9", *redisGet(t, stockKey))
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	require.NoError(t, env.redis.DecrBy(ctx, stockKey, 2).Err())
@@ -121,14 +166,15 @@ func TestSeckillReconcileActiveWarnsOnly(t *testing.T) {
 	for _, w := range warnings {
 		if w.ActivityID == id {
 			found, ok = w, true
-			require.Equal(t, 8, w.RedisStock)
-			require.Equal(t, 10, w.MySQLStock)
+			require.Equal(t, 7, w.RedisStock)
+			require.Equal(t, 9, w.MySQLStock)
+			require.Equal(t, 1, w.OrderCount, "对账应经 order 端口统计有效秒杀订单")
 			break
 		}
 	}
 	require.True(t, ok, "本活动差异应在告警列表中")
 	require.Contains(t, found.Detail, "补单")
-	require.Equal(t, "8", *redisGet(t, stockKey), "进行中只比对告警，Redis 预扣不得被覆盖")
+	require.Equal(t, "7", *redisGet(t, stockKey), "进行中只比对告警，Redis 预扣不得被覆盖")
 }
 
 // T13 收尾对账（验收标准 3）：刚结束的活动 Redis 库存与 MySQL 不一致 →

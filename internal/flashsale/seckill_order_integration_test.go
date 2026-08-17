@@ -77,11 +77,16 @@ func (m isolatedQueueMQ) Consume(ctx context.Context, queue string, handler mq.M
 // mqEnv 秒杀异步落单测试环境：真实 MQ 发布 + 常驻消费者 + 完整路由。
 // 复用 integration_test.go 的 testEnv（MySQL/Redis/verifier/product 等）。
 type mqEnv struct {
-	router    http.Handler
-	mqClient  mq.MQ
-	queue     string
-	timeout   flashsalesvc.SeckillTimeout
-	reconcile flashsalesvc.Reconciliation
+	router       http.Handler
+	mqClient     mq.MQ
+	queue        string
+	orderSvc     ordersvc.Service
+	flashsaleSvc flashsalesvc.Service
+	activities   flashsalerepo.ActivityRepository
+	tx           flashsalerepo.TxRunner
+	consumer     *flashsalesvc.SeckillOrderConsumer
+	timeout      flashsalesvc.SeckillTimeout
+	reconcile    flashsalesvc.Reconciliation
 }
 
 var (
@@ -180,7 +185,12 @@ func buildMQEnv() (*mqEnv, error) {
 	flashsaleHandler.RegisterRoutes(api, allowAll)
 	orderHandler.RegisterRoutes(api)
 
-	return &mqEnv{router: r, mqClient: mqClient, queue: queue, timeout: timeout, reconcile: reconcile}, nil
+	return &mqEnv{
+		router: r, mqClient: mqClient, queue: queue,
+		orderSvc: orderSvc, flashsaleSvc: flashsaleSvc,
+		activities: flashsaleStore.Activities, tx: flashsaleStore.Tx,
+		consumer: consumer, timeout: timeout, reconcile: reconcile,
+	}, nil
 }
 
 // ---- 请求助手（复用 integration_test.go 的 doJSONOn）----
@@ -303,6 +313,32 @@ func TestSeckillOrderFullLoop(t *testing.T) {
 
 	require.Equal(t, 9, mysqlStock(t, e, id), "落单应同事务扣减活动库存")
 	require.Equal(t, 1, countSeckillOrders(t, e, id))
+}
+
+func TestSeckillOrderTransactionRollsBackWhenActivityStockDeductionFails(t *testing.T) {
+	requireEnv(t)
+	e := requireMQEnv(t)
+	admin := adminToken(t, env)
+	id := seedPublishedOnSale(t, admin, 1)
+	_, userID := registerWithAddress(t, e, uniqueName("rbcreate"))
+	require.NoError(t, env.gdb.Exec(
+		"UPDATE flashsale_activities SET stock = 0 WHERE id = ?", id,
+	).Error)
+	orderNo := fmt.Sprintf("%d", time.Now().UnixNano())
+	body, err := json.Marshal(flashsalesvc.SeckillSuccessMessage{
+		OrderNo: orderNo, UserID: userID, ActivityID: id,
+	})
+	require.NoError(t, err)
+
+	err = e.consumer.Handle(context.Background(), body)
+
+	require.ErrorIs(t, err, mq.ErrPermanent)
+	var orders, items int64
+	require.NoError(t, env.gdb.Table("orders").Where("order_no = ?", orderNo).Count(&orders).Error)
+	require.NoError(t, env.gdb.Table("order_items").Where("order_no = ?", orderNo).Count(&items).Error)
+	require.Zero(t, orders, "活动库存扣减失败应回滚订单")
+	require.Zero(t, items, "活动库存扣减失败应回滚订单项")
+	require.Equal(t, 0, mysqlStock(t, e, id))
 }
 
 // 并发抢购不重复建单：30 用户抢 20 库存 → 恰好 20 单（唯一约束挡重复），库存归零。
