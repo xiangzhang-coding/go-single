@@ -8,25 +8,32 @@ import "fmt"
 // 对比微服务：无网络跳转（低延迟）、事务跨模块简单、无分布式难题；
 // 代价：只能整体扩容，模块间耦合靠纪律（DAG 依赖）维持。
 
-// 依赖方向：order → flashsale（order 侧声明接口，flashsale 实现），无环。
-type ActivityStock interface {
-	DeductStock(activityID, qty int64) error
+// 依赖方向：flashsale → order（flashsale 声明自己需要的最小订单能力），无环。
+type SeckillOrderWriter interface {
+	CreateInTx(orderNo string) error
 }
 
-type flashsaleModule struct{}
+type orderModule struct{}
 
-func (flashsaleModule) DeductStock(activityID, qty int64) error {
-	return fmt.Errorf("simulate deduct stock of activity %d", activityID)
+func (orderModule) CreateInTx(orderNo string) error {
+	return fmt.Errorf("simulate create order %s", orderNo)
+}
+
+type flashsaleModule struct{ orders SeckillOrderWriter }
+
+func (m flashsaleModule) Handle(orderNo string) error {
+	// 实际项目在同一事务中继续扣减 flashsale 活动库存。
+	return m.orders.CreateInTx(orderNo)
 }
 
 func main() {
-	// 进程内装配：order 拿到的是接口，运行时才绑定 flashsale 实现。
-	var port ActivityStock = flashsaleModule{}
-	fmt.Println("order 调用方视角：", port.DeductStock(1001, 1))
+	// 进程内装配：flashsale 只拿到 order 的最小接口，order 不反向持有 flashsale。
+	consumer := flashsaleModule{orders: orderModule{}}
+	fmt.Println("flashsale 调用方视角：", consumer.Handle("1001"))
 
 	fmt.Println("跨模块写怎么保证原子性？→ tx 参数汇入同一事务（见 q07）")
 }
 
-// 项目位置：internal/order/service/order_service.go 声明 ActivityStock/SeckillRestore
-// 最小接口（119-133），internal/flashsale/service 实现；装配在 cmd/server/main.go；
+// 项目位置：internal/flashsale/service 的消费者、SeckillTimeout 声明 order
+// 最小接口并完成应用编排；order 不持有 flashsale；装配在 cmd/server/main.go；
 // 模块依赖 DAG 见 docs/DESIGN.md 依赖图。

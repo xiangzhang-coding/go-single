@@ -43,7 +43,7 @@ func orderStatus(t *testing.T, orderNo string) string {
 }
 
 // T13 超时取消回补 + 允许再次抢购（验收标准 1）：抢购落单 → 拨回已超时 →
-// CancelExpiredSeckill 取消订单并回补 MySQL/Redis 库存与用户计数、释放幂等键 →
+// SeckillTimeout 取消订单并回补 MySQL/Redis 库存与用户计数、释放幂等键 →
 // 同一用户再次抢购成功（生成新订单，取消订单不占去重位）。
 func TestSeckillTimeoutCancelRestoresAndAllowsRepurchase(t *testing.T) {
 	requireEnv(t) // 初始化共享 env（adminToken/seed 依赖）
@@ -70,7 +70,7 @@ func TestSeckillTimeoutCancelRestoresAndAllowsRepurchase(t *testing.T) {
 	// 拨回已超时 → 秒杀超时取消。
 	require.NoError(t, env.gdb.Exec("UPDATE orders SET expire_at = ? WHERE order_no = ?",
 		time.Now().Add(-time.Minute), orderNo).Error)
-	cancelled, _, redisFailed, err := e.orderSvc.CancelExpiredSeckill(context.Background())
+	cancelled, _, redisFailed, err := e.timeout.CancelExpired(context.Background())
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, cancelled, 1, "超时秒杀订单应被取消")
 	require.Zero(t, redisFailed, "Redis 回补不应失败")

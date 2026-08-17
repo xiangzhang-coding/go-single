@@ -1,7 +1,7 @@
-// T13 秒杀取消回补与对账单元测试（中间 seam）：fake 活动仓储 + fake 缓存 +
+// T13 秒杀 Redis 回补与对账单元测试（中间 seam）：fake 活动仓储 + fake 缓存 +
 // fake 订单计数端口，覆盖——
-//   - RestoreStock/RestoreRedis：事务内 MySQL 回补、缓存原子回补 Redis 库存/
-//     用户计数/幂等键（key 缺失不重建、回补失败透传）；
+//   - RestoreRedis：缓存原子回补 Redis 库存/用户计数/幂等键
+//     （key 缺失不重建、回补失败透传）；
 //   - ReconcileActive：进行中只比对告警不写回，redis < mysql 识别补单信号，
 //     库存 key 缺失告警，一致无告警；
 //   - ReconcileEnded：以 MySQL 为准对齐刚结束活动的 Redis 库存，跳过下架/
@@ -21,17 +21,6 @@ import (
 )
 
 // ---- 取消回补 ----
-
-// RestoreStock 事务内回补活动库存（MySQL）。
-func TestRestoreStockRestoresMySQLStock(t *testing.T) {
-	fx := newFixture()
-	a := fx.createActivity(t, nil)
-	fx.svc.PublishActivity(context.Background(), a.ID) // 上架（不影响 MySQL stock）
-	want := a.Stock + 3
-
-	require.NoError(t, fx.svc.RestoreStock(context.Background(), nil, a.ID, 3))
-	require.Equal(t, want, fx.acts.byID[a.ID].Stock)
-}
 
 // RestoreRedis 原子回补：库存 INCR + 用户计数 DECR + 释放幂等键（允许再次抢购）。
 func TestRestoreRedisRestoresStockCountIdem(t *testing.T) {

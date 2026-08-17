@@ -259,7 +259,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/service/flashsale_consumer.go` → `order.CreateSeckill`；唯一键 `uk_orders_user_activity_key`（`migrations/000014_seckill_repurchase.up.sql`）+ 1062 映射（`order_repository_gorm.go`）。
+**项目位置**：`internal/flashsale/service/flashsale_consumer.go` → `order.CreateSeckillInTx`；唯一键 `uk_orders_user_activity_key`（`migrations/000014_seckill_repurchase.up.sql`）+ 1062 映射（`order_repository_gorm.go`）。
 
 ## Q6. 重试分类：永久失败 vs 瞬时失败
 
@@ -306,7 +306,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/service/flashsale_consumer.go` 的 `classifyCreateError`（ErrInvalidInput/ErrSeckillStockInsufficient/ErrSKUNotFound/ErrSKUUnavailable → 永久）；`internal/platform/mq/mq.go` 定义 `ErrPermanent`。
+**项目位置**：`internal/flashsale/service/flashsale_consumer.go` 的 `classifyCreateError`（order 参数/SKU 错误与 flashsale `ErrSeckillStockInsufficient` → 永久）；`internal/platform/mq/mq.go` 定义 `ErrPermanent`。
 
 ## Q7. 熔断器：消费者自我保护（gobreaker 简化版）
 

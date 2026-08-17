@@ -36,6 +36,6 @@ func main() {
 	fmt.Println(describe(123), describe("hi"), describe(1.5))
 }
 
-// 项目位置：模块间经 service 接口进程内调用——order 侧声明最小接口 ActivityStock /
-// SeckillRestore（internal/order/service/order_service.go），由 flashsale 实现；
+// 项目位置：模块间经 service 接口进程内调用——flashsale 消费者声明最小
+// OrderService 接口，由 order 实现；依赖保持 flashsale → order 单向；
 // 编译期断言 var _ Repository = (*GORMRepo)(nil) 遍布各模块 repository。

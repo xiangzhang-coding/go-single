@@ -109,7 +109,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/order/service/order_service.go` 的 `createOrder`（286-396）与 `CreateSeckill`（404-487）；跨模块写经 `TxRunner.WithinTx` 汇入同一事务（`internal/order/repository/order_repository.go`）。
+**项目位置**：`internal/order/service/order_service.go` 的 `createOrder` / `CreateSeckillInTx`；秒杀跨模块写由 flashsale 消费者经 `TxRunner.WithinTx` 汇入同一事务（`internal/flashsale/service/flashsale_consumer.go`）。
 
 ## Q3. 条件更新防超卖：`UPDATE ... WHERE stock >= ?`
 
@@ -167,7 +167,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/repository/activity_repository_gorm.go` 的条件扣减；秒杀订单事务内 `DeductStock`（ActivityStock 端口）同样条件扣减；商品 SKU 同理（`internal/product`）。
+**项目位置**：`internal/flashsale/repository/activity_repository_gorm.go` 的条件扣减；秒杀消费者在订单事务内调用该仓储的 `DeductStock`；商品 SKU 同理（`internal/product`）。
 
 ## Q4. 行锁与锁顺序：避免死锁
 

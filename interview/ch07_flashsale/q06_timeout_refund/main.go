@@ -30,6 +30,6 @@ func main() {
 		s.orderStatus, s.redisStock, s.mysqlStock)
 }
 
-// 项目位置：internal/order/service/order_service.go 的 CancelExpiredSeckill（920-968）——
-// 批量扫描 ListExpiredSeckillPending → 事务条件取消 + RestoreStock → 提交后
-// RestoreRedis；cron 任务 seckill-timeout-cancel 每分钟（cmd/server/main.go 435-449）。
+// 项目位置：internal/flashsale/service/seckill_timeout.go——调用 order.ListExpiredSeckill
+// → 同事务 order.CancelSeckill + 活动仓储 RestoreStock → 提交后 RestoreRedis；
+// cron 任务 seckill-timeout-cancel 每分钟（cmd/server/main.go）。

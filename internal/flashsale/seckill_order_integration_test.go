@@ -80,7 +80,7 @@ type mqEnv struct {
 	router    http.Handler
 	mqClient  mq.MQ
 	queue     string
-	orderSvc  ordersvc.Service
+	timeout   flashsalesvc.SeckillTimeout
 	reconcile flashsalesvc.Reconciliation
 }
 
@@ -139,7 +139,8 @@ func buildMQEnv() (*mqEnv, error) {
 	if err != nil {
 		return nil, err
 	}
-	flashsaleStore := flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(gdb)}
+	flashsaleActivityStore := flashsalerepo.NewGORMActivity(gdb)
+	flashsaleStore := flashsalerepo.Store{Activities: flashsaleActivityStore, Tx: flashsaleActivityStore}
 	flashsaleSvc := flashsalesvc.New(flashsaleStore, productSvc, cacheClient,
 		limiter.RedisCounterConfig{}, mqClient, orderNoGen, metrics.New().Business())
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
@@ -148,15 +149,18 @@ func buildMQEnv() (*mqEnv, error) {
 	couponSvc := couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(gdb), UserCoupon: couponrepo.NewGORMUserCoupon(gdb)}, cacheClient, metrics.New().Business())
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc, metrics.New().Business())
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, metrics.New().Business())
 	orderHandler := orderhandler.New(orderSvc, verifier)
+	timeout := flashsalesvc.NewSeckillTimeout(
+		flashsaleStore.Tx, orderSvc, flashsaleStore.Activities, flashsaleSvc, metrics.New().Business())
 
 	// T13 秒杀库存对账：有效订单数经 order 服务端口统计。
 	reconcile := flashsalesvc.NewReconciliation(flashsaleStore, cacheClient, orderSvc)
 
 	// 常驻消费者：订阅"抢购成功"队列异步落单；连接中断自动重连（at-least-once）。
 	log := zap.NewNop()
-	consumer := flashsalesvc.NewSeckillOrderConsumer(flashsaleStore.Activities, orderSvc, userSvc, log)
+	consumer := flashsalesvc.NewSeckillOrderConsumer(
+		flashsaleStore.Activities, flashsaleStore.Tx, orderSvc, userSvc, metrics.New().Business(), log)
 	go func() {
 		for {
 			if err := mqClient.Consume(context.Background(), flashsalesvc.SeckillOrderQueue, consumer.Handle); err != nil {
@@ -176,7 +180,7 @@ func buildMQEnv() (*mqEnv, error) {
 	flashsaleHandler.RegisterRoutes(api, allowAll)
 	orderHandler.RegisterRoutes(api)
 
-	return &mqEnv{router: r, mqClient: mqClient, queue: queue, orderSvc: orderSvc, reconcile: reconcile}, nil
+	return &mqEnv{router: r, mqClient: mqClient, queue: queue, timeout: timeout, reconcile: reconcile}, nil
 }
 
 // ---- 请求助手（复用 integration_test.go 的 doJSONOn）----

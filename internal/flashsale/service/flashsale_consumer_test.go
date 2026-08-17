@@ -16,6 +16,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
 )
@@ -23,13 +24,14 @@ import (
 // ---- fake 消费者依赖 ----
 
 type fakeOrderService struct {
-	created []ordersvc.SeckillCreateParams
-	err     error
+	created  []ordersvc.SeckillCreateParams
+	inserted bool
+	err      error
 }
 
-func (f *fakeOrderService) CreateSeckill(_ context.Context, p ordersvc.SeckillCreateParams) error {
+func (f *fakeOrderService) CreateSeckillInTx(_ context.Context, _ *gorm.DB, p ordersvc.SeckillCreateParams) (bool, error) {
 	f.created = append(f.created, p)
-	return f.err
+	return f.inserted, f.err
 }
 
 type fakeUserService struct {
@@ -66,10 +68,10 @@ type consumerFixture struct {
 
 func newConsumerFixture() *consumerFixture {
 	acts := newFakeActivities()
-	orders := &fakeOrderService{}
+	orders := &fakeOrderService{inserted: true}
 	users := newFakeUserService()
 	return &consumerFixture{
-		consumer: NewSeckillOrderConsumer(acts, orders, users, zap.NewNop()),
+		consumer: NewSeckillOrderConsumer(acts, fakeSeckillTx{}, orders, users, metrics.New().Business(), zap.NewNop()),
 		orders:   orders,
 		users:    users,
 		acts:     acts,
@@ -112,6 +114,7 @@ func TestConsumerHappyPath(t *testing.T) {
 	require.Equal(t, a.Price, p.Price, "订单应固化秒杀价")
 	require.Equal(t, 1, p.Quantity)
 	require.Equal(t, "张三", p.Address.Receiver, "地址快照应取自默认地址")
+	require.Equal(t, 9, a.Stock, "落单应在同一事务中扣减活动库存")
 }
 
 // 非法消息体 / 字段缺失：永久失败（死信），不触碰落单。
@@ -156,7 +159,7 @@ func TestConsumerActivityReadFailureTransient(t *testing.T) {
 	fx := newConsumerFixture()
 	fx.users.seedAddress(42)
 
-	fx.consumer = NewSeckillOrderConsumer(&failingActivities{}, fx.orders, fx.users, zap.NewNop())
+	fx.consumer = NewSeckillOrderConsumer(&failingActivities{}, fakeSeckillTx{}, fx.orders, fx.users, metrics.New().Business(), zap.NewNop())
 	err := fx.consumer.Handle(context.Background(),
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: 1}))
 	require.Error(t, err)
@@ -181,11 +184,23 @@ func TestConsumerAddressReadFailureTransient(t *testing.T) {
 func TestConsumerCreatePermanentFailure(t *testing.T) {
 	fx := newConsumerFixture()
 	a := fx.seed(t, 42)
-	fx.orders.err = ordersvc.ErrSeckillStockInsufficient
+	a.Stock = 0
 
 	err := fx.consumer.Handle(context.Background(),
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: a.ID}))
 	require.ErrorIs(t, err, mq.ErrPermanent, "库存不足应死信（对账兜底）")
+}
+
+func TestConsumerDuplicateOrderDoesNotDeductActivityStock(t *testing.T) {
+	fx := newConsumerFixture()
+	a := fx.seed(t, 42)
+	fx.orders.inserted = false
+
+	err := fx.consumer.Handle(context.Background(),
+		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: a.ID}))
+
+	require.NoError(t, err)
+	require.Equal(t, 10, a.Stock, "幂等命中不得重复扣减活动库存")
 }
 
 // 落单基础设施故障（DB 超时等）：瞬时失败（重投），at-least-once 不丢消息。

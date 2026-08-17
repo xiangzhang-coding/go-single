@@ -123,7 +123,7 @@ func buildEnv() (*testEnv, error) {
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(
 		orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
-		noopCache{}, stubOrderNoGen{}, stubProducts{}, stubCoupons{}, stubCart{}, userSvc, stubActivity{}, stubActivity{},
+		noopCache{}, stubOrderNoGen{}, stubProducts{}, stubCoupons{}, stubCart{}, userSvc,
 		metrics.New().Business())
 
 	socialStore := socialrepo.Store{

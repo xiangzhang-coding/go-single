@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
@@ -113,16 +111,9 @@ type Service interface {
 	// 状态/窗口/限购作为 ARGV 传入，Redis 内原子扣减）。
 	PreDeduct(ctx context.Context, userID, activityID int64) error
 
-	// ---- 落单库存扣减（T12，order 模块事务内调用）----
-	// DeductStock 事务内条件扣减活动库存（MySQL 落单事实源）；实现 order 侧
-	// ActivityStock 端口，返回是否扣减成功（库存不足返回 (false, nil)）。
-	DeductStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) (bool, error)
-
-	// ---- 取消回补（T13，order 模块超时取消调用）----
-	// RestoreStock 事务内回补活动库存（MySQL，与订单状态迁移同事务）；
-	// RestoreRedis 事务提交后回补 Redis 库存 + 用户计数并释放幂等键
-	// （允许再次抢购）；两者共同实现 order 侧 SeckillRestore 端口。
-	RestoreStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) error
+	// ---- 取消回补（T13，flashsale 应用编排调用）----
+	// RestoreRedis 在订单取消与 MySQL 活动库存回补事务提交后，回补 Redis
+	// 库存 + 用户计数并释放幂等键（允许再次抢购）。
 	RestoreRedis(ctx context.Context, activityID, userID int64, quantity int) error
 }
 
@@ -465,12 +456,6 @@ func isBusinessReject(err error) bool {
 }
 
 // ---- 取消回补（T13）----
-
-// RestoreStock 事务内回补活动库存（MySQL，对账事实源）：秒杀订单取消在
-// 订单事务内调用，与状态迁移同事务（实现 order 侧 SeckillRestore 端口）。
-func (s *flashsaleService) RestoreStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) error {
-	return s.store.Activities.RestoreStock(ctx, tx, activityID, quantity)
-}
 
 // RestoreRedis 事务提交后回补 Redis（best-effort，允许再次抢购）：
 // 缓存原子 INCR 库存 + DECR 用户计数 + 释放幂等键；key 不存在不重建

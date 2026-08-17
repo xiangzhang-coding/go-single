@@ -15,15 +15,21 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
+	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
 )
 
+// ErrSeckillStockInsufficient 表示 Redis 已预扣但 MySQL 活动库存不足。
+// 该错误不可通过 MQ 重投恢复，消费者将消息送入死信并由对账兜底。
+var ErrSeckillStockInsufficient = errors.New("seckill activity stock insufficient")
+
 // OrderService flashsale 消费侧最小接口（跨模块进程内调用，order 服务实现）：
 // 异步落单（幂等建单 + 同事务扣活动库存）。
 type OrderService interface {
-	CreateSeckill(ctx context.Context, p ordersvc.SeckillCreateParams) error
+	CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p ordersvc.SeckillCreateParams) (created bool, err error)
 }
 
 // UserService 用户模块最小接口：读取默认地址固化为秒杀订单地址快照。
@@ -32,20 +38,26 @@ type UserService interface {
 }
 
 // SeckillOrderConsumer 秒杀异步落单消费者（T12）。
-// 消费链路：消息 → 查活动（sku/秒杀价）→ 查默认地址 → CreateSeckill。
+// 消费链路：消息 → 查活动（sku/秒杀价）→ 查默认地址 → 开启事务 →
+// order.CreateSeckillInTx + 活动库存条件扣减。
 // 预扣成功绝不丢单：重复投递/并发消费由 (user_id, activity_id) 唯一约束幂等；
 // 失败重投（瞬时）/死信（永久）由平台 mq 层按返回错误分类执行。
 type SeckillOrderConsumer struct {
 	activities repository.ActivityRepository
+	tx         seckillTxRunner
 	orders     OrderService
 	users      UserService
+	metrics    *metrics.Business
 	log        *zap.Logger
 }
 
 // NewSeckillOrderConsumer 构造秒杀落单消费者。
 func NewSeckillOrderConsumer(activities repository.ActivityRepository,
-	orders OrderService, users UserService, log *zap.Logger) *SeckillOrderConsumer {
-	return &SeckillOrderConsumer{activities: activities, orders: orders, users: users, log: log}
+	tx seckillTxRunner, orders OrderService, users UserService, m *metrics.Business,
+	log *zap.Logger) *SeckillOrderConsumer {
+	return &SeckillOrderConsumer{
+		activities: activities, tx: tx, orders: orders, users: users, metrics: m, log: log,
+	}
 }
 
 // Handle 处理单条"抢购成功"消息（幂等；返回错误即触发 mq 层重投/死信）。
@@ -80,17 +92,36 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 		return c.permanent(ctx, "user has no default address", &msg, nil)
 	}
 
-	err = c.orders.CreateSeckill(ctx, ordersvc.SeckillCreateParams{
-		OrderNo:    msg.OrderNo,
-		UserID:     msg.UserID,
-		ActivityID: msg.ActivityID,
-		SKUID:      activity.SKUID,
-		Price:      activity.Price,
-		Quantity:   1,
-		Address:    address,
+	created := false
+	err = c.tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		created, err = c.orders.CreateSeckillInTx(ctx, tx, ordersvc.SeckillCreateParams{
+			OrderNo:    msg.OrderNo,
+			UserID:     msg.UserID,
+			ActivityID: msg.ActivityID,
+			SKUID:      activity.SKUID,
+			Price:      activity.Price,
+			Quantity:   1,
+			Address:    address,
+		})
+		if err != nil || !created {
+			return err
+		}
+		ok, err := c.activities.DeductStock(ctx, tx, msg.ActivityID, 1)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrSeckillStockInsufficient
+		}
+		return nil
 	})
 	if err != nil {
 		return c.classifyCreateError(ctx, &msg, err)
+	}
+	if created {
+		c.metrics.OrderCreated(ordermodel.OrderTypeSeckill)
+		c.metrics.OrderStatusChanged(ordermodel.OrderStatusPendingPayment)
 	}
 	return nil
 }
@@ -118,7 +149,7 @@ func (c *SeckillOrderConsumer) permanent(ctx context.Context, reason string, msg
 func (c *SeckillOrderConsumer) classifyCreateError(ctx context.Context, msg *SeckillSuccessMessage, err error) error {
 	switch {
 	case errors.Is(err, ordersvc.ErrInvalidInput),
-		errors.Is(err, ordersvc.ErrSeckillStockInsufficient),
+		errors.Is(err, ErrSeckillStockInsufficient),
 		errors.Is(err, ordersvc.ErrSKUNotFound),
 		errors.Is(err, ordersvc.ErrSKUUnavailable):
 		return c.permanent(ctx, "create seckill order rejected", msg, err)
@@ -127,12 +158,3 @@ func (c *SeckillOrderConsumer) classifyCreateError(ctx context.Context, msg *Sec
 		zap.String("order_no", msg.OrderNo), zap.Int64("activity_id", msg.ActivityID), zap.Error(err))
 	return err
 }
-
-// DeductStock 实现 order 服务侧的 ActivityStock 端口：在订单事务内条件扣减
-// 活动库存（MySQL 落单事实源，与 Redis 预扣对账；DESIGN.md 秒杀时序 [5]）。
-func (s *flashsaleService) DeductStock(ctx context.Context, tx *gorm.DB, activityID int64, quantity int) (bool, error) {
-	return s.store.Activities.DeductStock(ctx, tx, activityID, quantity)
-}
-
-// 编译期断言：flashsale 服务实现 order 侧端口。
-var _ ordersvc.ActivityStock = (*flashsaleService)(nil)

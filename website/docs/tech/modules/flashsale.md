@@ -67,7 +67,7 @@ admin（Bearer + admin）：
 
 ### 跨模块端口
 
-**对外（实现 order 侧端口，flashsale → order 单向依赖）**：`DeductStock`（ActivityStock：订单事务内条件扣减活动库存）、`RestoreStock` / `RestoreRedis`（SeckillRestore：取消回补）。**依赖**：`product.GetSKU` / `GetProduct`（活动校验与秒杀页摘要）、`order.CreateSeckill` / `order.CountValidSeckill`（消费者与对账）。
+**应用编排（flashsale → order 单向依赖）**：消费者通过 flashsale `TxRunner` 开启事务，调用 `order.CreateSeckillInTx` 后由活动仓储条件扣减库存；超时取消通过 `order.ListExpiredSeckill` / `CancelSeckill` 与活动仓储完成事务内取消和 MySQL 回补，提交后 `RestoreRedis`；对账调用 `order.CountValidSeckill`。**其他依赖**：`product.GetSKU` / `GetProduct`（活动校验与秒杀页摘要）。order 不反向持有 flashsale 实例。
 
 ## 关键流程
 
@@ -93,7 +93,8 @@ POST /api/flashsales/:id/purchase
 消息 {order_no, user_id, activity_id}
   → 查活动（sku_id/秒杀价为订单快照来源；不存在 → 永久失败进死信）
   → 查默认地址（user.GetDefaultAddress，固化为地址快照；无地址 → 永久失败进死信）
-  → order.CreateSeckill：单事务建秒杀订单（10min 超时）+ 订单项 + 条件扣活动库存
+  → flashsale 编排开启事务：order.CreateSeckillInTx 建秒杀订单（10min 超时）+ 订单项
+      → 活动仓储条件扣活动库存
       · 重复键（order_no 主键 / user_activity_key 唯一约束）→ 幂等成功（不重复扣减库存）
       · 活动库存不足 → 永久失败（死信）
       · DB 瞬时故障 → 重投（Nack requeue，at-least-once）

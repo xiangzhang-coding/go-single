@@ -32,5 +32,6 @@ func main() {
 }
 
 // 项目位置：internal/flashsale/service/flashsale_consumer.go 的 classifyCreateError——
-// ErrInvalidInput/ErrSeckillStockInsufficient/ErrSKUNotFound/ErrSKUUnavailable → 永久，
+// order.ErrInvalidInput / flashsale.ErrSeckillStockInsufficient /
+// order.ErrSKUNotFound / order.ErrSKUUnavailable → 永久，
 // 其余瞬时；internal/platform/mq/mq.go 定义 ErrPermanent 哨兵。

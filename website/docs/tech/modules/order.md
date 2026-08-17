@@ -4,7 +4,7 @@ sidebar_position: 5
 
 # order — 订单
 
-**定位**：购物车结算 / 直购下单（单事务：订单 + 订单项 + 库存扣减 + 地址快照 + 券核销 + 清购物车）、`client_request_id` 幂等、雪花订单号、状态机（待支付→已支付→已发货→已完成，含取消与超时取消）、秒杀异步落单与超时回补。
+**定位**：购物车结算 / 直购下单（单事务：订单 + 订单项 + 库存扣减 + 地址快照 + 券核销 + 清购物车）、`client_request_id` 幂等、雪花订单号、状态机（待支付→已支付→已发货→已完成，含取消与超时取消），并向 flashsale 编排提供事务内秒杀订单能力。
 
 实现：`internal/order/`。
 
@@ -67,9 +67,9 @@ admin（Bearer + admin）：
 
 ### 跨模块端口（进程内调用）
 
-**依赖（order 侧声明最小接口）**：`ProductService`（SKU 读取/条件扣减/回补）、`CouponService`（GetUsable/UseCoupon/RollbackCoupon）、`CartService`（LockItems/DeletePurchased）、`UserService`（GetAddress 快照）、`ActivityStock` 与 `SeckillRestore`（**由 flashsale 实现**——秒杀落单扣活动库存 / 取消回补）。
+**依赖（order 侧声明最小接口）**：`ProductService`（SKU 读取/条件扣减/回补）、`CouponService`（GetUsable/UseCoupon/RollbackCoupon）、`CartService`（LockItems/DeletePurchased）、`UserService`（GetAddress 快照）。order 不持有 flashsale service 或活动仓储。
 
-**对外端口（实现方为 order，被其他模块消费）**：`CreateSeckill`（flashsale 消费者）、`MarkPaid`（payment 事务内条件更新）、`GetDetail`（payment owner 校验）、`CountValidSeckill`（flashsale 对账）、`HasPurchasedSKU`（social 动态分享校验）。
+**对外端口（实现方为 order，被其他模块消费）**：`CreateSeckillInTx`（flashsale 消费者事务内建订单与订单项）、`ListExpiredSeckill` / `CancelSeckill`（flashsale 超时取消编排）、`CountValidSeckill`（flashsale 对账）、`MarkPaid`（payment 事务内条件更新）、`GetDetail`（payment owner 校验）、`HasPurchasedSKU`（social 动态分享校验）。
 
 ## 关键流程
 
@@ -101,8 +101,9 @@ Cancel（用户取消，仅普通订单）
 CancelExpired（cron 每分钟 order-timeout-cancel，批量上限 500）
   → 扫描待支付且已过 expire_at 的普通订单 → 逐个同事务取消（同上）
   → 单订单失败跳过计失败数，下个 tick 重试（不阻断整轮）
-CancelExpiredSeckill（cron 每分钟 seckill-timeout-cancel）
-  → 扫描待支付秒杀订单 → 事务：条件更新取消 + 回补活动 MySQL 库存
+flashsale.SeckillTimeout（cron 每分钟 seckill-timeout-cancel）
+  → order.ListExpiredSeckill 扫描待支付秒杀订单
+  → 事务：order.CancelSeckill 条件更新取消 + flashsale 活动仓储回补 MySQL 库存
   → 事务提交后回补 Redis（库存 INCR + 用户计数 DECR + 释放幂等键，允许再次抢购；
     best-effort，失败由对账 cron 兜底）
 ```

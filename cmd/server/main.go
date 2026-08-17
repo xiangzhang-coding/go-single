@@ -294,7 +294,8 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	if err != nil {
 		log.Fatal("初始化秒杀令牌桶限流失败", zap.Error(err))
 	}
-	flashsaleStore := flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(db)}
+	flashsaleActivityStore := flashsalerepo.NewGORMActivity(db)
+	flashsaleStore := flashsalerepo.Store{Activities: flashsaleActivityStore, Tx: flashsaleActivityStore}
 	flashsaleSvc := flashsalesvc.New(flashsaleStore, productSvc, cacheClient,
 		limiter.RedisCounterConfig{Max: cfg.FlashSale.PerUserMax, Window: cfg.FlashSale.PerUserWindow},
 		mqClient, orderNoGen, businessMetrics, retryCfg)
@@ -303,12 +304,14 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// order 模块：购物车结算/直购下单（单事务：订单+订单项+库存+地址快照+券核销+
 	// 删除购物车条目）、client_request_id 幂等（Redis SETNX）、雪花订单号、
 	// 订单列表/详情、取消（回补库存+回退券）、确认收货与 admin 发货；
-	// CreateSeckill（T12）：秒杀异步落单单事务 + 扣活动库存（flashsale 实现端口）；
-	// CancelExpiredSeckill（T13）：秒杀超时取消回补（flashsale 实现 SeckillRestore 端口）。
+	// 秒杀事务编排由 flashsale 模块单向调用 order 的事务内能力，order 不持有
+	// flashsale 实例，避免运行时依赖环。
 	orderStore := orderrepo.NewGORMOrder(db)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
-		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, flashsaleSvc, flashsaleSvc, businessMetrics, retryCfg)
+		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, businessMetrics, retryCfg)
 	orderHandler := orderhandler.New(orderSvc, verifier)
+	seckillTimeout := flashsalesvc.NewSeckillTimeout(
+		flashsaleStore.Tx, orderSvc, flashsaleStore.Activities, flashsaleSvc, businessMetrics)
 
 	// 秒杀库存对账（T13）：进行中只比对告警（补单信号），收尾以 MySQL 对齐 Redis；
 	// 有效订单数经 order 服务端口统计（进程内调用，flashsale → order 单向依赖）。
@@ -342,7 +345,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// order 服务幂等建单 + 同事务扣活动库存；瞬时失败 Nack 重投、
 	// 永久失败进死信（对账兜底）。消费中断 3s 后重连（at-least-once 不丢消息）。
 	seckillConsumer := flashsalesvc.NewSeckillOrderConsumer(
-		flashsaleStore.Activities, orderSvc, userSvc, log)
+		flashsaleStore.Activities, flashsaleStore.Tx, orderSvc, userSvc, businessMetrics, log)
 	go func() {
 		for {
 			err := mqClient.Consume(context.Background(), flashsalesvc.SeckillOrderQueue, seckillConsumer.Handle)
@@ -370,7 +373,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// T13 秒杀超时取消——每分钟扫描待支付秒杀订单，回补活动库存 + Redis 库存 +
 	// 用户计数（允许再次抢购）；对账——每小时进行中只比对告警（补单信号）、
 	// 每分钟收尾以 MySQL 对齐刚结束活动的 Redis 库存。
-	cronRegistry := registerCron(log, orderSvc, reconcile)
+	cronRegistry := registerCron(log, orderSvc, seckillTimeout, reconcile)
 	cronRegistry.Start()
 
 	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
@@ -423,7 +426,8 @@ func (n wsMessageNotifier) NotifyMessageSent(_ context.Context, msg *chatmodel.M
 var _ chatsvc.MessageNotifier = wsMessageNotifier{}
 
 // registerCron 注册全部定时任务并返回调度器（Start 由调用方执行）。
-func registerCron(log *zap.Logger, orderSvc ordersvc.Service, reconcile flashsalesvc.Reconciliation) *platformcron.Registry {
+func registerCron(log *zap.Logger, orderSvc ordersvc.Service, seckillTimeout flashsalesvc.SeckillTimeout,
+	reconcile flashsalesvc.Reconciliation) *platformcron.Registry {
 	registry := platformcron.New(log, 5*time.Minute)
 	if err := registry.Register(platformcron.Job{
 		Name: "order-timeout-cancel",
@@ -443,7 +447,7 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, reconcile flashsal
 		Name: "seckill-timeout-cancel",
 		Spec: "* * * * *",
 		Fn: func(ctx context.Context) error {
-			cancelled, failed, redisFailed, err := orderSvc.CancelExpiredSeckill(ctx)
+			cancelled, failed, redisFailed, err := seckillTimeout.CancelExpired(ctx)
 			if err != nil {
 				return err
 			}

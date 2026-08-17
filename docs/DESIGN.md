@@ -149,11 +149,14 @@ go_single/
     预扣成功 → 保留幂等键；业务拒绝（抢光/限购/窗口外/下架）→ 释放幂等键允许重试；
     基础设施失败 → 保留幂等键（防瞬时故障下重复预扣，预扣成功绝不丢单）
 [4] 预扣成功 → 发 MQ → 返回"排队中"
-[5] 消费者：建 DB 秒杀订单（user_activity_key 唯一约束兜底重复投递/并发——仅非取消订单占位，取消后置 NULL 允许再次抢购；重复即幂等成功）→ 同事务扣活动库存
+[5] 消费者由 flashsale 编排：开启数据库事务 → order.CreateSeckillInTx 建秒杀订单与订单项
+    → flashsale 活动仓储条件扣活动库存；user_activity_key 唯一约束兜底重复投递/并发
+    （仅非取消订单占位，取消后置 NULL 允许再次抢购；重复即幂等成功且不重复扣库存）
     失败 → MQ 重投/死信；对账 cron 兜底
 [6] 支付回调（状态机校验）→ 已支付（随后与普通订单一致走发货/确认收货）
-[7] 超时未支付（cron 扫描；RabbitMQ 延迟队列为更优解，进 backlog）→ 取消
-    → 回补 Redis 库存 + MySQL 库存 + 用户计数（允许再次抢购）
+[7] 超时未支付（cron 扫描；RabbitMQ 延迟队列为更优解，进 backlog）
+    → flashsale 编排读取 order 超时快照 → 同事务条件取消订单 + 回补 MySQL 活动库存
+    → 提交后回补 Redis 库存 + 用户计数（允许再次抢购）
 ```
 
 - **库存事实源**：秒杀期以 Redis 预扣为准；活动库存落单时同步扣减、取消时回补，用于对账
@@ -265,6 +268,8 @@ graph LR
 
 依赖方向无环（DAG），靠 code review 守住；`depguard` lint 强制执行进 backlog。admin 为横切路由组（各模块内联 `/api/admin/*` + RequireAdmin，见项目结构），不是模块节点、不产生模块间依赖。
 
+秒杀跨模块写遵循 `flashsale → order`：flashsale 的消费者与超时取消编排持有 order 的最小接口，并通过 flashsale 的 `TxRunner` 把 `CreateSeckillInTx` / `CancelSeckill` 与活动库存扣减 / 回补放入同一数据库事务；order 不持有 flashsale service 或活动仓储。库存对账同样由 flashsale 调用 `order.CountValidSeckill`，因此对象装配与运行时调用均不形成反向边。
+
 ## 可插拔 seam（ADR-0003）
 
 - **仓储接口**：每模块 `repository/` 定义接口，MySQL 实现（GORM 之上再包一层）；好友关系、订单、优惠券等业务数据的访问均为仓储 seam 的具体实例
@@ -273,7 +278,7 @@ graph LR
 
 ## 定时任务
 
-- 订单超时取消：cron 每分钟扫描超时待支付订单（更优解：RabbitMQ 延迟队列，backlog）
+- 订单超时取消：普通订单由 order cron 每分钟扫描；秒杀订单由 flashsale 超时取消编排每分钟扫描，并在同一事务中取消订单、回补 MySQL 活动库存（更优解：RabbitMQ 延迟队列，backlog）
 - 库存对账：cron 每小时比对 Redis 活动库存 vs `flashsale.stock` vs 秒杀有效订单数；**活动进行中只比对告警、不自动回写**（Redis 预扣领先属正常；仅识别"Redis 有扣减但无对应订单"作为补单信号）；差异告警
 - 收尾对账：cron 扫描刚过 end_at 的活动，触发最终对账——此时以 MySQL 为准对齐 Redis 库存（与每小时 cron 并存）
 

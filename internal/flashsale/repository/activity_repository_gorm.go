@@ -19,6 +19,10 @@ func NewGORMActivity(db *gorm.DB) *GORMActivityRepository {
 	return &GORMActivityRepository{db: db}
 }
 
+func (r *GORMActivityRepository) WithinTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
+	return r.db.WithContext(ctx).Transaction(fn)
+}
+
 func (r *GORMActivityRepository) Create(ctx context.Context, a *model.Activity) error {
 	return r.db.WithContext(ctx).Create(a).Error
 }
@@ -80,3 +84,4 @@ func (r *GORMActivityRepository) RestoreStock(ctx context.Context, tx *gorm.DB, 
 
 // 编译期断言：GORM 实现满足仓储接口。
 var _ ActivityRepository = (*GORMActivityRepository)(nil)
+var _ TxRunner = (*GORMActivityRepository)(nil)

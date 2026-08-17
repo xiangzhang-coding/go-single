@@ -9,6 +9,11 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 )
 
+// TxRunner 为 flashsale 跨模块应用编排开启共享数据库事务。
+type TxRunner interface {
+	WithinTx(ctx context.Context, fn func(tx *gorm.DB) error) error
+}
+
 // ActivityRepository 秒杀活动数据访问接口。
 type ActivityRepository interface {
 	Create(ctx context.Context, a *model.Activity) error
@@ -30,4 +35,5 @@ type ActivityRepository interface {
 // Store 聚合活动仓储，作为 service 的构造入参。
 type Store struct {
 	Activities ActivityRepository
+	Tx         TxRunner
 }

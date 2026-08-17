@@ -37,6 +37,6 @@ func main() {
 	fmt.Println("库存只扣 1 次:", repo.stock == 4)
 }
 
-// 项目位置：internal/flashsale/service/flashsale_consumer.go 的 Handle → order.CreateSeckill；
+// 项目位置：internal/flashsale/service/flashsale_consumer.go 的 Handle → order.CreateSeckillInTx；
 // 唯一键 uk_orders_user_activity_key（migrations/000014）+ 1062 映射（order_repository_gorm.go）
 // 使重复消费幂等；库存条件扣减保证不会二次扣。

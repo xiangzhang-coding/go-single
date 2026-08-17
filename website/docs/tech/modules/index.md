@@ -23,7 +23,7 @@ sidebar_position: 1
 
 - 模块间经 **service 接口进程内调用**（面向接口，非 HTTP），依赖方向无环（DAG，见 DESIGN 依赖图；仅秒杀落单走 MQ 异步）
 - 跨模块写经 **tx 参数汇入同一事务**（下单事务 = 订单 + 订单项 + 库存 + 地址快照 + 券核销 + 清购物车）
-- 跨模块端口按"**调用方声明最小接口**"组织：如 order 侧声明 `ActivityStock` / `SeckillRestore`，由 flashsale 实现（flashsale → order 单向依赖，无环）
+- 跨模块端口按"**调用方声明最小接口**"组织；跨模块事务由依赖上游编排，例如 flashsale 持有 order 的事务内最小接口来组合订单写入与活动库存变更，order 不反向持有 flashsale（单向依赖，无环）
 - admin 管理入口按模块内嵌（product/order/flashsale/coupon 的 admin 路由 + role 鉴权），不单独成模块
 - 权威源：`docs/DESIGN.md` 与各模块实现（`internal/`），本目录只放摘要与链接
 - 部署（本地 Nginx SSL / Cloudflare Pages / 后端平台选型）见 [docs/DEPLOYMENT.md](https://github.com/xiangzhang-coding/go-single/blob/main/docs/DEPLOYMENT.md) 与 [ADR-0005](https://github.com/xiangzhang-coding/go-single/blob/main/docs/adr/0005-backend-deploy-vps.md)

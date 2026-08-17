@@ -45,5 +45,5 @@ func main() {
 }
 
 // 项目位置：internal/order/service/order_service.go 的 createOrder（286-396）与
-// CreateSeckill（404-487）；跨模块写经 TxRunner.WithinTx 汇入同一事务
+// CreateSeckillInTx；跨模块写由 flashsale 消费者经 TxRunner.WithinTx 汇入同一事务
 // （internal/order/repository/order_repository.go）。

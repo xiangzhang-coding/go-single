@@ -198,7 +198,7 @@ func main() {
 
 ```
 
-**项目位置**：order 侧声明最小接口 `ActivityStock`/`SeckillRestore`（`internal/order/service/order_service.go:119-133`），由 flashsale 实现；`var _ Repository = (*GORMRepo)(nil)` 断言遍布各模块 repository；ADR-0003 记录该约定。
+**项目位置**：flashsale 消费者声明最小 `OrderService` 接口，由 order 实现，依赖保持 `flashsale → order` 单向；`var _ Repository = (*GORMRepo)(nil)` 断言遍布各模块 repository；ADR-0003 记录该约定。
 
 ## Q5. 结构体标签与 JSON 序列化
 
