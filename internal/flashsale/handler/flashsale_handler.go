@@ -1,5 +1,5 @@
 // Package handler 暴露 flashsale 模块的 HTTP 接口：admin 秒杀活动管理
-// （创建/编辑/列表/上架/下架）+ 用户抢购（限流 → 幂等键 → Lua 预扣 →
+// （创建/编辑/列表/上架/下架）+ 用户抢购（限流 → 幂等键 → 原子预扣 →
 // 发 MQ 异步落单 → 202 排队中 + order_no 供前端轮询）。
 package handler
 
@@ -140,7 +140,7 @@ func (h *Handler) UnpublishActivity(c *gin.Context) {
 }
 
 // Purchase 抢购：限流（全局令牌桶中间件 + 按用户 Redis 计数）→ 幂等键 →
-// Lua 原子预扣 → 发 MQ 异步落单；预扣成功立即返回 202"排队中"与订单号，
+// 缓存原子预扣 → 发 MQ 异步落单；预扣成功立即返回 202"排队中"与订单号，
 // 前端据此轮询 GET /api/orders/{order_no} 得知异步落单结果（T12）。
 func (h *Handler) Purchase(c *gin.Context) {
 	id, ok := idParam(c)

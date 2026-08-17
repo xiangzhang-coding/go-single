@@ -1,5 +1,5 @@
-// limiter 单元测试：令牌桶中间件（429 语义）+ RedisCounter（Lua 计数语义以
-// fake cache 模拟；真实 Redis 语义经 flashsale 集成测试覆盖）。
+// limiter 单元测试：令牌桶中间件（429 语义）+ RedisCounter（原子计数语义以
+// fake cache 模拟；真实 Redis 语义经 cache 适配器测试覆盖）。
 package limiter
 
 import (
@@ -13,11 +13,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
-
-	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 )
 
-// ---- fake cache（镜像 countScript 语义）----
+// ---- fake cache（镜像固定窗口原子计数语义）----
 
 type fakeCache struct {
 	mu   map[string]int
@@ -25,27 +23,17 @@ type fakeCache struct {
 	keys []string
 }
 
-func (f *fakeCache) Ping(context.Context) error { return nil }
-func (f *fakeCache) Close() error               { return nil }
-func (f *fakeCache) Get(context.Context, string) (string, error) {
-	return "", cache.ErrMiss
-}
-func (f *fakeCache) Set(context.Context, string, string, time.Duration) error {
-	return nil
-}
-func (f *fakeCache) Del(context.Context, string) error { return nil }
-
-func (f *fakeCache) Eval(_ context.Context, _ string, keys []string, args ...any) (int64, error) {
+func (f *fakeCache) IncrementFixedWindow(_ context.Context, key string, _ time.Duration) (int64, error) {
 	if f.err != nil {
 		return 0, f.err
 	}
-	f.keys = append(f.keys, keys[0])
-	if f.mu[keys[0]] == 0 {
-		f.mu[keys[0]] = 1
+	f.keys = append(f.keys, key)
+	if f.mu[key] == 0 {
+		f.mu[key] = 1
 	} else {
-		f.mu[keys[0]]++
+		f.mu[key]++
 	}
-	return int64(f.mu[keys[0]]), nil
+	return int64(f.mu[key]), nil
 }
 
 // ---- 令牌桶中间件 ----

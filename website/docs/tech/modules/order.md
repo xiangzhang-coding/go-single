@@ -78,8 +78,9 @@ admin（Bearer + admin）：
 ```text
 POST /api/orders {client_request_id, address_id, ...}
   [1] 参数校验（from_cart 与 items 互斥；直购同 SKU 多行合并，数量 1–99）
-  [2] 生成雪花订单号 + Redis 原子抢占幂等键 order:idem:{uid}:{crid}
-      （SETNX + TTL 15min；已存在 → 返回既有订单号，未落库则 202 轮询）
+  [2] 生成雪花订单号 + 类型化缓存能力 AcquireIdempotency 原子抢占
+      order:idem:{uid}:{crid}（内部 SETNX + TTL 15min；已存在 → 返回既有订单号，
+      未落库则 202 轮询）
   [3] 读地址（固化为快照）→ 组装订单项（购物车 LockItems / 直购）→ 校验券可用
   [4] 单事务：
         · 按 商品→SKU 固定顺序锁定并读取（GetSKUForUpdate），累计总额

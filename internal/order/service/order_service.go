@@ -73,15 +73,6 @@ func idemKey(userID int64, clientRequestID string) string {
 	return fmt.Sprintf("order:idem:%d:%s", userID, clientRequestID)
 }
 
-// idemScript 原子抢占幂等键（SETNX + EXPIRE）：返回 1 抢占成功 / 0 已存在。
-// KEYS[1] 幂等键；ARGV[1] 订单号；ARGV[2] TTL 秒。
-const idemScript = `
-if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
-    return 1
-end
-return 0
-`
-
 // ---- 跨模块最小接口（进程内调用，面向接口非 HTTP；实现见 main 装配） ----
 
 // ProductService 商品模块最小接口：下单读取 SKU/上架校验，
@@ -234,9 +225,15 @@ type lineSnapshot struct {
 	quantity  int
 }
 
+type idempotencyCache interface {
+	cache.IdempotencyStore
+	Get(ctx context.Context, key string) (string, error)
+	Del(ctx context.Context, key string) error
+}
+
 type orderService struct {
 	store repository.Store
-	cache cache.Cache
+	cache idempotencyCache
 	nos   OrderNoGenerator
 
 	products   ProductService
@@ -250,7 +247,7 @@ type orderService struct {
 }
 
 // New 构造订单服务；retryCfg 为下单重试配置（T20 有限重试；省略 = 不重试）。
-func New(store repository.Store, c cache.Cache, nos OrderNoGenerator,
+func New(store repository.Store, c idempotencyCache, nos OrderNoGenerator,
 	products ProductService, coupons CouponService, cart CartService, users UserService,
 	activities ActivityStock, seckill SeckillRestore, m *metrics.Business, retryCfg ...retry.Config) Service {
 	cfg := retry.OrDefault(retryCfg...)
@@ -534,12 +531,15 @@ func (s *orderService) acquireIdempotency(ctx context.Context, userID int64, cli
 	orderNo := strconv.FormatInt(no, 10)
 
 	key := idemKey(userID, clientRequestID)
-	code, err := s.cache.Eval(ctx, idemScript, []string{key}, orderNo, int64(idemTTL.Seconds()))
+	result, err := s.cache.AcquireIdempotency(ctx, key, orderNo, idemTTL)
 	if err != nil {
 		return "", false, fmt.Errorf("acquire idempotency key: %w", err)
 	}
-	if code == 1 {
+	if result == cache.IdempotencyAcquired {
 		return orderNo, true, nil
+	}
+	if result != cache.IdempotencyExists {
+		return "", false, fmt.Errorf("unexpected idempotency result: %d", result)
 	}
 	// 已存在：返回既有订单号（同一 client_request_id 复用同一订单）。
 	raw, err := s.cache.Get(ctx, key)

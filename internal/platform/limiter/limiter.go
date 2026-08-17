@@ -2,7 +2,7 @@
 //   - TokenBucket：进程内全局令牌桶中间件（golang.org/x/time/rate，QPS 可配，
 //     单实例；多实例替代方案 = Redis 分布式限流，见 BACKLOG）；
 //   - RedisCounter：基于 Redis INCR+TTL 的固定窗口计数限流（跨请求状态，
-//     如秒杀接口按用户限流；Lua 脚本封装在本包，业务模块只面向方法）。
+//     如秒杀接口按用户限流；原子实现由缓存适配器封装）。
 package limiter
 
 import (
@@ -57,24 +57,13 @@ type RedisCounterConfig struct {
 // 同一 key 在窗口内计数，超过 Max 拒绝。key 由调用方按业务约定提供。
 type RedisCounter struct {
 	cfg   RedisCounterConfig
-	cache cache.Cache
+	cache cache.FixedWindowStore
 }
 
 // NewRedisCounter 构造限流器；Max<=0 时 Allow 恒放行。
-func NewRedisCounter(c cache.Cache, cfg RedisCounterConfig) *RedisCounter {
+func NewRedisCounter(c cache.FixedWindowStore, cfg RedisCounterConfig) *RedisCounter {
 	return &RedisCounter{cfg: cfg, cache: c}
 }
-
-// countScript Lua 原子计数（固定窗口）：key 不存在则 SET 1 + EXPIRE
-// （窗口起点），已存在则 INCR。返回窗口内当前计数。
-// KEYS[1] 计数 key；ARGV[1] 窗口秒数。
-const countScript = `
-if redis.call('EXISTS', KEYS[1]) == 0 then
-    redis.call('SET', KEYS[1], 1, 'EX', ARGV[1])
-    return 1
-end
-return redis.call('INCR', KEYS[1])
-`
 
 // Allow 计数一次并判定放行：窗口内计数未超上限返回 true；
 // 超过上限返回 false（计数不回落，由 TTL 自清理，与 Lua 预扣同"只增不删"原则）。
@@ -83,7 +72,7 @@ func (r *RedisCounter) Allow(ctx context.Context, key string) (bool, error) {
 	if r.cfg.Max <= 0 || r.cfg.Window <= 0 {
 		return true, nil
 	}
-	n, err := r.cache.Eval(ctx, countScript, []string{key}, int(r.cfg.Window.Seconds()))
+	n, err := r.cache.IncrementFixedWindow(ctx, key, r.cfg.Window)
 	if err != nil {
 		return false, err
 	}

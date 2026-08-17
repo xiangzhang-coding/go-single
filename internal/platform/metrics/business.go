@@ -45,7 +45,7 @@ func (r *Registry) Business() *Business {
 	b := &Business{
 		seckillPreDeduct: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "seckill_prededuct_total",
-			Help: "秒杀 Lua 原子预扣次数，按 result（success/fail）分桶；失败含业务拒绝与基础设施故障",
+			Help: "秒杀原子预扣次数，按 result（success/fail）分桶；失败含业务拒绝与基础设施故障",
 		}, []string{"result"}),
 		seckillStock: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "seckill_stock_remaining",

@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// 内存版 SETNX + EXPIRE（对应项目 idemScript）。
+// 内存版 SETNX + EXPIRE（对应项目 cache.AcquireIdempotency 类型化能力）。
 type idemStore struct {
 	mu   sync.Mutex
 	keys map[string]bool
@@ -50,6 +50,6 @@ func main() {
 	_ = errors.New("unused")
 }
 
-// 项目位置：internal/flashsale/service/flashsale_service.go 的 idemScript（SETNX+EX 30min）
-// 与 isBusinessReject——业务拒绝释放、基础设施失败保留（防瞬时故障重复预扣）；
+// 项目位置：internal/platform/cache/atomic.go 的 AcquireIdempotency；
+// flashsale service 的 isBusinessReject 管理业务拒绝释放、基础设施失败保留；
 // 订单创建幂等键同理（order:idem:{user}:{client_request_id}，TTL 15min）。

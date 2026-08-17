@@ -1,0 +1,464 @@
+package cache
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/xiangzhang-coding/go-single/internal/testsupport"
+)
+
+func newAtomicRedis(t *testing.T) Client {
+	t.Helper()
+	c, err := NewRedis("127.0.0.1:6379", "", 15)
+	testsupport.RequireDependency(t, "Redis", err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+	return c
+}
+
+func atomicTestKey(t *testing.T, suffix string) string {
+	t.Helper()
+	return fmt.Sprintf("cache_test:atomic:%d:%s", time.Now().UnixNano(), suffix)
+}
+
+func TestAcquireIdempotency(t *testing.T) {
+	c := newAtomicRedis(t)
+	ctx := context.Background()
+	key := atomicTestKey(t, "idem")
+	t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), key)) })
+
+	result, err := c.AcquireIdempotency(ctx, key, "order-1", 30*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, IdempotencyAcquired, result)
+
+	value, err := c.Get(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, "order-1", value)
+
+	ttl, err := c.(*redisCache).client.TTL(ctx, key).Result()
+	require.NoError(t, err)
+	require.Greater(t, ttl, 28*time.Second)
+	require.LessOrEqual(t, ttl, 30*time.Second)
+
+	result, err = c.AcquireIdempotency(ctx, key, "order-2", time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, IdempotencyExists, result)
+	value, err = c.Get(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, "order-1", value, "重复抢占不得覆盖原值")
+}
+
+func TestAcquireIdempotencyPropagatesRedisError(t *testing.T) {
+	c := newAtomicRedis(t)
+	key := atomicTestKey(t, "idem-error")
+	t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), key)) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := c.AcquireIdempotency(ctx, key, "order-1", time.Minute)
+	require.ErrorIs(t, err, context.Canceled)
+
+	_, err = c.Get(context.Background(), key)
+	require.ErrorIs(t, err, ErrMiss, "失败的抢占不得留下幂等键")
+}
+
+func TestClaimCouponResultsAndState(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name          string
+		seedClaimed   string
+		seedPerUser   string
+		mutate        func(*CouponClaimParams)
+		want          CouponClaimResult
+		wantClaimed   string
+		wantPerUser   string
+		claimedExists bool
+		perUserExists bool
+	}{
+		{
+			name: "claimed", want: CouponClaimed,
+			wantClaimed: "1", wantPerUser: "1", claimedExists: true, perUserExists: true,
+		},
+		{
+			name: "sold out", seedClaimed: "2", want: CouponSoldOut,
+			wantClaimed: "2", claimedExists: true,
+		},
+		{
+			name: "not in window", want: CouponNotInWindow,
+			mutate: func(p *CouponClaimParams) {
+				p.ValidFrom = now.Add(time.Minute)
+				p.ValidUntil = now.Add(time.Hour)
+			},
+		},
+		{
+			name: "limit reached", seedPerUser: "1", want: CouponLimitReached,
+			wantPerUser: "1", perUserExists: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newAtomicRedis(t)
+			claimedKey := atomicTestKey(t, "coupon-claimed")
+			perUserKey := atomicTestKey(t, "coupon-per-user")
+			t.Cleanup(func() {
+				require.NoError(t, c.Del(context.Background(), claimedKey))
+				require.NoError(t, c.Del(context.Background(), perUserKey))
+			})
+			if tc.seedClaimed != "" {
+				require.NoError(t, c.Set(context.Background(), claimedKey, tc.seedClaimed, 0))
+			}
+			if tc.seedPerUser != "" {
+				require.NoError(t, c.Set(context.Background(), perUserKey, tc.seedPerUser, 0))
+			}
+
+			params := CouponClaimParams{
+				ClaimedKey: claimedKey, PerUserKey: perUserKey,
+				Now: now, Total: 2, ValidFrom: now.Add(-time.Minute),
+				ValidUntil: now.Add(time.Hour), PerUserLimit: 1,
+			}
+			if tc.mutate != nil {
+				tc.mutate(&params)
+			}
+			result, err := c.ClaimCoupon(context.Background(), params)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, result)
+			requireCacheState(t, c, claimedKey, tc.wantClaimed, tc.claimedExists)
+			requireCacheState(t, c, perUserKey, tc.wantPerUser, tc.perUserExists)
+		})
+	}
+}
+
+func TestClaimCouponPropagatesRedisError(t *testing.T) {
+	c := newAtomicRedis(t)
+	claimedKey := atomicTestKey(t, "coupon-error-claimed")
+	perUserKey := atomicTestKey(t, "coupon-error-per-user")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), claimedKey))
+		require.NoError(t, c.Del(context.Background(), perUserKey))
+	})
+
+	now := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := c.ClaimCoupon(ctx, CouponClaimParams{
+		ClaimedKey: claimedKey, PerUserKey: perUserKey,
+		Now: now, Total: 2, ValidFrom: now.Add(-time.Minute),
+		ValidUntil: now.Add(time.Hour), PerUserLimit: 1,
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	requireCacheState(t, c, claimedKey, "", false)
+	requireCacheState(t, c, perUserKey, "", false)
+}
+
+func TestWarmFlashSaleStockResultsAndTTL(t *testing.T) {
+	tests := []struct {
+		name      string
+		seed      string
+		seedTTL   time.Duration
+		stock     int
+		ttl       time.Duration
+		want      FlashSaleWarmResult
+		wantStock string
+		minTTL    time.Duration
+		maxTTL    time.Duration
+	}{
+		{
+			name: "missing stock is warmed", stock: 10, ttl: 30 * time.Second,
+			want: FlashSaleStockUpdated, wantStock: "10", minTTL: 28 * time.Second, maxTTL: 30 * time.Second,
+		},
+		{
+			name: "lower live stock is retained", seed: "4", seedTTL: 2 * time.Minute,
+			stock: 10, ttl: 30 * time.Second, want: FlashSaleStockRetained,
+			wantStock: "4", minTTL: 110 * time.Second, maxTTL: 2 * time.Minute,
+		},
+		{
+			name: "configured decrease replaces live stock", seed: "20", seedTTL: 2 * time.Minute,
+			stock: 10, ttl: 30 * time.Second, want: FlashSaleStockUpdated,
+			wantStock: "10", minTTL: 28 * time.Second, maxTTL: 30 * time.Second,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newAtomicRedis(t)
+			key := atomicTestKey(t, "flashsale-warm")
+			t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), key)) })
+			if tc.seed != "" {
+				require.NoError(t, c.Set(context.Background(), key, tc.seed, tc.seedTTL))
+			}
+
+			result, err := c.WarmFlashSaleStock(context.Background(), FlashSaleWarmParams{
+				StockKey: key, Stock: tc.stock, TTL: tc.ttl,
+			})
+			require.NoError(t, err)
+			require.Equal(t, tc.want, result)
+			requireCacheState(t, c, key, tc.wantStock, true)
+
+			ttl, err := c.(*redisCache).client.TTL(context.Background(), key).Result()
+			require.NoError(t, err)
+			require.Greater(t, ttl, tc.minTTL)
+			require.LessOrEqual(t, ttl, tc.maxTTL)
+		})
+	}
+}
+
+func TestWarmFlashSaleStockPropagatesRedisError(t *testing.T) {
+	c := newAtomicRedis(t)
+	key := atomicTestKey(t, "flashsale-warm-error")
+	t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), key)) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := c.WarmFlashSaleStock(ctx, FlashSaleWarmParams{StockKey: key, Stock: 10, TTL: time.Minute})
+	require.ErrorIs(t, err, context.Canceled)
+	requireCacheState(t, c, key, "", false)
+}
+
+func TestPreDeductFlashSaleResultsAndState(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name      string
+		stock     int
+		count     int
+		mutate    func(*FlashSalePreDeductParams)
+		want      FlashSalePreDeductResult
+		wantStock int
+		wantCount int
+	}{
+		{name: "deducted", stock: 5, want: FlashSalePreDeducted, wantStock: 4, wantCount: 1},
+		{
+			name: "sold out", stock: 0, want: FlashSaleSoldOut,
+			wantStock: 0, wantCount: 0,
+		},
+		{
+			name: "not in window", stock: 5, want: FlashSaleNotInWindow,
+			wantStock: 5, wantCount: 0,
+			mutate: func(p *FlashSalePreDeductParams) {
+				p.StartAt = now.Add(time.Minute)
+				p.EndAt = now.Add(time.Hour)
+			},
+		},
+		{
+			name: "limit reached", stock: 5, count: 2, want: FlashSaleLimitReached,
+			wantStock: 5, wantCount: 2,
+		},
+		{
+			name: "offline", stock: 5, want: FlashSaleOffline,
+			wantStock: 5, wantCount: 0,
+			mutate: func(p *FlashSalePreDeductParams) { p.Status = "off_sale" },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newAtomicRedis(t)
+			stockKey := atomicTestKey(t, "flashsale-stock")
+			countKey := atomicTestKey(t, "flashsale-count")
+			t.Cleanup(func() {
+				require.NoError(t, c.Del(context.Background(), stockKey))
+				require.NoError(t, c.Del(context.Background(), countKey))
+			})
+			require.NoError(t, c.Set(context.Background(), stockKey, fmt.Sprint(tc.stock), 0))
+			if tc.count > 0 {
+				require.NoError(t, c.Set(context.Background(), countKey, fmt.Sprint(tc.count), 0))
+			}
+
+			params := FlashSalePreDeductParams{
+				StockKey: stockKey, CountKey: countKey, Now: now,
+				StartAt: now.Add(-time.Minute), EndAt: now.Add(time.Hour),
+				Status: "on_sale", PerUserLimit: 2,
+			}
+			if tc.mutate != nil {
+				tc.mutate(&params)
+			}
+			result, err := c.PreDeductFlashSale(context.Background(), params)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, result)
+			requireCacheState(t, c, stockKey, fmt.Sprint(tc.wantStock), true)
+			if tc.wantCount == 0 {
+				requireCacheState(t, c, countKey, "", false)
+			} else {
+				requireCacheState(t, c, countKey, fmt.Sprint(tc.wantCount), true)
+			}
+		})
+	}
+}
+
+func TestPreDeductFlashSaleIsAtomicUnderContention(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-concurrent-stock")
+	t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), stockKey)) })
+	require.NoError(t, c.Set(context.Background(), stockKey, "5", 0))
+
+	now := time.Now()
+	results := make([]FlashSalePreDeductResult, 20)
+	errs := make([]error, 20)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			countKey := atomicTestKey(t, fmt.Sprintf("flashsale-concurrent-count-%d", i))
+			t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), countKey)) })
+			results[i], errs[i] = c.PreDeductFlashSale(context.Background(), FlashSalePreDeductParams{
+				StockKey: stockKey, CountKey: countKey, Now: now,
+				StartAt: now.Add(-time.Minute), EndAt: now.Add(time.Hour),
+				Status: "on_sale", PerUserLimit: 1,
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	deducted := 0
+	for i, err := range errs {
+		require.NoError(t, err)
+		if results[i] == FlashSalePreDeducted {
+			deducted++
+		} else {
+			require.Equal(t, FlashSaleSoldOut, results[i])
+		}
+	}
+	require.Equal(t, 5, deducted)
+	requireCacheState(t, c, stockKey, "0", true)
+}
+
+func TestPreDeductFlashSalePropagatesRedisError(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-deduct-error-stock")
+	countKey := atomicTestKey(t, "flashsale-deduct-error-count")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), stockKey))
+		require.NoError(t, c.Del(context.Background(), countKey))
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "5", 0))
+
+	now := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := c.PreDeductFlashSale(ctx, FlashSalePreDeductParams{
+		StockKey: stockKey, CountKey: countKey, Now: now,
+		StartAt: now.Add(-time.Minute), EndAt: now.Add(time.Hour),
+		Status: "on_sale", PerUserLimit: 1,
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	requireCacheState(t, c, stockKey, "5", true)
+	requireCacheState(t, c, countKey, "", false)
+}
+
+func TestRestoreFlashSaleState(t *testing.T) {
+	tests := []struct {
+		name        string
+		seedStock   bool
+		seedCount   bool
+		wantStock   string
+		wantCount   string
+		stockExists bool
+		countExists bool
+	}{
+		{name: "all state", seedStock: true, seedCount: true, wantStock: "10", wantCount: "0", stockExists: true, countExists: true},
+		{name: "missing stock", seedCount: true, wantCount: "0", countExists: true},
+		{name: "missing count", seedStock: true, wantStock: "10", stockExists: true},
+		{name: "missing stock and count"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newAtomicRedis(t)
+			stockKey := atomicTestKey(t, "flashsale-restore-stock")
+			countKey := atomicTestKey(t, "flashsale-restore-count")
+			idemKey := atomicTestKey(t, "flashsale-restore-idem")
+			t.Cleanup(func() {
+				require.NoError(t, c.Del(context.Background(), stockKey))
+				require.NoError(t, c.Del(context.Background(), countKey))
+				require.NoError(t, c.Del(context.Background(), idemKey))
+			})
+			if tc.seedStock {
+				require.NoError(t, c.Set(context.Background(), stockKey, "8", 0))
+			}
+			if tc.seedCount {
+				require.NoError(t, c.Set(context.Background(), countKey, "2", 0))
+			}
+			require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
+
+			err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+				StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
+			})
+			require.NoError(t, err)
+			requireCacheState(t, c, stockKey, tc.wantStock, tc.stockExists)
+			requireCacheState(t, c, countKey, tc.wantCount, tc.countExists)
+			requireCacheState(t, c, idemKey, "", false)
+		})
+	}
+}
+
+func TestRestoreFlashSalePropagatesRedisError(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-restore-error-stock")
+	countKey := atomicTestKey(t, "flashsale-restore-error-count")
+	idemKey := atomicTestKey(t, "flashsale-restore-error-idem")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), stockKey))
+		require.NoError(t, c.Del(context.Background(), countKey))
+		require.NoError(t, c.Del(context.Background(), idemKey))
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "8", 0))
+	require.NoError(t, c.Set(context.Background(), countKey, "2", 0))
+	require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := c.RestoreFlashSale(ctx, FlashSaleRestoreParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	requireCacheState(t, c, stockKey, "8", true)
+	requireCacheState(t, c, countKey, "2", true)
+	requireCacheState(t, c, idemKey, "1", true)
+}
+
+func TestIncrementFixedWindow(t *testing.T) {
+	c := newAtomicRedis(t)
+	key := atomicTestKey(t, "fixed-window")
+	t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), key)) })
+
+	count, err := c.IncrementFixedWindow(context.Background(), key, 30*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
+
+	firstTTL, err := c.(*redisCache).client.TTL(context.Background(), key).Result()
+	require.NoError(t, err)
+	count, err = c.IncrementFixedWindow(context.Background(), key, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), count)
+	secondTTL, err := c.(*redisCache).client.TTL(context.Background(), key).Result()
+	require.NoError(t, err)
+	require.LessOrEqual(t, secondTTL, firstTTL, "后续计数不得重置固定窗口")
+}
+
+func TestIncrementFixedWindowPropagatesRedisError(t *testing.T) {
+	c := newAtomicRedis(t)
+	key := atomicTestKey(t, "fixed-window-error")
+	t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), key)) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := c.IncrementFixedWindow(ctx, key, time.Minute)
+	require.ErrorIs(t, err, context.Canceled)
+	requireCacheState(t, c, key, "", false)
+}
+
+func requireCacheState(t *testing.T, c Cache, key, want string, exists bool) {
+	t.Helper()
+	got, err := c.Get(context.Background(), key)
+	if !exists {
+		require.ErrorIs(t, err, ErrMiss)
+		return
+	}
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+}

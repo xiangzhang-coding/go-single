@@ -146,12 +146,14 @@ func buildEnv() (*testEnv, error) {
 
 type noopCache struct{}
 
-func (noopCache) Ping(context.Context) error                                    { return nil }
-func (noopCache) Close() error                                                  { return nil }
-func (noopCache) Get(context.Context, string) (string, error)                   { return "", cache.ErrMiss }
-func (noopCache) Set(context.Context, string, string, time.Duration) error      { return nil }
-func (noopCache) Del(context.Context, string) error                             { return nil }
-func (noopCache) Eval(context.Context, string, []string, ...any) (int64, error) { return 0, nil }
+func (noopCache) Ping(context.Context) error                               { return nil }
+func (noopCache) Close() error                                             { return nil }
+func (noopCache) Get(context.Context, string) (string, error)              { return "", cache.ErrMiss }
+func (noopCache) Set(context.Context, string, string, time.Duration) error { return nil }
+func (noopCache) Del(context.Context, string) error                        { return nil }
+func (noopCache) AcquireIdempotency(context.Context, string, string, time.Duration) (cache.IdempotencyResult, error) {
+	return cache.IdempotencyAcquired, nil
+}
 
 type stubOrderNoGen struct{}
 

@@ -265,20 +265,17 @@ func (f *fakeIdemCache) Del(_ context.Context, key string) error {
 	return nil
 }
 
-// Eval 镜像 idemScript：SETNX（键不存在才写入）+ EX。
-func (f *fakeIdemCache) Eval(_ context.Context, _ string, keys []string, args ...any) (int64, error) {
+func (f *fakeIdemCache) AcquireIdempotency(_ context.Context, key, value string, ttl time.Duration) (cache.IdempotencyResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return 0, f.err
 	}
-	if _, exists := f.keys[keys[0]]; exists {
-		return 0, nil
+	if _, exists := f.keys[key]; exists {
+		return cache.IdempotencyExists, nil
 	}
-	value := args[0].(string)
-	ttl := time.Duration(args[1].(int64)) * time.Second
-	f.keys[keys[0]] = idemEntry{value: value, exp: time.Now().Add(ttl)}
-	return 1, nil
+	f.keys[key] = idemEntry{value: value, exp: time.Now().Add(ttl)}
+	return cache.IdempotencyAcquired, nil
 }
 
 // ---- fake 跨模块服务 ----
@@ -698,6 +695,16 @@ func TestCreateIdempotentInFlight(t *testing.T) {
 	require.True(t, res.Processing)
 	require.Empty(t, res.Order.Status, "订单尚未落库时不能伪装为待支付成功")
 	require.Equal(t, "12345", res.Order.OrderNo)
+}
+
+func TestCreatePropagatesIdempotencyCacheError(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.cache.err = context.DeadlineExceeded
+
+	_, err := fx.svc.Create(context.Background(), 42, fx.directParams("redis-error", 1, 1))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Empty(t, fx.orders.byID)
 }
 
 // 幂等键随下单失败释放：库存不足修正后可重试。

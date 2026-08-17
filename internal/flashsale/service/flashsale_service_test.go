@@ -1,5 +1,5 @@
 // service 层单元测试（中间 seam）：fake 活动仓储 + fake product 服务 + fake 缓存
-// （Lua 语义在 Go 内以互斥锁模拟原子执行），覆盖活动校验、SKU 校验、
+// （类型化原子能力在 Go 内以互斥锁模拟），覆盖活动校验、SKU 校验、
 // 上架预热（未开始覆盖/进行中只减不增）、下架清除与预扣拒绝、预扣各失败分支。
 package service
 
@@ -9,7 +9,6 @@ import (
 	"errors"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -124,7 +123,7 @@ func (f *fakeProducts) GetProduct(_ context.Context, id int64) (*productmodel.Pr
 	return nil, productsvc.ErrProductNotFound
 }
 
-// ---- fake 缓存（互斥锁模拟 Lua 原子预扣）----
+// ---- fake 缓存（互斥锁模拟类型化原子缓存能力）----
 
 type fakeCache struct {
 	mu    sync.Mutex
@@ -133,7 +132,7 @@ type fakeCache struct {
 	idem  map[string]bool // flashsale:idem:{id}:{user} → 幂等键
 	rl    map[string]int  // flashsale:rl:{user} → 限流计数
 	err   error
-	// deductErr 仅作用于 preDeductScript（模拟预扣时基础设施故障）。
+	// deductErr 仅作用于预扣能力（模拟预扣时基础设施故障）。
 	deductErr error
 }
 
@@ -184,68 +183,82 @@ func (f *fakeCache) Del(_ context.Context, key string) error {
 	return nil
 }
 
-// Eval 按 key 前缀与 ARGV 数量区分脚本并镜像其判定顺序
-// （加锁模拟单线程原子执行）：
-//   - flashsale:idem: → idemScript（SETNX + EXPIRE）；
-//   - flashsale:rl: → countScript（固定窗口计数 INCR）；
-//   - 3 个 key = restoreScript：库存 INCR + 用户计数 DECR + 释放幂等键；
-//   - 2 参 = prewarmScript：key 缺失写入；配置库存更低才覆盖（只减不增）；
-//   - 5 参 = preDeductScript：status → 时间窗口 → 库存 → 每人限购 → DECR + INCR。
-func (f *fakeCache) Eval(_ context.Context, _ string, keys []string, args ...any) (int64, error) {
+func (f *fakeCache) AcquireIdempotency(_ context.Context, key, _ string, _ time.Duration) (cache.IdempotencyResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return 0, f.err
 	}
-	switch {
-	case strings.HasPrefix(keys[0], "flashsale:idem:"):
-		if f.idem[keys[0]] {
-			return 0, nil
-		}
-		f.idem[keys[0]] = true
-		return 1, nil
-	case strings.HasPrefix(keys[0], "flashsale:rl:"):
-		f.rl[keys[0]]++
-		return int64(f.rl[keys[0]]), nil
-	case len(keys) == 3:
-		// restoreScript：镜像 EXISTS 守卫（key 缺失不重建）。
-		qty := args[0].(int)
-		if _, ok := f.stock[keys[0]]; ok {
-			f.stock[keys[0]] += qty
-		}
-		if _, ok := f.count[keys[1]]; ok {
-			f.count[keys[1]] -= qty
-		}
-		delete(f.idem, keys[2])
-		return 1, nil
-	case len(args) == 2:
-		stock := args[0].(int)
-		if cur, ok := f.stock[keys[0]]; !ok || stock < cur {
-			f.stock[keys[0]] = stock
-			return 1, nil
-		}
-		return 0, nil
+	if f.idem[key] {
+		return cache.IdempotencyExists, nil
+	}
+	f.idem[key] = true
+	return cache.IdempotencyAcquired, nil
+}
+
+func (f *fakeCache) IncrementFixedWindow(_ context.Context, key string, _ time.Duration) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	f.rl[key]++
+	return int64(f.rl[key]), nil
+}
+
+func (f *fakeCache) WarmFlashSaleStock(_ context.Context, p cache.FlashSaleWarmParams) (cache.FlashSaleWarmResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	if cur, ok := f.stock[p.StockKey]; !ok || p.Stock < cur {
+		f.stock[p.StockKey] = p.Stock
+		return cache.FlashSaleStockUpdated, nil
+	}
+	return cache.FlashSaleStockRetained, nil
+}
+
+func (f *fakeCache) PreDeductFlashSale(_ context.Context, p cache.FlashSalePreDeductParams) (cache.FlashSalePreDeductResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
 	}
 	if f.deductErr != nil {
 		return 0, f.deductErr
 	}
-	now, startAt, endAt := args[0].(int64), args[1].(int64), args[2].(int64)
-	status, perUserLimit := args[3].(string), args[4].(int)
-	if status != model.ActivityStatusOnSale {
-		return preDeductOffline, nil
+	if p.Status != model.ActivityStatusOnSale {
+		return cache.FlashSaleOffline, nil
 	}
-	if now < startAt || now > endAt {
-		return preDeductNotInWindow, nil
+	if p.Now.Before(p.StartAt) || p.Now.After(p.EndAt) {
+		return cache.FlashSaleNotInWindow, nil
 	}
-	if f.stock[keys[0]] <= 0 {
-		return preDeductSoldOut, nil
+	if f.stock[p.StockKey] <= 0 {
+		return cache.FlashSaleSoldOut, nil
 	}
-	if f.count[keys[1]] >= perUserLimit {
-		return preDeductLimitReach, nil
+	if f.count[p.CountKey] >= p.PerUserLimit {
+		return cache.FlashSaleLimitReached, nil
 	}
-	f.stock[keys[0]]--
-	f.count[keys[1]]++
-	return preDeductOK, nil
+	f.stock[p.StockKey]--
+	f.count[p.CountKey]++
+	return cache.FlashSalePreDeducted, nil
+}
+
+func (f *fakeCache) RestoreFlashSale(_ context.Context, p cache.FlashSaleRestoreParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if _, ok := f.stock[p.StockKey]; ok {
+		f.stock[p.StockKey] += p.Quantity
+	}
+	if _, ok := f.count[p.CountKey]; ok {
+		f.count[p.CountKey] -= p.Quantity
+	}
+	delete(f.idem, p.IdempotencyKey)
+	return nil
 }
 
 // ---- 辅助 ----
@@ -440,6 +453,18 @@ func TestPublishInProgressKeepsExisting(t *testing.T) {
 
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	require.Equal(t, 42, fx.cache.stock[stockKey(a.ID)])
+}
+
+func TestPublishPropagatesWarmCacheError(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	fx.cache.err = context.DeadlineExceeded
+
+	err := fx.svc.PublishActivity(context.Background(), a.ID)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	updated, getErr := fx.acts.GetByID(context.Background(), a.ID)
+	require.NoError(t, getErr)
+	require.Equal(t, model.ActivityStatusOffSale, updated.Status, "预热失败时活动不得上架")
 }
 
 // 已结束的活动不可上架。
@@ -655,7 +680,7 @@ func TestPreDeductFailures(t *testing.T) {
 	require.ErrorIs(t, fx.svc.PreDeduct(context.Background(), 1, 999), ErrActivityNotFound)
 }
 
-// 并发预扣不超卖：互斥锁模拟 Lua 原子性，20 用户抢 5 库存恰好 5 成功。
+// 并发预扣不超卖：互斥锁模拟缓存原子性，20 用户抢 5 库存恰好 5 成功。
 func TestPreDeductConcurrentNoOversell(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, func(p *ActivityParams) { p.Stock = 5 })
@@ -718,7 +743,7 @@ func TestListActivities(t *testing.T) {
 	require.Equal(t, model.ActivityStateEnded, stateByID[ended.ID])
 }
 
-// ---- 抢购（T11：限流 → 幂等键 → Lua 预扣）----
+// ---- 抢购（T11：限流 → 幂等键 → 原子预扣）----
 
 // 抢购成功（T12）：返回订单号，且"抢购成功"消息已发布到异步落单队列
 // （消息体 = order_no/user_id/activity_id，供消费者落单、前端轮询）。
@@ -836,6 +861,18 @@ func TestSeckillDuplicateBlocked(t *testing.T) {
 	a2 := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a2.ID))
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a2.ID))
+}
+
+func TestSeckillPropagatesIdempotencyCacheError(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.cache.err = context.DeadlineExceeded
+
+	err := discardSeckill(fx.svc, context.Background(), 7, a.ID)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.False(t, fx.cache.idem[idemKey(a.ID, 7)])
+	require.Equal(t, 100, fx.cache.stock[stockKey(a.ID)], "幂等抢占失败不得预扣")
 }
 
 // 按用户限流：窗口内超过 Max 次请求被拒（429 语义），且不触碰幂等键与库存。

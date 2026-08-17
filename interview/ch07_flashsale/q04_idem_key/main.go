@@ -18,6 +18,6 @@ func main() {
 	fmt.Println("对比：下单幂等键 order:idem:{user}:{client_request_id} TTL 15min")
 }
 
-// 项目位置：internal/flashsale/service/flashsale_service.go 的 Seckill（473-480 抢占、
-// isBusinessReject 529-533 释放）；订单侧幂等键 order_service.go 72-83；
-// restoreScript 在回补时 DEL 幂等键，允许取消后再次抢购。
+// 项目位置：flashsale service 的 Seckill 抢占、isBusinessReject 释放；
+// internal/platform/cache/atomic.go 的 AcquireIdempotency / RestoreFlashSale
+// 封装 SETNX 与回补时 DEL，允许取消后再次抢购。

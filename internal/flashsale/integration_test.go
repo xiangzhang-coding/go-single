@@ -60,7 +60,7 @@ type testEnv struct {
 	verifier       auth.TokenVerifier
 	gdb            *gorm.DB
 	redis          *redis.Client
-	cacheClient    cache.Cache
+	cacheClient    cache.Client
 	productSvc     productsvc.Service
 	userHandler    *userhandler.Handler
 	productHandler *producthandler.Handler

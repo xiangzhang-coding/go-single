@@ -14,7 +14,7 @@ type redisCache struct {
 }
 
 // NewRedis 创建 go-redis 实现并验证连通性。
-func NewRedis(addr, password string, db int) (Cache, error) {
+func NewRedis(addr, password string, db int) (Client, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: password,
@@ -56,7 +56,7 @@ func (r *redisCache) Close() error {
 	return r.client.Close()
 }
 
-func (r *redisCache) Eval(ctx context.Context, script string, keys []string, args ...any) (int64, error) {
+func (r *redisCache) evalInt(ctx context.Context, script string, keys []string, args ...any) (int64, error) {
 	v, err := r.client.Eval(ctx, script, keys, args...).Result()
 	if err != nil {
 		return 0, err

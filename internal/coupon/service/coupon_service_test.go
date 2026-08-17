@@ -1,4 +1,4 @@
-// service 层单元测试（中间 seam）：fake 仓储 + fake 缓存（Lua 逻辑在 Go 内以互斥锁模拟原子），
+// service 层单元测试（中间 seam）：fake 仓储 + fake 类型化缓存（互斥锁模拟原子），
 // 覆盖模板校验、领券各失败分支、并发不超发（总量/每人限领）、列表状态派生。
 package service
 
@@ -216,7 +216,7 @@ func slicePage[T any](in []T, offset, limit int) []T {
 	return in[offset:end]
 }
 
-// ---- fake 缓存（互斥锁模拟 Lua 原子性）----
+// ---- fake 类型化缓存（互斥锁模拟原子性）----
 
 type fakeClaimCache struct {
 	mu      sync.Mutex
@@ -237,27 +237,24 @@ func (f *fakeClaimCache) Get(context.Context, string) (string, error) {
 func (f *fakeClaimCache) Set(context.Context, string, string, time.Duration) error { return nil }
 func (f *fakeClaimCache) Del(context.Context, string) error                        { return nil }
 
-// Eval 镜像 claimScript 的判定顺序（加锁模拟单线程原子执行）。
-func (f *fakeClaimCache) Eval(_ context.Context, _ string, keys []string, args ...any) (int64, error) {
+func (f *fakeClaimCache) ClaimCoupon(_ context.Context, p cache.CouponClaimParams) (cache.CouponClaimResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return 0, f.err
 	}
-	now, total, validFrom, validUntil, perUser :=
-		args[0].(int64), args[1].(int), args[2].(int64), args[3].(int64), args[4].(int)
-	if now < validFrom || now > validUntil {
-		return claimNotInWindow, nil
+	if p.Now.Before(p.ValidFrom) || p.Now.After(p.ValidUntil) {
+		return cache.CouponNotInWindow, nil
 	}
-	if f.claimed[keys[0]] >= total {
-		return claimSoldOut, nil
+	if f.claimed[p.ClaimedKey] >= p.Total {
+		return cache.CouponSoldOut, nil
 	}
-	if f.perUser[keys[1]] >= perUser {
-		return claimLimitReach, nil
+	if f.perUser[p.PerUserKey] >= p.PerUserLimit {
+		return cache.CouponLimitReached, nil
 	}
-	f.claimed[keys[0]]++
-	f.perUser[keys[1]]++
-	return claimOK, nil
+	f.claimed[p.ClaimedKey]++
+	f.perUser[p.PerUserKey]++
+	return cache.CouponClaimed, nil
 }
 
 // ---- 测试夹具 ----
@@ -436,7 +433,7 @@ func TestClaimFailures(t *testing.T) {
 	})
 }
 
-// 并发领券不超发：总量与每人限领均原子强制（fake 缓存以锁模拟 Lua 原子性）。
+// 并发领券不超发：总量与每人限领均原子强制（fake 缓存以锁模拟原子性）。
 func TestClaimConcurrentNotOversell(t *testing.T) {
 	const (
 		workers = 20

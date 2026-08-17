@@ -1,5 +1,5 @@
 // Package service 承载 coupon 模块业务：admin 发布券模板，
-// 用户浏览可领券并领取（Lua 原子防超发），查看我的券（未用/已用/过期派生）。
+// 用户浏览可领券并领取（缓存原子能力防超发），查看我的券（未用/已用/过期派生）。
 package service
 
 import (
@@ -47,37 +47,6 @@ func perUserKey(templateID, userID int64) string {
 	return fmt.Sprintf("coupon:peruser:%d:%d", templateID, userID)
 }
 
-// claimScript Lua 原子领券（学习点，复用秒杀 Lua 模式防超发）：
-// 校验有效期窗口 → 检查总量 → 检查每人限领 → 双计数 INCR。
-// 返回码：1 成功 / 0 已抢光 / -1 不在有效期 / -2 超过每人限领。
-// KEYS[1] 总量计数；KEYS[2] 每人限领计数。
-// ARGV[1] 当前时间(ms)；ARGV[2] 总量；ARGV[3] 开始时间(ms)；
-// ARGV[4] 结束时间(ms)；ARGV[5] 每人限领。
-const claimScript = `
-if ARGV[1] < ARGV[3] or ARGV[1] > ARGV[4] then
-    return -1
-end
-local claimed = tonumber(redis.call('GET', KEYS[1]) or '0')
-if claimed >= tonumber(ARGV[2]) then
-    return 0
-end
-local per_user = tonumber(redis.call('GET', KEYS[2]) or '0')
-if per_user >= tonumber(ARGV[5]) then
-    return -2
-end
-redis.call('INCR', KEYS[1])
-redis.call('INCR', KEYS[2])
-return 1
-`
-
-// 领券脚本返回码。
-const (
-	claimOK          int64 = 1
-	claimSoldOut     int64 = 0
-	claimNotInWindow int64 = -1
-	claimLimitReach  int64 = -2
-)
-
 // TemplateParams 券模板参数（创建/编辑共用）。
 type TemplateParams struct {
 	Name         string
@@ -102,7 +71,7 @@ type Service interface {
 	// ---- 用户 ----
 	// ListClaimable 可领券列表（含当前用户视角的领取状态）。
 	ListClaimable(ctx context.Context, userID int64) ([]model.CouponTemplateView, error)
-	// Claim 领取：Lua 原子校验（有效期/总量/每人限领）后 DB 落库为最终态。
+	// Claim 领取：缓存原子校验（有效期/总量/每人限领）后 DB 落库为最终态。
 	Claim(ctx context.Context, userID, templateID int64) (*model.UserCoupon, error)
 	// ListMine 我的券（status 空 = 全部；unused/used/expired 筛选）。
 	ListMine(ctx context.Context, userID int64, status string, page, pageSize int) ([]model.UserCouponView, int64, error)
@@ -117,12 +86,12 @@ type Service interface {
 
 type couponService struct {
 	store   repository.Store
-	cache   cache.Cache
+	cache   cache.CouponStore
 	metrics *metrics.Business
 }
 
 // New 构造优惠券服务。
-func New(store repository.Store, c cache.Cache, m *metrics.Business) Service {
+func New(store repository.Store, c cache.CouponStore, m *metrics.Business) Service {
 	return &couponService{store: store, cache: c, metrics: m}
 }
 
@@ -194,7 +163,7 @@ func (s *couponService) ListTemplates(ctx context.Context) ([]model.CouponTempla
 // ListClaimable 状态判定：
 // not_started（未开始）/ ended（已结束）/ sold_out（总量已领完）/
 // limit_reached（用户已达每人限领）/ claimable（可领）。
-// 计数取 DB 已领数，仅作展示；防超发的强制校验在 Lua。
+// 计数取 DB 已领数，仅作展示；防超发的强制校验由缓存适配器原子完成。
 func (s *couponService) ListClaimable(ctx context.Context, userID int64) ([]model.CouponTemplateView, error) {
 	templates, err := s.store.Template.List(ctx)
 	if err != nil {
@@ -236,8 +205,8 @@ func (s *couponService) ListClaimable(ctx context.Context, userID int64) ([]mode
 	return views, nil
 }
 
-// Claim 领取流程：DB 读模板（含有效期快照）→ Lua 原子计数 → DB 落库最终态。
-// 模板过期/不存在由 DB 校验，其余并发条件由 Lua 原子强制。
+// Claim 领取流程：DB 读模板（含有效期快照）→ 缓存原子计数 → DB 落库最终态。
+// 模板过期/不存在由 DB 校验，其余并发条件由缓存适配器原子强制。
 func (s *couponService) Claim(ctx context.Context, userID, templateID int64) (*model.UserCoupon, error) {
 	t, err := s.store.Template.GetByID(ctx, templateID)
 	if err != nil {
@@ -248,23 +217,25 @@ func (s *couponService) Claim(ctx context.Context, userID, templateID int64) (*m
 	}
 
 	now := time.Now()
-	code, err := s.cache.Eval(ctx, claimScript,
-		[]string{claimedKey(templateID), perUserKey(templateID, userID)},
-		now.UnixMilli(), t.Total, t.ValidFrom.UnixMilli(), t.ValidUntil.UnixMilli(), t.PerUserLimit)
+	result, err := s.cache.ClaimCoupon(ctx, cache.CouponClaimParams{
+		ClaimedKey: claimedKey(templateID), PerUserKey: perUserKey(templateID, userID),
+		Now: now, Total: t.Total, ValidFrom: t.ValidFrom,
+		ValidUntil: t.ValidUntil, PerUserLimit: t.PerUserLimit,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	switch code {
-	case claimOK:
-	case claimSoldOut:
+	switch result {
+	case cache.CouponClaimed:
+	case cache.CouponSoldOut:
 		return nil, ErrSoldOut
-	case claimNotInWindow:
+	case cache.CouponNotInWindow:
 		return nil, ErrNotInWindow
-	case claimLimitReach:
+	case cache.CouponLimitReached:
 		return nil, ErrClaimLimitReached
 	default:
-		return nil, fmt.Errorf("%w: unexpected claim code %d", ErrInvalidInput, code)
+		return nil, fmt.Errorf("%w: unexpected claim result %d", ErrInvalidInput, result)
 	}
 
 	c := &model.UserCoupon{UserID: userID, TemplateID: templateID, Status: model.CouponStatusUnused}

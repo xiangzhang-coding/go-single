@@ -4,7 +4,7 @@ sidebar_position: 6
 
 # flashsale — 秒杀
 
-**定位**：活动管理（时间窗口 / 独立库存 / 秒杀价 / 限购）、上架预热 Redis（SETNX）、限流（全局令牌桶 + 按用户计数）、幂等键 + Lua 原子预扣、发 MQ 异步落单、超时回补与库存对账（进行中只告警、收尾以 MySQL 对齐）。
+**定位**：活动管理（时间窗口 / 独立库存 / 秒杀价 / 限购）、上架预热 Redis（SETNX）、限流（全局令牌桶 + 按用户计数）、幂等键 + 类型化缓存原子预扣、发 MQ 异步落单、超时回补与库存对账（进行中只告警、收尾以 MySQL 对齐）。
 
 实现：`internal/flashsale/`。
 
@@ -25,25 +25,25 @@ sidebar_position: 6
 
 派生状态（读取时计算，不落库）：用户视角 `not_started` / `in_progress`；admin 视角另含 `off_sale`（手动下架）/ `ended`（窗口已结束）。
 
-## Redis 约定与 Lua 脚本
+## Redis 约定与原子能力
 
 key 约定（活动进行中均为 Redis 预扣事实源）：
 
 | key | 说明 |
 | --- | --- |
 | `flashsale:stock:{id}` | 活动库存（上架预热；TTL = 结束时间 + 1h 自清理） |
-| `flashsale:count:{id}:{user}` | 用户抢购计数（Lua 预扣 INCR） |
+| `flashsale:count:{id}:{user}` | 用户抢购计数（原子预扣 INCR） |
 | `flashsale:idem:{id}:{user}` | 幂等键（挡预扣请求重复提交，TTL **30min**） |
 | `flashsale:rl:{user}` | 按用户限流计数（固定窗口 INCR+TTL） |
 
-Lua 脚本（全部经 `cache.Eval` 原子执行）：
+业务 service 只调用类型化缓存能力；Lua 文本与整数返回码协议封装在 `internal/platform/cache` Redis 适配器内：
 
-| 脚本 | 语义 |
+| 能力 | 语义 |
 | --- | --- |
-| `prewarmScript` | 预热：key 不存在写入；已存在仅当配置库存更低才覆盖（**进行中只减不增**） |
-| `preDeductScript` | 原子预扣：校验 on_sale → 时间窗口 → 库存 → 每人限购 → `DECR 库存 + INCR 用户计数`。返回 1 成功 / 0 抢光 / -1 窗口外 / -2 超限购 / -3 下架 |
-| `idemScript` | 幂等键抢占（SETNX + EX） |
-| `restoreScript` | 回补：库存 key 存在才 INCR、计数 key 存在才 DECR、DEL 幂等键（允许再次抢购） |
+| `WarmFlashSaleStock` | 预热：key 不存在写入；已存在仅当配置库存更低才覆盖（**进行中只减不增**） |
+| `PreDeductFlashSale` | 原子预扣：校验 on_sale → 时间窗口 → 库存 → 每人限购 → `DECR 库存 + INCR 用户计数`；返回命名结果而非整数码 |
+| `AcquireIdempotency` | 幂等键抢占（内部 SETNX + EX） |
+| `RestoreFlashSale` | 回补：库存 key 存在才 INCR、计数 key 存在才 DECR、DEL 幂等键（允许再次抢购） |
 
 ## 接口
 
@@ -78,7 +78,7 @@ POST /api/flashsales/:id/purchase
   [1] 全局令牌桶限流（中间件，429）→ 按用户 Redis 固定窗口计数（flashsale:rl:{user}）
   [2] 幂等键抢占（flashsale:idem:{id}:{user}，SETNX + TTL 30min）——先于预扣抢占，
       挡得住重复提交；已存在 → 409 重复请求
-  [3] Lua 原子预扣（preDeductScript）：
+  [3] PreDeductFlashSale 类型化原子预扣：
         · 成功 → 保留幂等键
         · 业务拒绝（抢光/限购/窗口外/下架）→ 释放幂等键（允许窗口内重试）
         · 基础设施失败 → 保留幂等键（防瞬时故障下重复预扣）

@@ -4,7 +4,7 @@ package main
 
 import "fmt"
 
-// 项目真实脚本（internal/flashsale/service/flashsale_service.go preDeductScript 简化）。
+// 项目 Redis 适配器脚本（internal/platform/cache/atomic.go）简化。
 // Redis 保证脚本整体原子执行：期间不会有其他命令插入。
 const preDeductScript = `
 -- KEYS[1]=库存key KEYS[2]=用户计数key
@@ -46,6 +46,5 @@ func main() {
 	fmt.Printf("执行结果=%d stock=%d count=%d（校验→扣减→计数全在一个原子步骤内）\n", code, stock, count)
 }
 
-// 项目位置：internal/flashsale/service/flashsale_service.go 的 preDeductScript/prewarmScript/
-// restoreScript；internal/coupon/service/coupon_service.go 的 claimScript；
-// internal/platform/limiter/limiter.go 的 countScript；统一经 cache.Eval 原子执行。
+// 项目位置：internal/platform/cache/atomic.go。业务模块只调用类型化原子能力，
+// Lua 文本与返回码协议不离开 Redis 适配器。

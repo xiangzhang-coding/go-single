@@ -1,6 +1,6 @@
 // T13 秒杀取消回补与对账单元测试（中间 seam）：fake 活动仓储 + fake 缓存 +
 // fake 订单计数端口，覆盖——
-//   - RestoreStock/RestoreRedis：事务内 MySQL 回补、Lua 原子回补 Redis 库存/
+//   - RestoreStock/RestoreRedis：事务内 MySQL 回补、缓存原子回补 Redis 库存/
 //     用户计数/幂等键（key 缺失不重建、回补失败透传）；
 //   - ReconcileActive：进行中只比对告警不写回，redis < mysql 识别补单信号，
 //     库存 key 缺失告警，一致无告警；
@@ -42,7 +42,7 @@ func TestRestoreRedisRestoresStockCountIdem(t *testing.T) {
 	stockKey := stockKey(a.ID)
 	countKey := countKey(a.ID, 42)
 	idemKey := idemKey(a.ID, 42)
-	_, err := fx.cache.Eval(context.Background(), "", []string{idemKey}, 1, 1)
+	_, err := fx.cache.AcquireIdempotency(context.Background(), idemKey, "1", time.Second)
 	require.NoError(t, err)
 	// 模拟预扣：库存 99、计数 1、幂等键已占。
 	fx.cache.stock[stockKey] = 99

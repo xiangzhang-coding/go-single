@@ -11,14 +11,14 @@ type state struct {
 	orderStatus string
 }
 
-// 超时取消流程：事务内条件取消 + 回补 MySQL → 提交后回补 Redis（Lua restoreScript）。
+// 超时取消流程：事务内条件取消 + 回补 MySQL → 提交后经 RestoreFlashSale 回补 Redis。
 func timeoutCancel(s *state) {
 	if s.orderStatus != "pending_payment" {
 		return // 条件更新不命中：订单已支付，跳过
 	}
 	s.orderStatus = "cancelled"
 	s.mysqlStock++ // 事务内回补 MySQL（与订单取消同事务）
-	s.redisStock++ // 提交后 Lua：INCR 库存 + DECR 计数 + DEL 幂等键
+	s.redisStock++ // 提交后缓存适配器原子执行：INCR 库存 + DECR 计数 + DEL 幂等键
 	s.orderPaid = false
 }
 

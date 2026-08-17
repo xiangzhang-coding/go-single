@@ -7,7 +7,7 @@ import (
 	"sync"
 )
 
-// 内存版 countScript：key 不存在 SET 1 + EXPIRE，存在则 INCR。
+// 内存版固定窗口脚本：key 不存在 SET 1 + EXPIRE，存在则 INCR。
 // 固定窗口的局限：窗口边界突发（第 59s 与第 61s 各放满一批）。
 type windowCounter struct {
 	mu     sync.Mutex
@@ -36,6 +36,6 @@ func main() {
 	fmt.Println("第 6 次被拒：固定窗口 60s 内最多 5 次")
 }
 
-// 项目位置：internal/platform/limiter/limiter.go 的 countScript（SET/INCR + EXPIRE
-// 原子脚本）与 RedisCounter.Allow；按用户限流调用点在 flashsale_service.go 的 Seckill。
+// 项目位置：internal/platform/cache/atomic.go 的 IncrementFixedWindow 与
+// internal/platform/limiter/limiter.go 的 RedisCounter.Allow；调用点为 Seckill。
 // 演进：滑动窗口/令牌桶在 Redis 侧实现（BACKLOG "Redis 分布式限流"）。

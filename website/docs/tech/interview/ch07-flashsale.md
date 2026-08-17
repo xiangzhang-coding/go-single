@@ -116,8 +116,8 @@ func main() {
 
 **答案要点**
 
-- 脚本返回码协议：1 成功 / 0 抢光 / -1 窗口外 / -2 超限购 / -3 下架。
-- 服务端把码映射为哨兵错误，handler 再映射 HTTP 状态码。
+- Redis 适配器内部脚本返回码协议：1 成功 / 0 抢光 / -1 窗口外 / -2 超限购 / -3 下架。
+- 缓存适配器先把整数码映射为类型化结果，service 再映射哨兵错误，handler 最后映射 HTTP 状态码。
 - 参数全部由服务端注入（状态/时间窗口/限购来自 DB 行），脚本内不做 IO。
 - 成功/失败打点 `seckill_prededuct_total{result}`，失败分类可观测。
 
@@ -128,7 +128,7 @@ package main
 
 import "fmt"
 
-// 预扣返回码（与项目 preDeductScript 一致）：1 成功 / 0 抢光 / -1 窗口外 / -2 超限购 / -3 下架。
+// 预扣返回码（与项目 Redis 适配器内部协议一致）：1 成功 / 0 抢光 / -1 窗口外 / -2 超限购 / -3 下架。
 func preDeduct(status string, now, start, end, stock, limit, count int) int {
 	if status != "on_sale" {
 		return -3
@@ -169,7 +169,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `preDeductScript`（91-109）与 `PreDeduct`（569-611）。
+**项目位置**：`internal/platform/cache/atomic.go` 的 `PreDeductFlashSale` 封装脚本与返回码；`internal/flashsale/service/flashsale_service.go` 的 `PreDeduct` 只处理类型化结果。
 
 ## Q4. 幂等键生命周期：何时保留、何时释放
 
@@ -204,7 +204,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `Seckill`（473-480 抢占、`isBusinessReject` 529-533 释放）；`restoreScript` 回补时 DEL 幂等键。
+**项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `Seckill` 抢占与 `isBusinessReject` 释放；`internal/platform/cache/atomic.go` 的 `AcquireIdempotency` / `RestoreFlashSale` 封装 SETNX 与回补时 DEL。
 
 ## Q5. 库存三方一致性：Redis 预扣 vs MySQL 库存 vs 有效订单数
 
@@ -255,7 +255,7 @@ func main() {
 
 - cron 每分钟扫 `pending_payment` 且超时的秒杀订单（10min 超时）。
 - 事务内：条件取消（仅未支付才生效）+ 回补 MySQL 库存。
-- 提交后：Lua `restoreScript` 回补 Redis（INCR 库存 + DECR 计数 + DEL 幂等键）。
+- 提交后：`RestoreFlashSale` 类型化缓存能力回补 Redis（内部 Lua：INCR 库存 + DECR 计数 + DEL 幂等键）。
 - Redis 回补失败不阻塞：对账 cron 兜底对齐。
 
 **可运行代码**
@@ -272,14 +272,14 @@ type state struct {
 	orderStatus string
 }
 
-// 超时取消流程：事务内条件取消 + 回补 MySQL → 提交后回补 Redis（Lua restoreScript）。
+// 超时取消流程：事务内条件取消 + 回补 MySQL → 提交后经 RestoreFlashSale 回补 Redis。
 func timeoutCancel(s *state) {
 	if s.orderStatus != "pending_payment" {
 		return // 条件更新不命中：订单已支付，跳过
 	}
 	s.orderStatus = "cancelled"
 	s.mysqlStock++ // 事务内回补 MySQL（与订单取消同事务）
-	s.redisStock++ // 提交后 Lua：INCR 库存 + DECR 计数 + DEL 幂等键
+	s.redisStock++ // 提交后缓存适配器原子执行：INCR 库存 + DECR 计数 + DEL 幂等键
 	s.orderPaid = false
 }
 

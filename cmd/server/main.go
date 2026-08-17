@@ -208,7 +208,7 @@ func runMigrations(cfg *config.Config, log *zap.Logger) error {
 	return nil
 }
 
-func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Cache, mqClient mq.MQ, fileSvc *file.MinIO, wsHub *ws.Hub) (*gin.Engine, *platformcron.Registry) {
+func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Client, mqClient mq.MQ, fileSvc *file.MinIO, wsHub *ws.Hub) (*gin.Engine, *platformcron.Registry) {
 	gin.SetMode(cfg.Server.Mode)
 
 	r := gin.New()

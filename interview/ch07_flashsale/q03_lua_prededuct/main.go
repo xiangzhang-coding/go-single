@@ -4,7 +4,7 @@ package main
 
 import "fmt"
 
-// 预扣返回码（与项目 preDeductScript 一致）：1 成功 / 0 抢光 / -1 窗口外 / -2 超限购 / -3 下架。
+// 预扣返回码（与项目 Redis 适配器内部协议一致）：1 成功 / 0 抢光 / -1 窗口外 / -2 超限购 / -3 下架。
 func preDeduct(status string, now, start, end, stock, limit, count int) int {
 	if status != "on_sale" {
 		return -3
@@ -43,5 +43,5 @@ func main() {
 	}
 }
 
-// 项目位置：internal/flashsale/service/flashsale_service.go 的 preDeductScript（91-109）
-// 与 PreDeduct（569-611）；返回码映射哨兵错误；成功/失败打点 seckill_prededuct_total。
+// 项目位置：internal/platform/cache/atomic.go 的 PreDeductFlashSale；
+// flashsale service 的 PreDeduct 只处理类型化结果并打点 seckill_prededuct_total。

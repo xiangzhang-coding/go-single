@@ -4,7 +4,7 @@ sidebar_position: 8
 
 # coupon — 优惠券
 
-**定位**：券模板（直减/满减，admin 发布）、领券（Lua 原子脚本防超发）、我的券、下单核销与取消回退；与秒杀互斥。
+**定位**：券模板（直减/满减，admin 发布）、领券（类型化缓存原子能力防超发）、我的券、下单核销与取消回退；与秒杀互斥。
 
 实现：`internal/coupon/`。
 
@@ -31,14 +31,14 @@ sidebar_position: 8
 | user_id / template_id | BIGINT UNSIGNED FK | 领取人与模板（CASCADE） |
 | status | VARCHAR(16) | `unused` / `used`；**`expired` 由读取时按有效期派生**（未用且已过 valid_until），不落库 |
 
-## Redis 约定与 Lua 脚本
+## Redis 约定与原子能力
 
 | key | 说明 |
 | --- | --- |
 | `coupon:claimed:{template_id}` | 总量计数 |
 | `coupon:peruser:{template_id}:{user_id}` | 每人限领计数 |
 
-`claimScript`（复用秒杀 Lua 模式防超发）：校验有效期窗口 → 检查总量 → 检查每人限领 → 双计数 INCR。返回 1 成功 / 0 已抢光 / -1 不在有效期 / -2 超过每人限领。
+业务 service 调用 `ClaimCoupon`，只处理 `CouponClaimed` / `CouponSoldOut` / `CouponNotInWindow` / `CouponLimitReached` 类型化结果。缓存适配器内部以 Lua 校验有效期窗口 → 检查总量 → 检查每人限领 → 双计数 INCR，并封装原始返回码。
 
 ## 接口
 
@@ -48,7 +48,7 @@ sidebar_position: 8
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | /api/coupons | 可领券列表（含当前用户视角状态：`claimable` / `not_started` / `ended` / `sold_out` / `limit_reached`；计数取 DB 仅作展示，防超发强制在 Lua） |
+| GET | /api/coupons | 可领券列表（含当前用户视角状态：`claimable` / `not_started` / `ended` / `sold_out` / `limit_reached`；计数取 DB 仅作展示，防超发由缓存适配器原子强制） |
 | POST | /api/coupons/:id/claim | 领取（成功 201 返回用户券） |
 | GET | /api/coupons/mine | 我的券（status 筛选：unused/used/expired + 分页） |
 
@@ -74,7 +74,7 @@ admin（Bearer + admin）：
 ```text
 POST /api/coupons/:id/claim
   → DB 读模板（含有效期快照；不存在 → 404）
-  → Lua 原子计数（claimScript）——模板状态/总量/限领的并发条件全部 Redis 内强制
+  → ClaimCoupon 类型化原子计数——模板状态/总量/限领的并发条件全部 Redis 内强制
   → DB 落库 user_coupons（unused）为最终态
 ```
 

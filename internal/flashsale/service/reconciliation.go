@@ -49,14 +49,19 @@ type Reconciliation interface {
 	ReconcileEnded(ctx context.Context) (aligned int, err error)
 }
 
+type stockCache interface {
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key, value string, ttl time.Duration) error
+}
+
 type reconciliationService struct {
 	store   repository.Store
-	cache   cache.Cache
+	cache   stockCache
 	counter SeckillOrderCounter
 }
 
 // NewReconciliation 构造秒杀库存对账服务。
-func NewReconciliation(store repository.Store, c cache.Cache, counter SeckillOrderCounter) Reconciliation {
+func NewReconciliation(store repository.Store, c stockCache, counter SeckillOrderCounter) Reconciliation {
 	return &reconciliationService{store: store, cache: c, counter: counter}
 }
 

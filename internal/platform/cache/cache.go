@@ -9,8 +9,8 @@ import (
 // ErrMiss 缓存未命中（key 不存在）。
 var ErrMiss = errors.New("cache miss")
 
-// Cache 缓存层接口（ADR-0003 seam），隔离 go-redis 客户端。
-// Lua 脚本封装在适配器内，业务模块只面向本接口。
+// Cache 是缓存层基础接口（ADR-0003 seam），隔离 go-redis 客户端。
+// 原子业务能力由同包类型化接口表达，Lua 仅存在于 Redis 适配器内。
 type Cache interface {
 	// Ping 检查连接可用性。
 	Ping(ctx context.Context) error
@@ -22,7 +22,4 @@ type Cache interface {
 	Set(ctx context.Context, key string, value string, ttl time.Duration) error
 	// Del 删除 key（不存在不视为错误）。
 	Del(ctx context.Context, key string) error
-	// Eval 原子执行 Lua 脚本（Redis EVAL 封装，学习点）。
-	// 业务模块持有脚本内容，仅经此方法执行；返回整数结果，脚本约定由调用方定义。
-	Eval(ctx context.Context, script string, keys []string, args ...any) (int64, error)
 }

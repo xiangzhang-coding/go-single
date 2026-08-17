@@ -160,7 +160,7 @@ import (
 	"sync"
 )
 
-// 内存版 SETNX + EXPIRE（对应项目 idemScript）。
+// 内存版 SETNX + EXPIRE（对应项目 cache.AcquireIdempotency 类型化能力）。
 type idemStore struct {
 	mu   sync.Mutex
 	keys map[string]bool
@@ -204,7 +204,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `idemScript`（SETNX+EX 30min）与 `isBusinessReject`；订单幂等键 `order:idem:{user}:{client_request_id}` TTL 15min。
+**项目位置**：`internal/platform/cache/atomic.go` 的 `AcquireIdempotency`（适配器内部 SETNX+EX）；`internal/flashsale/service/flashsale_service.go` 的 `isBusinessReject` 管理键生命周期；订单幂等键 `order:idem:{user}:{client_request_id}` TTL 15min。
 
 ## Q4. Lua 脚本原子性：一次往返 + 不可分割执行
 
@@ -222,7 +222,7 @@ package main
 
 import "fmt"
 
-// 项目真实脚本（internal/flashsale/service/flashsale_service.go preDeductScript 简化）。
+// 项目 Redis 适配器脚本（internal/platform/cache/atomic.go）简化。
 // Redis 保证脚本整体原子执行：期间不会有其他命令插入。
 const preDeductScript = `
 -- KEYS[1]=库存key KEYS[2]=用户计数key
@@ -266,7 +266,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/service/flashsale_service.go` 的 `preDeductScript`/`prewarmScript`/`restoreScript`；`internal/coupon/service/coupon_service.go` 的 `claimScript`；`internal/platform/limiter/limiter.go` 的 `countScript`；统一经 `cache.Eval` 原子执行。
+**项目位置**：脚本文本与整数返回码协议统一封装在 `internal/platform/cache/atomic.go`；业务模块只调用 `AcquireIdempotency` / `ClaimCoupon` / `WarmFlashSaleStock` / `PreDeductFlashSale` / `RestoreFlashSale` / `IncrementFixedWindow` 类型化能力，不能直接 `Eval`。
 
 ## Q5. 固定窗口限流（INCR + TTL）
 
@@ -287,7 +287,7 @@ import (
 	"sync"
 )
 
-// 内存版 countScript：key 不存在 SET 1 + EXPIRE，存在则 INCR。
+// 内存版固定窗口脚本：key 不存在 SET 1 + EXPIRE，存在则 INCR。
 // 固定窗口的局限：窗口边界突发（第 59s 与第 61s 各放满一批）。
 type windowCounter struct {
 	mu     sync.Mutex
@@ -318,7 +318,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/platform/limiter/limiter.go` 的 `countScript` 与 `RedisCounter.Allow`；调用点 `flashsale_service.go` 的 `Seckill`；演进"Redis 分布式限流"见 BACKLOG。
+**项目位置**：`internal/platform/cache/atomic.go` 的 `IncrementFixedWindow` 与 `internal/platform/limiter/limiter.go` 的 `RedisCounter.Allow`；调用点 `flashsale_service.go` 的 `Seckill`；演进"Redis 分布式限流"见 BACKLOG。
 
 ## Q6. TTL 与过期策略
 
