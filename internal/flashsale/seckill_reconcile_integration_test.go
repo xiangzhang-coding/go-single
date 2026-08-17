@@ -124,6 +124,13 @@ func TestSeckillTimeoutTransactionRollsBackWhenActivityRestoreFails(t *testing.T
 	require.NoError(t, env.gdb.Exec(
 		"UPDATE orders SET expire_at = ? WHERE order_no = ?", time.Now().Add(-time.Minute), orderNo,
 	).Error)
+	t.Cleanup(func() {
+		if err := env.gdb.Exec(
+			"UPDATE orders SET expire_at = ? WHERE order_no = ?", time.Now().Add(time.Hour), orderNo,
+		).Error; err != nil {
+			t.Errorf("清理回滚测试订单: %v", err)
+		}
+	})
 	timeout := flashsalesvc.NewSeckillTimeout(
 		e.tx, e.orderSvc, failingRestoreActivities{e.activities}, e.flashsaleSvc, metrics.New().Business(),
 	)
