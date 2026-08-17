@@ -31,7 +31,7 @@ DDD 风格的模块化单体：单一部署单元承载商城、秒杀、后台�
 | 定时任务 | robfig/cron | asynq；RabbitMQ 延迟队列（超时取消更优解） |
 | 限流 | golang.org/x/time/rate（令牌桶） | Redis 分布式限流 |
 | 数据库迁移 | golang-migrate | — |
-| API 文档 | swaggo/swag | — |
+| API 契约 | 手写 TS 类型 + HTTP 集成测试（ADR-0006） | swaggo/swag；openapi-typescript |
 | 测试 | testing + testify | — |
 | 依赖注入 | 手写（service 组装） | wire |
 | 反向代理 | Nginx（预写 upstream 双实例示例） | 多实例 LB 实操 |
@@ -90,7 +90,7 @@ go_single/
 
 ## 前端（演示前端）
 
-- **定义**：工程级插拔——每套主题 = `web/` 下独立 Vite 工程，共享同一后端（契约：Swagger REST 接口），互不依赖；换主题 = 部署时选一套构建
+- **定义**：工程级插拔——每套主题 = `web/` 下独立 Vite 工程，共享同一后端（契约：REST 接口，json tag ↔ 手写 TS 类型 + HTTP 集成测试，见 ADR-0006），互不依赖；换主题 = 部署时选一套构建
 - **主题资产**：四件套放 `web/<theme>/design/`——DESIGN.md（设计规范，供人/AI 参考）/ CSS_Variables.css / Design_Tokens.json（W3C DTCG）/ Tailwind_V4.css（`@theme`）；组件代码一律用语义化 Tailwind 类，不写死颜色
 - **工具链**：bun（`bun install` / `bun run dev` / `bun run build`）；Vite dev proxy 把 `/api`、`/ws` 转发到后端 :8080
 - **API 对接**：HTTP base 由 `VITE_API_BASE` 控制（dev 用 `/api` 代理，云端构建传后端绝对地址）；WebSocket 地址由 `VITE_WS_BASE` 控制（dev 用 `/ws` 代理）；后端 `platform/cors` 中间件允许前端域名（跨源场景）
@@ -107,7 +107,7 @@ go_single/
 - **JWT 存储**：localStorage（学习项目取舍；cookie 方案与 CSRF 讨论进 backlog）
 - **WS 握手**：token 经 query 参数传递（浏览器 WS API 无法自定义 header），注明 token 可能进入访问日志的风险为演示取舍
 - **组件策略**：手写组件 + 语义化 Tailwind 类（主题定制自由，与四件套主题机制契合）；shadcn/ui 进 backlog
-- **TS 类型**：api 层手写类型对齐 swagger 契约；openapi-typescript 自动生成进 backlog
+- **TS 类型**：api 层手写类型对齐后端 json tag（tsc 构建期校验）+ HTTP 集成测试固定响应形状（ADR-0006）；openapi-typescript 自动生成进 backlog
 - 布局策略：桌面优先，不做移动端适配（演示项目）
 - **部署双路径**：
   - 本地演示（同源）：Nginx 托管选定主题的构建产物（`web/<theme>/dist`）+ `location /api` 反代 :8080 + `try_files` SPA fallback；SSL 终止（自签证书）+ 安全头（T28，deploy/nginx/gen-certs.sh）

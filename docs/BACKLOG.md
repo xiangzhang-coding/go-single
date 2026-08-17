@@ -17,6 +17,7 @@
 - Kafka（替代 RabbitMQ）
 - Redis 分布式限流（替代单机令牌桶）
 - wire（替代手写 DI）
+- swaggo/swag（Swagger 注解 + /swagger 路由，按模块分批试点——ADR-0006 维持手写 TS 类型 + 集成测试为契约机制）
 - stdlib net/http 路由实验
 - depguard（模块依赖无环 lint，强制 DESIGN.md 的 DAG）
 - 第三方认证服务器（Keycloak/OIDC，经 TokenVerifier 接口替换自签 JWT）
@@ -39,7 +40,7 @@
 - 数据库读写分离（MySQL 主从）
 - 认证增强：登出黑名单、密码复杂度策略、双因素认证
 - shadcn/ui（组件库参考，按主题定制——当前手写组件）
-- openapi-typescript（swagger → TS 类型自动生成——当前手写对齐）
+- openapi-typescript（OpenAPI → TS 类型自动生成——当前手写对齐 json tag，见 ADR-0006）
 - JWT 存储方案讨论：cookie + CSRF 防护（当前 localStorage 取舍）
 
 ## 明确不做（单体阶段）

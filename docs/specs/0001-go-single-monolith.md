@@ -8,7 +8,7 @@
 
 构建一个模块化单体在线商城（go_single）：
 - **后端**：单一 Go 部署单元承载 9 个业务模块（user/product/cart/order/flashsale/payment/coupon/social/chat + admin）+ platform 共享基础设施；模块间经 service 接口进程内调用（面向接口，非 HTTP），依赖方向无环；仅秒杀落单走 MQ 异步
-- **演示前端**：工程级插拔——每套主题 = `web/` 下独立 Vite 工程（React+TS+Tailwind v4+bun），共享同一后端 Swagger REST 契约；首套主题 "faire" 的 4 件套设计资产已就位
+- **演示前端**：工程级插拔——每套主题 = `web/` 下独立 Vite 工程（React+TS+Tailwind v4+bun），共享同一后端 REST 接口契约（json tag ↔ 手写 TS 类型 + HTTP 集成测试，ADR-0006）；首套主题 "faire" 的 4 件套设计资产已就位
 - **文档站**：Docusaurus（zh-CN）独立部署于 Cloudflare Pages——用户指南（任务导向）+ 技术文档（模块/领域双视图）+ 面试题库（80-100 题随实现产出）
 - 就业向选型（Gin/GORM/MySQL8/go-redis/RabbitMQ/zap/viper/JWT），可插拔 seam（仓储/缓存/MQ），Docker Compose 一键起依赖，Prometheus+Grafana+Loki 可观测，全链路容错
 - 版本管理：git + GitHub 仓库（本次初始化）
@@ -107,7 +107,7 @@
 
 62. 作为演示者，我想用 Faire 风格主题的前端演示全部功能（13 个页面清单），以便展示项目
 63. 作为开发者，我想按主题工程级插拔前端（每套主题独立 Vite 工程，共享同一后端，部署时选一套构建），以便复用与换肤
-64. 作为开发者，我期望前端与后端以 Swagger REST 契约对接（axios + 拦截器统一 JWT/401 处理），以便联调
+64. 作为开发者，我期望前端与后端以 REST 接口契约对接（手写 TS 类型对齐后端 json tag + HTTP 集成测试固定响应形状，axios + 拦截器统一 JWT/401 处理），以便联调
 65. 作为演示者，我期望前端可本地 Nginx 部署（同源反代）或云端 Cloudflare Pages 独立部署（`_redirects` + `VITE_API_BASE` 跨源）
 
 ### 文档站
@@ -126,7 +126,7 @@
 - **演示前端与文档站不在单体单元内**（ADR-0001）：前端以 REST 契约为界独立构建，文档站为独立静态站点
 - **DDD 风格垂直模块**：9 个业务模块 + admin 管理入口（只做入口与 role 鉴权，业务逻辑在各模块 service）+ platform 共享基础设施（config/logger/metrics/auth/limiter/cors/cron/mq/cache/ws/file）
 - **可插拔 seam**（ADR-0003）：仅三类依赖定义接口——仓储层（每模块 repository 接口，GORM 之上再包一层）、缓存层（隔离 go-redis，Lua 封装在适配器）、消息层（RabbitMQ 实现，Kafka 可换）；好友关系等业务数据访问均为仓储 seam 实例；TokenVerifier 为额外轻量 seam（不在三类之列）
-- **选型**（ADR-0002/0004 + 技术栈表）：Gin/GORM/MySQL 8/go-redis v9/RabbitMQ/JWT 自签 HS256+bcrypt/zap/viper/validator/swaggo/robfig-cron/x-time-rate/golang-migrate/testing+testify/手写 DI；现代实践（sqlc/PostgreSQL/slog/session/env/asynq/Kafka/Redis 分布式限流/wire/stdlib 路由/OIDC）全部进 backlog
+- **选型**（ADR-0002/0004 + 技术栈表）：Gin/GORM/MySQL 8/go-redis v9/RabbitMQ/JWT 自签 HS256+bcrypt/zap/viper/robfig-cron/x-time-rate/golang-migrate/testing+testify/手写 DI；API 契约由手写 TS 类型 + HTTP 集成测试承担（ADR-0006，swaggo 进 backlog）；现代实践（sqlc/PostgreSQL/slog/session/env/asynq/Kafka/Redis 分布式限流/wire/stdlib 路由/OIDC）全部进 backlog
 
 ### 订单与交易
 
@@ -172,9 +172,9 @@
 
 ### 演示前端
 
-- 工程级插拔：每套主题 = `web/<theme>/` 独立 Vite 工程（bun），共享后端 Swagger REST 契约；换主题 = 部署时选一套构建；第二套主题克隆骨架；`web/shared/` 出现第二套再抽
+- 工程级插拔：每套主题 = `web/<theme>/` 独立 Vite 工程（bun），共享后端 REST 接口契约；换主题 = 部署时选一套构建；第二套主题克隆骨架；`web/shared/` 出现第二套再抽
 - 主题资产：四件套 `web/<theme>/design/`（DESIGN.md 规范参考 / CSS_Variables.css / Design_Tokens.json W3C DTCG / Tailwind_V4.css @theme）；组件一律语义化 Tailwind 类
-- 工程选型：react-router v7（admin 按角色分组 + role 守卫）、TanStack Query（服务端状态）+ zustand（客户端状态）、axios 拦截器（JWT 头 + 401 跳登录）、JWT 存 localStorage、手写组件、TS 类型手写对齐 swagger
+- 工程选型：react-router v7（admin 按角色分组 + role 守卫）、TanStack Query（服务端状态）+ zustand（客户端状态）、axios 拦截器（JWT 头 + 401 跳登录）、JWT 存 localStorage、手写组件、TS 类型手写对齐后端 json tag（ADR-0006）
 - 对接：`VITE_API_BASE` / `VITE_WS_BASE`（dev 用 /api、/ws 代理到 :8080）；文件上传 `POST /api/files` 后端代理（presigned 明确不做）
 - 页面清单（13 页）：登录/注册、首页、商品详情、购物车、结算、订单列表/详情、秒杀页、优惠券中心、好友列表/申请、好友圈、聊天、个人中心（地址簿）、后台管理
 - 交互约定：秒杀排队中轮询订单接口 1.5s×30；倒计时由轮询接口带服务端时间；401 跳登录；支付为订单详情页内动作（不设独立页）
