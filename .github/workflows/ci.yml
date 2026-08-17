@@ -58,7 +58,7 @@ jobs:
             --health-cmd "redis-cli ping" \
             --health-interval 5s --health-timeout 3s --health-retries 20 \
             redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08 \
-            redis-server --databases 21
+            redis-server --databases 21 --appendonly yes --appendfsync everysec
           docker run -d --name minio \
             -p 19000:9000 -p 19001:9001 \
             -e MINIO_ROOT_USER=minioadmin \

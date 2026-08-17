@@ -46,8 +46,9 @@ key 约定（活动进行中均为 Redis 预扣事实源）：
 | 能力 | 语义 |
 | --- | --- |
 | `WarmFlashSaleStock` | 预热：key 不存在写入；已存在仅当配置库存更低才覆盖（**进行中只减不增**） |
-| `PreDeductFlashSale` | 原子预扣：校验 on_sale → 时间窗口 → 库存 → 每人限购 → `DECR 库存 + INCR 用户计数 + reservation marker`；同一 marker 重放不重复扣减 |
-| `EnsureFlashSaleReservation` | 发布/重投前验证 marker；若 Redis 在 AOF fsync 前重启使整次 Lua 结果丢失，则按 MySQL 持久事实原子重建库存、用户计数、幂等键与 marker |
+| `PreDeductFlashSaleDurably` | 原子预扣后在同一专用连接执行 `WAITAOF`；同一 marker 重放会重写当前状态快照后再次确认 AOF |
+| `EnsureFlashSaleReservationDurably` | 发布/重投前验证 marker；若整次 Lua 结果丢失，则按 MySQL 持久事实原子重建库存、用户计数、幂等键与 marker，并等待 AOF fsync |
+| `EnsureOrderedFlashSaleReservationDurably` | ordered 事实按 MySQL 活动库存校准 Redis，并重建用户计数/幂等键/marker；AOF 确认后才允许清理 marker |
 | `AcquireIdempotency` | 幂等键抢占（内部 SETNX + EX） |
 | `RestoreFlashSale` | 仅 reservation token 匹配时回补并写 tombstone；重复执行不多回补，标记缺失不假报成功，且 compare-delete 不会删除新请求幂等键 |
 
@@ -69,7 +70,7 @@ admin（Bearer + admin）：
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | /api/flashsales | 秒杀页列表（仅进行中/即将开始；携带 `server_time` 供前端对齐倒计时；剩余库存读 Redis 预扣余量，缺失降级配置库存） |
-| POST | /api/flashsales/:id/purchase | 抢购；成功返回 **202 排队中 + pre_deduction_id + 可选 order_no** |
+| POST | /api/flashsales/:id/purchase | 抢购；成功返回 **202 排队中 + pre_deduction_id + 可选 order_no**；同一幂等键重试返回原生命周期 |
 | GET | /api/flashsales/purchases/:id | 查询本人预扣生命周期（owner 校验；他人记录返回 404） |
 
 ### 跨模块端口
@@ -89,7 +90,7 @@ POST /api/flashsales/:id/purchase
         · 业务拒绝（抢光/限购/窗口外/下架）→ 释放幂等键（允许窗口内重试）
         · 基础设施失败 → 保留幂等键（防瞬时故障下重复预扣）
   [4] 持久化雪花订单号 → 发布 MQ；确认成功转 pending_order
-      订单号生成/发布失败由启动恢复与每分钟任务继续；重投前验证或重建 Redis reservation；10 次仍失败转 pending_rollback
+      订单号生成/发布失败由启动恢复与每分钟任务继续；重投前验证或重建 Redis reservation；仅 pending_publish 10 次仍失败转回退，pending_order 不因补发失败误回退
   [5] 返回 202，前端按 pre_deduction_id 轮询 ordered / rolled_back
 ```
 
@@ -113,6 +114,8 @@ POST /api/flashsales/:id/purchase
 | --- | --- | --- |
 | flashsale-pre-deduction-recovery | 启动时 + 每分钟 | 扫描 preparing/pending_publish/pending_order/pending_rollback，继续发布、重投或幂等回退 |
 | flashsale-reservation-cleanup | 每分钟 | 查询 ordered 对应订单状态；离开待支付态后清理无需再补偿的持久 marker，并记录清理时间防重复扫描 |
+
+pre-R04 durable 主队列或 DLQ 消息没有 `pre_deduction_id` 时，会先按 `order_no` 创建/复用 legacy 生命周期，再进入同一落单和回退状态机。
 | flashsale-reconcile-active | 每小时 | 输出具体 pre_deduction_id/user_id/order_no/status，并保留聚合库存差异作为最终不变量告警 |
 | flashsale-reconcile-ended | 每分钟 | 无未决预扣事实时才以 MySQL 对齐 Redis，避免随后逐笔回退造成多回补 |
 

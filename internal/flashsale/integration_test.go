@@ -64,7 +64,12 @@ type testEnv struct {
 	productSvc     productsvc.Service
 	userHandler    *userhandler.Handler
 	productHandler *producthandler.Handler
-	flashsaleSvc   flashsalesvc.Service
+	flashsaleSvc   flashsaleTestService
+}
+
+type flashsaleTestService interface {
+	flashsalesvc.Service
+	PreDeduct(ctx context.Context, userID, activityID int64) error
 }
 
 var (
@@ -127,6 +132,12 @@ func buildEnv() (*testEnv, error) {
 	if err := rc.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("Redis 连接失败: %w", err)
 	}
+	if err := rc.ConfigSet(ctx, "appendonly", "yes").Err(); err != nil {
+		return nil, fmt.Errorf("Redis 开启 AOF: %w", err)
+	}
+	if err := rc.ConfigSet(ctx, "appendfsync", "always").Err(); err != nil {
+		return nil, fmt.Errorf("Redis 设置测试 AOF fsync: %w", err)
+	}
 	if err := rc.FlushDB(ctx).Err(); err != nil {
 		return nil, err
 	}
@@ -158,7 +169,7 @@ func buildEnv() (*testEnv, error) {
 		pub,
 		&fakeNos{next: time.Now().UnixNano()},
 		metrics.New().Business(),
-	)
+	).(flashsaleTestService)
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
 
 	gin.SetMode(gin.TestMode)

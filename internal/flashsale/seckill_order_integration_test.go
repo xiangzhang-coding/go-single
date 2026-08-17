@@ -27,6 +27,7 @@ import (
 	couponrepo "github.com/xiangzhang-coding/go-single/internal/coupon/repository"
 	couponsvc "github.com/xiangzhang-coding/go-single/internal/coupon/service"
 	flashsalehandler "github.com/xiangzhang-coding/go-single/internal/flashsale/handler"
+	flashsalemodel "github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	flashsalerepo "github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	flashsalesvc "github.com/xiangzhang-coding/go-single/internal/flashsale/service"
 	orderhandler "github.com/xiangzhang-coding/go-single/internal/order/handler"
@@ -80,16 +81,17 @@ func (m isolatedQueueMQ) Consume(ctx context.Context, queue string, handler mq.M
 // mqEnv 秒杀异步落单测试环境：真实 MQ 发布 + 常驻消费者 + 完整路由。
 // 复用 integration_test.go 的 testEnv（MySQL/Redis/verifier/product 等）。
 type mqEnv struct {
-	router       http.Handler
-	mqClient     mq.MQ
-	queue        string
-	orderSvc     ordersvc.Service
-	flashsaleSvc flashsalesvc.Service
-	activities   flashsalerepo.ActivityRepository
-	tx           flashsalerepo.TxRunner
-	consumer     *flashsalesvc.SeckillOrderConsumer
-	timeout      flashsalesvc.SeckillTimeout
-	reconcile    flashsalesvc.Reconciliation
+	router        http.Handler
+	mqClient      mq.MQ
+	queue         string
+	orderSvc      ordersvc.Service
+	flashsaleSvc  flashsalesvc.Service
+	activities    flashsalerepo.ActivityRepository
+	preDeductions flashsalerepo.PreDeductionRepository
+	tx            flashsalerepo.TxRunner
+	consumer      *flashsalesvc.SeckillOrderConsumer
+	timeout       flashsalesvc.SeckillTimeout
+	reconcile     flashsalesvc.Reconciliation
 }
 
 var (
@@ -173,7 +175,7 @@ func buildMQEnv() (*mqEnv, error) {
 	// 常驻消费者：订阅"抢购成功"队列异步落单；连接中断自动重连（at-least-once）。
 	log := zap.NewNop()
 	consumer := flashsalesvc.NewSeckillOrderConsumer(
-		flashsaleStore.Activities, flashsaleStore.PreDeductions, flashsaleStore.Tx,
+		flashsaleStore.Activities, flashsaleStore.PreDeductions, cacheClient, flashsaleStore.Tx,
 		orderSvc, userSvc, metrics.New().Business(), log)
 	go func() {
 		for {
@@ -207,7 +209,8 @@ func buildMQEnv() (*mqEnv, error) {
 		router: r, mqClient: mqClient, queue: queue,
 		orderSvc: orderSvc, flashsaleSvc: flashsaleSvc,
 		activities: flashsaleStore.Activities, tx: flashsaleStore.Tx,
-		consumer: consumer, timeout: timeout, reconcile: reconcile,
+		preDeductions: flashsaleStore.PreDeductions,
+		consumer:      consumer, timeout: timeout, reconcile: reconcile,
 	}, nil
 }
 
@@ -343,8 +346,13 @@ func TestSeckillOrderTransactionRollsBackWhenActivityStockDeductionFails(t *test
 		"UPDATE flashsale_activities SET stock = 0 WHERE id = ?", id,
 	).Error)
 	orderNo := fmt.Sprintf("%d", time.Now().UnixNano())
+	pd := &flashsalemodel.PreDeduction{
+		UserID: userID, ActivityID: id, OrderNo: &orderNo, Quantity: 1,
+		Status: flashsalemodel.PreDeductionStatusPendingOrder,
+	}
+	require.NoError(t, e.preDeductions.Create(context.Background(), pd))
 	body, err := json.Marshal(flashsalesvc.SeckillSuccessMessage{
-		OrderNo: orderNo, UserID: userID, ActivityID: id,
+		PreDeductionID: pd.ID, OrderNo: orderNo, UserID: userID, ActivityID: id,
 	})
 	require.NoError(t, err)
 

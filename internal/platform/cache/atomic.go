@@ -20,6 +20,10 @@ type IdempotencyStore interface {
 	AcquireIdempotency(ctx context.Context, key, value string, ttl time.Duration) (IdempotencyResult, error)
 }
 
+type DurableIdempotencyStore interface {
+	ReleaseIdempotencyDurably(ctx context.Context, key, value string, timeout time.Duration) error
+}
+
 // CouponClaimResult is the complete outcome set of an atomic coupon claim.
 type CouponClaimResult uint8
 
@@ -77,6 +81,8 @@ type FlashSalePreDeductParams struct {
 	ReservationKey   string
 	ReservationToken string
 	ReservationTTL   time.Duration
+	IdempotencyKey   string
+	IdempotencyTTL   time.Duration
 	Now              time.Time
 	StartAt          time.Time
 	EndAt            time.Time
@@ -91,7 +97,10 @@ type FlashSaleRestoreParams struct {
 	ReservationKey           string
 	ReservationToken         string
 	AllowIdempotencyFallback bool
+	AllowMissingReservation  bool
 	Quantity                 int
+	FallbackStock            int
+	StockTTL                 time.Duration
 }
 
 type FlashSaleRestoreResult uint8
@@ -121,12 +130,42 @@ type FlashSaleEnsureReservationParams struct {
 	StockTTL         time.Duration
 }
 
+type FlashSaleEnsureOrderedReservationParams struct {
+	StockKey         string
+	CountKey         string
+	IdempotencyKey   string
+	ReservationKey   string
+	ReservationToken string
+	IdempotencyTTL   time.Duration
+	Quantity         int
+	FallbackStock    int
+	StockTTL         time.Duration
+}
+
+type FlashSaleAdoptLegacyReservationParams struct {
+	StockKey         string
+	CountKey         string
+	IdempotencyKey   string
+	ReservationKey   string
+	ReservationToken string
+	IdempotencyTTL   time.Duration
+	TargetStock      int
+	TargetUserCount  int
+	StockTTL         time.Duration
+}
+
 // FlashSaleStore owns the scripts that mutate flash-sale Redis state.
 type FlashSaleStore interface {
 	WarmFlashSaleStock(ctx context.Context, p FlashSaleWarmParams) (FlashSaleWarmResult, error)
 	PreDeductFlashSale(ctx context.Context, p FlashSalePreDeductParams) (FlashSalePreDeductResult, error)
+	PreDeductFlashSaleDurably(ctx context.Context, p FlashSalePreDeductParams, timeout time.Duration) (FlashSalePreDeductResult, error)
 	EnsureFlashSaleReservation(ctx context.Context, p FlashSaleEnsureReservationParams) (FlashSaleEnsureReservationResult, error)
+	EnsureFlashSaleReservationDurably(ctx context.Context, p FlashSaleEnsureReservationParams, timeout time.Duration) (FlashSaleEnsureReservationResult, error)
+	EnsureOrderedFlashSaleReservation(ctx context.Context, p FlashSaleEnsureOrderedReservationParams) (FlashSaleEnsureReservationResult, error)
+	EnsureOrderedFlashSaleReservationDurably(ctx context.Context, p FlashSaleEnsureOrderedReservationParams, timeout time.Duration) (FlashSaleEnsureReservationResult, error)
+	AdoptLegacyFlashSaleReservationDurably(ctx context.Context, p FlashSaleAdoptLegacyReservationParams, timeout time.Duration) (FlashSaleEnsureReservationResult, error)
 	RestoreFlashSale(ctx context.Context, p FlashSaleRestoreParams) (FlashSaleRestoreResult, error)
+	RestoreFlashSaleDurably(ctx context.Context, p FlashSaleRestoreParams, timeout time.Duration) (FlashSaleRestoreResult, error)
 }
 
 // FixedWindowStore atomically increments a counter whose TTL is set only on
@@ -140,6 +179,7 @@ type FixedWindowStore interface {
 type Client interface {
 	Cache
 	IdempotencyStore
+	DurableIdempotencyStore
 	CouponStore
 	FlashSaleStore
 	FixedWindowStore
@@ -147,6 +187,14 @@ type Client interface {
 
 const acquireIdempotencyScript = `
 if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
+    return 1
+end
+return 0
+`
+
+const releaseIdempotencyScript = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    redis.call('DEL', KEYS[1])
     return 1
 end
 return 0
@@ -182,6 +230,22 @@ const preDeductFlashSaleScript = `
 if KEYS[3] ~= nil and KEYS[3] ~= '' then
     local reservation = redis.call('GET', KEYS[3])
     if reservation == ARGV[6] then
+        local stock_value = redis.call('GET', KEYS[1])
+        local count_value = redis.call('GET', KEYS[2])
+        if stock_value == false or count_value == false then
+            return redis.error_reply('flash-sale reserved state is incomplete')
+        end
+        local stock_ttl = redis.call('PTTL', KEYS[1])
+        if stock_ttl > 0 then
+            redis.call('SET', KEYS[1], stock_value, 'PX', stock_ttl)
+        else
+            redis.call('SET', KEYS[1], stock_value)
+        end
+        redis.call('SET', KEYS[2], count_value)
+        redis.call('SET', KEYS[3], ARGV[6])
+        if KEYS[4] ~= nil and KEYS[4] ~= '' then
+            redis.call('SET', KEYS[4], ARGV[6], 'EX', ARGV[8])
+        end
         return 2
     end
     if reservation ~= false then
@@ -211,10 +275,25 @@ if KEYS[3] ~= nil and KEYS[3] ~= '' then
         redis.call('SET', KEYS[3], ARGV[6])
     end
 end
+if KEYS[4] ~= nil and KEYS[4] ~= '' then
+    redis.call('SET', KEYS[4], ARGV[6], 'EX', ARGV[8])
+end
 return 1
 `
 
 const restoreFlashSaleScript = `
+local function rewrite_string(key)
+    if redis.call('EXISTS', key) == 0 then
+        return
+    end
+    local value = redis.call('GET', key)
+    local ttl = redis.call('PTTL', key)
+    if ttl > 0 then
+        redis.call('SET', key, value, 'PX', ttl)
+    else
+        redis.call('SET', key, value)
+    end
+end
 local function parse_safe_integer(value)
     if value ~= '0' and value ~= '-0' and
        string.match(value, '^[1-9]%d*$') == nil and
@@ -236,7 +315,13 @@ local should_restore = not scoped
 if scoped then
     local reservation = redis.call('GET', KEYS[4])
     if reservation == 'rolled_back:' .. ARGV[2] then
+        rewrite_string(KEYS[1])
+        rewrite_string(KEYS[2])
+        redis.call('SET', KEYS[4], reservation)
         return 2
+    end
+    if reservation ~= false and reservation ~= ARGV[2] then
+        return redis.error_reply('flash-sale reservation token mismatch')
     end
     should_restore = reservation == ARGV[2]
     if not should_restore and ARGV[3] == '1' then
@@ -245,6 +330,13 @@ if scoped then
     if not should_restore then
         if redis.call('GET', KEYS[3]) == ARGV[2] then
             redis.call('DEL', KEYS[3])
+        end
+        if reservation == false and ARGV[4] == '1' then
+            if redis.call('EXISTS', KEYS[1]) == 0 then
+                redis.call('SET', KEYS[1], ARGV[5], 'EX', ARGV[6])
+            end
+            redis.call('SET', KEYS[4], 'rolled_back:' .. ARGV[2])
+            return 1
         end
         return 0
     end
@@ -274,10 +366,7 @@ return 1
 
 const ensureFlashSaleReservationScript = `
 local reservation = redis.call('GET', KEYS[4])
-if reservation == ARGV[1] then
-    return 1
-end
-if reservation ~= false then
+if reservation ~= false and reservation ~= ARGV[1] then
     return redis.error_reply('flash-sale reservation token mismatch')
 end
 local idem = redis.call('GET', KEYS[3])
@@ -299,18 +388,110 @@ else
         return redis.error_reply('flash-sale stock is invalid during reservation recovery')
     end
 end
-if stock < quantity then
-    return redis.error_reply('flash-sale stock is insufficient during reservation recovery')
-end
 local count = tonumber(redis.call('GET', KEYS[2]) or '0')
 if count == nil then
     return redis.error_reply('flash-sale count is invalid during reservation recovery')
+end
+if reservation == ARGV[1] then
+    redis.call('SET', KEYS[1], stock, 'EX', ARGV[5])
+    redis.call('SET', KEYS[2], count)
+    redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[3])
+    redis.call('SET', KEYS[4], ARGV[1])
+    return 1
+end
+if stock < quantity then
+    return redis.error_reply('flash-sale stock is insufficient during reservation recovery')
 end
 redis.call('DECRBY', KEYS[1], quantity)
 redis.call('INCRBY', KEYS[2], quantity)
 redis.call('SET', KEYS[4], ARGV[1])
 if idem == false then
     redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[3])
+end
+return 2
+`
+
+const ensureOrderedFlashSaleReservationScript = `
+local reservation = redis.call('GET', KEYS[4])
+if reservation ~= false and reservation ~= ARGV[1] then
+    return redis.error_reply('flash-sale ordered reservation token mismatch')
+end
+local idem = redis.call('GET', KEYS[3])
+if idem ~= false and idem ~= ARGV[1] then
+    return redis.error_reply('flash-sale ordered idempotency token mismatch')
+end
+local stock_raw = redis.call('GET', KEYS[1])
+local stock = tonumber(stock_raw or '-1')
+local fallback_stock = tonumber(ARGV[4])
+if fallback_stock == nil or stock == nil then
+    return redis.error_reply('flash-sale ordered stock is invalid during reservation recovery')
+end
+if stock_raw == false or fallback_stock < stock then
+    redis.call('SET', KEYS[1], fallback_stock, 'EX', ARGV[5])
+    stock = fallback_stock
+end
+local count = tonumber(redis.call('GET', KEYS[2]) or '0')
+if count == nil then
+    return redis.error_reply('flash-sale ordered count is invalid during reservation recovery')
+end
+if reservation == ARGV[1] then
+    redis.call('SET', KEYS[1], stock, 'EX', ARGV[5])
+    redis.call('SET', KEYS[2], count)
+    redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[3])
+    redis.call('SET', KEYS[4], ARGV[1])
+    return 1
+end
+redis.call('INCRBY', KEYS[2], ARGV[2])
+redis.call('SET', KEYS[4], ARGV[1])
+if idem == false then
+    redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[3])
+end
+return 2
+`
+
+const adoptLegacyFlashSaleReservationScript = `
+local reservation = redis.call('GET', KEYS[4])
+if reservation ~= false and reservation ~= ARGV[1] then
+    return redis.error_reply('legacy flash-sale reservation token mismatch')
+end
+local idem = redis.call('GET', KEYS[3])
+if idem ~= false and idem ~= ARGV[1] then
+    return redis.error_reply('legacy flash-sale idempotency token mismatch')
+end
+local stock = redis.call('GET', KEYS[1])
+local target_stock = tonumber(ARGV[3])
+if target_stock == nil then
+    return redis.error_reply('legacy flash-sale target stock is invalid')
+end
+if stock == false or tonumber(stock) == nil or target_stock < tonumber(stock) then
+    stock = target_stock
+end
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    local stock_ttl = redis.call('PTTL', KEYS[1])
+    if stock_ttl > 0 then
+        redis.call('SET', KEYS[1], stock, 'PX', stock_ttl)
+    else
+        redis.call('SET', KEYS[1], stock)
+    end
+else
+    redis.call('SET', KEYS[1], stock, 'EX', ARGV[5])
+end
+local count = redis.call('GET', KEYS[2])
+local target_count = tonumber(ARGV[4])
+if target_count == nil then
+    return redis.error_reply('legacy flash-sale target count is invalid')
+end
+if count == false or tonumber(count) == nil or tonumber(count) < target_count then
+    count = target_count
+end
+if tonumber(count) == nil then
+    return redis.error_reply('legacy flash-sale count is invalid')
+end
+redis.call('SET', KEYS[2], count)
+redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[2])
+redis.call('SET', KEYS[4], ARGV[1])
+if reservation == ARGV[1] then
+    return 1
 end
 return 2
 `
@@ -336,6 +517,20 @@ func (r *redisCache) AcquireIdempotency(ctx context.Context, key, value string, 
 	default:
 		return 0, fmt.Errorf("unexpected idempotency result: %d", code)
 	}
+}
+
+func (r *redisCache) ReleaseIdempotencyDurably(ctx context.Context, key, value string, timeout time.Duration) error {
+	if key == "" || value == "" || timeout <= 0 {
+		return fmt.Errorf("durable idempotency release requires key, value, and positive timeout")
+	}
+	code, err := r.evalIntAndWaitAOF(ctx, timeout, releaseIdempotencyScript, []string{key}, value)
+	if err != nil {
+		return err
+	}
+	if code != 1 {
+		return fmt.Errorf("idempotency key no longer belongs to reservation")
+	}
+	return nil
 }
 
 func (r *redisCache) ClaimCoupon(ctx context.Context, p CouponClaimParams) (CouponClaimResult, error) {
@@ -374,6 +569,17 @@ func (r *redisCache) WarmFlashSaleStock(ctx context.Context, p FlashSaleWarmPara
 }
 
 func (r *redisCache) PreDeductFlashSale(ctx context.Context, p FlashSalePreDeductParams) (FlashSalePreDeductResult, error) {
+	return r.preDeductFlashSale(ctx, p, 0)
+}
+
+func (r *redisCache) PreDeductFlashSaleDurably(ctx context.Context, p FlashSalePreDeductParams, timeout time.Duration) (FlashSalePreDeductResult, error) {
+	if timeout <= 0 {
+		return 0, fmt.Errorf("flash-sale durable pre-deduction timeout must be positive")
+	}
+	return r.preDeductFlashSale(ctx, p, timeout)
+}
+
+func (r *redisCache) preDeductFlashSale(ctx context.Context, p FlashSalePreDeductParams, aofTimeout time.Duration) (FlashSalePreDeductResult, error) {
 	keys := []string{p.StockKey, p.CountKey}
 	if p.ReservationKey != "" {
 		if p.ReservationToken == "" {
@@ -383,14 +589,20 @@ func (r *redisCache) PreDeductFlashSale(ctx context.Context, p FlashSalePreDeduc
 			return 0, fmt.Errorf("flash-sale reservation TTL cannot be negative")
 		}
 		keys = append(keys, p.ReservationKey)
+		if p.IdempotencyKey != "" {
+			if p.IdempotencyTTL < time.Second {
+				return 0, fmt.Errorf("flash-sale idempotency TTL must be at least one second")
+			}
+			keys = append(keys, p.IdempotencyKey)
+		}
 	}
 	onSale := 0
 	if p.OnSale {
 		onSale = 1
 	}
-	code, err := r.evalInt(ctx, preDeductFlashSaleScript, keys,
+	code, err := r.evalFlashSaleInt(ctx, aofTimeout, preDeductFlashSaleScript, keys,
 		p.Now.UnixMilli(), p.StartAt.UnixMilli(), p.EndAt.UnixMilli(), onSale, p.PerUserLimit,
-		p.ReservationToken, int64(p.ReservationTTL.Seconds()))
+		p.ReservationToken, int64(p.ReservationTTL.Seconds()), int64(p.IdempotencyTTL.Seconds()))
 	if err != nil {
 		return 0, err
 	}
@@ -413,6 +625,17 @@ func (r *redisCache) PreDeductFlashSale(ctx context.Context, p FlashSalePreDeduc
 }
 
 func (r *redisCache) RestoreFlashSale(ctx context.Context, p FlashSaleRestoreParams) (FlashSaleRestoreResult, error) {
+	return r.restoreFlashSale(ctx, p, 0)
+}
+
+func (r *redisCache) RestoreFlashSaleDurably(ctx context.Context, p FlashSaleRestoreParams, timeout time.Duration) (FlashSaleRestoreResult, error) {
+	if timeout <= 0 {
+		return 0, fmt.Errorf("flash-sale durable restore timeout must be positive")
+	}
+	return r.restoreFlashSale(ctx, p, timeout)
+}
+
+func (r *redisCache) restoreFlashSale(ctx context.Context, p FlashSaleRestoreParams, aofTimeout time.Duration) (FlashSaleRestoreResult, error) {
 	if p.Quantity <= 0 {
 		return 0, fmt.Errorf("flash-sale restore quantity must be positive: %d", p.Quantity)
 	}
@@ -427,7 +650,16 @@ func (r *redisCache) RestoreFlashSale(ctx context.Context, p FlashSaleRestorePar
 	if p.AllowIdempotencyFallback {
 		fallback = 1
 	}
-	code, err := r.evalInt(ctx, restoreFlashSaleScript, keys, p.Quantity, p.ReservationToken, fallback)
+	allowMissing := 0
+	if p.AllowMissingReservation {
+		allowMissing = 1
+	}
+	stockTTLSeconds := int64(p.StockTTL.Seconds())
+	if p.AllowMissingReservation && (p.FallbackStock < 0 || stockTTLSeconds <= 0) {
+		return 0, fmt.Errorf("flash-sale missing reservation fallback stock/TTL is invalid")
+	}
+	code, err := r.evalFlashSaleInt(ctx, aofTimeout, restoreFlashSaleScript, keys,
+		p.Quantity, p.ReservationToken, fallback, allowMissing, p.FallbackStock, stockTTLSeconds)
 	if err != nil {
 		return 0, err
 	}
@@ -444,6 +676,17 @@ func (r *redisCache) RestoreFlashSale(ctx context.Context, p FlashSaleRestorePar
 }
 
 func (r *redisCache) EnsureFlashSaleReservation(ctx context.Context, p FlashSaleEnsureReservationParams) (FlashSaleEnsureReservationResult, error) {
+	return r.ensureFlashSaleReservation(ctx, p, 0)
+}
+
+func (r *redisCache) EnsureFlashSaleReservationDurably(ctx context.Context, p FlashSaleEnsureReservationParams, timeout time.Duration) (FlashSaleEnsureReservationResult, error) {
+	if timeout <= 0 {
+		return 0, fmt.Errorf("flash-sale durable reservation timeout must be positive")
+	}
+	return r.ensureFlashSaleReservation(ctx, p, timeout)
+}
+
+func (r *redisCache) ensureFlashSaleReservation(ctx context.Context, p FlashSaleEnsureReservationParams, aofTimeout time.Duration) (FlashSaleEnsureReservationResult, error) {
 	if p.ReservationToken == "" {
 		return 0, fmt.Errorf("flash-sale reservation token is required")
 	}
@@ -464,7 +707,7 @@ func (r *redisCache) EnsureFlashSaleReservation(ctx context.Context, p FlashSale
 	if ttlSeconds <= 0 {
 		return 0, fmt.Errorf("flash-sale idempotency TTL must be at least one second")
 	}
-	code, err := r.evalInt(ctx, ensureFlashSaleReservationScript,
+	code, err := r.evalFlashSaleInt(ctx, aofTimeout, ensureFlashSaleReservationScript,
 		[]string{p.StockKey, p.CountKey, p.IdempotencyKey, p.ReservationKey},
 		p.ReservationToken, p.Quantity, ttlSeconds, p.FallbackStock, stockTTLSeconds)
 	if err != nil {
@@ -478,6 +721,90 @@ func (r *redisCache) EnsureFlashSaleReservation(ctx context.Context, p FlashSale
 	default:
 		return 0, fmt.Errorf("unexpected flash-sale ensure reservation result: %d", code)
 	}
+}
+
+func (r *redisCache) EnsureOrderedFlashSaleReservation(ctx context.Context, p FlashSaleEnsureOrderedReservationParams) (FlashSaleEnsureReservationResult, error) {
+	return r.ensureOrderedFlashSaleReservation(ctx, p, 0)
+}
+
+func (r *redisCache) EnsureOrderedFlashSaleReservationDurably(ctx context.Context, p FlashSaleEnsureOrderedReservationParams, timeout time.Duration) (FlashSaleEnsureReservationResult, error) {
+	if timeout <= 0 {
+		return 0, fmt.Errorf("flash-sale durable ordered reservation timeout must be positive")
+	}
+	return r.ensureOrderedFlashSaleReservation(ctx, p, timeout)
+}
+
+func (r *redisCache) ensureOrderedFlashSaleReservation(ctx context.Context, p FlashSaleEnsureOrderedReservationParams, aofTimeout time.Duration) (FlashSaleEnsureReservationResult, error) {
+	if p.ReservationToken == "" {
+		return 0, fmt.Errorf("flash-sale ordered reservation token is required")
+	}
+	if p.Quantity <= 0 {
+		return 0, fmt.Errorf("flash-sale ordered reservation quantity must be positive: %d", p.Quantity)
+	}
+	if p.FallbackStock < 0 {
+		return 0, fmt.Errorf("flash-sale ordered fallback stock cannot be negative: %d", p.FallbackStock)
+	}
+	ttlSeconds := int64(p.IdempotencyTTL.Seconds())
+	if ttlSeconds <= 0 {
+		return 0, fmt.Errorf("flash-sale ordered idempotency TTL must be at least one second")
+	}
+	stockTTLSeconds := int64(p.StockTTL.Seconds())
+	if stockTTLSeconds <= 0 {
+		return 0, fmt.Errorf("flash-sale ordered stock TTL must be at least one second")
+	}
+	code, err := r.evalFlashSaleInt(ctx, aofTimeout, ensureOrderedFlashSaleReservationScript,
+		[]string{p.StockKey, p.CountKey, p.IdempotencyKey, p.ReservationKey},
+		p.ReservationToken, p.Quantity, ttlSeconds, p.FallbackStock, stockTTLSeconds)
+	if err != nil {
+		return 0, err
+	}
+	switch code {
+	case 1:
+		return FlashSaleReservationPresent, nil
+	case 2:
+		return FlashSaleReservationReinstated, nil
+	default:
+		return 0, fmt.Errorf("unexpected flash-sale ensure ordered reservation result: %d", code)
+	}
+}
+
+func (r *redisCache) AdoptLegacyFlashSaleReservationDurably(ctx context.Context, p FlashSaleAdoptLegacyReservationParams, timeout time.Duration) (FlashSaleEnsureReservationResult, error) {
+	if timeout <= 0 {
+		return 0, fmt.Errorf("legacy flash-sale durable reservation timeout must be positive")
+	}
+	if p.ReservationToken == "" {
+		return 0, fmt.Errorf("legacy flash-sale reservation token is required")
+	}
+	ttlSeconds := int64(p.IdempotencyTTL.Seconds())
+	if ttlSeconds <= 0 {
+		return 0, fmt.Errorf("legacy flash-sale idempotency TTL must be at least one second")
+	}
+	stockTTLSeconds := int64(p.StockTTL.Seconds())
+	if p.TargetStock < 0 || p.TargetUserCount <= 0 || stockTTLSeconds <= 0 {
+		return 0, fmt.Errorf("legacy flash-sale target stock, count, or TTL is invalid")
+	}
+	code, err := r.evalIntAndWaitAOF(ctx, timeout, adoptLegacyFlashSaleReservationScript,
+		[]string{p.StockKey, p.CountKey, p.IdempotencyKey, p.ReservationKey},
+		p.ReservationToken, ttlSeconds, p.TargetStock, p.TargetUserCount, stockTTLSeconds)
+	if err != nil {
+		return 0, err
+	}
+	switch code {
+	case 1:
+		return FlashSaleReservationPresent, nil
+	case 2:
+		return FlashSaleReservationReinstated, nil
+	default:
+		return 0, fmt.Errorf("unexpected legacy flash-sale reservation result: %d", code)
+	}
+}
+
+func (r *redisCache) evalFlashSaleInt(ctx context.Context, aofTimeout time.Duration,
+	script string, keys []string, args ...any) (int64, error) {
+	if aofTimeout > 0 {
+		return r.evalIntAndWaitAOF(ctx, aofTimeout, script, keys, args...)
+	}
+	return r.evalInt(ctx, script, keys, args...)
 }
 
 func (r *redisCache) IncrementFixedWindow(ctx context.Context, key string, window time.Duration) (int64, error) {

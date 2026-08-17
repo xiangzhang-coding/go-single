@@ -65,6 +65,7 @@ type consumerFixture struct {
 	users    *fakeUserService
 	acts     *fakeActivities
 	pd       *fakePreDeductions
+	cache    *fakeCache
 }
 
 func newConsumerFixture() *consumerFixture {
@@ -72,12 +73,14 @@ func newConsumerFixture() *consumerFixture {
 	orders := &fakeOrderService{inserted: true}
 	users := newFakeUserService()
 	pd := newFakePreDeductions()
+	cache := newFakeCache()
 	return &consumerFixture{
-		consumer: NewSeckillOrderConsumer(acts, pd, fakeSeckillTx{}, orders, users, metrics.New().Business(), zap.NewNop()),
+		consumer: NewSeckillOrderConsumer(acts, pd, cache, fakeSeckillTx{}, orders, users, metrics.New().Business(), zap.NewNop()),
 		orders:   orders,
 		users:    users,
 		acts:     acts,
 		pd:       pd,
+		cache:    cache,
 	}
 }
 
@@ -87,6 +90,8 @@ func (fx *consumerFixture) seed(t *testing.T, userID int64) *model.Activity {
 	fx.users.seedAddress(userID)
 	a := &model.Activity{ID: 1, SKUID: 5, Title: "限时秒杀", Price: 9900, Stock: 10, Status: "on_sale"}
 	require.NoError(t, fx.acts.Create(context.Background(), a))
+	fx.cache.stock[stockKey(a.ID)] = a.Stock
+	fx.cache.count[countKey(a.ID, userID)] = 1
 	return a
 }
 
@@ -162,7 +167,7 @@ func TestConsumerActivityReadFailureTransient(t *testing.T) {
 	fx := newConsumerFixture()
 	fx.users.seedAddress(42)
 
-	fx.consumer = NewSeckillOrderConsumer(&failingActivities{}, fx.pd, fakeSeckillTx{}, fx.orders, fx.users, metrics.New().Business(), zap.NewNop())
+	fx.consumer = NewSeckillOrderConsumer(&failingActivities{}, fx.pd, fx.cache, fakeSeckillTx{}, fx.orders, fx.users, metrics.New().Business(), zap.NewNop())
 	err := fx.consumer.Handle(context.Background(),
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: 1}))
 	require.Error(t, err)
@@ -188,9 +193,15 @@ func TestConsumerCreatePermanentFailure(t *testing.T) {
 	fx := newConsumerFixture()
 	a := fx.seed(t, 42)
 	a.Stock = 0
+	orderNo := "10001"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		Status: model.PreDeductionStatusPendingOrder,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
 
 	err := fx.consumer.Handle(context.Background(),
-		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: a.ID}))
+		marshalMsg(t, SeckillSuccessMessage{PreDeductionID: pd.ID, OrderNo: orderNo, UserID: 42, ActivityID: a.ID}))
 	require.ErrorIs(t, err, mq.ErrPermanent, "库存不足应死信并进入持久回退")
 }
 
@@ -259,6 +270,32 @@ func TestConsumerPermanentFailureSchedulesDurableRollback(t *testing.T) {
 	require.Equal(t, model.PreDeductionStatusPendingRollback, stored.Status)
 }
 
+func TestLegacyConsumerPermanentFailureCreatesRollbackLifecycle(t *testing.T) {
+	fx := newConsumerFixture()
+	a := fx.seed(t, 42)
+	delete(fx.cache.stock, stockKey(a.ID))
+	delete(fx.cache.count, countKey(a.ID, 42))
+	fx.users.addresses = map[int64]*usermodel.Address{}
+
+	err := fx.consumer.Handle(context.Background(), marshalMsg(t, SeckillSuccessMessage{
+		OrderNo: "legacy-10001", UserID: 42, ActivityID: a.ID,
+	}))
+	require.ErrorIs(t, err, mq.ErrPermanent)
+
+	fx.pd.mu.Lock()
+	defer fx.pd.mu.Unlock()
+	var lifecycle *model.PreDeduction
+	for _, pd := range fx.pd.byID {
+		if pd.OrderNumber() == "legacy-10001" {
+			lifecycle = pd
+			break
+		}
+	}
+	require.NotNil(t, lifecycle)
+	require.True(t, lifecycle.Legacy)
+	require.Equal(t, model.PreDeductionStatusPendingRollback, lifecycle.Status)
+}
+
 func TestConsumerAcknowledgesDeliveryAfterRollbackStarted(t *testing.T) {
 	fx := newConsumerFixture()
 	a := fx.seed(t, 42)
@@ -293,6 +330,29 @@ func TestDeadLetterSchedulesDurableRollback(t *testing.T) {
 	stored, getErr := fx.pd.GetByID(context.Background(), pd.ID)
 	require.NoError(t, getErr)
 	require.Equal(t, model.PreDeductionStatusPendingRollback, stored.Status)
+}
+
+func TestLegacyDeadLetterCreatesRollbackLifecycle(t *testing.T) {
+	fx := newConsumerFixture()
+	a := fx.seed(t, 42)
+	delete(fx.cache.stock, stockKey(a.ID))
+	delete(fx.cache.count, countKey(a.ID, 42))
+	err := fx.consumer.HandleDeadLetter(context.Background(), marshalMsg(t, SeckillSuccessMessage{
+		OrderNo: "legacy-dlq", UserID: 42, ActivityID: a.ID,
+	}))
+	require.NoError(t, err)
+
+	fx.pd.mu.Lock()
+	defer fx.pd.mu.Unlock()
+	var found bool
+	for _, pd := range fx.pd.byID {
+		if pd.OrderNumber() == "legacy-dlq" {
+			found = true
+			require.True(t, pd.Legacy)
+			require.Equal(t, model.PreDeductionStatusPendingRollback, pd.Status)
+		}
+	}
+	require.True(t, found)
 }
 
 func TestLateDeadLetterCannotRollbackCreatedOrder(t *testing.T) {

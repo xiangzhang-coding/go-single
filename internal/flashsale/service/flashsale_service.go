@@ -77,6 +77,7 @@ const idemTTL = 30 * time.Minute
 const (
 	maxPublishAttempts     = 10
 	preparingRecoveryDelay = 30 * time.Second
+	redisAOFTimeout        = 2 * time.Second
 )
 
 type PurchaseResult struct {
@@ -134,11 +135,6 @@ type Service interface {
 	Seckill(ctx context.Context, userID, activityID int64) (*PurchaseResult, error)
 	GetPreDeduction(ctx context.Context, userID, id int64) (*model.PreDeduction, error)
 	RecoverPreDeduction(ctx context.Context, id int64) error
-
-	// ---- 抢购预扣（底层原子操作，T11 抢购接口复用）----
-	// PreDeduct 缓存原子预扣：活动由调用方读库（与优惠券领券同模式，
-	// 状态/窗口/限购作为 ARGV 传入，Redis 内原子扣减）。
-	PreDeduct(ctx context.Context, userID, activityID int64) error
 }
 
 // ProductService product 模块暴露的最小查询接口（跨模块进程内调用，面向接口非 HTTP；
@@ -163,6 +159,7 @@ type OrderNoGenerator interface {
 
 type flashSaleCache interface {
 	cache.IdempotencyStore
+	cache.DurableIdempotencyStore
 	cache.FlashSaleStore
 	cache.FixedWindowStore
 	Get(ctx context.Context, key string) (string, error)
@@ -433,32 +430,36 @@ func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64
 	key := idemKey(activityID, userID)
 	result, err := s.cache.AcquireIdempotency(ctx, key, pd.ReservationToken(), idemTTL)
 	if err != nil {
-		return nil, fmt.Errorf("acquire flashsale idempotency: %w", err)
+		return purchaseResult(pd), nil
 	}
 	if result == cache.IdempotencyExists {
 		if markErr := s.store.PreDeductions.MarkRolledBack(ctx, pd.ID); markErr != nil {
 			return nil, markErr
 		}
+		if existing := s.existingPurchase(ctx, key, userID, activityID); existing != nil {
+			return purchaseResult(existing), nil
+		}
 		return nil, ErrDuplicateRequest
 	}
 	if result != cache.IdempotencyAcquired {
-		return nil, fmt.Errorf("unexpected flashsale idempotency result: %d", result)
+		return purchaseResult(pd), nil
 	}
 
 	// 4. 库存、用户计数与 reservation marker 在同一段 Lua 中提交。
 	if err := s.preDeductActivity(ctx, userID, activity, pd); err != nil {
 		if isBusinessReject(err) {
-			if delErr := s.cache.Del(ctx, key); delErr != nil {
+			if delErr := s.cache.ReleaseIdempotencyDurably(ctx, key, pd.ReservationToken(), redisAOFTimeout); delErr != nil {
 				return nil, fmt.Errorf("%w: release idempotency key: %v", err, delErr)
 			}
 			if markErr := s.store.PreDeductions.MarkRolledBack(ctx, pd.ID); markErr != nil {
 				return nil, fmt.Errorf("%w: mark rejected pre-deduction rolled back: %v", err, markErr)
 			}
+			return nil, err
 		}
-		return nil, err
+		return purchaseResult(pd), nil
 	}
 	if err := s.store.PreDeductions.MarkPreDeducted(ctx, pd.ID); err != nil {
-		return nil, err
+		return purchaseResult(pd), nil
 	}
 	pd.Status = model.PreDeductionStatusPendingPublish
 
@@ -469,6 +470,22 @@ func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64
 		pd = current
 	}
 	return purchaseResult(pd), nil
+}
+
+func (s *flashsaleService) existingPurchase(ctx context.Context, key string, userID, activityID int64) *model.PreDeduction {
+	token, err := s.cache.Get(ctx, key)
+	if err != nil {
+		return nil
+	}
+	id, err := strconv.ParseInt(token, 10, 64)
+	if err != nil || id <= 0 {
+		return nil
+	}
+	pd, err := s.store.PreDeductions.GetByID(ctx, id)
+	if err != nil || pd == nil || pd.UserID != userID || pd.ActivityID != activityID {
+		return nil
+	}
+	return pd
 }
 
 func purchaseResult(p *model.PreDeduction) *PurchaseResult {
@@ -531,7 +548,7 @@ func (s *flashsaleService) recordPublishFailure(ctx context.Context, pd *model.P
 	}
 	pd.PublishAttempts++
 	pd.LastError = cause.Error()
-	if pd.PublishAttempts >= maxPublishAttempts {
+	if pd.Status == model.PreDeductionStatusPendingPublish && pd.PublishAttempts >= maxPublishAttempts {
 		pd.Status = model.PreDeductionStatusPendingRollback
 	}
 	return cause
@@ -570,12 +587,18 @@ func (s *flashsaleService) RecoverPreDeductions(ctx context.Context) (RecoverySt
 	}
 	for phase := 0; phase < 2; phase++ {
 		for i := range list {
+			if err := ctx.Err(); err != nil {
+				return stats, err
+			}
 			isRollback := initialRollback[i]
 			if (phase == 0 && isRollback) || (phase == 1 && !isRollback) {
 				continue
 			}
 			before := list[i].Status
 			if err := s.recoverPreDeduction(ctx, &list[i]); err != nil {
+				if ctx.Err() != nil {
+					return stats, ctx.Err()
+				}
 				stats.Failed++
 				continue
 			}
@@ -665,11 +688,14 @@ func (s *flashsaleService) ensurePreDeductionReservation(ctx context.Context, pd
 	if activity == nil {
 		return ErrActivityNotFound
 	}
+	if pd.Legacy {
+		return adoptLegacyReservation(ctx, s.cache, s.store.PreDeductions, pd, activity)
+	}
 	stockTTL := remainingTTL(activity)
 	if stockTTL <= 0 {
 		stockTTL = stockKeyMargin
 	}
-	_, err = s.cache.EnsureFlashSaleReservation(ctx, cache.FlashSaleEnsureReservationParams{
+	_, err = s.cache.EnsureFlashSaleReservationDurably(ctx, cache.FlashSaleEnsureReservationParams{
 		StockKey:         stockKey(pd.ActivityID),
 		CountKey:         countKey(pd.ActivityID, pd.UserID),
 		IdempotencyKey:   idemKey(pd.ActivityID, pd.UserID),
@@ -679,7 +705,7 @@ func (s *flashsaleService) ensurePreDeductionReservation(ctx context.Context, pd
 		Quantity:         pd.Quantity,
 		FallbackStock:    activity.Stock,
 		StockTTL:         stockTTL,
-	})
+	}, redisAOFTimeout)
 	if err != nil {
 		return fmt.Errorf("ensure flash-sale reservation: %w", err)
 	}
@@ -687,30 +713,32 @@ func (s *flashsaleService) ensurePreDeductionReservation(ctx context.Context, pd
 }
 
 func (s *flashsaleService) rollbackPreDeduction(ctx context.Context, pd *model.PreDeduction, allowMissing bool) error {
-	if _, err := s.cache.Get(ctx, reservationKey(pd.ID)); errors.Is(err, cache.ErrMiss) {
+	fallbackStock := 0
+	stockTTL := stockKeyMargin
+	if allowMissing {
 		activity, activityErr := s.store.Activities.GetByID(ctx, pd.ActivityID)
 		if activityErr != nil {
 			return s.recordRollbackFailure(ctx, pd.ID, activityErr)
 		}
-		if activity != nil && remainingTTL(activity) > 0 {
-			if _, warmErr := s.cache.WarmFlashSaleStock(ctx, cache.FlashSaleWarmParams{
-				StockKey: stockKey(pd.ActivityID), Stock: activity.Stock, TTL: remainingTTL(activity),
-			}); warmErr != nil {
-				return s.recordRollbackFailure(ctx, pd.ID, warmErr)
+		if activity != nil {
+			fallbackStock = activity.Stock
+			if remainingTTL(activity) > 0 {
+				stockTTL = remainingTTL(activity)
 			}
 		}
-	} else if err != nil {
-		return s.recordRollbackFailure(ctx, pd.ID, err)
 	}
-	result, err := s.cache.RestoreFlashSale(ctx, cache.FlashSaleRestoreParams{
+	result, err := s.cache.RestoreFlashSaleDurably(ctx, cache.FlashSaleRestoreParams{
 		StockKey:                 stockKey(pd.ActivityID),
 		CountKey:                 countKey(pd.ActivityID, pd.UserID),
 		IdempotencyKey:           idemKey(pd.ActivityID, pd.UserID),
 		ReservationKey:           reservationKey(pd.ID),
 		ReservationToken:         pd.ReservationToken(),
 		AllowIdempotencyFallback: pd.Legacy,
+		AllowMissingReservation:  allowMissing,
 		Quantity:                 pd.Quantity,
-	})
+		FallbackStock:            fallbackStock,
+		StockTTL:                 stockTTL,
+	}, redisAOFTimeout)
 	if err != nil {
 		return s.recordRollbackFailure(ctx, pd.ID, err)
 	}
@@ -777,8 +805,16 @@ func (s *flashsaleService) preDeductActivity(ctx context.Context, userID int64, 
 	if pd != nil {
 		params.ReservationKey = reservationKey(pd.ID)
 		params.ReservationToken = pd.ReservationToken()
+		params.IdempotencyKey = idemKey(a.ID, userID)
+		params.IdempotencyTTL = idemTTL
 	}
-	result, err := s.cache.PreDeductFlashSale(ctx, params)
+	var result cache.FlashSalePreDeductResult
+	var err error
+	if pd != nil {
+		result, err = s.cache.PreDeductFlashSaleDurably(ctx, params, redisAOFTimeout)
+	} else {
+		result, err = s.cache.PreDeductFlashSale(ctx, params)
+	}
 	if err != nil {
 		s.preDeductFailed()
 		return err

@@ -105,6 +105,32 @@ func (s *reconciliationService) ReconcileActive(ctx context.Context) ([]Reconcil
 				Detail:         recoveryDetail(fact.Status),
 			})
 		}
+		ordered, err := s.store.PreDeductions.ListOrdered(ctx, 0)
+		if err != nil {
+			return nil, err
+		}
+		for i := range ordered {
+			fact := &ordered[i]
+			a := active[fact.ActivityID]
+			if a == nil || fact.Legacy {
+				continue
+			}
+			token, getErr := s.cache.Get(ctx, reservationKey(fact.ID))
+			if getErr == nil && token == fact.ReservationToken() {
+				continue
+			}
+			if getErr != nil && !errors.Is(getErr, cache.ErrMiss) {
+				return nil, getErr
+			}
+			detail := "已落单事实的 reservation marker 缺失（等待自动重建）"
+			if getErr == nil {
+				detail = "已落单事实的 reservation marker 不匹配（需停止自动清理并排查）"
+			}
+			warnings = append(warnings, ReconcileWarning{
+				PreDeductionID: fact.ID, UserID: fact.UserID, OrderNo: fact.OrderNumber(),
+				Status: string(fact.Status), ActivityID: fact.ActivityID, Title: a.Title, Detail: detail,
+			})
+		}
 	}
 	for i := range activities {
 		a := &activities[i]

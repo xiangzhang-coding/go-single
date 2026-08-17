@@ -314,7 +314,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, businessMetrics, retryCfg)
 	orderHandler := orderhandler.New(orderSvc, verifier)
 	reservationCleanup := flashsalesvc.NewReservationCleanup(
-		flashsaleStore.PreDeductions, cacheClient, orderSvc)
+		flashsaleStore.Activities, flashsaleStore.PreDeductions, cacheClient, orderSvc)
 	seckillTimeout := flashsalesvc.NewSeckillTimeout(
 		flashsaleStore.Tx, orderSvc, flashsaleStore.Activities, flashsaleStore.PreDeductions,
 		flashsaleSvc, businessMetrics)
@@ -351,7 +351,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// order 服务幂等建单 + 同事务扣活动库存；瞬时失败 Nack 重投、
 	// 永久失败进死信（对账兜底）。消费中断 3s 后重连（at-least-once 不丢消息）。
 	seckillConsumer := flashsalesvc.NewSeckillOrderConsumer(
-		flashsaleStore.Activities, flashsaleStore.PreDeductions, flashsaleStore.Tx,
+		flashsaleStore.Activities, flashsaleStore.PreDeductions, cacheClient, flashsaleStore.Tx,
 		orderSvc, userSvc, businessMetrics, log)
 	startConsumer := func(queue, name string, handler mq.MessageHandler) {
 		go func() {
@@ -366,11 +366,16 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 			}
 		}()
 	}
-	if stats, err := flashsaleSvc.RecoverPreDeductions(context.Background()); err != nil {
+	if stats, err := recoverPreDeductionsAtStartup(flashsaleSvc, 10*time.Second); err != nil {
 		log.Error("秒杀预扣启动恢复失败（定时任务将重试）", zap.Error(err))
 	} else if stats.Published+stats.RolledBack+stats.Failed > 0 {
 		log.Info("秒杀预扣启动恢复完成", zap.Int("published", stats.Published),
 			zap.Int("rolled_back", stats.RolledBack), zap.Int("failed", stats.Failed))
+	}
+	if cleaned, err := cleanupReservationsAtStartup(reservationCleanup, 10*time.Second); err != nil {
+		log.Error("秒杀 ordered reservation 启动修复失败（定时任务将重试）", zap.Error(err))
+	} else if cleaned > 0 {
+		log.Info("秒杀 ordered reservation 启动清理完成", zap.Int("cleaned", cleaned))
 	}
 	startConsumer(flashsalesvc.SeckillOrderQueue, "秒杀落单消费者", seckillConsumer.Handle)
 	startConsumer(flashsalesvc.SeckillOrderDeadLetterQueue, "秒杀死信消费者", seckillConsumer.HandleDeadLetter)
@@ -417,6 +422,18 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	fileHandler.RegisterRoutes(api)
 
 	return r, cronRegistry
+}
+
+func recoverPreDeductionsAtStartup(recovery flashsalesvc.PreDeductionRecovery, timeout time.Duration) (flashsalesvc.RecoveryStats, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return recovery.RecoverPreDeductions(ctx)
+}
+
+func cleanupReservationsAtStartup(cleanup flashsalesvc.ReservationCleanup, timeout time.Duration) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return cleanup.CleanupOrderedReservations(ctx)
 }
 
 func healthHandler(checker *health.Checker) gin.HandlerFunc {

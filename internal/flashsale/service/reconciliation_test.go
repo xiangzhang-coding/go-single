@@ -138,6 +138,29 @@ func TestReconcileActiveIdentifiesUnresolvedPreDeduction(t *testing.T) {
 	require.True(t, found, "reconciliation must identify the exact recoverable pre-deduction")
 }
 
+func TestReconcileActiveIdentifiesOrderedFactWithMissingReservation(t *testing.T) {
+	fx := newReconcileFixture()
+	a := fx.seedActive(t, 9)
+	orderNo := "ordered-aof"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		Status: model.PreDeductionStatusOrdered,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	warnings, err := fx.svc.ReconcileActive(context.Background())
+	require.NoError(t, err)
+	var found bool
+	for _, warning := range warnings {
+		if warning.PreDeductionID == pd.ID {
+			found = true
+			require.Equal(t, "ordered", warning.Status)
+			require.Contains(t, warning.Detail, "reservation marker 缺失")
+		}
+	}
+	require.True(t, found)
+}
+
 // 进行中对账：Redis 高于 MySQL（多回补/缺预扣）→ 告警，不写回。
 func TestReconcileActiveRedisAboveMySQLWarns(t *testing.T) {
 	fx := newReconcileFixture()

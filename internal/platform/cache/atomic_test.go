@@ -16,6 +16,8 @@ func newAtomicRedis(t *testing.T) Client {
 	t.Helper()
 	c, err := NewRedis("127.0.0.1:6379", "", redisTestDB)
 	testsupport.RequireDependency(t, "Redis", err)
+	require.NoError(t, c.(*redisCache).client.ConfigSet(context.Background(), "appendonly", "yes").Err())
+	require.NoError(t, c.(*redisCache).client.ConfigSet(context.Background(), "appendfsync", "always").Err())
 	t.Cleanup(func() { require.NoError(t, c.Close()) })
 	return c
 }
@@ -64,6 +66,17 @@ func TestAcquireIdempotencyPropagatesRedisError(t *testing.T) {
 
 	_, err = c.Get(context.Background(), key)
 	require.ErrorIs(t, err, ErrMiss, "失败的抢占不得留下幂等键")
+}
+
+func TestReleaseIdempotencyDurablyDeletesOnlyOwnedKey(t *testing.T) {
+	c := newAtomicRedis(t)
+	key := atomicTestKey(t, "idem-release")
+	t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), key)) })
+	require.NoError(t, c.Set(context.Background(), key, "reservation-42", time.Minute))
+
+	err := c.ReleaseIdempotencyDurably(context.Background(), key, "reservation-42", 2*time.Second)
+	require.NoError(t, err)
+	requireCacheState(t, c, key, "", false)
 }
 
 func TestClaimCouponResultsAndState(t *testing.T) {
@@ -346,11 +359,11 @@ func TestPreDeductFlashSaleReservationIsIdempotent(t *testing.T) {
 		Now: now, StartAt: now.Add(-time.Minute), EndAt: now.Add(time.Hour),
 		OnSale: true, PerUserLimit: 1,
 	}
-	result, err := c.PreDeductFlashSale(context.Background(), params)
+	result, err := c.PreDeductFlashSaleDurably(context.Background(), params, 2*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, FlashSalePreDeducted, result)
 
-	result, err = c.PreDeductFlashSale(context.Background(), params)
+	result, err = c.PreDeductFlashSaleDurably(context.Background(), params, 2*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, FlashSaleAlreadyPreDeducted, result)
 	requireCacheState(t, c, stockKey, "4", true)
@@ -401,16 +414,133 @@ func TestEnsureFlashSaleReservationReinstatesLostPreDeduction(t *testing.T) {
 		IdempotencyTTL: 30 * time.Minute, Quantity: 1, FallbackStock: 5, StockTTL: time.Hour,
 	}
 
-	result, err := c.EnsureFlashSaleReservation(context.Background(), params)
+	result, err := c.EnsureFlashSaleReservationDurably(context.Background(), params, 2*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, FlashSaleReservationReinstated, result)
-	result, err = c.EnsureFlashSaleReservation(context.Background(), params)
+	result, err = c.EnsureFlashSaleReservationDurably(context.Background(), params, 2*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, FlashSaleReservationPresent, result)
 	requireCacheState(t, c, stockKey, "4", true)
 	requireCacheState(t, c, countKey, "1", true)
 	requireCacheState(t, c, idemKey, "reservation-42", true)
 	requireCacheState(t, c, reservationKey, "reservation-42", true)
+}
+
+func TestEnsureOrderedFlashSaleReservationDurablyRebuildsState(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-ordered-stock")
+	countKey := atomicTestKey(t, "flashsale-ordered-count")
+	idemKey := atomicTestKey(t, "flashsale-ordered-idem")
+	reservationKey := atomicTestKey(t, "flashsale-ordered-reservation")
+	t.Cleanup(func() {
+		for _, key := range []string{stockKey, countKey, idemKey, reservationKey} {
+			require.NoError(t, c.Del(context.Background(), key))
+		}
+	})
+	params := FlashSaleEnsureOrderedReservationParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
+		ReservationKey: reservationKey, ReservationToken: "ordered-42",
+		IdempotencyTTL: 30 * time.Minute, Quantity: 1, FallbackStock: 9, StockTTL: time.Hour,
+	}
+
+	result, err := c.EnsureOrderedFlashSaleReservationDurably(context.Background(), params, 2*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, FlashSaleReservationReinstated, result)
+	requireCacheState(t, c, stockKey, "9", true)
+	requireCacheState(t, c, countKey, "1", true)
+	requireCacheState(t, c, idemKey, "ordered-42", true)
+	requireCacheState(t, c, reservationKey, "ordered-42", true)
+}
+
+func TestAdoptLegacyFlashSaleReservationDoesNotDeductAgain(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-legacy-stock")
+	countKey := atomicTestKey(t, "flashsale-legacy-count")
+	idemKey := atomicTestKey(t, "flashsale-legacy-idem")
+	reservationKey := atomicTestKey(t, "flashsale-legacy-reservation")
+	t.Cleanup(func() {
+		for _, key := range []string{stockKey, countKey, idemKey, reservationKey} {
+			require.NoError(t, c.Del(context.Background(), key))
+		}
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "9", time.Hour))
+	require.NoError(t, c.Set(context.Background(), countKey, "1", 0))
+	params := FlashSaleAdoptLegacyReservationParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
+		ReservationKey: reservationKey, ReservationToken: "1", IdempotencyTTL: 30 * time.Minute,
+		TargetStock: 9, TargetUserCount: 1, StockTTL: time.Hour,
+	}
+
+	result, err := c.AdoptLegacyFlashSaleReservationDurably(context.Background(), params, 2*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, FlashSaleReservationReinstated, result)
+	result, err = c.AdoptLegacyFlashSaleReservationDurably(context.Background(), params, 2*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, FlashSaleReservationPresent, result)
+	requireCacheState(t, c, stockKey, "9", true)
+	requireCacheState(t, c, countKey, "1", true)
+}
+
+func TestAdoptLegacyFlashSaleReservationRebuildsExpiredKeys(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-legacy-expired-stock")
+	countKey := atomicTestKey(t, "flashsale-legacy-expired-count")
+	idemKey := atomicTestKey(t, "flashsale-legacy-expired-idem")
+	reservationKey := atomicTestKey(t, "flashsale-legacy-expired-reservation")
+	t.Cleanup(func() {
+		for _, key := range []string{stockKey, countKey, idemKey, reservationKey} {
+			require.NoError(t, c.Del(context.Background(), key))
+		}
+	})
+	params := FlashSaleAdoptLegacyReservationParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
+		ReservationKey: reservationKey, ReservationToken: "1", IdempotencyTTL: 30 * time.Minute,
+		TargetStock: 9, TargetUserCount: 1, StockTTL: time.Hour,
+	}
+
+	result, err := c.AdoptLegacyFlashSaleReservationDurably(context.Background(), params, 2*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, FlashSaleReservationReinstated, result)
+	requireCacheState(t, c, stockKey, "9", true)
+	requireCacheState(t, c, countKey, "1", true)
+}
+
+func TestAdoptMultipleLegacyReservationsConvergesFromFacts(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-legacy-multi-stock")
+	countKey := atomicTestKey(t, "flashsale-legacy-multi-count")
+	idemKey := atomicTestKey(t, "flashsale-legacy-multi-idem")
+	reservation1 := atomicTestKey(t, "flashsale-legacy-multi-r1")
+	reservation2 := atomicTestKey(t, "flashsale-legacy-multi-r2")
+	t.Cleanup(func() {
+		for _, key := range []string{stockKey, countKey, idemKey, reservation1, reservation2} {
+			require.NoError(t, c.Del(context.Background(), key))
+		}
+	})
+	base := FlashSaleAdoptLegacyReservationParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
+		ReservationToken: "1", IdempotencyTTL: 30 * time.Minute, StockTTL: time.Hour,
+	}
+	first := base
+	first.ReservationKey, first.TargetStock, first.TargetUserCount = reservation1, 9, 1
+	second := base
+	second.ReservationKey, second.TargetStock, second.TargetUserCount = reservation2, 8, 2
+	_, err := c.AdoptLegacyFlashSaleReservationDurably(context.Background(), first, 2*time.Second)
+	require.NoError(t, err)
+	_, err = c.AdoptLegacyFlashSaleReservationDurably(context.Background(), second, 2*time.Second)
+	require.NoError(t, err)
+	requireCacheState(t, c, stockKey, "8", true)
+	requireCacheState(t, c, countKey, "2", true)
+
+	for _, reservationKey := range []string{reservation1, reservation2} {
+		_, err = c.RestoreFlashSaleDurably(context.Background(), FlashSaleRestoreParams{
+			StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
+			ReservationKey: reservationKey, ReservationToken: "1", Quantity: 1,
+		}, 2*time.Second)
+		require.NoError(t, err)
+	}
+	requireCacheState(t, c, stockKey, "10", true)
+	requireCacheState(t, c, countKey, "0", true)
 }
 
 func TestRestoreFlashSaleState(t *testing.T) {
@@ -481,10 +611,10 @@ func TestRestoreFlashSaleReservationIsIdempotentAndTokenScoped(t *testing.T) {
 		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
 		ReservationKey: reservationKey, ReservationToken: "reservation-42", Quantity: 1,
 	}
-	result, err := c.RestoreFlashSale(context.Background(), params)
+	result, err := c.RestoreFlashSaleDurably(context.Background(), params, 2*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, FlashSaleRestored, result)
-	result, err = c.RestoreFlashSale(context.Background(), params)
+	result, err = c.RestoreFlashSaleDurably(context.Background(), params, 2*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, FlashSaleAlreadyRestored, result)
 

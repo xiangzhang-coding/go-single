@@ -18,9 +18,11 @@ import (
 )
 
 type fakePreDeductions struct {
-	mu     sync.Mutex
-	nextID int64
-	byID   map[int64]*model.PreDeduction
+	mu                   sync.Mutex
+	nextID               int64
+	byID                 map[int64]*model.PreDeduction
+	markPreDeductedError error
+	markReleasedError    error
 }
 
 func newFakePreDeductions() *fakePreDeductions {
@@ -56,6 +58,45 @@ func (f *fakePreDeductions) GetByIDForUpdate(ctx context.Context, _ *gorm.DB, id
 	return f.GetByID(ctx, id)
 }
 
+func (f *fakePreDeductions) EnsureLegacyPendingOrder(_ context.Context, seed *model.PreDeduction) (*model.PreDeduction, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, pd := range f.byID {
+		if pd.OrderNumber() == seed.OrderNumber() {
+			copy := *pd
+			return &copy, nil
+		}
+	}
+	f.nextID++
+	seed.ID = f.nextID
+	seed.Status = model.PreDeductionStatusPendingOrder
+	seed.Legacy = true
+	seed.CreatedAt = time.Now()
+	seed.UpdatedAt = seed.CreatedAt
+	copy := *seed
+	f.byID[seed.ID] = &copy
+	return seed, nil
+}
+
+func (f *fakePreDeductions) ReservationTargets(_ context.Context, activityID, userID int64) (int, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var pending, user int
+	for _, pd := range f.byID {
+		if pd.ActivityID != activityID {
+			continue
+		}
+		if pd.Status == model.PreDeductionStatusPendingPublish || pd.Status == model.PreDeductionStatusPendingOrder {
+			pending += pd.Quantity
+		}
+		if pd.UserID == userID && (pd.Status == model.PreDeductionStatusPendingPublish ||
+			pd.Status == model.PreDeductionStatusPendingOrder || pd.Status == model.PreDeductionStatusOrdered) {
+			user += pd.Quantity
+		}
+	}
+	return pending, user, nil
+}
+
 func (f *fakePreDeductions) ListRecoverable(context.Context, int) ([]model.PreDeduction, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -83,6 +124,9 @@ func (f *fakePreDeductions) ListOrdered(context.Context, int) ([]model.PreDeduct
 }
 
 func (f *fakePreDeductions) MarkPreDeducted(_ context.Context, id int64) error {
+	if f.markPreDeductedError != nil {
+		return f.markPreDeductedError
+	}
 	return f.update(id, func(p *model.PreDeduction) { p.Status = model.PreDeductionStatusPendingPublish })
 }
 
@@ -107,7 +151,7 @@ func (f *fakePreDeductions) RecordPublishFailure(_ context.Context, id int64, ma
 	return f.update(id, func(p *model.PreDeduction) {
 		p.PublishAttempts++
 		p.LastError = detail
-		if p.PublishAttempts >= maxAttempts {
+		if p.Status == model.PreDeductionStatusPendingPublish && p.PublishAttempts >= maxAttempts {
 			p.Status = model.PreDeductionStatusPendingRollback
 		}
 	})
@@ -157,6 +201,9 @@ func (f *fakePreDeductions) MarkRolledBack(_ context.Context, id int64) error {
 }
 
 func (f *fakePreDeductions) MarkReservationReleased(_ context.Context, id int64) error {
+	if f.markReleasedError != nil {
+		return f.markReleasedError
+	}
 	return f.update(id, func(p *model.PreDeduction) {
 		now := time.Now()
 		p.ReservationReleasedAt = &now
@@ -210,8 +257,10 @@ func newRecoveryFixture(pub *fakePublisher, nos OrderNoGenerator) *recoveryFixtu
 	}
 	pd := newFakePreDeductions()
 	base.pub = pub
-	base.svc = New(repository.Store{Activities: base.acts, PreDeductions: pd}, base.products, base.cache,
-		limiter.RedisCounterConfig{}, pub, nos, metrics.New().Business())
+	base.svc = asTestFlashSaleService(New(
+		repository.Store{Activities: base.acts, PreDeductions: pd}, base.products, base.cache,
+		limiter.RedisCounterConfig{}, pub, nos, metrics.New().Business(),
+	))
 	return &recoveryFixture{svc: base.svc, base: base, pd: pd}
 }
 
@@ -296,6 +345,18 @@ func TestRecoverPreDeductionAfterOrderNumberFailure(t *testing.T) {
 	require.Equal(t, 1, stats.Published)
 }
 
+func TestSeckillReturnsLifecycleWhenPreDeductTransitionFails(t *testing.T) {
+	fx := newRecoveryFixture(nil, nil)
+	a := fx.publishedActivity(t)
+	fx.pd.markPreDeductedError = errors.New("mysql transition failed")
+
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	require.NoError(t, err)
+	require.NotZero(t, result.PreDeductionID)
+	require.Equal(t, model.PreDeductionStatusPreparing, result.Status)
+	require.Equal(t, 99, fx.base.cache.stock[stockKey(a.ID)], "Redis pre-deduction already succeeded")
+}
+
 func TestRecoverPreDeductionRetriesFailedCancellationCompensation(t *testing.T) {
 	fx := newRecoveryFixture(nil, nil)
 	a := fx.publishedActivity(t)
@@ -350,6 +411,36 @@ func TestPublishRecoveryExhaustionCompletesRollback(t *testing.T) {
 	require.Equal(t, 100, fx.base.cache.stock[stockKey(a.ID)])
 }
 
+func TestPendingOrderRepublishFailureDoesNotRollbackConfirmedMessage(t *testing.T) {
+	fx := newRecoveryFixture(nil, nil)
+	a := fx.publishedActivity(t)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.PreDeductionStatusPendingOrder, result.Status)
+	fx.base.pub.err = errors.New("rabbitmq unavailable")
+
+	for range maxPublishAttempts + 2 {
+		_, err = fx.svc.RecoverPreDeductions(context.Background())
+		require.NoError(t, err)
+	}
+	pd, err := fx.pd.GetByID(context.Background(), result.PreDeductionID)
+	require.NoError(t, err)
+	require.Equal(t, model.PreDeductionStatusPendingOrder, pd.Status,
+		"a broker-confirmed message must wait for consumption instead of being rolled back by republish failures")
+}
+
+func TestRecoveryStopsWhenContextIsCancelled(t *testing.T) {
+	fx := newRecoveryFixture(nil, nil)
+	a := fx.publishedActivity(t)
+	_, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = fx.svc.RecoverPreDeductions(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestRollbackRecoversWhenUnflushedRedisMutationIsLost(t *testing.T) {
 	fx := newRecoveryFixture(nil, nil)
 	a := fx.publishedActivity(t)
@@ -370,6 +461,37 @@ func TestRollbackRecoversWhenUnflushedRedisMutationIsLost(t *testing.T) {
 	require.Equal(t, model.PreDeductionStatusRolledBack, pd.Status)
 	require.Equal(t, 100, fx.base.cache.stock[stockKey(a.ID)])
 	require.Zero(t, fx.base.cache.count[countKey(a.ID, 42)])
+}
+
+func TestRollbackDoesNotAdvanceWhenAOFConfirmationFails(t *testing.T) {
+	fx := newRecoveryFixture(nil, nil)
+	a := fx.publishedActivity(t)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	require.NoError(t, err)
+	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), nil, result.PreDeductionID, "order cancelled"))
+
+	fx.base.cache.aofErr = errors.New("WAITAOF timeout")
+	_, err = fx.svc.RecoverPreDeductions(context.Background())
+	require.NoError(t, err)
+	pd, err := fx.pd.GetByID(context.Background(), result.PreDeductionID)
+	require.NoError(t, err)
+	require.Equal(t, model.PreDeductionStatusPendingRollback, pd.Status)
+	require.Equal(t, 100, fx.base.cache.stock[stockKey(a.ID)])
+
+	// Redis acknowledged the restore but crashed before AOF fsync, replaying the
+	// earlier deducted reservation. Recovery must apply it again and restart the wait.
+	fx.base.cache.stock[stockKey(a.ID)] = 99
+	fx.base.cache.count[countKey(a.ID, 42)] = 1
+	fx.base.cache.idem[idemKey(a.ID, 42)] = true
+	fx.base.cache.idemToken[idemKey(a.ID, 42)] = pd.ReservationToken()
+	fx.base.cache.reservations[reservationKey(pd.ID)] = pd.ReservationToken()
+	fx.base.cache.aofErr = nil
+	_, err = fx.svc.RecoverPreDeductions(context.Background())
+	require.NoError(t, err)
+	pd, err = fx.pd.GetByID(context.Background(), pd.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.PreDeductionStatusRolledBack, pd.Status)
+	require.Equal(t, 100, fx.base.cache.stock[stockKey(a.ID)])
 }
 
 func TestRecoveryDoesNotRollbackLivePreparingRequest(t *testing.T) {

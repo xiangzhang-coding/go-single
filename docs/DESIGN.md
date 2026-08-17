@@ -100,7 +100,7 @@ go_single/
   - 结算（下单）→ order + user(地址簿) + coupon；订单列表/详情 → order；秒杀页 → flashsale
   - 优惠券中心 → coupon；好友列表/申请 → social；好友圈 → social；聊天 → chat
   - 个人中心（个人资料：昵称/头像，头像经 `POST /api/files` 上传 + `PATCH /api/users/me` 写入；地址簿）→ user；后台管理 → product/order/flashsale/coupon 内联 admin 路由组（role 鉴权）
-- **交互约定**：秒杀提交后返回"排队中"与 `pre_deduction_id`，前端轮询 `GET /api/flashsales/purchases/{pre_deduction_id}`（1.5s×30 次上限）直到 `ordered` / `rolled_back`；`ordered` 响应携带 `order_no`；秒杀页倒计时由列表接口携带服务端时间；接口 401 时前端跳转登录；演示账号 admin/admin123（user-guide 同步写明）
+- **交互约定**：秒杀提交后返回"排队中"与 `pre_deduction_id`，前端轮询 `GET /api/flashsales/purchases/{pre_deduction_id}`（1.5s×30 次上限）直到 `ordered` / `rolled_back`；`ordered` 响应携带 `order_no`；HTTP 响应丢失后的幂等重试返回原生命周期 ID，而不是新建预扣或只返回 409；秒杀页倒计时由列表接口携带服务端时间；接口 401 时前端跳转登录；演示账号 admin/admin123（user-guide 同步写明）
 - **路由**：react-router v7；面向用户的页面与后台管理（admin）按角色分组，admin 路由加 role 守卫（前端隐藏 + 后端兜底）
 - **状态管理**：TanStack Query（服务端状态：API 数据缓存、秒杀轮询、好友圈分页）+ zustand（客户端状态：登录态、用户信息、聊天连接）
 - **API client**：axios + 拦截器——统一携带 JWT（Authorization 头）、401 统一跳登录、错误统一处理
@@ -149,7 +149,8 @@ go_single/
     + 写 flashsale:reservation:{pre_deduction_id}）；成功后事实转 pending_publish
 [4] 持久化雪花订单号 → 发布 MQ；确认成功转 pending_order，失败保留 pending_publish。启动恢复与每分钟任务
     发布前先原子验证 reservation marker；若 Redis 在 AOF fsync 前重启导致整次 Lua 结果回退，则按持久事实重建
-    库存/计数/幂等键/marker，再复用同一订单号发布；累计 10 次仍失败转 pending_rollback；返回 202 + pre_deduction_id
+    库存/计数/幂等键/marker，再复用同一订单号发布；仅 pending_publish 累计 10 次仍失败才转 pending_rollback，
+    broker 已确认的 pending_order 持续等待消费或永久失败回退；返回 202 + pre_deduction_id
 [5] 消费者由 flashsale 编排：锁定预扣事实 → 开启数据库事务 → order.CreateSeckillInTx 建秒杀订单与订单项
     → flashsale 活动仓储条件扣活动库存；user_activity_key 唯一约束兜底重复投递/并发
     → 同事务将预扣事实转 ordered（仅非取消订单占位，重复即幂等成功且不重复扣库存）
@@ -161,7 +162,8 @@ go_single/
 ```
 
 - **库存事实源**：秒杀期以 Redis 预扣为准；活动库存落单时同步扣减、取消时回补，用于对账
-- **可恢复生命周期**：`flashsale_pre_deductions` 是逐用户/活动/订单的持久事实源，状态为 `preparing → pending_publish → pending_order → ordered → pending_rollback → rolled_back`；Redis reservation marker 不设 TTL，完整回退时原子改写为 `rolled_back` tombstone，让长时间故障和“Redis 已回补、MySQL 状态未提交”后的重试仍可判定；MySQL 写入 `rolled_back` 后清理 tombstone，订单离开待支付态后也由定时任务清理无需补偿的 marker。取消/超时取消在状态迁移同事务将 `user_activity_key` 置 NULL 并写回退意图，同一用户完整回退后允许再次抢购
+- **可恢复生命周期**：`flashsale_pre_deductions` 是逐用户/活动/订单的持久事实源，状态为 `preparing → pending_publish → pending_order → ordered → pending_rollback → rolled_back`；所有影响终态的 Redis Lua 都在同一专用连接上紧跟 `WAITAOF`，只有本地 AOF 明确 fsync 后才推进 MySQL 状态或释放 marker。回退先写 `rolled_back` tombstone，MySQL 写入终态后再清理；ordered 事实也会在启动和 cron 中重建/验证库存、计数、幂等键和 marker。取消/超时取消在状态迁移同事务将 `user_activity_key` 置 NULL 并写回退意图，同一用户完整回退后允许再次抢购
+- **升级兼容**：pre-R04 的 durable 主队列/DLQ 消息缺少 `pre_deduction_id` 时，消费者按 `order_no` 收编为 legacy 生命周期，再执行落单或持久回退，不直接丢弃
 - **限购**：`per_user_limit` 字段，后台创建/编辑活动时配置（默认 1），作为 ARGV 传入 Lua
 
 ## 秒杀活动

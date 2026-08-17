@@ -134,6 +134,7 @@ type fakeCache struct {
 	reservations map[string]string
 	rl           map[string]int // flashsale:rl:{user} → 限流计数
 	err          error
+	aofErr       error
 	// deductErr 仅作用于预扣能力（模拟预扣时基础设施故障）。
 	deductErr error
 }
@@ -163,6 +164,9 @@ func (f *fakeCache) Get(_ context.Context, key string) (string, error) {
 		return intToStr(v), nil
 	}
 	if v, ok := f.reservations[key]; ok {
+		return v, nil
+	}
+	if v, ok := f.idemToken[key]; ok {
 		return v, nil
 	}
 	return "", cache.ErrMiss
@@ -206,6 +210,18 @@ func (f *fakeCache) AcquireIdempotency(_ context.Context, key, value string, _ t
 	return cache.IdempotencyAcquired, nil
 }
 
+func (f *fakeCache) ReleaseIdempotencyDurably(_ context.Context, key, value string, _ time.Duration) error {
+	f.mu.Lock()
+	if f.idemToken[key] != value {
+		f.mu.Unlock()
+		return errors.New("idempotency token mismatch")
+	}
+	delete(f.idem, key)
+	delete(f.idemToken, key)
+	f.mu.Unlock()
+	return f.afterAOF(nil)
+}
+
 func (f *fakeCache) IncrementFixedWindow(_ context.Context, key string, _ time.Duration) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -242,6 +258,10 @@ func (f *fakeCache) PreDeductFlashSale(_ context.Context, p cache.FlashSalePreDe
 		if token != p.ReservationToken {
 			return 0, errors.New("reservation token mismatch")
 		}
+		if p.IdempotencyKey != "" {
+			f.idem[p.IdempotencyKey] = true
+			f.idemToken[p.IdempotencyKey] = p.ReservationToken
+		}
 		return cache.FlashSaleAlreadyPreDeducted, nil
 	}
 	if !p.OnSale {
@@ -261,7 +281,16 @@ func (f *fakeCache) PreDeductFlashSale(_ context.Context, p cache.FlashSalePreDe
 	if p.ReservationKey != "" {
 		f.reservations[p.ReservationKey] = p.ReservationToken
 	}
+	if p.IdempotencyKey != "" {
+		f.idem[p.IdempotencyKey] = true
+		f.idemToken[p.IdempotencyKey] = p.ReservationToken
+	}
 	return cache.FlashSalePreDeducted, nil
+}
+
+func (f *fakeCache) PreDeductFlashSaleDurably(ctx context.Context, p cache.FlashSalePreDeductParams, _ time.Duration) (cache.FlashSalePreDeductResult, error) {
+	result, err := f.PreDeductFlashSale(ctx, p)
+	return result, f.afterAOF(err)
 }
 
 func (f *fakeCache) EnsureFlashSaleReservation(_ context.Context, p cache.FlashSaleEnsureReservationParams) (cache.FlashSaleEnsureReservationResult, error) {
@@ -295,6 +324,66 @@ func (f *fakeCache) EnsureFlashSaleReservation(_ context.Context, p cache.FlashS
 	return cache.FlashSaleReservationReinstated, nil
 }
 
+func (f *fakeCache) EnsureFlashSaleReservationDurably(ctx context.Context, p cache.FlashSaleEnsureReservationParams, _ time.Duration) (cache.FlashSaleEnsureReservationResult, error) {
+	result, err := f.EnsureFlashSaleReservation(ctx, p)
+	return result, f.afterAOF(err)
+}
+
+func (f *fakeCache) EnsureOrderedFlashSaleReservation(_ context.Context, p cache.FlashSaleEnsureOrderedReservationParams) (cache.FlashSaleEnsureReservationResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	if stock, exists := f.stock[p.StockKey]; !exists || p.FallbackStock < stock {
+		f.stock[p.StockKey] = p.FallbackStock
+	}
+	if f.reservations[p.ReservationKey] == p.ReservationToken {
+		return cache.FlashSaleReservationPresent, nil
+	}
+	if token := f.reservations[p.ReservationKey]; token != "" {
+		return 0, errors.New("ordered reservation token mismatch")
+	}
+	if token := f.idemToken[p.IdempotencyKey]; token != "" && token != p.ReservationToken {
+		return 0, errors.New("ordered idempotency token mismatch")
+	}
+	f.count[p.CountKey] += p.Quantity
+	f.reservations[p.ReservationKey] = p.ReservationToken
+	f.idem[p.IdempotencyKey] = true
+	f.idemToken[p.IdempotencyKey] = p.ReservationToken
+	return cache.FlashSaleReservationReinstated, nil
+}
+
+func (f *fakeCache) EnsureOrderedFlashSaleReservationDurably(ctx context.Context, p cache.FlashSaleEnsureOrderedReservationParams, _ time.Duration) (cache.FlashSaleEnsureReservationResult, error) {
+	result, err := f.EnsureOrderedFlashSaleReservation(ctx, p)
+	return result, f.afterAOF(err)
+}
+
+func (f *fakeCache) AdoptLegacyFlashSaleReservationDurably(_ context.Context, p cache.FlashSaleAdoptLegacyReservationParams, _ time.Duration) (cache.FlashSaleEnsureReservationResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	if stock, ok := f.stock[p.StockKey]; !ok || p.TargetStock < stock {
+		f.stock[p.StockKey] = p.TargetStock
+	}
+	if count, ok := f.count[p.CountKey]; !ok || count < p.TargetUserCount {
+		f.count[p.CountKey] = p.TargetUserCount
+	}
+	if token := f.reservations[p.ReservationKey]; token != "" && token != p.ReservationToken {
+		return 0, errors.New("legacy reservation token mismatch")
+	}
+	already := f.reservations[p.ReservationKey] == p.ReservationToken
+	f.reservations[p.ReservationKey] = p.ReservationToken
+	f.idem[p.IdempotencyKey] = true
+	f.idemToken[p.IdempotencyKey] = p.ReservationToken
+	if already {
+		return cache.FlashSaleReservationPresent, nil
+	}
+	return cache.FlashSaleReservationReinstated, nil
+}
+
 func (f *fakeCache) RestoreFlashSale(_ context.Context, p cache.FlashSaleRestoreParams) (cache.FlashSaleRestoreResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -306,9 +395,22 @@ func (f *fakeCache) RestoreFlashSale(_ context.Context, p cache.FlashSaleRestore
 	}
 	shouldRestore := p.ReservationKey == ""
 	if p.ReservationKey != "" {
-		shouldRestore = f.reservations[p.ReservationKey] == p.ReservationToken
+		reservation := f.reservations[p.ReservationKey]
+		if reservation != "" && reservation != p.ReservationToken {
+			return 0, errors.New("reservation token mismatch")
+		}
+		shouldRestore = reservation == p.ReservationToken
 		if !shouldRestore && p.AllowIdempotencyFallback {
 			shouldRestore = f.idemToken[p.IdempotencyKey] == p.ReservationToken
+		}
+		if !shouldRestore && reservation == "" && p.AllowMissingReservation {
+			if _, exists := f.stock[p.StockKey]; !exists {
+				f.stock[p.StockKey] = p.FallbackStock
+			}
+			f.reservations[p.ReservationKey] = "rolled_back:" + p.ReservationToken
+			delete(f.idem, p.IdempotencyKey)
+			delete(f.idemToken, p.IdempotencyKey)
+			return cache.FlashSaleRestored, nil
 		}
 	}
 	if shouldRestore {
@@ -330,6 +432,20 @@ func (f *fakeCache) RestoreFlashSale(_ context.Context, p cache.FlashSaleRestore
 		return cache.FlashSaleRestored, nil
 	}
 	return cache.FlashSaleReservationMissing, nil
+}
+
+func (f *fakeCache) RestoreFlashSaleDurably(ctx context.Context, p cache.FlashSaleRestoreParams, _ time.Duration) (cache.FlashSaleRestoreResult, error) {
+	result, err := f.RestoreFlashSale(ctx, p)
+	return result, f.afterAOF(err)
+}
+
+func (f *fakeCache) afterAOF(err error) error {
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.aofErr
 }
 
 // ---- 辅助 ----
@@ -394,12 +510,21 @@ func (f *fakeNos) Next() (int64, error) {
 }
 
 type fixture struct {
-	svc           Service
+	svc           testFlashSaleService
 	acts          *fakeActivities
 	preDeductions *fakePreDeductions
 	products      *fakeProducts
 	cache         *fakeCache
 	pub           *fakePublisher
+}
+
+type testFlashSaleService interface {
+	Service
+	PreDeduct(ctx context.Context, userID, activityID int64) error
+}
+
+func asTestFlashSaleService(svc Service) testFlashSaleService {
+	return svc.(testFlashSaleService)
 }
 
 func newFixture() *fixture {
@@ -408,7 +533,7 @@ func newFixture() *fixture {
 	fc := newFakeCache()
 	pub := &fakePublisher{}
 	pd := newFakePreDeductions()
-	svc := New(repository.Store{Activities: acts, PreDeductions: pd}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{}, metrics.New().Business())
+	svc := asTestFlashSaleService(New(repository.Store{Activities: acts, PreDeductions: pd}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{}, metrics.New().Business()))
 	return &fixture{svc: svc, acts: acts, preDeductions: pd, products: products, cache: fc, pub: pub}
 }
 
@@ -419,8 +544,10 @@ func newFixtureLimited(max int, window time.Duration) *fixture {
 	fc := newFakeCache()
 	pub := &fakePublisher{}
 	pd := newFakePreDeductions()
-	svc := New(repository.Store{Activities: acts, PreDeductions: pd}, products, fc, limiter.RedisCounterConfig{Max: max, Window: window},
-		pub, &fakeNos{}, metrics.New().Business())
+	svc := asTestFlashSaleService(New(
+		repository.Store{Activities: acts, PreDeductions: pd}, products, fc,
+		limiter.RedisCounterConfig{Max: max, Window: window}, pub, &fakeNos{}, metrics.New().Business(),
+	))
 	return &fixture{svc: svc, acts: acts, preDeductions: pd, products: products, cache: fc, pub: pub}
 }
 
@@ -854,8 +981,10 @@ func TestSeckillPublishFailureKeepsIdemKey(t *testing.T) {
 	require.Equal(t, model.PreDeductionStatusPendingPublish, result.Status)
 	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "发布失败应保留幂等键（防重复预扣）")
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)], "预扣已生效，库存不再变动")
-	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 7, a.ID), ErrDuplicateRequest,
-		"幂等键保留 → 重试被拦，不会二次预扣")
+	retryResult, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.NoError(t, err)
+	require.Equal(t, result.PreDeductionID, retryResult.PreDeductionID,
+		"幂等重试返回原生命周期，不会二次预扣")
 }
 
 // T20 幂等操作有限重试：MQ 发布瞬时失败自动重试 + 退避（Attempts 次），
@@ -896,12 +1025,12 @@ func newFixtureWithRetry(t *testing.T, attempts int) *fixture {
 	fc := newFakeCache()
 	pub := &fakePublisher{}
 	pd := newFakePreDeductions()
-	svc := New(repository.Store{Activities: acts, PreDeductions: pd}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{},
+	svc := asTestFlashSaleService(New(repository.Store{Activities: acts, PreDeductions: pd}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{},
 		metrics.New().Business(), retry.Config{
 			Attempts:       attempts,
 			InitialBackoff: time.Millisecond,
 			MaxBackoff:     2 * time.Millisecond,
-		})
+		}))
 	return &fixture{svc: svc, acts: acts, preDeductions: pd, products: products, cache: fc, pub: pub}
 }
 
@@ -910,8 +1039,10 @@ func TestSeckillOrderNoFailureKeepsIdemKey(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
-	fx.svc = New(repository.Store{Activities: fx.acts, PreDeductions: fx.preDeductions}, fx.products, fx.cache,
-		limiter.RedisCounterConfig{}, fx.pub, &failingNos{}, metrics.New().Business())
+	fx.svc = asTestFlashSaleService(New(
+		repository.Store{Activities: fx.acts, PreDeductions: fx.preDeductions}, fx.products, fx.cache,
+		limiter.RedisCounterConfig{}, fx.pub, &failingNos{}, metrics.New().Business(),
+	))
 
 	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
 	require.NoError(t, err)
@@ -925,14 +1056,17 @@ type failingNos struct{}
 
 func (failingNos) Next() (int64, error) { return 0, errors.New("clock rollback") }
 
-// 重复抢购：幂等键拦截（同一用户+活动 30min 内第二次被拒，库存不再扣）。
-func TestSeckillDuplicateBlocked(t *testing.T) {
+// 重复抢购：返回原生命周期，库存不再扣。
+func TestSeckillDuplicateReturnsExistingLifecycle(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 
-	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a.ID))
-	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 7, a.ID), ErrDuplicateRequest)
+	first, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.NoError(t, err)
+	second, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.NoError(t, err)
+	require.Equal(t, first.PreDeductionID, second.PreDeductionID)
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)], "重复请求不得再次预扣")
 	require.Equal(t, 1, fx.cache.count[countKey(a.ID, 7)])
 
@@ -942,14 +1076,16 @@ func TestSeckillDuplicateBlocked(t *testing.T) {
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a2.ID))
 }
 
-func TestSeckillPropagatesIdempotencyCacheError(t *testing.T) {
+func TestSeckillIdempotencyCacheErrorReturnsLifecycle(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.cache.err = context.DeadlineExceeded
 
-	err := discardSeckill(fx.svc, context.Background(), 7, a.ID)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.NoError(t, err)
+	require.NotZero(t, result.PreDeductionID)
+	require.Equal(t, model.PreDeductionStatusPreparing, result.Status)
 	require.False(t, fx.cache.idem[idemKey(a.ID, 7)])
 	require.Equal(t, 100, fx.cache.stock[stockKey(a.ID)], "幂等抢占失败不得预扣")
 }
@@ -979,9 +1115,12 @@ func TestSeckillRateLimitDisabled(t *testing.T) {
 	a2 := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a2.ID))
 
-	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a.ID))
+	first, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.NoError(t, err)
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a2.ID), "关闭限流后同一用户可继续抢购其他活动")
-	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 7, a.ID), ErrDuplicateRequest)
+	retryResult, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.NoError(t, err)
+	require.Equal(t, first.PreDeductionID, retryResult.PreDeductionID)
 }
 
 // 预扣业务拒绝：释放幂等键（允许重试）；库存与计数不受影响。
@@ -1013,16 +1152,17 @@ func TestSeckillActivityNotFound(t *testing.T) {
 	require.False(t, fx.cache.idem[idemKey(999, 1)], "活动不存在应释放幂等键")
 }
 
-// 预扣基础设施故障：保留幂等键（防瞬时故障下重复预扣造成双重扣减）。
-func TestSeckillInfraFailureKeepsIdemKey(t *testing.T) {
+// 预扣基础设施结果不确定：返回持久生命周期供查询，避免客户端丢失关联。
+func TestSeckillInfraFailureReturnsRecoverableLifecycle(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.cache.deductErr = errors.New("redis down")
 
-	err := discardSeckill(fx.svc, context.Background(), 7, a.ID)
-	require.Error(t, err)
-	require.NotErrorIs(t, err, ErrSoldOut, "基础设施故障不应映射为业务拒绝")
+	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	require.NoError(t, err)
+	require.NotZero(t, result.PreDeductionID)
+	require.Equal(t, model.PreDeductionStatusPreparing, result.Status)
 	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "基础设施失败应保留幂等键")
 	require.Equal(t, 100, fx.cache.stock[stockKey(a.ID)], "失败不得预扣")
 }
@@ -1059,8 +1199,11 @@ func TestSeckillConcurrentNoOversell(t *testing.T) {
 	// 同一用户再次提交（不同活动）：独立幂等键，仍可抢购。
 	dup := fx.createActivity(t, func(p *ActivityParams) { p.Stock = 1 })
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), dup.ID))
-	require.NoError(t, discardSeckill(fx.svc, context.Background(), 1, dup.ID))
-	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 1, dup.ID), ErrDuplicateRequest)
+	first, err := fx.svc.Seckill(context.Background(), 1, dup.ID)
+	require.NoError(t, err)
+	retryResult, err := fx.svc.Seckill(context.Background(), 1, dup.ID)
+	require.NoError(t, err)
+	require.Equal(t, first.PreDeductionID, retryResult.PreDeductionID)
 }
 
 // ---- 秒杀页活动列表（T23）----

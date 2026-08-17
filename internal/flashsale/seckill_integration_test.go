@@ -139,19 +139,20 @@ func TestSeckillPurchaseConcurrentNoOversell(t *testing.T) {
 	require.Equal(t, 0, redisStock(t, env, id))
 }
 
-// 重复抢购被幂等键拦截：同一用户同一活动第二次 409，库存不再扣减。
-func TestSeckillPurchaseDuplicateBlocked(t *testing.T) {
+// 重复抢购返回同一生命周期，库存不再扣减。
+func TestSeckillPurchaseDuplicateReturnsExistingLifecycle(t *testing.T) {
 	env := requireEnv(t)
 	admin := adminToken(t, env)
 	id := seedPublished(t, env, admin, 10)
 	router := env.newFlashsaleRouter(t, purchasePermissive, limiter.RedisCounterConfig{})
 	token := registerAndToken(t, env, uniqueName("dup"))
 
-	w, _ := purchase(t, router, id, token)
+	w, first := purchase(t, router, id, token)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	w, _ = purchase(t, router, id, token)
-	require.Equal(t, http.StatusConflict, w.Code, "重复提交应被幂等键拦截")
+	w, second := purchase(t, router, id, token)
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.Equal(t, first["pre_deduction_id"], second["pre_deduction_id"])
 	require.Equal(t, 9, redisStock(t, env, id), "重复请求不得再次预扣")
 
 	claims, err := env.verifier.Verify(context.Background(), token)

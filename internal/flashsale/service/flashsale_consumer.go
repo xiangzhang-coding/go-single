@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -18,6 +19,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
+	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
@@ -46,6 +48,7 @@ type UserService interface {
 type SeckillOrderConsumer struct {
 	activities    repository.ActivityRepository
 	preDeductions repository.PreDeductionRepository
+	legacyCache   legacyReservationCache
 	tx            seckillTxRunner
 	orders        OrderService
 	users         UserService
@@ -55,10 +58,11 @@ type SeckillOrderConsumer struct {
 
 // NewSeckillOrderConsumer 构造秒杀落单消费者。
 func NewSeckillOrderConsumer(activities repository.ActivityRepository, preDeductions repository.PreDeductionRepository,
+	legacyCache legacyReservationCache,
 	tx seckillTxRunner, orders OrderService, users UserService, m *metrics.Business,
 	log *zap.Logger) *SeckillOrderConsumer {
 	return &SeckillOrderConsumer{
-		activities: activities, preDeductions: preDeductions,
+		activities: activities, preDeductions: preDeductions, legacyCache: legacyCache,
 		tx: tx, orders: orders, users: users, metrics: m, log: log,
 	}
 }
@@ -102,6 +106,9 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 	}
 	if activity == nil {
 		return c.permanent(ctx, "activity not found", &msg, nil)
+	}
+	if err := c.adoptLegacyMessage(ctx, &msg, activity); err != nil {
+		return err
 	}
 
 	// 默认地址固化为地址快照（秒杀下单无选地址步骤；无地址为永久失败，对账兜底）。
@@ -199,11 +206,72 @@ func (c *SeckillOrderConsumer) permanent(ctx context.Context, reason string, msg
 // the same recovery worker used after crashes.
 func (c *SeckillOrderConsumer) HandleDeadLetter(ctx context.Context, body []byte) error {
 	var msg SeckillSuccessMessage
-	if err := json.Unmarshal(body, &msg); err != nil || msg.PreDeductionID <= 0 {
+	if err := json.Unmarshal(body, &msg); err != nil || msg.OrderNo == "" || msg.UserID <= 0 || msg.ActivityID <= 0 {
 		c.log.Error("无法关联预扣事实的秒杀死信已丢弃", zap.ByteString("body", body), zap.Error(err))
 		return nil
 	}
+	if msg.PreDeductionID <= 0 {
+		activity, err := c.activities.GetByID(ctx, msg.ActivityID)
+		if err != nil {
+			return err
+		}
+		if activity == nil {
+			c.log.Error("无法关联活动的秒杀死信已丢弃", zap.Int64("activity_id", msg.ActivityID))
+			return nil
+		}
+		if err := c.adoptLegacyMessage(ctx, &msg, activity); err != nil {
+			return err
+		}
+	}
 	return c.preDeductions.MarkPendingRollback(ctx, nil, msg.PreDeductionID, "message reached dead-letter queue")
+}
+
+func (c *SeckillOrderConsumer) adoptLegacyMessage(ctx context.Context, msg *SeckillSuccessMessage, activity *model.Activity) error {
+	if msg.PreDeductionID > 0 {
+		return nil
+	}
+	orderNo := msg.OrderNo
+	pd, err := c.preDeductions.EnsureLegacyPendingOrder(ctx, &model.PreDeduction{
+		UserID: msg.UserID, ActivityID: msg.ActivityID, OrderNo: &orderNo, Quantity: 1,
+	})
+	if err != nil {
+		return fmt.Errorf("adopt legacy seckill message: %w", err)
+	}
+	msg.PreDeductionID = pd.ID
+	if !pd.Legacy {
+		return nil
+	}
+	return adoptLegacyReservation(ctx, c.legacyCache, c.preDeductions, pd, activity)
+}
+
+type legacyReservationCache interface {
+	AdoptLegacyFlashSaleReservationDurably(ctx context.Context, p cache.FlashSaleAdoptLegacyReservationParams, timeout time.Duration) (cache.FlashSaleEnsureReservationResult, error)
+}
+
+func adoptLegacyReservation(ctx context.Context, client legacyReservationCache,
+	preDeductions repository.PreDeductionRepository, pd *model.PreDeduction, activity *model.Activity) error {
+	stockTTL := remainingTTL(activity)
+	if stockTTL <= 0 {
+		stockTTL = stockKeyMargin
+	}
+	pendingQuantity, userQuantity, err := preDeductions.ReservationTargets(ctx, pd.ActivityID, pd.UserID)
+	if err != nil {
+		return err
+	}
+	targetStock := activity.Stock - pendingQuantity
+	if targetStock < 0 || userQuantity <= 0 {
+		return fmt.Errorf("legacy flash-sale reservation targets are invalid: stock=%d count=%d", targetStock, userQuantity)
+	}
+	_, err = client.AdoptLegacyFlashSaleReservationDurably(ctx, cache.FlashSaleAdoptLegacyReservationParams{
+		StockKey: stockKey(pd.ActivityID), CountKey: countKey(pd.ActivityID, pd.UserID),
+		IdempotencyKey: idemKey(pd.ActivityID, pd.UserID), ReservationKey: reservationKey(pd.ID),
+		ReservationToken: pd.ReservationToken(), IdempotencyTTL: idemTTL,
+		TargetStock: targetStock, TargetUserCount: userQuantity, StockTTL: stockTTL,
+	}, redisAOFTimeout)
+	if err != nil {
+		return fmt.Errorf("adopt legacy flash-sale reservation: %w", err)
+	}
+	return nil
 }
 
 // classifyCreateError 落单错误分类：

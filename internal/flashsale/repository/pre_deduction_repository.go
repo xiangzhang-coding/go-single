@@ -16,6 +16,8 @@ type PreDeductionRepository interface {
 	Create(ctx context.Context, p *model.PreDeduction) error
 	GetByID(ctx context.Context, id int64) (*model.PreDeduction, error)
 	GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.PreDeduction, error)
+	EnsureLegacyPendingOrder(ctx context.Context, seed *model.PreDeduction) (*model.PreDeduction, error)
+	ReservationTargets(ctx context.Context, activityID, userID int64) (pendingQuantity, userQuantity int, err error)
 	ListRecoverable(ctx context.Context, limit int) ([]model.PreDeduction, error)
 	ListOrdered(ctx context.Context, limit int) ([]model.PreDeduction, error)
 	MarkPreDeducted(ctx context.Context, id int64) error

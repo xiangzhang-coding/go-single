@@ -31,6 +31,46 @@ func (r *GORMPreDeductionRepository) GetByIDForUpdate(ctx context.Context, tx *g
 	return r.getByID(r.exec(ctx, tx).Clauses(clause.Locking{Strength: "UPDATE"}), id)
 }
 
+func (r *GORMPreDeductionRepository) EnsureLegacyPendingOrder(ctx context.Context, seed *model.PreDeduction) (*model.PreDeduction, error) {
+	db := r.db.WithContext(ctx)
+	var existing model.PreDeduction
+	err := db.Where("order_no = ?", seed.OrderNumber()).First(&existing).Error
+	if err == nil {
+		return &existing, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	seed.Status = model.PreDeductionStatusPendingOrder
+	seed.Legacy = true
+	if err := db.Create(seed).Error; err != nil {
+		if getErr := db.Where("order_no = ?", seed.OrderNumber()).First(&existing).Error; getErr == nil {
+			return &existing, nil
+		}
+		return nil, err
+	}
+	return seed, nil
+}
+
+func (r *GORMPreDeductionRepository) ReservationTargets(ctx context.Context, activityID, userID int64) (int, int, error) {
+	var pending, user int
+	db := r.db.WithContext(ctx).Model(&model.PreDeduction{})
+	if err := db.Select("COALESCE(SUM(quantity), 0)").
+		Where("activity_id = ? AND status IN ?", activityID, []model.PreDeductionStatus{
+			model.PreDeductionStatusPendingPublish, model.PreDeductionStatusPendingOrder,
+		}).Scan(&pending).Error; err != nil {
+		return 0, 0, err
+	}
+	if err := db.Select("COALESCE(SUM(quantity), 0)").
+		Where("activity_id = ? AND user_id = ? AND status IN ?", activityID, userID, []model.PreDeductionStatus{
+			model.PreDeductionStatusPendingPublish, model.PreDeductionStatusPendingOrder,
+			model.PreDeductionStatusOrdered,
+		}).Scan(&user).Error; err != nil {
+		return 0, 0, err
+	}
+	return pending, user, nil
+}
+
 func (r *GORMPreDeductionRepository) getByID(db *gorm.DB, id int64) (*model.PreDeduction, error) {
 	var p model.PreDeduction
 	if err := db.First(&p, id).Error; err != nil {
@@ -93,11 +133,12 @@ func (r *GORMPreDeductionRepository) MarkPendingOrder(ctx context.Context, id in
 func (r *GORMPreDeductionRepository) RecordPublishFailure(ctx context.Context, id int64, maxAttempts int, detail string) error {
 	return requirePreDeductionTransition(r.db.WithContext(ctx).Exec(`
 		UPDATE flashsale_pre_deductions
-		SET status = CASE WHEN publish_attempts + 1 >= ? THEN ? ELSE status END,
+		SET status = CASE WHEN status = ? AND publish_attempts + 1 >= ? THEN ? ELSE status END,
 		    publish_attempts = publish_attempts + 1,
 		    last_error = ?, updated_at = ?
 		WHERE id = ? AND status IN ?`,
-		maxAttempts, model.PreDeductionStatusPendingRollback, detail, time.Now(), id,
+		model.PreDeductionStatusPendingPublish, maxAttempts, model.PreDeductionStatusPendingRollback,
+		detail, time.Now(), id,
 		[]model.PreDeductionStatus{model.PreDeductionStatusPendingPublish, model.PreDeductionStatusPendingOrder},
 	))
 }

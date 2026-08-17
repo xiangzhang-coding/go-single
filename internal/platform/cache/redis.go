@@ -67,3 +67,32 @@ func (r *redisCache) evalInt(ctx context.Context, script string, keys []string, 
 	}
 	return n, nil
 }
+
+func (r *redisCache) evalIntAndWaitAOF(ctx context.Context, timeout time.Duration,
+	script string, keys []string, args ...any) (int64, error) {
+	if timeout <= 0 {
+		return 0, fmt.Errorf("Redis WAITAOF timeout must be positive")
+	}
+	conn := r.client.Conn()
+	defer conn.Close()
+	v, err := conn.Eval(ctx, script, keys, args...).Result()
+	if err != nil {
+		return 0, err
+	}
+	n, ok := v.(int64)
+	if !ok {
+		return 0, fmt.Errorf("Lua 脚本返回类型异常: %T", v)
+	}
+	fsynced, err := conn.Do(ctx, "WAITAOF", 1, 0, timeout.Milliseconds()).Slice()
+	if err != nil {
+		return 0, err
+	}
+	if len(fsynced) != 2 {
+		return 0, fmt.Errorf("Redis WAITAOF 返回类型异常: %v", fsynced)
+	}
+	local, ok := fsynced[0].(int64)
+	if !ok || local < 1 {
+		return 0, fmt.Errorf("Redis AOF 未在超时内 fsync: %v", fsynced)
+	}
+	return n, nil
+}
