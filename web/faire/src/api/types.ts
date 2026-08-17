@@ -133,6 +133,36 @@ export interface FlashSaleListResponse {
   items: FlashSaleActivity[];
 }
 
+export type FlashSalePurchaseStatus =
+  | "preparing"
+  | "pending_publish"
+  | "pending_order"
+  | "ordered"
+  | "pending_rollback"
+  | "rolled_back";
+
+export interface FlashSalePurchase {
+  id: string;
+  user_id: number;
+  activity_id: number;
+  order_no?: string;
+  quantity: number;
+  status: FlashSalePurchaseStatus;
+  publish_attempts: number;
+  rollback_attempts: number;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlashSalePurchaseResponse {
+  pre_deduction_id: string;
+  order_no: string;
+  status: "queued";
+  pre_deduction_status: FlashSalePurchaseStatus;
+  message: string;
+}
+
 export type OrderStatus =
   | "pending_payment"
   | "paid"

@@ -295,7 +295,10 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		log.Fatal("初始化秒杀令牌桶限流失败", zap.Error(err))
 	}
 	flashsaleActivityStore := flashsalerepo.NewGORMActivity(db)
-	flashsaleStore := flashsalerepo.Store{Activities: flashsaleActivityStore, Tx: flashsaleActivityStore}
+	flashsalePreDeductions := flashsalerepo.NewGORMPreDeduction(db)
+	flashsaleStore := flashsalerepo.Store{
+		Activities: flashsaleActivityStore, PreDeductions: flashsalePreDeductions, Tx: flashsaleActivityStore,
+	}
 	flashsaleSvc := flashsalesvc.New(flashsaleStore, productSvc, cacheClient,
 		limiter.RedisCounterConfig{Max: cfg.FlashSale.PerUserMax, Window: cfg.FlashSale.PerUserWindow},
 		mqClient, orderNoGen, businessMetrics, retryCfg)
@@ -310,8 +313,11 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, businessMetrics, retryCfg)
 	orderHandler := orderhandler.New(orderSvc, verifier)
+	reservationCleanup := flashsalesvc.NewReservationCleanup(
+		flashsaleStore.PreDeductions, cacheClient, orderSvc)
 	seckillTimeout := flashsalesvc.NewSeckillTimeout(
-		flashsaleStore.Tx, orderSvc, flashsaleStore.Activities, flashsaleSvc, businessMetrics)
+		flashsaleStore.Tx, orderSvc, flashsaleStore.Activities, flashsaleStore.PreDeductions,
+		flashsaleSvc, businessMetrics)
 
 	// 秒杀库存对账（T13）：进行中只比对告警（补单信号），收尾以 MySQL 对齐 Redis；
 	// 有效订单数经 order 服务端口统计（进程内调用，flashsale → order 单向依赖）。
@@ -345,18 +351,29 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// order 服务幂等建单 + 同事务扣活动库存；瞬时失败 Nack 重投、
 	// 永久失败进死信（对账兜底）。消费中断 3s 后重连（at-least-once 不丢消息）。
 	seckillConsumer := flashsalesvc.NewSeckillOrderConsumer(
-		flashsaleStore.Activities, flashsaleStore.Tx, orderSvc, userSvc, businessMetrics, log)
-	go func() {
-		for {
-			err := mqClient.Consume(context.Background(), flashsalesvc.SeckillOrderQueue, seckillConsumer.Handle)
-			if err != nil {
-				log.Error("秒杀落单消费者中断，3s 后重连", zap.Error(err))
-				time.Sleep(3 * time.Second)
-				continue
+		flashsaleStore.Activities, flashsaleStore.PreDeductions, flashsaleStore.Tx,
+		orderSvc, userSvc, businessMetrics, log)
+	startConsumer := func(queue, name string, handler mq.MessageHandler) {
+		go func() {
+			for {
+				err := mqClient.Consume(context.Background(), queue, handler)
+				if err != nil {
+					log.Error(name+"中断，3s 后重连", zap.Error(err))
+					time.Sleep(3 * time.Second)
+					continue
+				}
+				return
 			}
-			return
-		}
-	}()
+		}()
+	}
+	if stats, err := flashsaleSvc.RecoverPreDeductions(context.Background()); err != nil {
+		log.Error("秒杀预扣启动恢复失败（定时任务将重试）", zap.Error(err))
+	} else if stats.Published+stats.RolledBack+stats.Failed > 0 {
+		log.Info("秒杀预扣启动恢复完成", zap.Int("published", stats.Published),
+			zap.Int("rolled_back", stats.RolledBack), zap.Int("failed", stats.Failed))
+	}
+	startConsumer(flashsalesvc.SeckillOrderQueue, "秒杀落单消费者", seckillConsumer.Handle)
+	startConsumer(flashsalesvc.SeckillOrderDeadLetterQueue, "秒杀死信消费者", seckillConsumer.HandleDeadLetter)
 
 	// payment 模块：模拟支付回调（成功/失败），流水唯一约束（payment_id）挡重复回调，
 	// 成功路径单事务（流水 + 订单 待支付→已支付，WHERE 校验状态机与金额）；
@@ -373,7 +390,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// T13 秒杀超时取消——每分钟扫描待支付秒杀订单，回补活动库存 + Redis 库存 +
 	// 用户计数（允许再次抢购）；对账——每小时进行中只比对告警（补单信号）、
 	// 每分钟收尾以 MySQL 对齐刚结束活动的 Redis 库存。
-	cronRegistry := registerCron(log, orderSvc, seckillTimeout, reconcile)
+	cronRegistry := registerCron(log, orderSvc, flashsaleSvc, reservationCleanup, seckillTimeout, reconcile)
 	cronRegistry.Start()
 
 	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
@@ -426,7 +443,9 @@ func (n wsMessageNotifier) NotifyMessageSent(_ context.Context, msg *chatmodel.M
 var _ chatsvc.MessageNotifier = wsMessageNotifier{}
 
 // registerCron 注册全部定时任务并返回调度器（Start 由调用方执行）。
-func registerCron(log *zap.Logger, orderSvc ordersvc.Service, seckillTimeout flashsalesvc.SeckillTimeout,
+func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsalesvc.PreDeductionRecovery,
+	reservationCleanup flashsalesvc.ReservationCleanup,
+	seckillTimeout flashsalesvc.SeckillTimeout,
 	reconcile flashsalesvc.Reconciliation) *platformcron.Registry {
 	registry := platformcron.New(log, 5*time.Minute)
 	if err := registry.Register(platformcron.Job{
@@ -442,6 +461,39 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, seckillTimeout fla
 		},
 	}); err != nil {
 		log.Fatal("注册超时取消任务失败", zap.Error(err))
+	}
+	if err := registry.Register(platformcron.Job{
+		Name: "flashsale-pre-deduction-recovery",
+		Spec: "* * * * *",
+		Fn: func(ctx context.Context) error {
+			stats, err := recovery.RecoverPreDeductions(ctx)
+			if err != nil {
+				return err
+			}
+			if stats.Published+stats.RolledBack+stats.Failed > 0 {
+				log.Info("秒杀预扣恢复完成", zap.Int("published", stats.Published),
+					zap.Int("rolled_back", stats.RolledBack), zap.Int("failed", stats.Failed))
+			}
+			return nil
+		},
+	}); err != nil {
+		log.Fatal("注册秒杀预扣恢复任务失败", zap.Error(err))
+	}
+	if err := registry.Register(platformcron.Job{
+		Name: "flashsale-reservation-cleanup",
+		Spec: "* * * * *",
+		Fn: func(ctx context.Context) error {
+			cleaned, err := reservationCleanup.CleanupOrderedReservations(ctx)
+			if err != nil {
+				return err
+			}
+			if cleaned > 0 {
+				log.Info("秒杀 reservation marker 清理完成", zap.Int("cleaned", cleaned))
+			}
+			return nil
+		},
+	}); err != nil {
+		log.Fatal("注册秒杀 reservation marker 清理任务失败", zap.Error(err))
 	}
 	if err := registry.Register(platformcron.Job{
 		Name: "seckill-timeout-cancel",
@@ -468,6 +520,8 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, seckillTimeout fla
 			}
 			for _, w := range warnings {
 				log.Warn("秒杀库存对账差异（进行中，仅告警不写回）",
+					zap.Int64("pre_deduction_id", w.PreDeductionID), zap.Int64("user_id", w.UserID),
+					zap.String("order_no", w.OrderNo), zap.String("status", w.Status),
 					zap.Int64("activity_id", w.ActivityID), zap.String("title", w.Title),
 					zap.Int("redis_stock", w.RedisStock), zap.Int("mysql_stock", w.MySQLStock),
 					zap.Int("order_count", w.OrderCount), zap.String("detail", w.Detail))

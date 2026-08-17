@@ -62,6 +62,10 @@ func (f *fakeOrders) GetByNo(_ context.Context, orderNo string) (*model.Order, e
 	return f.byID[orderNo], nil
 }
 
+func (f *fakeOrders) GetByNoInTx(ctx context.Context, _ *gorm.DB, orderNo string) (*model.Order, error) {
+	return f.GetByNo(ctx, orderNo)
+}
+
 func (f *fakeOrders) List(_ context.Context, userID int64, status string, offset, limit int) ([]model.Order, int64, error) {
 	var out []model.Order
 	for _, o := range f.byID {
@@ -1415,8 +1419,8 @@ func TestCreateSeckillDuplicateOrderNoIdempotent(t *testing.T) {
 	require.Len(t, fx.orders.createLog, 2, "第二次为重复尝试（被唯一约束拦截）")
 }
 
-// 并发重复（同 (user_id, activity_id) 不同 order_no 竞态）：唯一约束命中视为成功。
-func TestCreateSeckillDuplicateUserActivityIdempotent(t *testing.T) {
+// 同 (user_id, activity_id) 不同 order_no 冲突不是该消息的幂等命中。
+func TestCreateSeckillDuplicateUserActivityRejected(t *testing.T) {
 	fx := newFixture()
 	fx.seed(t)
 
@@ -1427,7 +1431,7 @@ func TestCreateSeckillDuplicateUserActivityIdempotent(t *testing.T) {
 	fx.orders.duplicate["S2"] = true
 	p2 := fx.seckillParams("S2")
 	created, err = fx.svc.CreateSeckillInTx(context.Background(), serviceTestTx, p2)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrSeckillOrderConflict)
 	require.False(t, created)
 
 	require.Nil(t, fx.orders.byID["S2"], "重复订单不得落库")

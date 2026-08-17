@@ -131,6 +131,8 @@ npx wrangler pages project create go-single-website
 | Redis | `go_single_redis_data:/data` | AOF `appendonly=yes` + `appendfsync=everysec` 为主，RDB `3600/1 300/100 60/10000` 为兜底 | 容器重建后保留未过期的订单幂等、秒杀预扣和优惠券计数；正常故障约 1 秒 RPO |
 | RabbitMQ | `go_single_rabbitmq_data:/var/lib/rabbitmq` | 固定 `rabbit@go-single-rabbitmq` 节点名；应用声明 durable 主队列/DLQ，以 delivery mode 2 发布并等待 publisher confirm | 容器重建后 durable 队列和已确认的 persistent 消息仍可消费 |
 
+MySQL 的 `flashsale_pre_deductions` 是 Redis 预扣与 RabbitMQ 消息之间的恢复事实源，必须随订单表一起备份。应用启动时立即恢复一批未决事实，随后 `flashsale-pre-deduction-recovery` 每分钟继续处理；每次发布/重投前会验证 Redis reservation，覆盖 AOF `everysec` 的 pre-fsync 重启窗口（整次 Lua 丢失时按持久事实原子重建）。监控 `pending_publish`、`pending_order`、`pending_rollback` 的数量和最老 `updated_at`，不能只观察聚合库存或 DLQ 深度。
+
 `docker compose down` 默认保留命名卷；`docker compose down -v`、`docker volume rm go_single_redis_data` 和 `docker volume rm go_single_rabbitmq_data` 会销毁业务状态，日常部署禁止使用。Redis 未配置淘汰上限，因为这些键包含业务状态而不只是可重建缓存；容量不足时应扩容或拆分实例，不能改成 LRU 静默淘汰。
 
 ### 首次从旧匿名卷迁移
@@ -260,7 +262,7 @@ Redis 至少预留当前 AOF 两倍的可用磁盘供重写，并监控 `aof_las
 
 ### 容器重建演练
 
-脚本写入代表性的订单幂等、秒杀预扣/计数和优惠券计数状态，声明 durable 测试队列并发布 delivery mode 2 消息，然后删除并重建 Redis/RabbitMQ 容器，验证 TTL、值、队列和消息后清理测试数据。脚本会中断已有连接，只在本地或维护窗口运行，且绝不使用 `down -v`。
+脚本写入代表性的订单幂等、秒杀预扣/计数/reservation marker 和优惠券计数状态，声明 durable 测试队列并发布 delivery mode 2 消息，然后删除并重建 Redis/RabbitMQ 容器，验证 TTL、值、队列和消息后清理测试数据。脚本会中断已有连接，只在本地或维护窗口运行，且绝不使用 `down -v`。
 
 ```bash
 bash scripts/persistence-drill.sh

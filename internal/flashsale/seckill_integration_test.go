@@ -5,6 +5,7 @@ package flashsale_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -13,7 +14,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	flashsalerepo "github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
+	flashsalesvc "github.com/xiangzhang-coding/go-single/internal/flashsale/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
+	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 )
 
 // purchasePermissive 抢购专项测试用的宽松全局限流（仅测业务路径）。
@@ -41,7 +45,61 @@ func TestSeckillPurchaseOK(t *testing.T) {
 	w, body := purchase(t, router, id, token)
 	require.Equal(t, http.StatusAccepted, w.Code, "预扣成功应返回 202 排队中: %s", w.Body.String())
 	require.Equal(t, "queued", body["status"])
+	preDeductionID, ok := body["pre_deduction_id"].(string)
+	require.True(t, ok && preDeductionID != "", "response must expose the durable pre-deduction identity")
+	require.Equal(t, "pending_order", body["pre_deduction_status"])
+
+	w, lifecycle := doJSONOn(t, router, http.MethodGet,
+		"/api/flashsales/purchases/"+preDeductionID, "", token)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, preDeductionID, lifecycle["id"])
+	require.Equal(t, "pending_order", lifecycle["status"])
+
+	other := registerAndToken(t, env, uniqueName("otherbuyer"))
+	w, _ = doJSONOn(t, router, http.MethodGet,
+		"/api/flashsales/purchases/"+preDeductionID, "", other)
+	require.Equal(t, http.StatusNotFound, w.Code, "pre-deduction status is owner-scoped")
 	require.Equal(t, 9, redisStock(t, env, id))
+}
+
+func TestSeckillPublishFailurePersistsForRecovery(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	id := seedPublished(t, env, admin, 10)
+	token := registerAndToken(t, env, uniqueName("pubrec"))
+	claims, err := env.verifier.Verify(context.Background(), token)
+	require.NoError(t, err)
+
+	activities := flashsalerepo.NewGORMActivity(env.gdb)
+	pdRepo := flashsalerepo.NewGORMPreDeduction(env.gdb)
+	pub := &fakePublisher{err: errors.New("publisher confirm timeout")}
+	svc := flashsalesvc.New(
+		flashsalerepo.Store{Activities: activities, PreDeductions: pdRepo, Tx: activities},
+		env.productSvc, env.cacheClient, limiter.RedisCounterConfig{}, pub,
+		&fakeNos{next: time.Now().UnixNano()}, metrics.New().Business(),
+	)
+
+	result, err := svc.Seckill(context.Background(), claims.UserID, id)
+	require.NoError(t, err)
+	require.Equal(t, "pending_publish", string(result.Status))
+	var attempts int
+	require.NoError(t, env.gdb.Table("flashsale_pre_deductions").Select("publish_attempts").
+		Where("id = ?", result.PreDeductionID).Scan(&attempts).Error)
+	require.Equal(t, 1, attempts)
+
+	pub.mu.Lock()
+	pub.err = nil
+	pub.mu.Unlock()
+	restarted := flashsalesvc.New(
+		flashsalerepo.Store{Activities: activities, PreDeductions: pdRepo, Tx: activities},
+		env.productSvc, env.cacheClient, limiter.RedisCounterConfig{}, pub,
+		&fakeNos{next: time.Now().UnixNano()}, metrics.New().Business(),
+	)
+	require.NoError(t, restarted.RecoverPreDeduction(context.Background(), result.PreDeductionID))
+	pd, err := pdRepo.GetByID(context.Background(), result.PreDeductionID)
+	require.NoError(t, err)
+	require.Equal(t, "pending_order", string(pd.Status))
+	require.Equal(t, result.OrderNo, pd.OrderNumber())
 }
 
 // 并发抢购不超卖：100 并发抢 50 库存 → 恰好 50 个 202，Redis 库存归零。

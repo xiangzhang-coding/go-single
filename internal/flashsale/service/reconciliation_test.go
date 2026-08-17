@@ -20,56 +20,6 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 )
 
-// ---- 取消回补 ----
-
-// RestoreRedis 原子回补：库存 INCR + 用户计数 DECR + 释放幂等键（允许再次抢购）。
-func TestRestoreRedisRestoresStockCountIdem(t *testing.T) {
-	fx := newFixture()
-	a := fx.createActivity(t, nil)
-	fx.svc.PublishActivity(context.Background(), a.ID)
-
-	stockKey := stockKey(a.ID)
-	countKey := countKey(a.ID, 42)
-	idemKey := idemKey(a.ID, 42)
-	_, err := fx.cache.AcquireIdempotency(context.Background(), idemKey, "1", time.Second)
-	require.NoError(t, err)
-	// 模拟预扣：库存 99、计数 1、幂等键已占。
-	fx.cache.stock[stockKey] = 99
-	fx.cache.count[countKey] = 1
-
-	require.NoError(t, fx.svc.RestoreRedis(context.Background(), a.ID, 42, 1))
-
-	require.Equal(t, 100, fx.cache.stock[stockKey], "库存应回补")
-	require.Equal(t, 0, fx.cache.count[countKey], "用户计数应回补")
-	_, ok := fx.cache.idem[idemKey]
-	require.False(t, ok, "幂等键应释放，允许再次抢购")
-}
-
-// RestoreRedis 的 key 缺失不重建：预热 TTL 过期自清理后回补无意义（不产生僵尸 key）。
-func TestRestoreRedisSkipsMissingKeys(t *testing.T) {
-	fx := newFixture()
-	a := fx.createActivity(t, nil)
-
-	stockKey := stockKey(a.ID)
-	countKey := countKey(a.ID, 42)
-	require.NoError(t, fx.svc.RestoreRedis(context.Background(), a.ID, 42, 1))
-
-	_, ok := fx.cache.stock[stockKey]
-	require.False(t, ok, "库存 key 缺失不应重建")
-	_, ok = fx.cache.count[countKey]
-	require.False(t, ok, "计数 key 缺失不应重建")
-}
-
-// RestoreRedis 基础设施故障透传（对账兜底信号）。
-func TestRestoreRedisPropagatesCacheError(t *testing.T) {
-	fx := newFixture()
-	a := fx.createActivity(t, nil)
-	fx.cache.err = errors.New("redis down")
-
-	err := fx.svc.RestoreRedis(context.Background(), a.ID, 42, 1)
-	require.ErrorContains(t, err, "redis down")
-}
-
 // ---- 对账 ----
 
 // fakeCounter 秒杀有效订单数端口替身。
@@ -92,6 +42,7 @@ func (f *fakeCounter) CountValidSeckill(_ context.Context, activityID int64) (in
 // reconcileFixture 对账测试夹具：活动仓储 + 缓存 + 计数端口 + 对账服务。
 type reconcileFixture struct {
 	acts  *fakeActivities
+	pd    *fakePreDeductions
 	cache *fakeCache
 	cnt   *fakeCounter
 	svc   Reconciliation
@@ -101,11 +52,13 @@ func newReconcileFixture() *reconcileFixture {
 	acts := newFakeActivities()
 	fc := newFakeCache()
 	cnt := newFakeCounter()
+	pd := newFakePreDeductions()
 	return &reconcileFixture{
 		acts:  acts,
+		pd:    pd,
 		cache: fc,
 		cnt:   cnt,
-		svc:   NewReconciliation(repository.Store{Activities: acts}, fc, cnt),
+		svc:   NewReconciliation(repository.Store{Activities: acts, PreDeductions: pd}, fc, cnt),
 	}
 }
 
@@ -155,6 +108,34 @@ func TestReconcileActiveDeductWithoutOrderWarns(t *testing.T) {
 	require.Equal(t, 2, w.OrderCount)
 	require.Contains(t, w.Detail, "补单")
 	require.Equal(t, 6, fx.cache.stock[stockKey(a.ID)], "进行中只比对告警，不自动回写")
+}
+
+func TestReconcileActiveIdentifiesUnresolvedPreDeduction(t *testing.T) {
+	fx := newReconcileFixture()
+	a := fx.seedActive(t, 10)
+	orderNo := "S100"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		Status: model.PreDeductionStatusPendingPublish,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+	fx.cache.stock[stockKey(a.ID)] = 9
+
+	warnings, err := fx.svc.ReconcileActive(context.Background())
+	require.NoError(t, err)
+	require.NotEmpty(t, warnings)
+
+	found := false
+	for _, warning := range warnings {
+		if warning.PreDeductionID == pd.ID {
+			found = true
+			require.Equal(t, int64(42), warning.UserID)
+			require.Equal(t, orderNo, warning.OrderNo)
+			require.Equal(t, string(model.PreDeductionStatusPendingPublish), warning.Status)
+			require.Contains(t, warning.Detail, "继续发布")
+		}
+	}
+	require.True(t, found, "reconciliation must identify the exact recoverable pre-deduction")
 }
 
 // 进行中对账：Redis 高于 MySQL（多回补/缺预扣）→ 告警，不写回。
@@ -229,6 +210,28 @@ func TestReconcileEndedAlignsToMySQL(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, aligned)
 	require.Equal(t, a.Stock, fx.cache.stock[stockKey(a.ID)], "以 MySQL 为准对齐 Redis")
+}
+
+func TestReconcileEndedSkipsActivityWithUnresolvedLifecycle(t *testing.T) {
+	fx := newReconcileFixture()
+	a := &model.Activity{
+		ID: 1, SKUID: 1, Title: "已结束", Price: 100, Stock: 7,
+		PerUserLimit: 1, Status: model.ActivityStatusOnSale,
+		StartAt: time.Now().Add(-2 * time.Hour), EndAt: time.Now().Add(-time.Minute),
+	}
+	require.NoError(t, fx.acts.Create(context.Background(), a))
+	fx.cache.stock[stockKey(a.ID)] = 3
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, Quantity: 1,
+		Status: model.PreDeductionStatusPendingRollback,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	aligned, err := fx.svc.ReconcileEnded(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, aligned)
+	require.Equal(t, 3, fx.cache.stock[stockKey(a.ID)],
+		"aggregate alignment must wait for exact lifecycle compensation")
 }
 
 // 收尾对账：已一致不重复对齐（对齐数 0）。

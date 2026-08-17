@@ -30,6 +30,8 @@ type OrderRepository interface {
 	Create(ctx context.Context, tx *gorm.DB, order *model.Order) error
 	// GetByNo 按订单号读取（不含归属过滤，归属校验在 service 层）。
 	GetByNo(ctx context.Context, orderNo string) (*model.Order, error)
+	// GetByNoInTx 在调用方事务内核验重复键是否确为同一订单。
+	GetByNoInTx(ctx context.Context, tx *gorm.DB, orderNo string) (*model.Order, error)
 	// List 我的订单：状态筛选（空 = 全部）+ 分页，返回条目与总数。
 	List(ctx context.Context, userID int64, status string, offset, limit int) ([]model.Order, int64, error)
 	// ListAll 全量订单（后台 T25）：跨用户，状态筛选（空 = 全部）+ 分页。

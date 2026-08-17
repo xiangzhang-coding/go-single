@@ -34,6 +34,7 @@ type ActivityRepository interface {
 
 // Store 聚合活动仓储，作为 service 的构造入参。
 type Store struct {
-	Activities ActivityRepository
-	Tx         TxRunner
+	Activities    ActivityRepository
+	PreDeductions PreDeductionRepository
+	Tx            TxRunner
 }

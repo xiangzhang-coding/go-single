@@ -43,6 +43,7 @@ var (
 	ErrInsufficientStock     = errors.New("insufficient stock")
 	ErrSKUNotFound           = errors.New("sku not found")
 	ErrSKUUnavailable        = errors.New("sku product is not on sale")
+	ErrSeckillOrderConflict  = errors.New("seckill order conflicts with an existing purchase")
 	ErrCouponNotFound        = errors.New("coupon not found")
 	ErrCouponUsed            = errors.New("coupon already used")
 	ErrCouponExpired         = errors.New("coupon not in valid period")
@@ -180,6 +181,9 @@ type Service interface {
 	// CountValidSeckill 活动的秒杀有效订单数（非取消），对账端口
 	// （flashsale 模块 ReconcileActive 进程内调用）。
 	CountValidSeckill(ctx context.Context, activityID int64) (int, error)
+	// SeckillOrderStatus 为 flashsale 清理已无需补偿的 reservation marker
+	// 提供最小只读状态；非秒杀或不存在返回 found=false。
+	SeckillOrderStatus(ctx context.Context, orderNo string) (status string, found bool, err error)
 	// MarkPaid 支付成功状态迁移：待支付 → 已支付（支付模块事务内条件更新；
 	// WHERE 同时校验 status 与 pay_amount，false = 状态已变或金额不符）。
 	MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error)
@@ -437,10 +441,17 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p Sec
 	}
 
 	if err := s.store.Orders.Create(ctx, tx, order); err != nil {
-		// 重复键 = 幂等命中（订单已存在，消费重投/并发建单成功路径），
-		// 调用方据 created=false 跳过活动库存扣减。
 		if errors.Is(err, repository.ErrOrderDuplicate) {
-			return false, nil
+			existing, getErr := s.store.Orders.GetByNoInTx(ctx, tx, p.OrderNo)
+			if getErr != nil {
+				return false, getErr
+			}
+			if existing != nil && existing.UserID == p.UserID &&
+				existing.ActivityID != nil && *existing.ActivityID == p.ActivityID &&
+				existing.OrderType == model.OrderTypeSeckill {
+				return false, nil
+			}
+			return false, ErrSeckillOrderConflict
 		}
 		return false, err
 	}
@@ -917,6 +928,17 @@ func (s *orderService) CancelSeckill(ctx context.Context, tx *gorm.DB, orderNo s
 // （flashsale ReconcileActive 以此解释 Redis/MySQL 库存差额）。
 func (s *orderService) CountValidSeckill(ctx context.Context, activityID int64) (int, error) {
 	return s.store.Orders.CountValidByActivity(ctx, activityID)
+}
+
+func (s *orderService) SeckillOrderStatus(ctx context.Context, orderNo string) (string, bool, error) {
+	order, err := s.store.Orders.GetByNo(ctx, orderNo)
+	if err != nil {
+		return "", false, err
+	}
+	if order == nil || order.OrderType != model.OrderTypeSeckill {
+		return "", false, nil
+	}
+	return order.Status, true, nil
 }
 
 // sumItemQuantity 订单项数量合计（秒杀订单固定单条订单项 Quantity=1，

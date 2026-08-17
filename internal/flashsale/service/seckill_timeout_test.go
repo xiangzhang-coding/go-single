@@ -41,8 +41,8 @@ type fakeSeckillRedisRestorer struct {
 	err      error
 }
 
-func (f *fakeSeckillRedisRestorer) RestoreRedis(_ context.Context, activityID, userID int64, quantity int) error {
-	f.restored = append(f.restored, formatRestore(activityID, userID, quantity))
+func (f *fakeSeckillRedisRestorer) RecoverPreDeduction(_ context.Context, id int64) error {
+	f.restored = append(f.restored, fmt.Sprint(id))
 	return f.err
 }
 
@@ -54,7 +54,8 @@ func TestSeckillTimeoutCountsRedisFailureAfterDatabaseCommit(t *testing.T) {
 		OrderNo: "S1", UserID: 42, ActivityID: activity.ID, Quantity: 1,
 	}}}
 	redis := &fakeSeckillRedisRestorer{err: errors.New("redis down")}
-	timeout := NewSeckillTimeout(fakeSeckillTx{}, orders, activities, redis, metrics.New().Business())
+	pd := newFakePreDeductions()
+	timeout := NewSeckillTimeout(fakeSeckillTx{}, orders, activities, pd, redis, metrics.New().Business())
 
 	cancelled, failed, redisFailed, err := timeout.CancelExpired(context.Background())
 
@@ -63,6 +64,11 @@ func TestSeckillTimeoutCountsRedisFailureAfterDatabaseCommit(t *testing.T) {
 	require.Zero(t, failed)
 	require.Equal(t, 1, redisFailed)
 	require.Equal(t, 5, activity.Stock, "Redis 故障不得回滚已提交的 MySQL 回补")
+	rows, listErr := pd.ListRecoverable(context.Background(), 10)
+	require.NoError(t, listErr)
+	require.Len(t, rows, 1)
+	require.Equal(t, model.PreDeductionStatusPendingRollback, rows[0].Status,
+		"Redis failure must leave durable compensation work")
 }
 
 func TestSeckillTimeoutSkipsChangedAndMalformedOrders(t *testing.T) {
@@ -77,7 +83,7 @@ func TestSeckillTimeoutSkipsChangedAndMalformedOrders(t *testing.T) {
 		changed: map[string]bool{"changed": true},
 	}
 	redis := &fakeSeckillRedisRestorer{}
-	timeout := NewSeckillTimeout(fakeSeckillTx{}, orders, activities, redis, metrics.New().Business())
+	timeout := NewSeckillTimeout(fakeSeckillTx{}, orders, activities, newFakePreDeductions(), redis, metrics.New().Business())
 
 	cancelled, failed, redisFailed, err := timeout.CancelExpired(context.Background())
 
@@ -94,6 +100,7 @@ func TestSeckillTimeoutPropagatesScanFailure(t *testing.T) {
 		fakeSeckillTx{},
 		&fakeSeckillCancellations{listErr: errors.New("mysql down")},
 		newFakeActivities(),
+		newFakePreDeductions(),
 		&fakeSeckillRedisRestorer{},
 		metrics.New().Business(),
 	)
@@ -115,7 +122,7 @@ func TestSeckillTimeoutRestoresActivityStockAndRedis(t *testing.T) {
 		OrderNo: "S1", UserID: 42, ActivityID: activity.ID, Quantity: 1,
 	}}}
 	redis := &fakeSeckillRedisRestorer{}
-	timeout := NewSeckillTimeout(fakeSeckillTx{}, orders, activities, redis, metrics.New().Business())
+	timeout := NewSeckillTimeout(fakeSeckillTx{}, orders, activities, newFakePreDeductions(), redis, metrics.New().Business())
 
 	cancelled, failed, redisFailed, err := timeout.CancelExpired(context.Background())
 
@@ -125,5 +132,5 @@ func TestSeckillTimeoutRestoresActivityStockAndRedis(t *testing.T) {
 	require.Zero(t, redisFailed)
 	require.Equal(t, []string{"S1"}, orders.cancelled)
 	require.Equal(t, 10, activity.Stock)
-	require.Equal(t, []string{"1:42:1"}, redis.restored)
+	require.Len(t, redis.restored, 1)
 }

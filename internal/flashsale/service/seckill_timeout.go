@@ -5,6 +5,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
@@ -25,25 +26,28 @@ type seckillCancellationOrders interface {
 	CancelSeckill(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error)
 }
 
-type seckillRedisRestorer interface {
-	RestoreRedis(ctx context.Context, activityID, userID int64, quantity int) error
+type preDeductionRecoverer interface {
+	RecoverPreDeduction(ctx context.Context, id int64) error
 }
 
 type seckillTimeoutService struct {
-	tx         seckillTxRunner
-	orders     seckillCancellationOrders
-	activities repository.ActivityRepository
-	redis      seckillRedisRestorer
-	metrics    *metrics.Business
+	tx            seckillTxRunner
+	orders        seckillCancellationOrders
+	activities    repository.ActivityRepository
+	preDeductions repository.PreDeductionRepository
+	recovery      preDeductionRecoverer
+	metrics       *metrics.Business
 }
 
 // NewSeckillTimeout 将 order 的状态迁移与 flashsale 的库存回补组合成单向
 // flashsale -> order 编排；两个业务模块不再互相持有实例。
 func NewSeckillTimeout(tx seckillTxRunner, orders seckillCancellationOrders,
-	activities repository.ActivityRepository, redis seckillRedisRestorer,
+	activities repository.ActivityRepository, preDeductions repository.PreDeductionRepository,
+	recovery preDeductionRecoverer,
 	m *metrics.Business) SeckillTimeout {
 	return &seckillTimeoutService{
-		tx: tx, orders: orders, activities: activities, redis: redis, metrics: m,
+		tx: tx, orders: orders, activities: activities,
+		preDeductions: preDeductions, recovery: recovery, metrics: m,
 	}
 }
 
@@ -57,6 +61,7 @@ func (s *seckillTimeoutService) CancelExpired(ctx context.Context) (cancelled, f
 			failed++
 			continue
 		}
+		var pdID int64
 		dbErr := s.tx.WithinTx(ctx, func(tx *gorm.DB) error {
 			ok, err := s.orders.CancelSeckill(ctx, tx, order.OrderNo)
 			if err != nil {
@@ -65,7 +70,19 @@ func (s *seckillTimeoutService) CancelExpired(ctx context.Context) (cancelled, f
 			if !ok {
 				return ordersvc.ErrOrderChanged
 			}
-			return s.activities.RestoreStock(ctx, tx, order.ActivityID, order.Quantity)
+			if err := s.activities.RestoreStock(ctx, tx, order.ActivityID, order.Quantity); err != nil {
+				return err
+			}
+			orderNo := order.OrderNo
+			pd, err := s.preDeductions.EnsurePendingRollback(ctx, tx, &model.PreDeduction{
+				UserID: order.UserID, ActivityID: order.ActivityID, OrderNo: &orderNo,
+				Quantity: order.Quantity, LastError: "seckill order cancelled",
+			})
+			if err != nil {
+				return err
+			}
+			pdID = pd.ID
+			return nil
 		})
 		if dbErr != nil {
 			failed++
@@ -73,7 +90,7 @@ func (s *seckillTimeoutService) CancelExpired(ctx context.Context) (cancelled, f
 		}
 		cancelled++
 		s.metrics.OrderStatusChanged(ordermodel.OrderStatusCancelled)
-		if err := s.redis.RestoreRedis(ctx, order.ActivityID, order.UserID, order.Quantity); err != nil {
+		if err := s.recovery.RecoverPreDeduction(ctx, pdID); err != nil {
 			redisFailed++
 		}
 	}

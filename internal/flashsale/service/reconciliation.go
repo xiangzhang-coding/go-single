@@ -23,12 +23,16 @@ const endedReconcileWindow = 30 * time.Minute
 
 // ReconcileWarning 单活动对账差异（进行中对账告警内容，cron 回调转 zap 结构化日志）。
 type ReconcileWarning struct {
-	ActivityID int64
-	Title      string
-	RedisStock int // Redis 活动库存（预扣为准）
-	MySQLStock int // flashsale.stock（落单事实源）
-	OrderCount int // 秒杀有效订单数（非取消，解释差额的上下文）
-	Detail     string
+	PreDeductionID int64
+	UserID         int64
+	OrderNo        string
+	Status         string
+	ActivityID     int64
+	Title          string
+	RedisStock     int // Redis 活动库存（预扣为准）
+	MySQLStock     int // flashsale.stock（落单事实源）
+	OrderCount     int // 秒杀有效订单数（非取消，解释差额的上下文）
+	Detail         string
 }
 
 // SeckillOrderCounter 秒杀有效订单数统计端口（order 服务实现，进程内调用；
@@ -74,6 +78,34 @@ func (s *reconciliationService) ReconcileActive(ctx context.Context) ([]Reconcil
 	}
 	now := time.Now()
 	var warnings []ReconcileWarning
+	active := make(map[int64]*model.Activity)
+	for i := range activities {
+		if activities[i].InProgress(now) {
+			active[activities[i].ID] = &activities[i]
+		}
+	}
+	if s.store.PreDeductions != nil {
+		facts, err := s.store.PreDeductions.ListRecoverable(ctx, 0)
+		if err != nil {
+			return nil, err
+		}
+		for i := range facts {
+			fact := &facts[i]
+			a := active[fact.ActivityID]
+			if a == nil {
+				continue
+			}
+			warnings = append(warnings, ReconcileWarning{
+				PreDeductionID: fact.ID,
+				UserID:         fact.UserID,
+				OrderNo:        fact.OrderNumber(),
+				Status:         string(fact.Status),
+				ActivityID:     fact.ActivityID,
+				Title:          a.Title,
+				Detail:         recoveryDetail(fact.Status),
+			})
+		}
+	}
 	for i := range activities {
 		a := &activities[i]
 		if !a.InProgress(now) {
@@ -88,6 +120,21 @@ func (s *reconciliationService) ReconcileActive(ctx context.Context) ([]Reconcil
 		}
 	}
 	return warnings, nil
+}
+
+func recoveryDetail(status model.PreDeductionStatus) string {
+	switch status {
+	case model.PreDeductionStatusPreparing:
+		return "核验 Redis 预扣事实后继续发布或完整回退"
+	case model.PreDeductionStatusPendingPublish:
+		return "持久预扣待继续发布"
+	case model.PreDeductionStatusPendingOrder:
+		return "消息待落单，恢复任务将用同一订单号重投"
+	case model.PreDeductionStatusPendingRollback:
+		return "持久预扣待完整回退"
+	default:
+		return "未知预扣恢复状态"
+	}
 }
 
 // diffActive 单活动差异判定（只读比对，进行中绝不写回）。
@@ -154,6 +201,15 @@ func (s *reconciliationService) ReconcileEnded(ctx context.Context) (int, error)
 		a := &activities[i]
 		if !a.IsOnSale() || now.Before(a.EndAt) {
 			continue
+		}
+		if s.store.PreDeductions != nil {
+			unresolved, err := s.store.PreDeductions.HasUnresolved(ctx, a.ID)
+			if err != nil {
+				return aligned, err
+			}
+			if unresolved {
+				continue
+			}
 		}
 		raw, err := s.cache.Get(ctx, stockKey(a.ID))
 		if err != nil && !errors.Is(err, cache.ErrMiss) {

@@ -17,6 +17,7 @@ order_idem_key="order:idem:persistence-drill:$run_id"
 flash_stock_key="flashsale:stock:persistence-drill:$run_id"
 flash_count_key="flashsale:count:persistence-drill:user:$run_id"
 flash_idem_key="flashsale:idem:persistence-drill:user:$run_id"
+flash_reservation_key="flashsale:reservation:persistence-drill:$run_id"
 coupon_total_key="coupon:claimed:persistence-drill:$run_id"
 coupon_user_key="coupon:peruser:persistence-drill:user:$run_id"
 redis_keys=(
@@ -24,6 +25,7 @@ redis_keys=(
   "$flash_stock_key"
   "$flash_count_key"
   "$flash_idem_key"
+  "$flash_reservation_key"
   "$coupon_total_key"
   "$coupon_user_key"
 )
@@ -147,6 +149,7 @@ redis SET "$order_idem_key" "order-persistence-drill-$run_id" EX 900 >/dev/null
 redis SET "$flash_stock_key" 17 EX 1800 >/dev/null
 redis SET "$flash_count_key" 2 >/dev/null
 redis SET "$flash_idem_key" "order-persistence-drill-flash-$run_id" EX 1800 >/dev/null
+redis SET "$flash_reservation_key" "order-persistence-drill-flash-$run_id" >/dev/null
 redis SET "$coupon_total_key" 9 >/dev/null
 redis SET "$coupon_user_key" 1 >/dev/null
 
@@ -175,6 +178,8 @@ assert_redis_value "$flash_count_key" 2
 assert_no_ttl "$flash_count_key"
 assert_redis_value "$flash_idem_key" "order-persistence-drill-flash-$run_id"
 assert_positive_ttl "$flash_idem_key"
+assert_redis_value "$flash_reservation_key" "order-persistence-drill-flash-$run_id"
+assert_no_ttl "$flash_reservation_key"
 assert_redis_value "$coupon_total_key" 9
 assert_no_ttl "$coupon_total_key"
 assert_redis_value "$coupon_user_key" 1

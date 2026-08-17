@@ -2,16 +2,16 @@ import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 
-import { getFlashSales, getOrder, purchaseFlashSale } from "../api/endpoints";
+import { getFlashSalePurchase, getFlashSales, purchaseFlashSale } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
-import type { FlashSaleActivity } from "../api/types";
+import type { FlashSaleActivity, FlashSalePurchaseResponse } from "../api/types";
 import { formatMoney, formatSpecs } from "../lib/format";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, ProductVisual, Spinner } from "../components/ui";
 
 const POLL_INTERVAL_MS = 1500;
 const POLL_MAX_ATTEMPTS = 30;
 
-type SeckillPhase = "idle" | "queued" | "success" | "timeout";
+type SeckillPhase = "idle" | "queued" | "success" | "rolled_back" | "timeout";
 
 function pad2(n: number) {
   return String(n).padStart(2, "0");
@@ -52,34 +52,37 @@ function useServerClock(serverTime?: string) {
   return now + offset;
 }
 
-// useSeckillPoll 排队中轮询（DESIGN.md：秒杀轮询归 TanStack Query）：
-// useQuery + 动态 refetchInterval 实现 1.5s×30 次上限的 GET /api/orders/{order_no}，
-// 命中非空 status 即成功停表；达上限后停表并进入 timeout（可"再查一次"重跑）。
-function useSeckillPoll(orderNo: string | undefined, enabled: boolean) {
+// 轮询持久预扣状态，而不是猜测订单是否已经生成。即使首次 MQ 发布失败，
+// 后台恢复也会把同一生命周期收敛为 ordered 或 rolled_back。
+function useSeckillPoll(purchase: FlashSalePurchaseResponse | undefined, enabled: boolean) {
   const [phase, setPhase] = useState<SeckillPhase>("idle");
   const [attempt, setAttempt] = useState(0);
   const attemptsRef = useRef(0);
 
   useEffect(() => {
-    if (enabled && orderNo) {
+    if (enabled && purchase) {
       setPhase("queued");
     }
-  }, [enabled, orderNo]);
+  }, [enabled, purchase]);
 
   const query = useQuery({
-    queryKey: ["seckill-poll", orderNo],
+    queryKey: ["seckill-poll", purchase?.pre_deduction_id],
     // 尝试次数在 queryFn（异步执行）中累计：refetchInterval 回调会在渲染期
     // 被调用，若在其中 setState 会引发渲染循环、interval 反复重建（轮询中断）。
     queryFn: () => {
       attemptsRef.current += 1;
       setAttempt(attemptsRef.current);
-      return getOrder(orderNo!);
+      return getFlashSalePurchase(purchase!.pre_deduction_id);
     },
-    enabled: enabled && Boolean(orderNo),
+    enabled: enabled && Boolean(purchase),
     retry: false,
     refetchInterval: (pollQuery) => {
       // 已落单或达到次数上限：停止轮询。
-      if (pollQuery.state.data?.status || attemptsRef.current >= POLL_MAX_ATTEMPTS) {
+      if (
+        pollQuery.state.data?.status === "ordered" ||
+        pollQuery.state.data?.status === "rolled_back" ||
+        attemptsRef.current >= POLL_MAX_ATTEMPTS
+      ) {
         return false;
       }
       return POLL_INTERVAL_MS;
@@ -87,8 +90,10 @@ function useSeckillPoll(orderNo: string | undefined, enabled: boolean) {
   });
 
   useEffect(() => {
-    if (query.data?.status) {
+    if (query.data?.status === "ordered") {
       setPhase("success");
+    } else if (query.data?.status === "rolled_back") {
+      setPhase("rolled_back");
     } else if (
       enabled &&
       attemptsRef.current >= POLL_MAX_ATTEMPTS &&
@@ -105,12 +110,17 @@ function useSeckillPoll(orderNo: string | undefined, enabled: boolean) {
     query.refetch();
   }
 
-  return { phase, attempt: Math.max(attempt, 1), retry };
+  return {
+    phase,
+    attempt: Math.max(attempt, 1),
+    orderNo: query.data?.order_no || purchase?.order_no,
+    retry,
+  };
 }
 
 export function FlashSalePage() {
   const queryClient = useQueryClient();
-  const [orderNos, setOrderNos] = useState<Record<number, string>>({});
+  const [purchases, setPurchases] = useState<Record<number, FlashSalePurchaseResponse>>({});
   const [errors, setErrors] = useState<Record<number, string>>({});
   const [pendingId, setPendingId] = useState<number | null>(null);
 
@@ -124,7 +134,7 @@ export function FlashSalePage() {
   const purchaseMutation = useMutation({
     mutationFn: purchaseFlashSale,
     onSuccess: (result, activityId) => {
-      setOrderNos((prev) => ({ ...prev, [activityId]: result.order_no }));
+      setPurchases((prev) => ({ ...prev, [activityId]: result }));
       setErrors((prev) => {
         const next = { ...prev };
         delete next[activityId];
@@ -177,7 +187,7 @@ export function FlashSalePage() {
               key={activity.id}
               activity={activity}
               serverClock={serverClock}
-              orderNo={orderNos[activity.id]}
+              purchase={purchases[activity.id]}
               error={errors[activity.id]}
               busy={pendingId === activity.id}
               onBuy={() => {
@@ -200,20 +210,20 @@ export function FlashSalePage() {
 function FlashSaleCard({
   activity,
   serverClock,
-  orderNo,
+  purchase,
   error,
   busy,
   onBuy,
 }: {
   activity: FlashSaleActivity;
   serverClock: number;
-  orderNo?: string;
+  purchase?: FlashSalePurchaseResponse;
   error?: string;
   busy: boolean;
   onBuy: () => void;
 }) {
-  const queued = Boolean(orderNo);
-  const { phase, attempt, retry } = useSeckillPoll(orderNo, queued);
+  const queued = Boolean(purchase);
+  const { phase, attempt, orderNo, retry } = useSeckillPoll(purchase, queued);
 
   const inProgress = activity.state === "in_progress";
   const soldOut = activity.stock <= 0;
@@ -261,7 +271,7 @@ function FlashSaleCard({
           <strong className="font-mono">{locallyEnded ? "--:--:--" : formatCountdown(countdown)}</strong>
         </div>
 
-        {phase === "queued" && orderNo ? (
+        {phase === "queued" ? (
           <div className="processing-panel processing-panel-sm" aria-live="polite">
             <span className="processing-mark"><Icon name="clock" size={22} /></span>
             <div>
@@ -277,7 +287,7 @@ function FlashSaleCard({
               去查看订单 <span aria-hidden="true">↗</span>
             </Link>
           </div>
-        ) : phase === "timeout" && orderNo ? (
+        ) : phase === "timeout" ? (
           <div className="notice notice-error">
             <p><strong>仍在处理中</strong>，{POLL_MAX_ATTEMPTS} 次查询后未等到落单结果。</p>
             <div className="mt-3 flex items-center gap-4">
@@ -286,6 +296,10 @@ function FlashSaleCard({
                 到订单页确认 <span aria-hidden="true">↗</span>
               </Link>
             </div>
+          </div>
+        ) : phase === "rolled_back" ? (
+          <div className="notice notice-error">
+            <p><strong>抢购未完成</strong>，预扣库存已完整退回，可以重新尝试。</p>
           </div>
         ) : error ? (
           <div className="notice notice-error">
@@ -298,8 +312,10 @@ function FlashSaleCard({
             <Button variant="secondary" disabled><Spinner label="排队中" /></Button>
           ) : phase === "success" && orderNo ? (
             <Link to={`/orders/${orderNo}`}><Button>查看订单 <Icon name="arrow-right" size={15} /></Button></Link>
-          ) : phase === "timeout" && orderNo ? (
+          ) : phase === "timeout" ? (
             <Button variant="secondary" disabled>等待落单</Button>
+          ) : phase === "rolled_back" ? (
+            <Button onClick={onBuy} disabled={!inProgress || soldOut || busy}>{busy ? "提交中…" : "重新抢购"}</Button>
           ) : soldOut ? (
             <Button variant="secondary" disabled>已抢光</Button>
           ) : locallyEnded || !inProgress ? (

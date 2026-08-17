@@ -64,17 +64,20 @@ type consumerFixture struct {
 	orders   *fakeOrderService
 	users    *fakeUserService
 	acts     *fakeActivities
+	pd       *fakePreDeductions
 }
 
 func newConsumerFixture() *consumerFixture {
 	acts := newFakeActivities()
 	orders := &fakeOrderService{inserted: true}
 	users := newFakeUserService()
+	pd := newFakePreDeductions()
 	return &consumerFixture{
-		consumer: NewSeckillOrderConsumer(acts, fakeSeckillTx{}, orders, users, metrics.New().Business(), zap.NewNop()),
+		consumer: NewSeckillOrderConsumer(acts, pd, fakeSeckillTx{}, orders, users, metrics.New().Business(), zap.NewNop()),
 		orders:   orders,
 		users:    users,
 		acts:     acts,
+		pd:       pd,
 	}
 }
 
@@ -131,7 +134,7 @@ func TestConsumerInvalidMessagePermanent(t *testing.T) {
 	require.Empty(t, fx.orders.created)
 }
 
-// 活动不存在：永久失败（死信；对账兜底），不落单。
+// 活动不存在：永久失败（死信；持久生命周期回退），不落单。
 func TestConsumerActivityMissingPermanent(t *testing.T) {
 	fx := newConsumerFixture()
 	fx.users.seedAddress(42)
@@ -142,7 +145,7 @@ func TestConsumerActivityMissingPermanent(t *testing.T) {
 	require.Empty(t, fx.orders.created)
 }
 
-// 无默认地址：永久失败（死信；对账兜底），不落单。
+// 无默认地址：永久失败（死信；持久生命周期回退），不落单。
 func TestConsumerNoDefaultAddressPermanent(t *testing.T) {
 	fx := newConsumerFixture()
 	a := fx.seed(t, 42)
@@ -159,7 +162,7 @@ func TestConsumerActivityReadFailureTransient(t *testing.T) {
 	fx := newConsumerFixture()
 	fx.users.seedAddress(42)
 
-	fx.consumer = NewSeckillOrderConsumer(&failingActivities{}, fakeSeckillTx{}, fx.orders, fx.users, metrics.New().Business(), zap.NewNop())
+	fx.consumer = NewSeckillOrderConsumer(&failingActivities{}, fx.pd, fakeSeckillTx{}, fx.orders, fx.users, metrics.New().Business(), zap.NewNop())
 	err := fx.consumer.Handle(context.Background(),
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: 1}))
 	require.Error(t, err)
@@ -188,7 +191,7 @@ func TestConsumerCreatePermanentFailure(t *testing.T) {
 
 	err := fx.consumer.Handle(context.Background(),
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: a.ID}))
-	require.ErrorIs(t, err, mq.ErrPermanent, "库存不足应死信（对账兜底）")
+	require.ErrorIs(t, err, mq.ErrPermanent, "库存不足应死信并进入持久回退")
 }
 
 func TestConsumerDuplicateOrderDoesNotDeductActivityStock(t *testing.T) {
@@ -213,6 +216,101 @@ func TestConsumerCreateTransientFailure(t *testing.T) {
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: a.ID}))
 	require.Error(t, err)
 	require.NotErrorIs(t, err, mq.ErrPermanent, "基础设施故障应重投而非死信")
+}
+
+func TestConsumerTransitionsPreDeductionToOrdered(t *testing.T) {
+	fx := newConsumerFixture()
+	a := fx.seed(t, 42)
+	orderNo := "10001"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		Status: model.PreDeductionStatusPendingOrder,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	err := fx.consumer.Handle(context.Background(), marshalMsg(t, SeckillSuccessMessage{
+		PreDeductionID: pd.ID, OrderNo: orderNo, UserID: 42, ActivityID: a.ID,
+	}))
+	require.NoError(t, err)
+
+	stored, err := fx.pd.GetByID(context.Background(), pd.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.PreDeductionStatusOrdered, stored.Status)
+}
+
+func TestConsumerPermanentFailureSchedulesDurableRollback(t *testing.T) {
+	fx := newConsumerFixture()
+	a := fx.seed(t, 42)
+	fx.users.addresses = map[int64]*usermodel.Address{}
+	orderNo := "10001"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		Status: model.PreDeductionStatusPendingOrder,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	err := fx.consumer.Handle(context.Background(), marshalMsg(t, SeckillSuccessMessage{
+		PreDeductionID: pd.ID, OrderNo: orderNo, UserID: 42, ActivityID: a.ID,
+	}))
+	require.ErrorIs(t, err, mq.ErrPermanent)
+
+	stored, getErr := fx.pd.GetByID(context.Background(), pd.ID)
+	require.NoError(t, getErr)
+	require.Equal(t, model.PreDeductionStatusPendingRollback, stored.Status)
+}
+
+func TestConsumerAcknowledgesDeliveryAfterRollbackStarted(t *testing.T) {
+	fx := newConsumerFixture()
+	a := fx.seed(t, 42)
+	orderNo := "10001"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		Status: model.PreDeductionStatusPendingRollback,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	err := fx.consumer.Handle(context.Background(), marshalMsg(t, SeckillSuccessMessage{
+		PreDeductionID: pd.ID, OrderNo: orderNo, UserID: 42, ActivityID: a.ID,
+	}))
+	require.NoError(t, err)
+	require.Empty(t, fx.orders.created, "late duplicate must not recreate a rolled-back order")
+}
+
+func TestDeadLetterSchedulesDurableRollback(t *testing.T) {
+	fx := newConsumerFixture()
+	orderNo := "10001"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: 9, OrderNo: &orderNo, Quantity: 1,
+		Status: model.PreDeductionStatusPendingOrder,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	err := fx.consumer.HandleDeadLetter(context.Background(), marshalMsg(t, SeckillSuccessMessage{
+		PreDeductionID: pd.ID, OrderNo: orderNo, UserID: 42, ActivityID: 9,
+	}))
+	require.NoError(t, err)
+
+	stored, getErr := fx.pd.GetByID(context.Background(), pd.ID)
+	require.NoError(t, getErr)
+	require.Equal(t, model.PreDeductionStatusPendingRollback, stored.Status)
+}
+
+func TestLateDeadLetterCannotRollbackCreatedOrder(t *testing.T) {
+	fx := newConsumerFixture()
+	orderNo := "10001"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: 9, OrderNo: &orderNo, Quantity: 1,
+		Status: model.PreDeductionStatusOrdered,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	err := fx.consumer.HandleDeadLetter(context.Background(), marshalMsg(t, SeckillSuccessMessage{
+		PreDeductionID: pd.ID, OrderNo: orderNo, UserID: 42, ActivityID: 9,
+	}))
+	require.NoError(t, err)
+	stored, getErr := fx.pd.GetByID(context.Background(), pd.ID)
+	require.NoError(t, getErr)
+	require.Equal(t, model.PreDeductionStatusOrdered, stored.Status)
 }
 
 // failingActivities 活动读取恒失败仓储（模拟 DB 故障）。

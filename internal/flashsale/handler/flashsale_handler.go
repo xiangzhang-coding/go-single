@@ -1,6 +1,6 @@
 // Package handler 暴露 flashsale 模块的 HTTP 接口：admin 秒杀活动管理
 // （创建/编辑/列表/上架/下架）+ 用户抢购（限流 → 幂等键 → 原子预扣 →
-// 发 MQ 异步落单 → 202 排队中 + order_no 供前端轮询）。
+// 持久生命周期 → MQ 异步落单 → 202 排队中 + pre_deduction_id 供前端轮询）。
 package handler
 
 import (
@@ -41,8 +41,8 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 //
 //	GET  /api/flashsales             秒杀页活动列表（进行中/即将开始，携带 server_time
 //	                                  供前端对齐倒计时；状态/剩余库存服务端派生）
-//	POST /api/flashsales/:id/purchase      抢购（seckillTokenBucket 全局令牌桶限流，
-//	                                        成功返回 202 排队中 + order_no，异步落单见 T12）
+//	POST /api/flashsales/:id/purchase      抢购（成功返回 202 + pre_deduction_id）
+//	GET  /api/flashsales/purchases/:id     查询本人预扣生命周期
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup, seckillTokenBucket gin.HandlerFunc) {
 	admin := rg.Group("/admin", auth.Middleware(h.verifier), auth.RequireAdmin())
 	admin.POST("/flashsales", h.CreateActivity)
@@ -54,6 +54,7 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup, seckillTokenBucket gin.Han
 	protected := rg.Group("", auth.Middleware(h.verifier))
 	protected.GET("/flashsales", h.ListUserActivities)
 	protected.POST("/flashsales/:id/purchase", seckillTokenBucket, h.Purchase)
+	protected.GET("/flashsales/purchases/:id", h.GetPurchase)
 }
 
 type activityRequest struct {
@@ -140,8 +141,8 @@ func (h *Handler) UnpublishActivity(c *gin.Context) {
 }
 
 // Purchase 抢购：限流（全局令牌桶中间件 + 按用户 Redis 计数）→ 幂等键 →
-// 缓存原子预扣 → 发 MQ 异步落单；预扣成功立即返回 202"排队中"与订单号，
-// 前端据此轮询 GET /api/orders/{order_no} 得知异步落单结果（T12）。
+// 缓存原子预扣 → 持久恢复生命周期 → MQ 异步落单；预扣成功立即返回
+// 202"排队中"与稳定预扣 ID，前端据此查询最终落单或完整回退状态。
 func (h *Handler) Purchase(c *gin.Context) {
 	id, ok := idParam(c)
 	if !ok {
@@ -152,12 +153,36 @@ func (h *Handler) Purchase(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 		return
 	}
-	orderNo, err := h.svc.Seckill(c.Request.Context(), claims.UserID, id)
+	result, err := h.svc.Seckill(c.Request.Context(), claims.UserID, id)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"status": "queued", "order_no": orderNo, "message": "排队中"})
+	c.JSON(http.StatusAccepted, gin.H{
+		"pre_deduction_id":     strconv.FormatInt(result.PreDeductionID, 10),
+		"pre_deduction_status": result.Status,
+		"status":               "queued",
+		"order_no":             result.OrderNo,
+		"message":              "排队中",
+	})
+}
+
+func (h *Handler) GetPurchase(c *gin.Context) {
+	id, ok := idParam(c)
+	if !ok {
+		return
+	}
+	claims, ok := auth.ClaimsFrom(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		return
+	}
+	pd, err := h.svc.GetPreDeduction(c.Request.Context(), claims.UserID, id)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, pd)
 }
 
 func activityParams(req activityRequest) service.ActivityParams {
@@ -201,6 +226,8 @@ func writeError(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrInvalidInput):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrActivityNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	case errors.Is(err, service.ErrPreDeductionNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrRateLimited):
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})

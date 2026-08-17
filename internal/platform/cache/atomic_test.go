@@ -327,6 +327,40 @@ func TestPreDeductFlashSaleIsAtomicUnderContention(t *testing.T) {
 	requireCacheState(t, c, stockKey, "0", true)
 }
 
+func TestPreDeductFlashSaleReservationIsIdempotent(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-reserved-stock")
+	countKey := atomicTestKey(t, "flashsale-reserved-count")
+	reservationKey := atomicTestKey(t, "flashsale-reservation")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), stockKey))
+		require.NoError(t, c.Del(context.Background(), countKey))
+		require.NoError(t, c.Del(context.Background(), reservationKey))
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "5", 0))
+
+	now := time.Now()
+	params := FlashSalePreDeductParams{
+		StockKey: stockKey, CountKey: countKey,
+		ReservationKey: reservationKey, ReservationToken: "reservation-42",
+		Now: now, StartAt: now.Add(-time.Minute), EndAt: now.Add(time.Hour),
+		OnSale: true, PerUserLimit: 1,
+	}
+	result, err := c.PreDeductFlashSale(context.Background(), params)
+	require.NoError(t, err)
+	require.Equal(t, FlashSalePreDeducted, result)
+
+	result, err = c.PreDeductFlashSale(context.Background(), params)
+	require.NoError(t, err)
+	require.Equal(t, FlashSaleAlreadyPreDeducted, result)
+	requireCacheState(t, c, stockKey, "4", true)
+	requireCacheState(t, c, countKey, "1", true)
+	requireCacheState(t, c, reservationKey, "reservation-42", true)
+	ttl, err := c.(*redisCache).client.TTL(context.Background(), reservationKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(-1), ttl, "reservation remains until compensation is no longer possible")
+}
+
 func TestPreDeductFlashSalePropagatesRedisError(t *testing.T) {
 	c := newAtomicRedis(t)
 	stockKey := atomicTestKey(t, "flashsale-deduct-error-stock")
@@ -348,6 +382,35 @@ func TestPreDeductFlashSalePropagatesRedisError(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	requireCacheState(t, c, stockKey, "5", true)
 	requireCacheState(t, c, countKey, "", false)
+}
+
+func TestEnsureFlashSaleReservationReinstatesLostPreDeduction(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-reinstate-stock")
+	countKey := atomicTestKey(t, "flashsale-reinstate-count")
+	idemKey := atomicTestKey(t, "flashsale-reinstate-idem")
+	reservationKey := atomicTestKey(t, "flashsale-reinstate-reservation")
+	t.Cleanup(func() {
+		for _, key := range []string{stockKey, countKey, idemKey, reservationKey} {
+			require.NoError(t, c.Del(context.Background(), key))
+		}
+	})
+	params := FlashSaleEnsureReservationParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
+		ReservationKey: reservationKey, ReservationToken: "reservation-42",
+		IdempotencyTTL: 30 * time.Minute, Quantity: 1, FallbackStock: 5, StockTTL: time.Hour,
+	}
+
+	result, err := c.EnsureFlashSaleReservation(context.Background(), params)
+	require.NoError(t, err)
+	require.Equal(t, FlashSaleReservationReinstated, result)
+	result, err = c.EnsureFlashSaleReservation(context.Background(), params)
+	require.NoError(t, err)
+	require.Equal(t, FlashSaleReservationPresent, result)
+	requireCacheState(t, c, stockKey, "4", true)
+	requireCacheState(t, c, countKey, "1", true)
+	requireCacheState(t, c, idemKey, "reservation-42", true)
+	requireCacheState(t, c, reservationKey, "reservation-42", true)
 }
 
 func TestRestoreFlashSaleState(t *testing.T) {
@@ -385,15 +448,51 @@ func TestRestoreFlashSaleState(t *testing.T) {
 			}
 			require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
 
-			err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+			result, err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
 				StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
 			})
 			require.NoError(t, err)
+			require.Equal(t, FlashSaleRestored, result)
 			requireCacheState(t, c, stockKey, tc.wantStock, tc.stockExists)
 			requireCacheState(t, c, countKey, tc.wantCount, tc.countExists)
 			requireCacheState(t, c, idemKey, "", false)
 		})
 	}
+}
+
+func TestRestoreFlashSaleReservationIsIdempotentAndTokenScoped(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-idempotent-restore-stock")
+	countKey := atomicTestKey(t, "flashsale-idempotent-restore-count")
+	idemKey := atomicTestKey(t, "flashsale-idempotent-restore-idem")
+	reservationKey := atomicTestKey(t, "flashsale-idempotent-restore-reservation")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), stockKey))
+		require.NoError(t, c.Del(context.Background(), countKey))
+		require.NoError(t, c.Del(context.Background(), idemKey))
+		require.NoError(t, c.Del(context.Background(), reservationKey))
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "8", 0))
+	require.NoError(t, c.Set(context.Background(), countKey, "2", 0))
+	require.NoError(t, c.Set(context.Background(), idemKey, "newer-reservation", time.Minute))
+	require.NoError(t, c.Set(context.Background(), reservationKey, "reservation-42", time.Minute))
+
+	params := FlashSaleRestoreParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
+		ReservationKey: reservationKey, ReservationToken: "reservation-42", Quantity: 1,
+	}
+	result, err := c.RestoreFlashSale(context.Background(), params)
+	require.NoError(t, err)
+	require.Equal(t, FlashSaleRestored, result)
+	result, err = c.RestoreFlashSale(context.Background(), params)
+	require.NoError(t, err)
+	require.Equal(t, FlashSaleAlreadyRestored, result)
+
+	requireCacheState(t, c, stockKey, "9", true)
+	requireCacheState(t, c, countKey, "1", true)
+	requireCacheState(t, c, reservationKey, "rolled_back:reservation-42", true)
+	requireCacheState(t, c, idemKey, "newer-reservation", true,
+		"delayed compensation must not delete a newer request's idempotency key")
 }
 
 func TestRestoreFlashSalePropagatesRedisError(t *testing.T) {
@@ -412,7 +511,7 @@ func TestRestoreFlashSalePropagatesRedisError(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := c.RestoreFlashSale(ctx, FlashSaleRestoreParams{
+	_, err := c.RestoreFlashSale(ctx, FlashSaleRestoreParams{
 		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
 	})
 	require.ErrorIs(t, err, context.Canceled)
@@ -435,7 +534,7 @@ func TestRestoreFlashSaleRejectsInvalidStateBeforeMutation(t *testing.T) {
 	require.NoError(t, c.(*redisCache).client.HSet(context.Background(), countKey, "invalid", "state").Err())
 	require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
 
-	err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+	_, err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
 		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
 	})
 	require.ErrorContains(t, err, "WRONGTYPE")
@@ -460,7 +559,7 @@ func TestRestoreFlashSaleRejectsNonIntegerBeforeMutation(t *testing.T) {
 	require.NoError(t, c.Set(context.Background(), countKey, "1.5", 0))
 	require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
 
-	err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+	_, err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
 		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
 	})
 	require.ErrorContains(t, err, "safe integer")
@@ -483,7 +582,7 @@ func TestRestoreFlashSaleRejectsOverflowBeforeMutation(t *testing.T) {
 	require.NoError(t, c.Set(context.Background(), countKey, "2", 0))
 	require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
 
-	err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+	_, err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
 		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
 	})
 	require.ErrorContains(t, err, "safe integer")
@@ -506,7 +605,7 @@ func TestRestoreFlashSaleRejectsInvalidQuantityBeforeMutation(t *testing.T) {
 	require.NoError(t, c.Set(context.Background(), countKey, "2", 0))
 	require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
 
-	err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+	_, err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
 		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
 	})
 	require.ErrorContains(t, err, "must be positive")
@@ -546,13 +645,13 @@ func TestIncrementFixedWindowPropagatesRedisError(t *testing.T) {
 	requireCacheState(t, c, key, "", false)
 }
 
-func requireCacheState(t *testing.T, c Cache, key, want string, exists bool) {
+func requireCacheState(t *testing.T, c Cache, key, want string, exists bool, msgAndArgs ...any) {
 	t.Helper()
 	got, err := c.Get(context.Background(), key)
 	if !exists {
-		require.ErrorIs(t, err, ErrMiss)
+		require.ErrorIs(t, err, ErrMiss, msgAndArgs...)
 		return
 	}
-	require.NoError(t, err)
-	require.Equal(t, want, got)
+	require.NoError(t, err, msgAndArgs...)
+	require.Equal(t, want, got, msgAndArgs...)
 }

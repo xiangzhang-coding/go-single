@@ -148,12 +148,15 @@ func buildEnv() (*testEnv, error) {
 	// 异步落单闭环（T12）走真实 MQ，见 seckill_order_integration_test.go。
 	pub := &fakePublisher{}
 	flashsaleSvc := flashsalesvc.New(
-		flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(gdb)},
+		flashsalerepo.Store{
+			Activities:    flashsalerepo.NewGORMActivity(gdb),
+			PreDeductions: flashsalerepo.NewGORMPreDeduction(gdb),
+		},
 		productSvc,
 		cacheClient,
 		limiter.RedisCounterConfig{},
 		pub,
-		&fakeNos{next: 900000},
+		&fakeNos{next: time.Now().UnixNano()},
 		metrics.New().Business(),
 	)
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
@@ -185,6 +188,7 @@ type fakePublisher struct {
 	mu    sync.Mutex
 	queue string
 	body  []byte
+	err   error
 }
 
 func (f *fakePublisher) Publish(_ context.Context, queue string, body []byte) error {
@@ -192,7 +196,7 @@ func (f *fakePublisher) Publish(_ context.Context, queue string, body []byte) er
 	defer f.mu.Unlock()
 	f.queue = queue
 	f.body = body
-	return nil
+	return f.err
 }
 
 // fakeNos 雪花订单号替身（确定性序列，避免依赖真实实现）。
@@ -213,12 +217,15 @@ func (f *fakeNos) Next() (int64, error) {
 func (e *testEnv) newFlashsaleRouter(t *testing.T, limitCfg limiter.TokenBucketConfig, rlCfg limiter.RedisCounterConfig) http.Handler {
 	t.Helper()
 	svc := flashsalesvc.New(
-		flashsalerepo.Store{Activities: flashsalerepo.NewGORMActivity(e.gdb)},
+		flashsalerepo.Store{
+			Activities:    flashsalerepo.NewGORMActivity(e.gdb),
+			PreDeductions: flashsalerepo.NewGORMPreDeduction(e.gdb),
+		},
 		e.productSvc,
 		e.cacheClient,
 		rlCfg,
 		&fakePublisher{},
-		&fakeNos{next: 910000},
+		&fakeNos{next: time.Now().UnixNano()},
 		metrics.New().Business(),
 	)
 	h := flashsalehandler.New(svc, e.verifier)

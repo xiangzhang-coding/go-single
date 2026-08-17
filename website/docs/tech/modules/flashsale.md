@@ -4,7 +4,7 @@ sidebar_position: 6
 
 # flashsale — 秒杀
 
-**定位**：活动管理（时间窗口 / 独立库存 / 秒杀价 / 限购）、上架预热 Redis（SETNX）、限流（全局令牌桶 + 按用户计数）、幂等键 + 类型化缓存原子预扣、发 MQ 异步落单、超时回补与库存对账（进行中只告警、收尾以 MySQL 对齐）。
+**定位**：活动管理（时间窗口 / 独立库存 / 秒杀价 / 限购）、上架预热 Redis、限流、类型化缓存原子预扣、持久预扣生命周期、MQ 异步落单、可重试回补与逐预扣事实对账。
 
 实现：`internal/flashsale/`。
 
@@ -25,6 +25,10 @@ sidebar_position: 6
 
 派生状态（读取时计算，不落库）：用户视角 `not_started` / `in_progress`；admin 视角另含 `off_sale`（手动下架）/ `ended`（窗口已结束）。
 
+### flashsale_pre_deductions
+
+每次抢购先创建稳定 `id`，再触碰 Redis。记录 `user_id`、`activity_id`、`order_no`、发布/回退次数和最后错误；状态流为 `preparing → pending_publish → pending_order → ordered → pending_rollback → rolled_back`。该表同时承担本地 saga 与 MQ outbox 事实源。
+
 ## Redis 约定与原子能力
 
 key 约定（活动进行中均为 Redis 预扣事实源）：
@@ -34,6 +38,7 @@ key 约定（活动进行中均为 Redis 预扣事实源）：
 | `flashsale:stock:{id}` | 活动库存（上架预热；TTL = 结束时间 + 1h 自清理） |
 | `flashsale:count:{id}:{user}` | 用户抢购计数（原子预扣 INCR） |
 | `flashsale:idem:{id}:{user}` | 幂等键（挡预扣请求重复提交，TTL **30min**） |
+| `flashsale:reservation:{pre_deduction_id}` | 与库存/计数同一 Lua 写入的持久预扣标记；回退先写 `rolled_back` tombstone，MySQL 终态提交后再清理，重试可区分“已回补”与“标记异常缺失” |
 | `flashsale:rl:{user}` | 按用户限流计数（固定窗口 INCR+TTL） |
 
 业务 service 只调用类型化缓存能力；Lua 文本与整数返回码协议封装在 `internal/platform/cache` Redis 适配器内：
@@ -41,9 +46,10 @@ key 约定（活动进行中均为 Redis 预扣事实源）：
 | 能力 | 语义 |
 | --- | --- |
 | `WarmFlashSaleStock` | 预热：key 不存在写入；已存在仅当配置库存更低才覆盖（**进行中只减不增**） |
-| `PreDeductFlashSale` | 原子预扣：校验 on_sale → 时间窗口 → 库存 → 每人限购 → `DECR 库存 + INCR 用户计数`；返回命名结果而非整数码 |
+| `PreDeductFlashSale` | 原子预扣：校验 on_sale → 时间窗口 → 库存 → 每人限购 → `DECR 库存 + INCR 用户计数 + reservation marker`；同一 marker 重放不重复扣减 |
+| `EnsureFlashSaleReservation` | 发布/重投前验证 marker；若 Redis 在 AOF fsync 前重启使整次 Lua 结果丢失，则按 MySQL 持久事实原子重建库存、用户计数、幂等键与 marker |
 | `AcquireIdempotency` | 幂等键抢占（内部 SETNX + EX） |
-| `RestoreFlashSale` | 回补：库存 key 存在才 INCR、计数 key 存在才 DECR、DEL 幂等键（允许再次抢购） |
+| `RestoreFlashSale` | 仅 reservation token 匹配时回补并写 tombstone；重复执行不多回补，标记缺失不假报成功，且 compare-delete 不会删除新请求幂等键 |
 
 ## 接口
 
@@ -63,7 +69,8 @@ admin（Bearer + admin）：
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | /api/flashsales | 秒杀页列表（仅进行中/即将开始；携带 `server_time` 供前端对齐倒计时；剩余库存读 Redis 预扣余量，缺失降级配置库存） |
-| POST | /api/flashsales/:id/purchase | 抢购（**全局令牌桶中间件**限流 + 服务内按用户限流；成功返回 **202 排队中 + order_no** 供轮询） |
+| POST | /api/flashsales/:id/purchase | 抢购；成功返回 **202 排队中 + pre_deduction_id + 可选 order_no** |
+| GET | /api/flashsales/purchases/:id | 查询本人预扣生命周期（owner 校验；他人记录返回 404） |
 
 ### 跨模块端口
 
@@ -76,21 +83,20 @@ admin（Bearer + admin）：
 ```text
 POST /api/flashsales/:id/purchase
   [1] 全局令牌桶限流（中间件，429）→ 按用户 Redis 固定窗口计数（flashsale:rl:{user}）
-  [2] 幂等键抢占（flashsale:idem:{id}:{user}，SETNX + TTL 30min）——先于预扣抢占，
-      挡得住重复提交；已存在 → 409 重复请求
+  [2] MySQL 创建 preparing 事实，幂等键以 pre_deduction_id 为值抢占
   [3] PreDeductFlashSale 类型化原子预扣：
-        · 成功 → 保留幂等键
+        · 成功 → 库存/计数/reservation marker 同时提交，状态转 pending_publish
         · 业务拒绝（抢光/限购/窗口外/下架）→ 释放幂等键（允许窗口内重试）
         · 基础设施失败 → 保留幂等键（防瞬时故障下重复预扣）
-  [4] 预扣成功 → 生成雪花订单号 → 发布 MQ"抢购成功"消息
-      （flashsale.order.create 队列，发布确认 + 有限重试；发布失败保留幂等键，对账兜底）
-  [5] 返回 202 {"status":"queued","order_no":...}，前端轮询 GET /api/orders/{order_no}
+  [4] 持久化雪花订单号 → 发布 MQ；确认成功转 pending_order
+      订单号生成/发布失败由启动恢复与每分钟任务继续；重投前验证或重建 Redis reservation；10 次仍失败转 pending_rollback
+  [5] 返回 202，前端按 pre_deduction_id 轮询 ordered / rolled_back
 ```
 
 ### 异步落单消费者（flashsale.order.create）
 
 ```text
-消息 {order_no, user_id, activity_id}
+消息 {pre_deduction_id, order_no, user_id, activity_id}
   → 查活动（sku_id/秒杀价为订单快照来源；不存在 → 永久失败进死信）
   → 查默认地址（user.GetDefaultAddress，固化为地址快照；无地址 → 永久失败进死信）
   → flashsale 编排开启事务：order.CreateSeckillInTx 建秒杀订单（10min 超时）+ 订单项
@@ -98,13 +104,16 @@ POST /api/flashsales/:id/purchase
       · 重复键（order_no 主键 / user_activity_key 唯一约束）→ 幂等成功（不重复扣减库存）
       · 活动库存不足 → 永久失败（死信）
       · DB 瞬时故障 → 重投（Nack requeue，at-least-once）
+      · 永久失败 → 持久化 pending_rollback 后进 DLQ；死信消费者确认回退意图
 ```
 
 ### 对账（cron）
 
 | 任务 | 频率 | 语义 |
 | --- | --- | --- |
-| flashsale-reconcile-active | 每小时 | 进行中活动：比对 Redis 库存 vs MySQL 库存 vs 秒杀有效订单数，**只告警不写回**；`redis < mysql` 识别为"有预扣无订单"补单/回补信号 |
-| flashsale-reconcile-ended | 每分钟 | 刚过 end_at 的上架活动：**以 MySQL 为准 SET 对齐 Redis**（key 缺失仅结束 30min 窗口内回建；下架活动不回建） |
+| flashsale-pre-deduction-recovery | 启动时 + 每分钟 | 扫描 preparing/pending_publish/pending_order/pending_rollback，继续发布、重投或幂等回退 |
+| flashsale-reservation-cleanup | 每分钟 | 查询 ordered 对应订单状态；离开待支付态后清理无需再补偿的持久 marker，并记录清理时间防重复扫描 |
+| flashsale-reconcile-active | 每小时 | 输出具体 pre_deduction_id/user_id/order_no/status，并保留聚合库存差异作为最终不变量告警 |
+| flashsale-reconcile-ended | 每分钟 | 无未决预扣事实时才以 MySQL 对齐 Redis，避免随后逐笔回退造成多回补 |
 
 权威源：[docs/DESIGN.md 秒杀时序 / 秒杀活动 / 定时任务](https://github.com/xiangzhang-coding/go-single/blob/main/docs/DESIGN.md)、迁移 `000008_flashsale_activities`。对账细节亦见[运营域](../domains/operations)。

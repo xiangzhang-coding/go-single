@@ -1,7 +1,7 @@
 // 秒杀异步落单消费者（T12）：订阅 SeckillOrderQueue 队列处理"抢购成功"消息，
 // 落单链路为 查活动 → 查默认地址（固化地址快照）→ order 服务单事务建单 +
 // 扣活动库存（(user_id, activity_id) 唯一约束幂等，预扣成功绝不丢单）。
-// 失败分类：业务拒绝/数据缺失 = 永久失败（mq.ErrPermanent → 死信队列，对账兜底）；
+// 失败分类：业务拒绝/数据缺失 = 永久失败（先持久化回退意图，再进死信队列）；
 // 基础设施故障 = 瞬时失败（Nack 重投，at-least-once）。
 package service
 
@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
+	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
@@ -23,7 +24,7 @@ import (
 )
 
 // ErrSeckillStockInsufficient 表示 Redis 已预扣但 MySQL 活动库存不足。
-// 该错误不可通过 MQ 重投恢复，消费者将消息送入死信并由对账兜底。
+// 该错误不可通过 MQ 重投恢复，消费者将预扣转为待回退后送入死信。
 var ErrSeckillStockInsufficient = errors.New("seckill activity stock insufficient")
 
 // OrderService flashsale 消费侧最小接口（跨模块进程内调用，order 服务实现）：
@@ -41,22 +42,24 @@ type UserService interface {
 // 消费链路：消息 → 查活动（sku/秒杀价）→ 查默认地址 → 开启事务 →
 // order.CreateSeckillInTx + 活动库存条件扣减。
 // 预扣成功绝不丢单：重复投递/并发消费由 (user_id, activity_id) 唯一约束幂等；
-// 失败重投（瞬时）/死信（永久）由平台 mq 层按返回错误分类执行。
+// 瞬时失败由 MQ 重投；永久失败与死信由持久生命周期驱动完整回退。
 type SeckillOrderConsumer struct {
-	activities repository.ActivityRepository
-	tx         seckillTxRunner
-	orders     OrderService
-	users      UserService
-	metrics    *metrics.Business
-	log        *zap.Logger
+	activities    repository.ActivityRepository
+	preDeductions repository.PreDeductionRepository
+	tx            seckillTxRunner
+	orders        OrderService
+	users         UserService
+	metrics       *metrics.Business
+	log           *zap.Logger
 }
 
 // NewSeckillOrderConsumer 构造秒杀落单消费者。
-func NewSeckillOrderConsumer(activities repository.ActivityRepository,
+func NewSeckillOrderConsumer(activities repository.ActivityRepository, preDeductions repository.PreDeductionRepository,
 	tx seckillTxRunner, orders OrderService, users UserService, m *metrics.Business,
 	log *zap.Logger) *SeckillOrderConsumer {
 	return &SeckillOrderConsumer{
-		activities: activities, tx: tx, orders: orders, users: users, metrics: m, log: log,
+		activities: activities, preDeductions: preDeductions,
+		tx: tx, orders: orders, users: users, metrics: m, log: log,
 	}
 }
 
@@ -68,6 +71,26 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 	}
 	if msg.OrderNo == "" || msg.UserID <= 0 || msg.ActivityID <= 0 {
 		return c.permanent(ctx, "invalid seckill message", &msg, nil)
+	}
+	if msg.PreDeductionID > 0 {
+		pd, err := c.preDeductions.GetByID(ctx, msg.PreDeductionID)
+		if err != nil {
+			return err
+		}
+		if pd == nil {
+			return c.permanent(ctx, "pre-deduction not found", &msg, nil)
+		}
+		if pd.UserID != msg.UserID || pd.ActivityID != msg.ActivityID || pd.OrderNumber() != msg.OrderNo {
+			return c.permanent(ctx, "pre-deduction does not match message", &msg, nil)
+		}
+		switch pd.Status {
+		case model.PreDeductionStatusOrdered,
+			model.PreDeductionStatusPendingRollback,
+			model.PreDeductionStatusRolledBack:
+			return nil
+		case model.PreDeductionStatusPreparing:
+			return errors.New("pre-deduction is not ready for order creation")
+		}
 	}
 
 	// 活动必须仍存在（sku_id/秒杀价作为订单快照来源；活动删除受限外键 RESTRICT）。
@@ -94,6 +117,24 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 
 	created := false
 	err = c.tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		if msg.PreDeductionID > 0 {
+			pd, err := c.preDeductions.GetByIDForUpdate(ctx, tx, msg.PreDeductionID)
+			if err != nil {
+				return err
+			}
+			if pd == nil {
+				return ErrPreDeductionNotFound
+			}
+			switch pd.Status {
+			case model.PreDeductionStatusOrdered,
+				model.PreDeductionStatusPendingRollback,
+				model.PreDeductionStatusRolledBack:
+				return nil
+			case model.PreDeductionStatusPendingPublish, model.PreDeductionStatusPendingOrder:
+			default:
+				return fmt.Errorf("pre-deduction cannot create order from status %s", pd.Status)
+			}
+		}
 		var err error
 		created, err = c.orders.CreateSeckillInTx(ctx, tx, ordersvc.SeckillCreateParams{
 			OrderNo:    msg.OrderNo,
@@ -104,15 +145,20 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 			Quantity:   1,
 			Address:    address,
 		})
-		if err != nil || !created {
-			return err
-		}
-		ok, err := c.activities.DeductStock(ctx, tx, msg.ActivityID, 1)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			return ErrSeckillStockInsufficient
+		if created {
+			ok, err := c.activities.DeductStock(ctx, tx, msg.ActivityID, 1)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return ErrSeckillStockInsufficient
+			}
+		}
+		if msg.PreDeductionID > 0 {
+			return c.preDeductions.MarkOrdered(ctx, tx, msg.PreDeductionID)
 		}
 		return nil
 	})
@@ -136,11 +182,28 @@ func (c *SeckillOrderConsumer) permanent(ctx context.Context, reason string, msg
 	if cause != nil {
 		fields = append(fields, zap.Error(cause))
 	}
-	c.log.Error("秒杀落单永久失败（进死信，对账兜底）", fields...)
+	c.log.Error("秒杀落单永久失败（持久化回退意图后进死信）", fields...)
+	if msg != nil && msg.PreDeductionID > 0 && c.preDeductions != nil {
+		if err := c.preDeductions.MarkPendingRollback(ctx, nil, msg.PreDeductionID, reason); err != nil {
+			return fmt.Errorf("persist permanent seckill failure: %w", err)
+		}
+	}
 	if cause != nil {
 		return fmt.Errorf("%w: %s: %v", mq.ErrPermanent, reason, cause)
 	}
 	return fmt.Errorf("%w: %s: %+v", mq.ErrPermanent, reason, msg)
+}
+
+// HandleDeadLetter drains a poison message after the main consumer persisted
+// its rollback intent. Reprocessing is idempotent and leaves compensation to
+// the same recovery worker used after crashes.
+func (c *SeckillOrderConsumer) HandleDeadLetter(ctx context.Context, body []byte) error {
+	var msg SeckillSuccessMessage
+	if err := json.Unmarshal(body, &msg); err != nil || msg.PreDeductionID <= 0 {
+		c.log.Error("无法关联预扣事实的秒杀死信已丢弃", zap.ByteString("body", body), zap.Error(err))
+		return nil
+	}
+	return c.preDeductions.MarkPendingRollback(ctx, nil, msg.PreDeductionID, "message reached dead-letter queue")
 }
 
 // classifyCreateError 落单错误分类：
@@ -150,6 +213,7 @@ func (c *SeckillOrderConsumer) classifyCreateError(ctx context.Context, msg *Sec
 	switch {
 	case errors.Is(err, ordersvc.ErrInvalidInput),
 		errors.Is(err, ErrSeckillStockInsufficient),
+		errors.Is(err, ordersvc.ErrSeckillOrderConflict),
 		errors.Is(err, ordersvc.ErrSKUNotFound),
 		errors.Is(err, ordersvc.ErrSKUUnavailable):
 		return c.permanent(ctx, "create seckill order rejected", msg, err)

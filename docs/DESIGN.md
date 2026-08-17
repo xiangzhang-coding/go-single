@@ -100,7 +100,7 @@ go_single/
   - 结算（下单）→ order + user(地址簿) + coupon；订单列表/详情 → order；秒杀页 → flashsale
   - 优惠券中心 → coupon；好友列表/申请 → social；好友圈 → social；聊天 → chat
   - 个人中心（个人资料：昵称/头像，头像经 `POST /api/files` 上传 + `PATCH /api/users/me` 写入；地址簿）→ user；后台管理 → product/order/flashsale/coupon 内联 admin 路由组（role 鉴权）
-- **交互约定**：秒杀提交后返回"排队中"，前端轮询 `GET /api/orders/{order_no}`（1.5s×30 次上限）获取结果；秒杀页倒计时由轮询接口携带服务端时间；接口 401 时前端跳转登录；演示账号 admin/admin123（user-guide 同步写明）
+- **交互约定**：秒杀提交后返回"排队中"与 `pre_deduction_id`，前端轮询 `GET /api/flashsales/purchases/{pre_deduction_id}`（1.5s×30 次上限）直到 `ordered` / `rolled_back`；`ordered` 响应携带 `order_no`；秒杀页倒计时由列表接口携带服务端时间；接口 401 时前端跳转登录；演示账号 admin/admin123（user-guide 同步写明）
 - **路由**：react-router v7；面向用户的页面与后台管理（admin）按角色分组，admin 路由加 role 守卫（前端隐藏 + 后端兜底）
 - **状态管理**：TanStack Query（服务端状态：API 数据缓存、秒杀轮询、好友圈分页）+ zustand（客户端状态：登录态、用户信息、聊天连接）
 - **API client**：axios + 拦截器——统一携带 JWT（Authorization 头）、401 统一跳登录、错误统一处理
@@ -144,23 +144,24 @@ go_single/
 
 ```
 [1] 限流（全局令牌桶 + 按用户限流）
-[2] Redis 幂等键（用户+活动，类型化缓存能力封装 SETNX，TTL 30min）——先于预扣抢占，才挡得住重复提交
-[3] 缓存适配器原子预扣（内部 Lua：活动时间窗口 + status 下架标志 / per_user_limit / DECR 库存 / INCR 用户计数）
-    预扣成功 → 保留幂等键；业务拒绝（抢光/限购/窗口外/下架）→ 释放幂等键允许重试；
-    基础设施失败 → 保留幂等键（防瞬时故障下重复预扣，预扣成功绝不丢单）
-[4] 预扣成功 → 发 MQ → 返回"排队中"
-[5] 消费者由 flashsale 编排：开启数据库事务 → order.CreateSeckillInTx 建秒杀订单与订单项
+[2] MySQL 创建 preparing 预扣事实（稳定 pre_deduction_id）；Redis 幂等键以该 ID 为值抢占（TTL 30min）
+[3] 缓存适配器原子预扣（内部 Lua：活动窗口/status/限购 + DECR 库存 + INCR 用户计数
+    + 写 flashsale:reservation:{pre_deduction_id}）；成功后事实转 pending_publish
+[4] 持久化雪花订单号 → 发布 MQ；确认成功转 pending_order，失败保留 pending_publish。启动恢复与每分钟任务
+    发布前先原子验证 reservation marker；若 Redis 在 AOF fsync 前重启导致整次 Lua 结果回退，则按持久事实重建
+    库存/计数/幂等键/marker，再复用同一订单号发布；累计 10 次仍失败转 pending_rollback；返回 202 + pre_deduction_id
+[5] 消费者由 flashsale 编排：锁定预扣事实 → 开启数据库事务 → order.CreateSeckillInTx 建秒杀订单与订单项
     → flashsale 活动仓储条件扣活动库存；user_activity_key 唯一约束兜底重复投递/并发
-    （仅非取消订单占位，取消后置 NULL 允许再次抢购；重复即幂等成功且不重复扣库存）
-    失败 → MQ 重投/死信；对账 cron 兜底
+    → 同事务将预扣事实转 ordered（仅非取消订单占位，重复即幂等成功且不重复扣库存）
+    永久失败先转 pending_rollback 再进入 DLQ；死信消费者补写回退意图，恢复任务完整回退
 [6] 支付回调（状态机校验）→ 已支付（随后与普通订单一致走发货/确认收货）
 [7] 超时未支付（cron 扫描；RabbitMQ 延迟队列为更优解，进 backlog）
     → flashsale 编排读取 order 超时快照 → 同事务条件取消订单 + 回补 MySQL 活动库存
-    → 提交后回补 Redis 库存 + 用户计数（允许再次抢购）
+    + 将预扣事实转 pending_rollback → 提交后立即尝试 Redis 回补；失败持久计数并由恢复任务重试
 ```
 
 - **库存事实源**：秒杀期以 Redis 预扣为准；活动库存落单时同步扣减、取消时回补，用于对账
-- **幂等两段式**：Redis 键挡预扣请求的重复提交（先于 Lua 抢占，见时序 [2]）；DB 唯一约束挡落单重复（消费者直接建单，`user_activity_key` 唯一约束命中视为幂等成功，不重复扣减库存）——预扣成功绝不丢单；取消/超时取消在状态迁移同事务将 `user_activity_key` 置 NULL，同一用户取消后允许再次抢购（T13）
+- **可恢复生命周期**：`flashsale_pre_deductions` 是逐用户/活动/订单的持久事实源，状态为 `preparing → pending_publish → pending_order → ordered → pending_rollback → rolled_back`；Redis reservation marker 不设 TTL，完整回退时原子改写为 `rolled_back` tombstone，让长时间故障和“Redis 已回补、MySQL 状态未提交”后的重试仍可判定；MySQL 写入 `rolled_back` 后清理 tombstone，订单离开待支付态后也由定时任务清理无需补偿的 marker。取消/超时取消在状态迁移同事务将 `user_activity_key` 置 NULL 并写回退意图，同一用户完整回退后允许再次抢购
 - **限购**：`per_user_limit` 字段，后台创建/编辑活动时配置（默认 1），作为 ARGV 传入 Lua
 
 ## 秒杀活动
@@ -168,7 +169,7 @@ go_single/
 - 字段：`start_at` / `end_at` / `status`（上架/下架）/ `stock`（活动独立库存）/ `price`（秒杀价）/ `per_user_limit`
 - **库存模型**：活动独立库存，与 `sku.stock`（普通订单库存）互不干扰；落单扣活动库存；对账 = Redis 活动库存 vs `flashsale.stock` vs 秒杀有效订单数
 - **上架预热**：admin 上架/编辑活动时，服务端将 `stock` 写入 Redis（SETNX，不覆盖在售中存量）；未开始的活动可覆盖（DEL+SET），进行中只可减不可增
-- **Redis key 约定**：`flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}` / `flashsale:rl:{user}`（按用户限流计数，固定窗口 INCR+TTL）
+- **Redis key 约定**：`flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}` / `flashsale:reservation:{pre_deduction_id}` / `flashsale:rl:{user}`（按用户限流计数，固定窗口 INCR+TTL）
 - 状态判定：进行中 = `status=上架 && start_at <= now <= end_at`（时间窗口动态判定，不显式翻转）；`status` 仅用于手动下架/紧急停止
 
 ## 模拟支付

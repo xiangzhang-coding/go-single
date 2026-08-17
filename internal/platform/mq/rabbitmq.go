@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -162,6 +163,12 @@ func consumeOne(ctx context.Context, d amqp.Delivery, handler MessageHandler) er
 // declareQueue 声明主队列（含死信配置）与死信队列，声明幂等（已存在则 no-op）。
 // 主队列 x-dead-letter-exchange 为空串 = 默认交换机，路由键指向死信队列名。
 func declareQueue(ch *amqp.Channel, queue string) error {
+	if strings.HasSuffix(queue, dlqSuffix) {
+		if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
+			return fmt.Errorf("MQ 声明死信队列 %s: %w", queue, err)
+		}
+		return nil
+	}
 	dlq := queue + dlqSuffix
 	if _, err := ch.QueueDeclare(dlq, true, false, false, false, nil); err != nil {
 		return fmt.Errorf("MQ 声明死信队列 %s: %w", dlq, err)

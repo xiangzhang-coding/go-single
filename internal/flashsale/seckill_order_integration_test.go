@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -70,6 +71,8 @@ func (m isolatedQueueMQ) Publish(ctx context.Context, queue string, body []byte)
 func (m isolatedQueueMQ) Consume(ctx context.Context, queue string, handler mq.MessageHandler) error {
 	if queue == flashsalesvc.SeckillOrderQueue {
 		queue = m.queue
+	} else if queue == flashsalesvc.SeckillOrderDeadLetterQueue {
+		queue = m.queue + ".dlq"
 	}
 	return m.MQ.Consume(ctx, queue, handler)
 }
@@ -145,7 +148,11 @@ func buildMQEnv() (*mqEnv, error) {
 		return nil, err
 	}
 	flashsaleActivityStore := flashsalerepo.NewGORMActivity(gdb)
-	flashsaleStore := flashsalerepo.Store{Activities: flashsaleActivityStore, Tx: flashsaleActivityStore}
+	flashsaleStore := flashsalerepo.Store{
+		Activities:    flashsaleActivityStore,
+		PreDeductions: flashsalerepo.NewGORMPreDeduction(gdb),
+		Tx:            flashsaleActivityStore,
+	}
 	flashsaleSvc := flashsalesvc.New(flashsaleStore, productSvc, cacheClient,
 		limiter.RedisCounterConfig{}, mqClient, orderNoGen, metrics.New().Business())
 	flashsaleHandler := flashsalehandler.New(flashsaleSvc, verifier)
@@ -157,7 +164,8 @@ func buildMQEnv() (*mqEnv, error) {
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, metrics.New().Business())
 	orderHandler := orderhandler.New(orderSvc, verifier)
 	timeout := flashsalesvc.NewSeckillTimeout(
-		flashsaleStore.Tx, orderSvc, flashsaleStore.Activities, flashsaleSvc, metrics.New().Business())
+		flashsaleStore.Tx, orderSvc, flashsaleStore.Activities, flashsaleStore.PreDeductions,
+		flashsaleSvc, metrics.New().Business())
 
 	// T13 秒杀库存对账：有效订单数经 order 服务端口统计。
 	reconcile := flashsalesvc.NewReconciliation(flashsaleStore, cacheClient, orderSvc)
@@ -165,10 +173,20 @@ func buildMQEnv() (*mqEnv, error) {
 	// 常驻消费者：订阅"抢购成功"队列异步落单；连接中断自动重连（at-least-once）。
 	log := zap.NewNop()
 	consumer := flashsalesvc.NewSeckillOrderConsumer(
-		flashsaleStore.Activities, flashsaleStore.Tx, orderSvc, userSvc, metrics.New().Business(), log)
+		flashsaleStore.Activities, flashsaleStore.PreDeductions, flashsaleStore.Tx,
+		orderSvc, userSvc, metrics.New().Business(), log)
 	go func() {
 		for {
 			if err := mqClient.Consume(context.Background(), flashsalesvc.SeckillOrderQueue, consumer.Handle); err != nil {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			return
+		}
+	}()
+	go func() {
+		for {
+			if err := mqClient.Consume(context.Background(), flashsalesvc.SeckillOrderDeadLetterQueue, consumer.HandleDeadLetter); err != nil {
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
@@ -386,39 +404,55 @@ func TestSeckillOrderRedeliveryIdempotent(t *testing.T) {
 	e := requireMQEnv(t)
 	admin := adminToken(t, env)
 	id := seedPublishedOnSale(t, admin, 10)
-	token, _ := registerWithAddress(t, e, uniqueName("dup_msg"))
-	claims, err := env.verifier.Verify(context.Background(), token)
+	token, userID := registerWithAddress(t, e, uniqueName("dup_msg"))
+	w, response := purchaseOn(t, e, id, token)
+	require.Equal(t, http.StatusAccepted, w.Code)
+	orderNo := response["order_no"].(string)
+	require.NotNil(t, pollOrder(t, e, orderNo, token))
+	pdID, err := strconv.ParseInt(response["pre_deduction_id"].(string), 10, 64)
 	require.NoError(t, err)
 
 	body, _ := json.Marshal(flashsalesvc.SeckillSuccessMessage{
-		OrderNo: fmt.Sprintf("%d", time.Now().UnixNano()%1e14), UserID: claims.UserID, ActivityID: id,
+		PreDeductionID: pdID, OrderNo: orderNo, UserID: userID, ActivityID: id,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
 	require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
 
-	waitSeckillOrders(t, e, id, 1, 5*time.Second)
 	time.Sleep(500 * time.Millisecond) // 给第二条（重复）消息处理时间
 	require.Equal(t, 1, countSeckillOrders(t, e, id), "重复投递不得重复建单")
 	require.Equal(t, 9, mysqlStock(t, e, id), "重复投递不得重复扣减库存")
 }
 
-// 永久失败进死信：活动不存在的消息被消费者拒收 → 落入死信队列（对账兜底）。
-func TestSeckillOrderDeadLetter(t *testing.T) {
+// 永久失败先持久化回退意图，消息进入 DLQ 后被自动消费，恢复任务完整回退。
+func TestSeckillOrderDeadLetterTriggersAutomaticRollback(t *testing.T) {
+	requireEnv(t)
 	e := requireMQEnv(t)
-	body, _ := json.Marshal(flashsalesvc.SeckillSuccessMessage{
-		OrderNo: "dead999", UserID: 1, ActivityID: 999999,
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
+	admin := adminToken(t, env)
+	id := seedPublishedOnSale(t, admin, 10)
+	token := registerAndToken(t, env, uniqueName("no_address"))
+	claims, err := env.verifier.Verify(context.Background(), token)
+	require.NoError(t, err)
 
-	got := receiveFromDLQ(t, e.queue)
-	require.NotNil(t, got, "永久失败消息应进死信队列")
-	var msg flashsalesvc.SeckillSuccessMessage
-	require.NoError(t, json.Unmarshal(got, &msg))
-	require.Equal(t, int64(999999), msg.ActivityID)
+	w, body := purchaseOn(t, e, id, token)
+	require.Equal(t, http.StatusAccepted, w.Code)
+	pdID := body["pre_deduction_id"].(string)
+
+	require.Eventually(t, func() bool {
+		var status string
+		err := env.gdb.Table("flashsale_pre_deductions").Select("status").Where("id = ?", pdID).Scan(&status).Error
+		return err == nil && status == "pending_rollback"
+	}, 5*time.Second, 100*time.Millisecond)
+
+	pdIDInt, err := strconv.ParseInt(pdID, 10, 64)
+	require.NoError(t, err)
+	require.NoError(t, e.flashsaleSvc.RecoverPreDeduction(context.Background(), pdIDInt))
+	var status string
+	require.NoError(t, env.gdb.Table("flashsale_pre_deductions").Select("status").Where("id = ?", pdID).Scan(&status).Error)
+	require.Equal(t, "rolled_back", status)
+	require.Equal(t, "10", *redisGet(t, fmt.Sprintf("flashsale:stock:%d", id)))
+	require.Nil(t, redisGet(t, fmt.Sprintf("flashsale:idem:%d:%d", id, claims.UserID)))
 }
 
 // ---- 死信读取助手（测试直连 amqp 读死信队列）----

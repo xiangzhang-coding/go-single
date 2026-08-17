@@ -82,10 +82,9 @@ func TestSeckillTimeoutCancelRestoresAndAllowsRepurchase(t *testing.T) {
 	// 拨回已超时 → 秒杀超时取消。
 	require.NoError(t, env.gdb.Exec("UPDATE orders SET expire_at = ? WHERE order_no = ?",
 		time.Now().Add(-time.Minute), orderNo).Error)
-	cancelled, _, redisFailed, err := e.timeout.CancelExpired(context.Background())
+	cancelled, _, _, err := e.timeout.CancelExpired(context.Background())
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, cancelled, 1, "超时秒杀订单应被取消")
-	require.Zero(t, redisFailed, "Redis 回补不应失败")
 
 	// 回补断言：订单取消 + MySQL 库存回补 + Redis 库存/计数回补 + 幂等键释放。
 	require.Equal(t, ordermodel.OrderStatusCancelled, orderStatus(t, orderNo))
@@ -132,7 +131,8 @@ func TestSeckillTimeoutTransactionRollsBackWhenActivityRestoreFails(t *testing.T
 		}
 	})
 	timeout := flashsalesvc.NewSeckillTimeout(
-		e.tx, e.orderSvc, failingRestoreActivities{e.activities}, e.flashsaleSvc, metrics.New().Business(),
+		e.tx, e.orderSvc, failingRestoreActivities{e.activities},
+		flashsalerepo.NewGORMPreDeduction(env.gdb), e.flashsaleSvc, metrics.New().Business(),
 	)
 
 	cancelled, failed, redisFailed, err := timeout.CancelExpired(context.Background())

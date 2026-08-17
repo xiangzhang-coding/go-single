@@ -52,8 +52,16 @@ func (s *GORMOrderStore) Create(ctx context.Context, tx *gorm.DB, order *model.O
 }
 
 func (s *GORMOrderStore) GetByNo(ctx context.Context, orderNo string) (*model.Order, error) {
+	return s.getByNo(s.db.WithContext(ctx), orderNo)
+}
+
+func (s *GORMOrderStore) GetByNoInTx(ctx context.Context, tx *gorm.DB, orderNo string) (*model.Order, error) {
+	return s.getByNo(tx.WithContext(ctx), orderNo)
+}
+
+func (s *GORMOrderStore) getByNo(db *gorm.DB, orderNo string) (*model.Order, error) {
 	var o model.Order
-	if err := s.db.WithContext(ctx).First(&o, "order_no = ?", orderNo).Error; err != nil {
+	if err := db.First(&o, "order_no = ?", orderNo).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}

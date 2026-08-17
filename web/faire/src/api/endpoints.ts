@@ -18,6 +18,8 @@ import type {
   FlashSaleActivity,
   FlashSaleAdminListResponse,
   FlashSaleListResponse,
+  FlashSalePurchase,
+  FlashSalePurchaseResponse,
   FriendRequest,
   FriendRequestView,
   FriendView,
@@ -152,9 +154,14 @@ export async function getFlashSales() {
 }
 
 export async function purchaseFlashSale(activityId: number) {
-  const { data } = await api.post<{ status: "queued"; order_no: string; message: string }>(
+  const { data } = await api.post<FlashSalePurchaseResponse>(
     `/flashsales/${activityId}/purchase`,
   );
+  return data;
+}
+
+export async function getFlashSalePurchase(id: string) {
+  const { data } = await api.get<FlashSalePurchase>(`/flashsales/purchases/${id}`);
   return data;
 }
 
