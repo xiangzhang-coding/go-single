@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -54,12 +56,34 @@ func TestSeckillPurchaseOK(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, preDeductionID, lifecycle["id"])
 	require.Equal(t, "pending_order", lifecycle["status"])
+	require.Equal(t, float64(1), lifecycle["quantity"])
+	require.Equal(t, preDeductionID, lifecycle["purchase_slot"])
+	require.NotZero(t, lifecycle["sku_id"])
+	require.Equal(t, float64(9900), lifecycle["price"])
 
 	other := registerAndToken(t, env, uniqueName("otherbuyer"))
 	w, _ = doJSONOn(t, router, http.MethodGet,
 		"/api/flashsales/purchases/"+preDeductionID, "", other)
 	require.Equal(t, http.StatusNotFound, w.Code, "pre-deduction status is owner-scoped")
 	require.Equal(t, 9, redisStock(t, env, id))
+}
+
+func TestSeckillPurchaseRequiresClientRequestID(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	id := seedPublished(t, env, admin, 10)
+	router := env.newFlashsaleRouter(t, purchasePermissive, limiter.RedisCounterConfig{})
+	token := registerAndToken(t, env, uniqueName("requestid"))
+	path := fmt.Sprintf("/api/flashsales/%d/purchase", id)
+
+	w, _ := doJSONOn(t, router, http.MethodPost, path, "", token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	w, _ = doJSONOn(t, router, http.MethodPost, path, `{}`, token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	w, _ = doJSONOn(t, router, http.MethodPost, path,
+		fmt.Sprintf(`{"client_request_id":%q}`, strings.Repeat("x", 65)), token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Equal(t, 10, redisStock(t, env, id), "invalid request identities must not pre-deduct")
 }
 
 func TestSeckillPublishFailurePersistsForRecovery(t *testing.T) {
@@ -79,7 +103,7 @@ func TestSeckillPublishFailurePersistsForRecovery(t *testing.T) {
 		&fakeNos{next: time.Now().UnixNano()}, metrics.New().Business(),
 	)
 
-	result, err := svc.Seckill(context.Background(), claims.UserID, id)
+	result, err := svc.Seckill(context.Background(), claims.UserID, id, uniqueName("publish-recovery"))
 	require.NoError(t, err)
 	require.Equal(t, "pending_publish", string(result.Status))
 	var attempts int
@@ -146,20 +170,49 @@ func TestSeckillPurchaseDuplicateReturnsExistingLifecycle(t *testing.T) {
 	id := seedPublished(t, env, admin, 10)
 	router := env.newFlashsaleRouter(t, purchasePermissive, limiter.RedisCounterConfig{})
 	token := registerAndToken(t, env, uniqueName("dup"))
+	requestID := uniqueName("dup-request")
 
-	w, first := purchase(t, router, id, token)
+	w, first := purchase(t, router, id, token, requestID)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	w, second := purchase(t, router, id, token)
+	w, second := purchase(t, router, id, token, requestID)
 	require.Equal(t, http.StatusAccepted, w.Code)
 	require.Equal(t, first["pre_deduction_id"], second["pre_deduction_id"])
 	require.Equal(t, 9, redisStock(t, env, id), "重复请求不得再次预扣")
 
 	claims, err := env.verifier.Verify(context.Background(), token)
 	require.NoError(t, err)
-	n, err := env.redis.Exists(context.Background(), idemKey(id, claims.UserID)).Result()
+	pdID, err := strconv.ParseInt(first["pre_deduction_id"].(string), 10, 64)
+	require.NoError(t, err)
+	n, err := env.redis.Exists(context.Background(), slotIdemKey(id, claims.UserID, pdID)).Result()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), n, "预扣成功后幂等键应保留")
+}
+
+func TestSeckillPurchaseLimitTwoCreatesTwoIndependentSlots(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	skuID := seedSKU(t, env, admin)
+	id := createActivity(t, env, admin, skuID, 10, 2, -time.Minute, time.Hour)
+	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", id), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	router := env.newFlashsaleRouter(t, purchasePermissive, limiter.RedisCounterConfig{})
+	token := registerAndToken(t, env, uniqueName("limit2"))
+
+	w, first := purchase(t, router, id, token, "slot-request-1")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	w, second := purchase(t, router, id, token, "slot-request-2")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.NotEqual(t, first["pre_deduction_id"], second["pre_deduction_id"])
+	require.NotEqual(t, first["order_no"], second["order_no"])
+
+	w, replay := purchase(t, router, id, token, "slot-request-1")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.Equal(t, first["pre_deduction_id"], replay["pre_deduction_id"])
+	require.Equal(t, 8, redisStock(t, env, id), "request replay must not consume a third slot")
+
+	w, _ = purchase(t, router, id, token, "slot-request-3")
+	require.Equal(t, http.StatusConflict, w.Code)
 }
 
 // 全局限流：令牌桶桶空时抢购请求被 429 拒绝。

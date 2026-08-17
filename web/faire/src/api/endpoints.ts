@@ -153,10 +153,11 @@ export async function getFlashSales() {
   return data;
 }
 
-export async function purchaseFlashSale(activityId: number) {
-  const { data } = await api.post<FlashSalePurchaseResponse>(
-    `/flashsales/${activityId}/purchase`,
-  );
+export async function purchaseFlashSale(activityId: number, clientRequestId: string) {
+	const { data } = await api.post<FlashSalePurchaseResponse>(
+		`/flashsales/${activityId}/purchase`,
+		{ client_request_id: clientRequestId },
+	);
   return data;
 }
 

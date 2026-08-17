@@ -75,8 +75,10 @@ func (s *seckillTimeoutService) CancelExpired(ctx context.Context) (cancelled, f
 			}
 			orderNo := order.OrderNo
 			pd, err := s.preDeductions.EnsurePendingRollback(ctx, tx, &model.PreDeduction{
-				UserID: order.UserID, ActivityID: order.ActivityID, OrderNo: &orderNo,
-				Quantity: order.Quantity, LastError: "seckill order cancelled",
+				UserID: order.UserID, ActivityID: order.ActivityID,
+				ClientRequestID: "legacy-cancel:" + order.OrderNo, OrderNo: &orderNo,
+				SKUID: order.SKUID, Price: order.Price, Quantity: order.Quantity,
+				PurchaseSlot: order.PurchaseSlot, LastError: "seckill order cancelled",
 			})
 			if err != nil {
 				return err

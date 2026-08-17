@@ -125,6 +125,51 @@ func TestConsumerHappyPath(t *testing.T) {
 	require.Equal(t, 9, a.Stock, "落单应在同一事务中扣减活动库存")
 }
 
+func TestConsumerUsesAcceptedSnapshotAfterActivityEdit(t *testing.T) {
+	fx := newConsumerFixture()
+	a := fx.seed(t, 42)
+	orderNo := "snapshot-10001"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo,
+		SKUID: 5, Price: 9900, Quantity: 1, PurchaseSlot: 7,
+		Status: model.PreDeductionStatusPendingOrder,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	// 模拟消息等待消费期间管理员下架并换 SKU/改价。
+	a.SKUID = 9
+	a.Price = 7700
+	err := fx.consumer.Handle(context.Background(), marshalMsg(t, SeckillSuccessMessage{
+		PreDeductionID: pd.ID, OrderNo: orderNo, UserID: 42, ActivityID: a.ID,
+		SKUID: 5, Price: 9900, Quantity: 1, PurchaseSlot: 7,
+	}))
+	require.NoError(t, err)
+	require.Len(t, fx.orders.created, 1)
+	require.Equal(t, int64(5), fx.orders.created[0].SKUID)
+	require.Equal(t, int64(9900), fx.orders.created[0].Price)
+	require.Equal(t, 1, fx.orders.created[0].Quantity)
+	require.Equal(t, int64(7), fx.orders.created[0].PurchaseSlot)
+}
+
+func TestConsumerRejectsMessageForDifferentPurchaseSlot(t *testing.T) {
+	fx := newConsumerFixture()
+	a := fx.seed(t, 42)
+	orderNo := "slot-mismatch"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo,
+		SKUID: a.SKUID, Price: a.Price, Quantity: 1, PurchaseSlot: 7,
+		Status: model.PreDeductionStatusPendingOrder,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	err := fx.consumer.Handle(context.Background(), marshalMsg(t, SeckillSuccessMessage{
+		PreDeductionID: pd.ID, OrderNo: orderNo, UserID: 42, ActivityID: a.ID,
+		SKUID: a.SKUID, Price: a.Price, Quantity: 1, PurchaseSlot: 8,
+	}))
+	require.ErrorIs(t, err, mq.ErrPermanent)
+	require.Empty(t, fx.orders.created)
+}
+
 // 非法消息体 / 字段缺失：永久失败（死信），不触碰落单。
 func TestConsumerInvalidMessagePermanent(t *testing.T) {
 	fx := newConsumerFixture()
@@ -195,7 +240,8 @@ func TestConsumerCreatePermanentFailure(t *testing.T) {
 	a.Stock = 0
 	orderNo := "10001"
 	pd := &model.PreDeduction{
-		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo,
+		SKUID: a.SKUID, Price: a.Price, Quantity: 1,
 		Status: model.PreDeductionStatusPendingOrder,
 	}
 	require.NoError(t, fx.pd.Create(context.Background(), pd))
@@ -234,7 +280,8 @@ func TestConsumerTransitionsPreDeductionToOrdered(t *testing.T) {
 	a := fx.seed(t, 42)
 	orderNo := "10001"
 	pd := &model.PreDeduction{
-		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo,
+		SKUID: a.SKUID, Price: a.Price, Quantity: 1,
 		Status: model.PreDeductionStatusPendingOrder,
 	}
 	require.NoError(t, fx.pd.Create(context.Background(), pd))
@@ -255,7 +302,8 @@ func TestConsumerPermanentFailureSchedulesDurableRollback(t *testing.T) {
 	fx.users.addresses = map[int64]*usermodel.Address{}
 	orderNo := "10001"
 	pd := &model.PreDeduction{
-		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo,
+		SKUID: a.SKUID, Price: a.Price, Quantity: 1,
 		Status: model.PreDeductionStatusPendingOrder,
 	}
 	require.NoError(t, fx.pd.Create(context.Background(), pd))
@@ -301,7 +349,8 @@ func TestConsumerAcknowledgesDeliveryAfterRollbackStarted(t *testing.T) {
 	a := fx.seed(t, 42)
 	orderNo := "10001"
 	pd := &model.PreDeduction{
-		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, Quantity: 1,
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo,
+		SKUID: a.SKUID, Price: a.Price, Quantity: 1,
 		Status: model.PreDeductionStatusPendingRollback,
 	}
 	require.NoError(t, fx.pd.Create(context.Background(), pd))
@@ -378,7 +427,13 @@ type failingActivities struct{}
 
 func (failingActivities) Create(context.Context, *model.Activity) error { return nil }
 func (failingActivities) Update(context.Context, *model.Activity) error { return nil }
+func (failingActivities) UpdateInTx(context.Context, *gorm.DB, *model.Activity) error {
+	return nil
+}
 func (failingActivities) GetByID(context.Context, int64) (*model.Activity, error) {
+	return nil, errors.New("mysql down")
+}
+func (failingActivities) GetByIDForUpdate(context.Context, *gorm.DB, int64) (*model.Activity, error) {
 	return nil, errors.New("mysql down")
 }
 func (failingActivities) List(context.Context) ([]model.Activity, error) { return nil, nil }

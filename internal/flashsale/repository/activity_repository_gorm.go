@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 )
@@ -28,12 +29,30 @@ func (r *GORMActivityRepository) Create(ctx context.Context, a *model.Activity) 
 }
 
 func (r *GORMActivityRepository) Update(ctx context.Context, a *model.Activity) error {
-	return r.db.WithContext(ctx).Model(a).Select("sku_id", "title", "price", "stock", "per_user_limit", "start_at", "end_at").Updates(a).Error
+	return r.update(r.db.WithContext(ctx), a)
+}
+
+func (r *GORMActivityRepository) UpdateInTx(ctx context.Context, tx *gorm.DB, a *model.Activity) error {
+	return tx.WithContext(ctx).Model(a).
+		Select("sku_id", "title", "price", "stock", "per_user_limit", "status", "start_at", "end_at").
+		Updates(a).Error
+}
+
+func (r *GORMActivityRepository) update(db *gorm.DB, a *model.Activity) error {
+	return db.Model(a).Select("sku_id", "title", "price", "stock", "per_user_limit", "start_at", "end_at").Updates(a).Error
 }
 
 func (r *GORMActivityRepository) GetByID(ctx context.Context, id int64) (*model.Activity, error) {
+	return r.getByID(r.db.WithContext(ctx), id)
+}
+
+func (r *GORMActivityRepository) GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.Activity, error) {
+	return r.getByID(tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}), id)
+}
+
+func (r *GORMActivityRepository) getByID(db *gorm.DB, id int64) (*model.Activity, error) {
 	var a model.Activity
-	if err := r.db.WithContext(ctx).First(&a, id).Error; err != nil {
+	if err := db.First(&a, id).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}

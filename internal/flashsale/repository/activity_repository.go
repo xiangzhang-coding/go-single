@@ -19,7 +19,9 @@ type ActivityRepository interface {
 	Create(ctx context.Context, a *model.Activity) error
 	// Update 编辑活动（不含状态；状态经 UpdateStatus 走 上架/下架 端点）。
 	Update(ctx context.Context, a *model.Activity) error
+	UpdateInTx(ctx context.Context, tx *gorm.DB, a *model.Activity) error
 	GetByID(ctx context.Context, id int64) (*model.Activity, error)
+	GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.Activity, error)
 	List(ctx context.Context) ([]model.Activity, error)
 	// UpdateStatus 上架/下架状态迁移。
 	UpdateStatus(ctx context.Context, id int64, status string) error

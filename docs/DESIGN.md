@@ -100,7 +100,7 @@ go_single/
   - 结算（下单）→ order + user(地址簿) + coupon；订单列表/详情 → order；秒杀页 → flashsale
   - 优惠券中心 → coupon；好友列表/申请 → social；好友圈 → social；聊天 → chat
   - 个人中心（个人资料：昵称/头像，头像经 `POST /api/files` 上传 + `PATCH /api/users/me` 写入；地址簿）→ user；后台管理 → product/order/flashsale/coupon 内联 admin 路由组（role 鉴权）
-- **交互约定**：秒杀提交后返回"排队中"与 `pre_deduction_id`，前端轮询 `GET /api/flashsales/purchases/{pre_deduction_id}`（1.5s×30 次上限）直到 `ordered` / `rolled_back`；`ordered` 响应携带 `order_no`；HTTP 响应丢失后的幂等重试返回原生命周期 ID，而不是新建预扣或只返回 409；秒杀页倒计时由列表接口携带服务端时间；接口 401 时前端跳转登录；演示账号 admin/admin123（user-guide 同步写明）
+- **交互约定**：秒杀提交携带 `client_request_id`，返回"排队中"与 `pre_deduction_id`，前端轮询 `GET /api/flashsales/purchases/{pre_deduction_id}`（1.5s×30 次上限）直到 `ordered` / `rolled_back`；同一请求 ID 重试返回原生命周期，新请求 ID 在 `per_user_limit` 内分配新购买槽位；秒杀页倒计时由列表接口携带服务端时间；接口 401 时前端跳转登录；演示账号 admin/admin123（user-guide 同步写明）
 - **路由**：react-router v7；面向用户的页面与后台管理（admin）按角色分组，admin 路由加 role 守卫（前端隐藏 + 后端兜底）
 - **状态管理**：TanStack Query（服务端状态：API 数据缓存、秒杀轮询、好友圈分页）+ zustand（客户端状态：登录态、用户信息、聊天连接）
 - **API client**：axios + 拦截器——统一携带 JWT（Authorization 头）、401 统一跳登录、错误统一处理
@@ -119,7 +119,7 @@ go_single/
 
 待支付 → 已支付 → 已发货 → 已完成；含取消与超时取消。状态迁移仅允许合法跃迁（如 待支付→已支付），非法迁移直接拒绝。
 
-订单表含 `order_type`（normal/seckill）：普通订单与秒杀订单共用状态机；秒杀订单不使用优惠券，且 `user_activity_key` 唯一约束（仅非取消订单，取消后置 NULL 允许再次抢购，T13）。
+订单表含 `order_type`（normal/seckill）：普通订单与秒杀订单共用状态机；秒杀订单不使用优惠券，`purchase_slot` 固化预扣槽位，`user_activity_key=user_id:activity_id:purchase_slot` 唯一约束只拦同槽重投；取消后置 NULL 释放该槽位。
 
 - 待支付 → 已支付：支付回调
 - 已支付 → 已发货：后台发货
@@ -144,7 +144,8 @@ go_single/
 
 ```
 [1] 限流（全局令牌桶 + 按用户限流）
-[2] MySQL 创建 preparing 预扣事实（稳定 pre_deduction_id）；Redis 幂等键以该 ID 为值抢占（TTL 30min）
+[2] 以 (user, activity, client_request_id) 幂等创建 preparing 预扣事实，固化 SKU/成交价/数量；
+    pre_deduction_id 同时作为购买槽位，Redis 槽位键以该 ID 为值抢占（TTL 30min）
 [3] 缓存适配器原子预扣（内部 Lua：活动窗口/status/限购 + DECR 库存 + INCR 用户计数
     + 写 flashsale:reservation:{pre_deduction_id}）；成功后事实转 pending_publish
 [4] 持久化雪花订单号 → 发布 MQ；确认成功转 pending_order，失败保留 pending_publish。启动恢复与每分钟任务
@@ -152,7 +153,8 @@ go_single/
     库存/计数/幂等键/marker，再复用同一订单号发布；仅 pending_publish 累计 10 次仍失败才转 pending_rollback，
     broker 已确认的 pending_order 持续等待消费或永久失败回退；返回 202 + pre_deduction_id
 [5] 消费者由 flashsale 编排：锁定预扣事实 → 开启数据库事务 → order.CreateSeckillInTx 建秒杀订单与订单项
-    → flashsale 活动仓储条件扣活动库存；user_activity_key 唯一约束兜底重复投递/并发
+    → 消息与持久快照逐字段校验，订单使用预扣时 SKU/价格/数量/槽位 → flashsale 活动仓储条件扣活动库存；
+    user_activity_key=user:activity:slot 唯一约束只兜底对应槽位的重复投递
     → 同事务将预扣事实转 ordered（仅非取消订单占位，重复即幂等成功且不重复扣库存）
     永久失败先转 pending_rollback 再进入 DLQ；死信消费者补写回退意图，恢复任务完整回退
 [6] 支付回调（状态机校验）→ 已支付（随后与普通订单一致走发货/确认收货）
@@ -162,16 +164,16 @@ go_single/
 ```
 
 - **库存事实源**：秒杀期以 Redis 预扣为准；活动库存落单时同步扣减、取消时回补，用于对账
-- **可恢复生命周期**：`flashsale_pre_deductions` 是逐用户/活动/订单的持久事实源，状态为 `preparing → pending_publish → pending_order → ordered → pending_rollback → rolled_back`；所有影响终态的 Redis Lua 都在同一专用连接上紧跟 `WAITAOF`，只有本地 AOF 明确 fsync 后才推进 MySQL 状态或释放 marker。回退先写 `rolled_back` tombstone，MySQL 写入终态后再清理；ordered 事实也会在启动和 cron 中重建/验证库存、计数、幂等键和 marker。取消/超时取消在状态迁移同事务将 `user_activity_key` 置 NULL 并写回退意图，同一用户完整回退后允许再次抢购
+- **可恢复生命周期**：`flashsale_pre_deductions` 是逐购买槽位的持久事实源，包含 `client_request_id`、SKU、成交价、数量和槽位，状态为 `preparing → pending_publish → pending_order → ordered → pending_rollback → rolled_back`；所有影响终态的 Redis Lua 都在同一专用连接上紧跟 `WAITAOF`，只有本地 AOF 明确 fsync 后才推进 MySQL 状态或释放 marker。回退先写 `rolled_back` tombstone，MySQL 写入终态后再清理；ordered 事实也会在启动和 cron 中重建/验证库存、计数、槽位键和 marker。取消只回补对应 marker 并将该订单 `user_activity_key` 置 NULL，不影响同一用户的其他槽位
 - **升级兼容**：pre-R04 的 durable 主队列/DLQ 消息缺少 `pre_deduction_id` 时，消费者按 `order_no` 收编为 legacy 生命周期，再执行落单或持久回退，不直接丢弃
-- **限购**：`per_user_limit` 字段，后台创建/编辑活动时配置（默认 1），作为 ARGV 传入 Lua
+- **限购**：`per_user_limit=N` 表示同一用户最多持有 N 个有效购买槽位；同请求 ID 重试不新增槽位，取消一个槽位后计数减一并可补购
 
 ## 秒杀活动
 
 - 字段：`start_at` / `end_at` / `status`（上架/下架）/ `stock`（活动独立库存）/ `price`（秒杀价）/ `per_user_limit`
 - **库存模型**：活动独立库存，与 `sku.stock`（普通订单库存）互不干扰；落单扣活动库存；对账 = Redis 活动库存 vs `flashsale.stock` vs 秒杀有效订单数
-- **上架预热**：admin 上架/编辑活动时，服务端将 `stock` 写入 Redis（SETNX，不覆盖在售中存量）；未开始的活动可覆盖（DEL+SET），进行中只可减不可增
-- **Redis key 约定**：`flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}` / `flashsale:reservation:{pre_deduction_id}` / `flashsale:rl:{user}`（按用户限流计数，固定窗口 INCR+TTL）
+- **上架与编辑**：未开始活动可覆盖预热库存；进行中只允许改标题和减少库存，SKU、价格、时间窗口、限购锁定。库存编辑先用 Redis pause key 原子封住新预扣，再锁 MySQL 活动行重读库存、校验不得低于已接受预扣，事务提交“新库存 + 临时下架”后按锁内差额持久扣 Redis，成功才恢复上架并解封；进程中断或任一基础设施步骤失败都保持下架，不会在 Redis 未同步时继续售卖
+- **Redis key 约定**：`flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}:{purchase_slot}` / `flashsale:reservation:{pre_deduction_id}` / `flashsale:pause:{id}` / `flashsale:rl:{user}`（按用户限流计数，固定窗口 INCR+TTL）
 - 状态判定：进行中 = `status=上架 && start_at <= now <= end_at`（时间窗口动态判定，不显式翻转）；`status` 仅用于手动下架/紧急停止
 
 ## 模拟支付

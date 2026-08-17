@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -20,11 +21,39 @@ func NewGORMPreDeduction(db *gorm.DB) *GORMPreDeductionRepository {
 }
 
 func (r *GORMPreDeductionRepository) Create(ctx context.Context, p *model.PreDeduction) error {
-	return r.db.WithContext(ctx).Create(p).Error
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(p).Error; err != nil {
+			return err
+		}
+		if p.PurchaseSlot == 0 {
+			p.PurchaseSlot = p.ID
+			return tx.Model(p).Update("purchase_slot", p.PurchaseSlot).Error
+		}
+		return nil
+	})
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+		return ErrPreDeductionDuplicate
+	}
+	return err
 }
 
 func (r *GORMPreDeductionRepository) GetByID(ctx context.Context, id int64) (*model.PreDeduction, error) {
 	return r.getByID(r.db.WithContext(ctx), id)
+}
+
+func (r *GORMPreDeductionRepository) GetByRequestID(ctx context.Context, userID, activityID int64, requestID string) (*model.PreDeduction, error) {
+	var p model.PreDeduction
+	err := r.db.WithContext(ctx).
+		Where("user_id = ? AND activity_id = ? AND client_request_id = ?", userID, activityID, requestID).
+		First(&p).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
 }
 
 func (r *GORMPreDeductionRepository) GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.PreDeduction, error) {
@@ -33,23 +62,51 @@ func (r *GORMPreDeductionRepository) GetByIDForUpdate(ctx context.Context, tx *g
 
 func (r *GORMPreDeductionRepository) EnsureLegacyPendingOrder(ctx context.Context, seed *model.PreDeduction) (*model.PreDeduction, error) {
 	db := r.db.WithContext(ctx)
-	var existing model.PreDeduction
-	err := db.Where("order_no = ?", seed.OrderNumber()).First(&existing).Error
+	var result *model.PreDeduction
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var existing model.PreDeduction
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("order_no = ?", seed.OrderNumber()).First(&existing).Error
+		if err == nil {
+			if existing.PurchaseSlot == 0 {
+				existing.PurchaseSlot = existing.ID
+				if err := tx.Model(&existing).Update("purchase_slot", existing.PurchaseSlot).Error; err != nil {
+					return err
+				}
+			}
+			result = &existing
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		seed.Status = model.PreDeductionStatusPendingOrder
+		seed.Legacy = true
+		if err := tx.Create(seed).Error; err != nil {
+			return err
+		}
+		seed.PurchaseSlot = seed.ID
+		if err := tx.Model(seed).Update("purchase_slot", seed.PurchaseSlot).Error; err != nil {
+			return err
+		}
+		result = seed
+		return nil
+	})
 	if err == nil {
+		return result, nil
+	}
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1062 {
+		return nil, err
+	}
+	var existing model.PreDeduction
+	if getErr := db.Where("order_no = ?", seed.OrderNumber()).First(&existing).Error; getErr == nil {
+		if existing.PurchaseSlot == 0 {
+			return nil, errors.New("legacy pre-deduction purchase slot is not initialized")
+		}
 		return &existing, nil
 	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, err
-	}
-	seed.Status = model.PreDeductionStatusPendingOrder
-	seed.Legacy = true
-	if err := db.Create(seed).Error; err != nil {
-		if getErr := db.Where("order_no = ?", seed.OrderNumber()).First(&existing).Error; getErr == nil {
-			return &existing, nil
-		}
-		return nil, err
-	}
-	return seed, nil
+	return nil, err
 }
 
 func (r *GORMPreDeductionRepository) ReservationTargets(ctx context.Context, activityID, userID int64) (int, int, error) {
@@ -58,17 +115,37 @@ func (r *GORMPreDeductionRepository) ReservationTargets(ctx context.Context, act
 	if err := db.Select("COALESCE(SUM(quantity), 0)").
 		Where("activity_id = ? AND status IN ?", activityID, []model.PreDeductionStatus{
 			model.PreDeductionStatusPendingPublish, model.PreDeductionStatusPendingOrder,
+			model.PreDeductionStatusPendingRollback,
 		}).Scan(&pending).Error; err != nil {
 		return 0, 0, err
 	}
-	if err := db.Select("COALESCE(SUM(quantity), 0)").
+	if err := db.Select("COUNT(*)").
 		Where("activity_id = ? AND user_id = ? AND status IN ?", activityID, userID, []model.PreDeductionStatus{
 			model.PreDeductionStatusPendingPublish, model.PreDeductionStatusPendingOrder,
-			model.PreDeductionStatusOrdered,
+			model.PreDeductionStatusOrdered, model.PreDeductionStatusPendingRollback,
 		}).Scan(&user).Error; err != nil {
 		return 0, 0, err
 	}
 	return pending, user, nil
+}
+
+func (r *GORMPreDeductionRepository) PendingReservationQuantityForUpdate(ctx context.Context, tx *gorm.DB, activityID int64) (int, error) {
+	var rows []model.PreDeduction
+	err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id", "quantity").
+		Where("activity_id = ? AND status IN ?", activityID, []model.PreDeductionStatus{
+			model.PreDeductionStatusPendingPublish,
+			model.PreDeductionStatusPendingOrder,
+			model.PreDeductionStatusPendingRollback,
+		}).Find(&rows).Error
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for i := range rows {
+		total += rows[i].Quantity
+	}
+	return total, nil
 }
 
 func (r *GORMPreDeductionRepository) getByID(db *gorm.DB, id int64) (*model.PreDeduction, error) {
@@ -95,6 +172,18 @@ func (r *GORMPreDeductionRepository) ListRecoverable(ctx context.Context, limit 
 		query = query.Limit(limit)
 	}
 	err := query.Find(&list).Error
+	return list, err
+}
+
+func (r *GORMPreDeductionRepository) ListRecoverableByActivity(ctx context.Context, activityID int64) ([]model.PreDeduction, error) {
+	var list []model.PreDeduction
+	err := r.db.WithContext(ctx).
+		Where("activity_id = ? AND status IN ?", activityID, []model.PreDeductionStatus{
+			model.PreDeductionStatusPreparing,
+			model.PreDeductionStatusPendingPublish,
+			model.PreDeductionStatusPendingOrder,
+			model.PreDeductionStatusPendingRollback,
+		}).Order("updated_at ASC, id ASC").Find(&list).Error
 	return list, err
 }
 

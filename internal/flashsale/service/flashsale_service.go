@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
@@ -24,34 +27,41 @@ import (
 
 // 业务错误：handler 据此映射 HTTP 状态码。
 var (
-	ErrActivityNotFound        = errors.New("flashsale activity not found")
-	ErrInvalidInput            = errors.New("invalid input")
-	ErrStockIncreaseInProgress = errors.New("stock can only decrease while activity is in progress")
-	ErrNotInWindow             = errors.New("flashsale not in time window")
-	ErrSoldOut                 = errors.New("flashsale sold out")
-	ErrLimitReached            = errors.New("per user limit reached")
-	ErrOffline                 = errors.New("flashsale activity offline")
-	ErrDuplicateRequest        = errors.New("duplicate flashsale request")
-	ErrRateLimited             = errors.New("flashsale rate limited")
-	ErrPreDeductionNotFound    = errors.New("flashsale purchase not found")
+	ErrActivityNotFound               = errors.New("flashsale activity not found")
+	ErrInvalidInput                   = errors.New("invalid input")
+	ErrStockIncreaseInProgress        = errors.New("stock can only decrease while activity is in progress")
+	ErrActivityFieldsLocked           = errors.New("sku, price, time window, and per-user limit are locked while activity is in progress")
+	ErrStockBelowAcceptedReservations = errors.New("stock cannot be reduced below accepted reservations")
+	ErrReservationsUnsettled          = errors.New("flashsale reservations must settle before this activity change")
+	ErrNotInWindow                    = errors.New("flashsale not in time window")
+	ErrSoldOut                        = errors.New("flashsale sold out")
+	ErrLimitReached                   = errors.New("per user limit reached")
+	ErrOffline                        = errors.New("flashsale activity offline")
+	ErrRateLimited                    = errors.New("flashsale rate limited")
+	ErrPreDeductionNotFound           = errors.New("flashsale purchase not found")
 )
 
 // Redis key 约定（DESIGN.md）：flashsale:stock:{id}（活动库存，上架预热）/
 // flashsale:count:{id}:{user}（用户抢购计数，原子预扣 INCR）/
-// flashsale:idem:{id}:{user}（幂等键，挡预扣请求重复提交）/
+// flashsale:idem:{id}:{user}:{slot}（槽位所有权键）/
 // flashsale:reservation:{pre_deduction_id}（预扣标记，与库存/计数原子写入）/
+// flashsale:pause:{id}（进行中编辑的短暂预扣栅栏）/
 // flashsale:rl:{user}（按用户限流计数）。
 func stockKey(id int64) string { return fmt.Sprintf("flashsale:stock:%d", id) }
 func countKey(id, userID int64) string {
 	return fmt.Sprintf("flashsale:count:%d:%d", id, userID)
 }
-func idemKey(activityID, userID int64) string {
+func legacyIdemKey(activityID, userID int64) string {
 	return fmt.Sprintf("flashsale:idem:%d:%d", activityID, userID)
+}
+func slotIdemKey(activityID, userID, purchaseSlot int64) string {
+	return fmt.Sprintf("flashsale:idem:%d:%d:%d", activityID, userID, purchaseSlot)
 }
 func reservationKey(preDeductionID int64) string {
 	return fmt.Sprintf("flashsale:reservation:%d", preDeductionID)
 }
-func rlKey(userID int64) string { return fmt.Sprintf("flashsale:rl:%d", userID) }
+func pauseKey(activityID int64) string { return fmt.Sprintf("flashsale:pause:%d", activityID) }
+func rlKey(userID int64) string        { return fmt.Sprintf("flashsale:rl:%d", userID) }
 
 // SeckillOrderQueue 秒杀异步落单队列：预扣成功后发布"抢购成功"消息，
 // 消费者落单（唯一约束幂等）+ 同事务扣活动库存；失败重投/死信（平台 mq 层）。
@@ -66,18 +76,23 @@ type SeckillSuccessMessage struct {
 	OrderNo        string `json:"order_no"`
 	UserID         int64  `json:"user_id"`
 	ActivityID     int64  `json:"activity_id"`
+	SKUID          int64  `json:"sku_id"`
+	Price          int64  `json:"price"`
+	Quantity       int    `json:"quantity"`
+	PurchaseSlot   int64  `json:"purchase_slot"`
 }
 
 // stockKeyMargin 预热库存 TTL 的余量：剩余时长 + 1h，活动结束后自清理。
 const stockKeyMargin = time.Hour
 
-// idemTTL 幂等键 TTL：与规格一致（30min，DESIGN.md），仅挡预扣请求的重复提交。
+// idemTTL 槽位所有权键 TTL：与规格一致（30min，DESIGN.md）。
 const idemTTL = 30 * time.Minute
 
 const (
 	maxPublishAttempts     = 10
 	preparingRecoveryDelay = 30 * time.Second
 	redisAOFTimeout        = 2 * time.Second
+	stockEditPauseTTL      = 30 * time.Second
 )
 
 type PurchaseResult struct {
@@ -132,7 +147,7 @@ type Service interface {
 	// Seckill 抢购全流程：持久 preparing 事实 → 以稳定 ID 抢占幂等键 →
 	// 缓存原子写入库存/计数/reservation marker → 持久订单号 → 发布 MQ。
 	// 预扣成功后即由恢复任务接管，发布失败不再让请求事实丢失。
-	Seckill(ctx context.Context, userID, activityID int64) (*PurchaseResult, error)
+	Seckill(ctx context.Context, userID, activityID int64, clientRequestID string) (*PurchaseResult, error)
 	GetPreDeduction(ctx context.Context, userID, id int64) (*model.PreDeduction, error)
 	RecoverPreDeduction(ctx context.Context, id int64) error
 }
@@ -176,6 +191,7 @@ type flashsaleService struct {
 	nos       OrderNoGenerator
 	metrics   *metrics.Business // 业务指标打点（T19c）
 	retryCfg  retry.Config      // 幂等操作有限重试（T20）：仅"抢购成功"消息发布
+	adminMu   sync.RWMutex      // 编辑与“读取活动→接受预扣”互斥，抢购之间仍可并发
 }
 
 // New 构造秒杀服务。userLimiter 为按用户限流配置（Max<=0 不启用）；
@@ -224,6 +240,8 @@ func (s *flashsaleService) CreateActivity(ctx context.Context, p ActivityParams)
 }
 
 func (s *flashsaleService) UpdateActivity(ctx context.Context, id int64, p ActivityParams) error {
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
 	if err := validateActivity(&p); err != nil {
 		return err
 	}
@@ -240,31 +258,156 @@ func (s *flashsaleService) UpdateActivity(ctx context.Context, id int64, p Activ
 		}
 	}
 
-	// 进行中（当前上架且窗口覆盖 now，或编辑后窗口覆盖 now）编辑库存只减不增：
-	// DB 拒绝调高，与 Redis 预热规则保持一致（DESIGN.md 上架预热节）。
-	// 按"当前是否进行中"判定，避免同一次编辑改窗口绕过（把 start_at 移到未来）。
-	now := time.Now()
-	if p.Stock > old.Stock && old.IsOnSale() && (old.InProgress(now) || inWindow(p, now)) {
-		return ErrStockIncreaseInProgress
+	if s.store.Tx == nil {
+		return errors.New("flashsale transaction runner is not configured")
 	}
-
-	newA := &model.Activity{
-		ID:           id,
-		SKUID:        p.SKUID,
-		Title:        p.Title,
-		Price:        p.Price,
-		Stock:        p.Stock,
-		PerUserLimit: p.PerUserLimit,
-		Status:       old.Status,
-		StartAt:      p.StartAt,
-		EndAt:        p.EndAt,
+	if !old.IsOnSale() || !old.InProgress(time.Now()) {
+		if err := s.settleActivityReservations(ctx, id); err != nil {
+			return err
+		}
 	}
-	if err := s.store.Activities.Update(ctx, newA); err != nil {
+	var current *model.Activity
+	var inProgress bool
+	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		current, err = s.store.Activities.GetByIDForUpdate(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return ErrActivityNotFound
+		}
+		now := time.Now()
+		inProgress = current.IsOnSale() && (current.InProgress(now) || inWindow(p, now))
+		if inProgress {
+			return nil
+		}
+		pendingQuantity, err := s.store.PreDeductions.PendingReservationQuantityForUpdate(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if p.Stock < pendingQuantity {
+			return ErrStockBelowAcceptedReservations
+		}
+		return s.store.Activities.UpdateInTx(ctx, tx, &model.Activity{
+			ID: id, SKUID: p.SKUID, Title: p.Title, Price: p.Price, Stock: p.Stock,
+			PerUserLimit: p.PerUserLimit, Status: current.Status, StartAt: p.StartAt, EndAt: p.EndAt,
+		})
+	})
+	if err != nil {
 		return err
 	}
+	if inProgress {
+		return s.updateInProgressActivity(ctx, id, p)
+	}
 	// 已上架的活动编辑后同步预热库存。
-	if old.IsOnSale() {
-		return s.syncStock(ctx, newA, now)
+	if current.IsOnSale() {
+		newA := &model.Activity{
+			ID: id, SKUID: p.SKUID, Title: p.Title, Price: p.Price, Stock: p.Stock,
+			PerUserLimit: p.PerUserLimit, Status: current.Status, StartAt: p.StartAt, EndAt: p.EndAt,
+		}
+		syncErr := s.syncStock(ctx, newA, time.Now())
+		if syncErr != nil {
+			return s.failClosedActivity(ctx, id, syncErr)
+		}
+	}
+	return nil
+}
+
+func (s *flashsaleService) updateInProgressActivity(ctx context.Context, id int64, p ActivityParams) error {
+	if s.store.Tx == nil {
+		return errors.New("flashsale transaction runner is not configured")
+	}
+	key := pauseKey(id)
+	token := strconv.FormatInt(time.Now().UnixNano(), 10)
+	redisStock, err := s.cache.PauseFlashSaleStockDurably(ctx, cache.FlashSalePauseParams{
+		StockKey: stockKey(id), PauseKey: key, Token: token, TTL: stockEditPauseTTL,
+	}, redisAOFTimeout)
+	if err != nil {
+		return s.failClosedActivity(ctx, id, fmt.Errorf("pause flash-sale stock: %w", err))
+	}
+
+	var delta int
+	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		current, err := s.store.Activities.GetByIDForUpdate(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return ErrActivityNotFound
+		}
+		if !current.IsOnSale() || !current.InProgress(time.Now()) ||
+			p.SKUID != current.SKUID || p.Price != current.Price || p.PerUserLimit != current.PerUserLimit ||
+			!p.StartAt.Equal(current.StartAt) || !p.EndAt.Equal(current.EndAt) {
+			return ErrActivityFieldsLocked
+		}
+		if p.Stock > current.Stock {
+			return ErrStockIncreaseInProgress
+		}
+		if redisStock > current.Stock {
+			return fmt.Errorf("Redis sellable stock %d exceeds MySQL stock %d", redisStock, current.Stock)
+		}
+		delta = current.Stock - p.Stock
+		if delta > redisStock {
+			return ErrStockBelowAcceptedReservations
+		}
+		return s.store.Activities.UpdateInTx(ctx, tx, &model.Activity{
+			ID: id, SKUID: current.SKUID, Title: p.Title, Price: current.Price,
+			Stock: p.Stock, PerUserLimit: current.PerUserLimit, Status: model.ActivityStatusOffSale,
+			StartAt: current.StartAt, EndAt: current.EndAt,
+		})
+	})
+	if err != nil {
+		if errors.Is(err, ErrActivityNotFound) || errors.Is(err, ErrActivityFieldsLocked) ||
+			errors.Is(err, ErrStockIncreaseInProgress) || errors.Is(err, ErrStockBelowAcceptedReservations) {
+			if releaseErr := s.cache.ReleaseFlashSalePauseDurably(ctx, key, token, redisAOFTimeout); releaseErr != nil {
+				return s.failClosedActivity(ctx, id, errors.Join(err, releaseErr))
+			}
+			return err
+		}
+		return s.failClosedActivity(ctx, id, err)
+	}
+	if delta > 0 {
+		if err := s.cache.DecreaseFlashSaleStockDurably(ctx, cache.FlashSaleDecreaseParams{
+			StockKey: stockKey(id), Delta: delta,
+		}, redisAOFTimeout); err != nil {
+			return s.failClosedActivity(ctx, id, fmt.Errorf("decrease paused flash-sale stock: %w", err))
+		}
+	}
+	if err := s.store.Activities.UpdateStatus(ctx, id, model.ActivityStatusOnSale); err != nil {
+		return s.failClosedActivity(ctx, id, fmt.Errorf("restore flash-sale status after edit: %w", err))
+	}
+	if err := s.cache.ReleaseFlashSalePauseDurably(ctx, key, token, redisAOFTimeout); err != nil {
+		return s.failClosedActivity(ctx, id, fmt.Errorf("release flash-sale stock pause: %w", err))
+	}
+	s.refreshStockGauge(ctx, id)
+	return nil
+}
+
+func (s *flashsaleService) failClosedActivity(ctx context.Context, id int64, cause error) error {
+	statusErr := s.store.Activities.UpdateStatus(ctx, id, model.ActivityStatusOffSale)
+	deleteStockErr := s.cache.Del(ctx, stockKey(id))
+	releasePauseErr := s.cache.ReleaseFlashSalePauseDurably(ctx, pauseKey(id), "", redisAOFTimeout)
+	s.metrics.DeleteSeckillStock(id)
+	return errors.Join(cause, statusErr, deleteStockErr, releasePauseErr)
+}
+
+func (s *flashsaleService) settleActivityReservations(ctx context.Context, activityID int64) error {
+	rows, err := s.store.PreDeductions.ListRecoverableByActivity(ctx, activityID)
+	if err != nil {
+		return err
+	}
+	for i := range rows {
+		if err := s.RecoverPreDeduction(ctx, rows[i].ID); err != nil {
+			return fmt.Errorf("%w: %v", ErrReservationsUnsettled, err)
+		}
+		current, err := s.store.PreDeductions.GetByID(ctx, rows[i].ID)
+		if err != nil {
+			return err
+		}
+		if current != nil && (current.Status == model.PreDeductionStatusPreparing ||
+			current.Status == model.PreDeductionStatusPendingRollback) {
+			return ErrReservationsUnsettled
+		}
 	}
 	return nil
 }
@@ -352,6 +495,8 @@ func (s *flashsaleService) attachSKU(ctx context.Context, v *model.ActivityView)
 // PublishActivity 上架：先预热 Redis 库存、后写状态——预热失败时活动保持下架，
 // 避免出现"已上架但无预热库存"（那样抢购会误报已抢光）。
 func (s *flashsaleService) PublishActivity(ctx context.Context, id int64) error {
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
 	a, err := s.store.Activities.GetByID(ctx, id)
 	if err != nil {
 		return err
@@ -359,17 +504,52 @@ func (s *flashsaleService) PublishActivity(ctx context.Context, id int64) error 
 	if a == nil {
 		return ErrActivityNotFound
 	}
-	now := time.Now()
-	if now.After(a.EndAt) {
-		return fmt.Errorf("%w: activity already ended", ErrInvalidInput)
+	if a.IsOnSale() {
+		return nil
 	}
-	if err := s.syncStock(ctx, a, now); err != nil {
+	if err := s.settleActivityReservations(ctx, id); err != nil {
 		return err
 	}
-	return s.store.Activities.UpdateStatus(ctx, id, model.ActivityStatusOnSale)
+	if s.store.Tx == nil {
+		return errors.New("flashsale transaction runner is not configured")
+	}
+	return s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		current, err := s.store.Activities.GetByIDForUpdate(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return ErrActivityNotFound
+		}
+		now := time.Now()
+		if now.After(current.EndAt) {
+			return fmt.Errorf("%w: activity already ended", ErrInvalidInput)
+		}
+		stockSnapshot := *current
+		if current.InProgress(now) {
+			pendingQuantity, err := s.store.PreDeductions.PendingReservationQuantityForUpdate(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			if pendingQuantity > current.Stock {
+				return ErrStockBelowAcceptedReservations
+			}
+			stockSnapshot.Stock -= pendingQuantity
+		}
+		if err := s.syncStock(ctx, &stockSnapshot, now); err != nil {
+			return err
+		}
+		if err := s.cache.ReleaseFlashSalePauseDurably(ctx, pauseKey(id), "", redisAOFTimeout); err != nil {
+			return err
+		}
+		current.Status = model.ActivityStatusOnSale
+		return s.store.Activities.UpdateInTx(ctx, tx, current)
+	})
 }
 
 func (s *flashsaleService) UnpublishActivity(ctx context.Context, id int64) error {
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
 	a, err := s.store.Activities.GetByID(ctx, id)
 	if err != nil {
 		return err
@@ -377,16 +557,20 @@ func (s *flashsaleService) UnpublishActivity(ctx context.Context, id int64) erro
 	if a == nil {
 		return ErrActivityNotFound
 	}
-	if err := s.store.Activities.UpdateStatus(ctx, id, model.ActivityStatusOffSale); err != nil {
-		return err
+	var pauseErr error
+	if a.IsOnSale() {
+		token := strconv.FormatInt(time.Now().UnixNano(), 10)
+		_, pauseErr = s.cache.PauseFlashSaleStockDurably(ctx, cache.FlashSalePauseParams{
+			StockKey: stockKey(id), PauseKey: pauseKey(id), Token: token, TTL: stockEditPauseTTL,
+		}, redisAOFTimeout)
 	}
+	statusErr := s.store.Activities.UpdateStatus(ctx, id, model.ActivityStatusOffSale)
 	// 清除预热库存：key 生命周期 = 上架时预热、下架时清理（再上架重新预热）。
-	if err := s.cache.Del(ctx, stockKey(id)); err != nil {
-		return err
-	}
+	deleteStockErr := s.cache.Del(ctx, stockKey(id))
+	releasePauseErr := s.cache.ReleaseFlashSalePauseDurably(ctx, pauseKey(id), "", redisAOFTimeout)
 	// 库存余量 gauge 同步移除（与 Redis key 生命周期一致，T19c）。
 	s.metrics.DeleteSeckillStock(id)
-	return nil
+	return errors.Join(pauseErr, statusErr, deleteStockErr, releasePauseErr)
 }
 
 // ---- 抢购（T11）----
@@ -395,16 +579,28 @@ func (s *flashsaleService) UnpublishActivity(ctx context.Context, id int64) erro
 // 以事实 ID 抢占幂等键 → Redis 原子预扣与 marker → pending_publish →
 // 持久订单号并发布。成功预扣后即使当前请求的订单号生成或发布失败，也返回
 // 可查询的事实 ID，由启动恢复和 cron 继续发布或完整回退。
-func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64) (*PurchaseResult, error) {
-	// 1. 按用户限流：fail-closed（限流不可用时拒绝放行，保护后端）。
-	ok, err := s.perUser.Allow(ctx, rlKey(userID))
+func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64, clientRequestID string) (*PurchaseResult, error) {
+	clientRequestID = strings.TrimSpace(clientRequestID)
+	if clientRequestID == "" || len(clientRequestID) > 64 {
+		return nil, fmt.Errorf("%w: invalid client_request_id", ErrInvalidInput)
+	}
+	if s.store.PreDeductions == nil {
+		return nil, errors.New("flashsale pre-deduction repository is not configured")
+	}
+	existing, err := s.store.PreDeductions.GetByRequestID(ctx, userID, activityID, clientRequestID)
 	if err != nil {
-		return nil, fmt.Errorf("flashsale rate limit: %w", err)
+		return nil, err
 	}
-	if !ok {
-		return nil, ErrRateLimited
+	if existing != nil {
+		return purchaseResult(existing), nil
 	}
-
+	s.adminMu.RLock()
+	activityLocked := true
+	defer func() {
+		if activityLocked {
+			s.adminMu.RUnlock()
+		}
+	}()
 	activity, err := s.store.Activities.GetByID(ctx, activityID)
 	if err != nil {
 		return nil, err
@@ -412,34 +608,49 @@ func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64
 	if activity == nil {
 		return nil, ErrActivityNotFound
 	}
-	if s.store.PreDeductions == nil {
-		return nil, errors.New("flashsale pre-deduction repository is not configured")
-	}
-
 	// 2. 先持久化 preparing 事实，再触碰 Redis。若进程在任一外部写入前后崩溃，
 	// 恢复任务都能用 reservation marker 判断预扣是否真正发生。
 	pd := &model.PreDeduction{
-		UserID: userID, ActivityID: activityID, Quantity: 1,
+		UserID: userID, ActivityID: activityID, ClientRequestID: clientRequestID,
+		SKUID: activity.SKUID, Price: activity.Price, Quantity: 1,
 		Status: model.PreDeductionStatusPreparing,
 	}
 	if err := s.store.PreDeductions.Create(ctx, pd); err != nil {
+		if errors.Is(err, repository.ErrPreDeductionDuplicate) {
+			existing, getErr := s.store.PreDeductions.GetByRequestID(ctx, userID, activityID, clientRequestID)
+			if getErr != nil {
+				return nil, getErr
+			}
+			if existing != nil {
+				return purchaseResult(existing), nil
+			}
+		}
 		return nil, err
 	}
+	// Request identity is durable before rate limiting, so concurrent retries
+	// converge on the same fact instead of one retry being rejected as new work.
+	ok, err := s.perUser.Allow(ctx, rlKey(userID))
+	if err != nil {
+		if markErr := s.store.PreDeductions.MarkRolledBack(ctx, pd.ID); markErr != nil {
+			return nil, errors.Join(fmt.Errorf("flashsale rate limit: %w", err), markErr)
+		}
+		return nil, fmt.Errorf("flashsale rate limit: %w", err)
+	}
+	if !ok {
+		if err := s.store.PreDeductions.MarkRolledBack(ctx, pd.ID); err != nil {
+			return nil, err
+		}
+		return nil, ErrRateLimited
+	}
 
-	// 3. 幂等键的值就是稳定预扣 ID，延迟补偿只能删除自己的键。
-	key := idemKey(activityID, userID)
+	// 3. 每个预扣事实就是一个稳定购买槽位；Redis 所有权键按槽位隔离。
+	key := slotIdemKey(activityID, userID, pd.PurchaseSlot)
 	result, err := s.cache.AcquireIdempotency(ctx, key, pd.ReservationToken(), idemTTL)
 	if err != nil {
 		return purchaseResult(pd), nil
 	}
 	if result == cache.IdempotencyExists {
-		if markErr := s.store.PreDeductions.MarkRolledBack(ctx, pd.ID); markErr != nil {
-			return nil, markErr
-		}
-		if existing := s.existingPurchase(ctx, key, userID, activityID); existing != nil {
-			return purchaseResult(existing), nil
-		}
-		return nil, ErrDuplicateRequest
+		return purchaseResult(pd), nil
 	}
 	if result != cache.IdempotencyAcquired {
 		return purchaseResult(pd), nil
@@ -458,6 +669,8 @@ func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64
 		}
 		return purchaseResult(pd), nil
 	}
+	s.adminMu.RUnlock()
+	activityLocked = false
 	if err := s.store.PreDeductions.MarkPreDeducted(ctx, pd.ID); err != nil {
 		return purchaseResult(pd), nil
 	}
@@ -470,22 +683,6 @@ func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64
 		pd = current
 	}
 	return purchaseResult(pd), nil
-}
-
-func (s *flashsaleService) existingPurchase(ctx context.Context, key string, userID, activityID int64) *model.PreDeduction {
-	token, err := s.cache.Get(ctx, key)
-	if err != nil {
-		return nil
-	}
-	id, err := strconv.ParseInt(token, 10, 64)
-	if err != nil || id <= 0 {
-		return nil
-	}
-	pd, err := s.store.PreDeductions.GetByID(ctx, id)
-	if err != nil || pd == nil || pd.UserID != userID || pd.ActivityID != activityID {
-		return nil
-	}
-	return pd
 }
 
 func purchaseResult(p *model.PreDeduction) *PurchaseResult {
@@ -522,6 +719,10 @@ func (s *flashsaleService) dispatchPreDeduction(ctx context.Context, pd *model.P
 		OrderNo:        orderNo,
 		UserID:         pd.UserID,
 		ActivityID:     pd.ActivityID,
+		SKUID:          pd.SKUID,
+		Price:          pd.Price,
+		Quantity:       pd.Quantity,
+		PurchaseSlot:   pd.PurchaseSlot,
 	})
 	if err != nil {
 		return s.recordPublishFailure(ctx, pd, fmt.Errorf("marshal seckill message: %w", err))
@@ -698,7 +899,7 @@ func (s *flashsaleService) ensurePreDeductionReservation(ctx context.Context, pd
 	_, err = s.cache.EnsureFlashSaleReservationDurably(ctx, cache.FlashSaleEnsureReservationParams{
 		StockKey:         stockKey(pd.ActivityID),
 		CountKey:         countKey(pd.ActivityID, pd.UserID),
-		IdempotencyKey:   idemKey(pd.ActivityID, pd.UserID),
+		IdempotencyKey:   preDeductionIdemKey(pd),
 		ReservationKey:   reservationKey(pd.ID),
 		ReservationToken: pd.ReservationToken(),
 		IdempotencyTTL:   idemTTL,
@@ -730,7 +931,7 @@ func (s *flashsaleService) rollbackPreDeduction(ctx context.Context, pd *model.P
 	result, err := s.cache.RestoreFlashSaleDurably(ctx, cache.FlashSaleRestoreParams{
 		StockKey:                 stockKey(pd.ActivityID),
 		CountKey:                 countKey(pd.ActivityID, pd.UserID),
-		IdempotencyKey:           idemKey(pd.ActivityID, pd.UserID),
+		IdempotencyKey:           preDeductionIdemKey(pd),
 		ReservationKey:           reservationKey(pd.ID),
 		ReservationToken:         pd.ReservationToken(),
 		AllowIdempotencyFallback: pd.Legacy,
@@ -798,14 +999,14 @@ func (s *flashsaleService) PreDeduct(ctx context.Context, userID, activityID int
 func (s *flashsaleService) preDeductActivity(ctx context.Context, userID int64, a *model.Activity, pd *model.PreDeduction) error {
 	now := time.Now()
 	params := cache.FlashSalePreDeductParams{
-		StockKey: stockKey(a.ID), CountKey: countKey(a.ID, userID), Now: now,
+		StockKey: stockKey(a.ID), CountKey: countKey(a.ID, userID), PauseKey: pauseKey(a.ID), Now: now,
 		StartAt: a.StartAt, EndAt: a.EndAt, OnSale: a.Status == model.ActivityStatusOnSale,
 		PerUserLimit: a.PerUserLimit,
 	}
 	if pd != nil {
 		params.ReservationKey = reservationKey(pd.ID)
 		params.ReservationToken = pd.ReservationToken()
-		params.IdempotencyKey = idemKey(a.ID, userID)
+		params.IdempotencyKey = slotIdemKey(a.ID, userID, pd.PurchaseSlot)
 		params.IdempotencyTTL = idemTTL
 	}
 	var result cache.FlashSalePreDeductResult
@@ -835,13 +1036,20 @@ func (s *flashsaleService) preDeductActivity(ctx context.Context, userID int64, 
 	case cache.FlashSaleLimitReached:
 		s.preDeductFailed()
 		return ErrLimitReached
-	case cache.FlashSaleOffline:
+	case cache.FlashSaleOffline, cache.FlashSalePaused:
 		s.preDeductFailed()
 		return ErrOffline
 	default:
 		s.preDeductFailed()
 		return fmt.Errorf("%w: unexpected pre-deduct result %d", ErrInvalidInput, result)
 	}
+}
+
+func preDeductionIdemKey(pd *model.PreDeduction) string {
+	if pd.Legacy {
+		return legacyIdemKey(pd.ActivityID, pd.UserID)
+	}
+	return slotIdemKey(pd.ActivityID, pd.UserID, pd.PurchaseSlot)
 }
 
 // preDeductSuccess/preDeductFailed 预扣结果打点（T19c）。
@@ -897,7 +1105,6 @@ func remainingTTL(a *model.Activity) time.Duration {
 	return time.Until(a.EndAt) + stockKeyMargin
 }
 
-// inWindow 时间窗口判定（与状态无关，仅比较时间）。
 func inWindow(p ActivityParams, now time.Time) bool {
 	return !now.Before(p.StartAt) && !now.After(p.EndAt)
 }

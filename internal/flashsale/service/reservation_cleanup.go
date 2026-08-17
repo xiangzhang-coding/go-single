@@ -65,7 +65,7 @@ func (s *reservationCleanupService) CleanupOrderedReservations(ctx context.Conte
 			}
 			_, err = s.cache.EnsureOrderedFlashSaleReservationDurably(ctx, cache.FlashSaleEnsureOrderedReservationParams{
 				StockKey: stockKey(activity.ID), CountKey: countKey(rows[i].ActivityID, rows[i].UserID),
-				IdempotencyKey: idemKey(rows[i].ActivityID, rows[i].UserID),
+				IdempotencyKey: preDeductionIdemKey(&rows[i]),
 				ReservationKey: reservationKey(rows[i].ID), ReservationToken: rows[i].ReservationToken(),
 				IdempotencyTTL: idemTTL, Quantity: rows[i].Quantity,
 				FallbackStock: activity.Stock, StockTTL: stockTTL,

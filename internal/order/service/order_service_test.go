@@ -51,6 +51,16 @@ func (f *fakeOrders) Create(_ context.Context, _ *gorm.DB, o *model.Order) error
 	if f.duplicate[o.OrderNo] {
 		return repository.ErrOrderDuplicate
 	}
+	if _, exists := f.byID[o.OrderNo]; exists {
+		return repository.ErrOrderDuplicate
+	}
+	if o.UserActivityKey != nil {
+		for _, existing := range f.byID {
+			if existing.UserActivityKey != nil && *existing.UserActivityKey == *o.UserActivityKey {
+				return repository.ErrOrderDuplicate
+			}
+		}
+	}
 	f.byID[o.OrderNo] = o
 	return nil
 }
@@ -1023,7 +1033,8 @@ func TestListExpiredSeckillReturnsCancellationSnapshot(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, []ExpiredSeckillOrder{{
-		OrderNo: "SK1", UserID: 42, ActivityID: 100, Quantity: 1,
+		OrderNo: "SK1", UserID: 42, ActivityID: 100, PurchaseSlot: 1,
+		SKUID: 1, Price: 9900, Quantity: 1,
 	}}, orders)
 }
 
@@ -1357,13 +1368,14 @@ func TestCreateFromCartWithCoupon(t *testing.T) {
 func (fx *fixture) seckillParams(orderNo string) SeckillCreateParams {
 	addr := fx.users.addresses[1] // fx.seed 种入的地址（ID 1）
 	return SeckillCreateParams{
-		OrderNo:    orderNo,
-		UserID:     42,
-		ActivityID: 100,
-		SKUID:      1,
-		Price:      9900,
-		Quantity:   1,
-		Address:    addr,
+		OrderNo:      orderNo,
+		UserID:       42,
+		ActivityID:   100,
+		PurchaseSlot: 1,
+		SKUID:        1,
+		Price:        9900,
+		Quantity:     1,
+		Address:      addr,
 	}
 }
 
@@ -1419,22 +1431,37 @@ func TestCreateSeckillDuplicateOrderNoIdempotent(t *testing.T) {
 	require.Len(t, fx.orders.createLog, 2, "第二次为重复尝试（被唯一约束拦截）")
 }
 
-// 同 (user_id, activity_id) 不同 order_no 冲突不是该消息的幂等命中。
-func TestCreateSeckillDuplicateUserActivityRejected(t *testing.T) {
+// 同一购买槽位的不同 order_no 冲突不是该消息的幂等命中。
+func TestCreateSeckillDuplicatePurchaseSlotRejected(t *testing.T) {
 	fx := newFixture()
 	fx.seed(t)
 
 	created, err := fx.svc.CreateSeckillInTx(context.Background(), serviceTestTx, fx.seckillParams("S1"))
 	require.NoError(t, err)
 	require.True(t, created)
-	// 模拟并发竞态：第二个消息同用户同活动（不同订单号）被唯一约束拦截。
-	fx.orders.duplicate["S2"] = true
 	p2 := fx.seckillParams("S2")
 	created, err = fx.svc.CreateSeckillInTx(context.Background(), serviceTestTx, p2)
 	require.ErrorIs(t, err, ErrSeckillOrderConflict)
 	require.False(t, created)
 
 	require.Nil(t, fx.orders.byID["S2"], "重复订单不得落库")
+}
+
+func TestCreateSeckillDifferentPurchaseSlotsAllowed(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	first := fx.seckillParams("S1")
+	created, err := fx.svc.CreateSeckillInTx(context.Background(), serviceTestTx, first)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	second := fx.seckillParams("S2")
+	second.PurchaseSlot = 2
+	created, err = fx.svc.CreateSeckillInTx(context.Background(), serviceTestTx, second)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NotEqual(t, *fx.orders.byID["S1"].UserActivityKey, *fx.orders.byID["S2"].UserActivityKey)
 }
 
 func TestSeckillTransactionMethodsRequireTransaction(t *testing.T) {
@@ -1460,6 +1487,7 @@ func TestCreateSeckillValidation(t *testing.T) {
 		{"空订单号", func(p *SeckillCreateParams) { p.OrderNo = "" }},
 		{"缺地址", func(p *SeckillCreateParams) { p.Address = nil }},
 		{"非法活动", func(p *SeckillCreateParams) { p.ActivityID = 0 }},
+		{"非法购买槽位", func(p *SeckillCreateParams) { p.PurchaseSlot = 0 }},
 		{"非法数量", func(p *SeckillCreateParams) { p.Quantity = 0 }},
 	}
 	for _, tc := range cases {

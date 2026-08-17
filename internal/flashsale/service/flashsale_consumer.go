@@ -1,6 +1,6 @@
 // 秒杀异步落单消费者（T12）：订阅 SeckillOrderQueue 队列处理"抢购成功"消息，
 // 落单链路为 查活动 → 查默认地址（固化地址快照）→ order 服务单事务建单 +
-// 扣活动库存（(user_id, activity_id) 唯一约束幂等，预扣成功绝不丢单）。
+// 扣活动库存（购买槽位唯一约束幂等，预扣成功绝不丢单）。
 // 失败分类：业务拒绝/数据缺失 = 永久失败（先持久化回退意图，再进死信队列）；
 // 基础设施故障 = 瞬时失败（Nack 重投，at-least-once）。
 package service
@@ -43,7 +43,7 @@ type UserService interface {
 // SeckillOrderConsumer 秒杀异步落单消费者（T12）。
 // 消费链路：消息 → 查活动（sku/秒杀价）→ 查默认地址 → 开启事务 →
 // order.CreateSeckillInTx + 活动库存条件扣减。
-// 预扣成功绝不丢单：重复投递/并发消费由 (user_id, activity_id) 唯一约束幂等；
+// 预扣成功绝不丢单：重复投递/并发消费由购买槽位唯一约束幂等；
 // 瞬时失败由 MQ 重投；永久失败与死信由持久生命周期驱动完整回退。
 type SeckillOrderConsumer struct {
 	activities    repository.ActivityRepository
@@ -87,6 +87,10 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 		if pd.UserID != msg.UserID || pd.ActivityID != msg.ActivityID || pd.OrderNumber() != msg.OrderNo {
 			return c.permanent(ctx, "pre-deduction does not match message", &msg, nil)
 		}
+		adoptPersistedMessageSnapshot(&msg, pd)
+		if !messageMatchesPreDeduction(&msg, pd) {
+			return c.permanent(ctx, "pre-deduction snapshot does not match message", &msg, nil)
+		}
 		switch pd.Status {
 		case model.PreDeductionStatusOrdered,
 			model.PreDeductionStatusPendingRollback,
@@ -97,7 +101,7 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 		}
 	}
 
-	// 活动必须仍存在（sku_id/秒杀价作为订单快照来源；活动删除受限外键 RESTRICT）。
+	// 活动必须仍存在（库存仍由活动行结算；成交快照来自预扣事实）。
 	activity, err := c.activities.GetByID(ctx, msg.ActivityID)
 	if err != nil {
 		c.log.Warn("秒杀落单读取活动失败（瞬时，将重投）",
@@ -109,6 +113,9 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 	}
 	if err := c.adoptLegacyMessage(ctx, &msg, activity); err != nil {
 		return err
+	}
+	if msg.SKUID <= 0 || msg.Price <= 0 || msg.Quantity <= 0 || msg.PurchaseSlot <= 0 {
+		return c.permanent(ctx, "invalid seckill purchase snapshot", &msg, nil)
 	}
 
 	// 默认地址固化为地址快照（秒杀下单无选地址步骤；无地址为永久失败，对账兜底）。
@@ -124,6 +131,13 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 
 	created := false
 	err = c.tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		lockedActivity, err := c.activities.GetByIDForUpdate(ctx, tx, msg.ActivityID)
+		if err != nil {
+			return err
+		}
+		if lockedActivity == nil {
+			return ErrActivityNotFound
+		}
 		if msg.PreDeductionID > 0 {
 			pd, err := c.preDeductions.GetByIDForUpdate(ctx, tx, msg.PreDeductionID)
 			if err != nil {
@@ -131,6 +145,10 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 			}
 			if pd == nil {
 				return ErrPreDeductionNotFound
+			}
+			adoptPersistedMessageSnapshot(&msg, pd)
+			if !messageMatchesPreDeduction(&msg, pd) {
+				return fmt.Errorf("pre-deduction snapshot changed before order creation")
 			}
 			switch pd.Status {
 			case model.PreDeductionStatusOrdered,
@@ -142,21 +160,21 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 				return fmt.Errorf("pre-deduction cannot create order from status %s", pd.Status)
 			}
 		}
-		var err error
 		created, err = c.orders.CreateSeckillInTx(ctx, tx, ordersvc.SeckillCreateParams{
-			OrderNo:    msg.OrderNo,
-			UserID:     msg.UserID,
-			ActivityID: msg.ActivityID,
-			SKUID:      activity.SKUID,
-			Price:      activity.Price,
-			Quantity:   1,
-			Address:    address,
+			OrderNo:      msg.OrderNo,
+			UserID:       msg.UserID,
+			ActivityID:   msg.ActivityID,
+			PurchaseSlot: msg.PurchaseSlot,
+			SKUID:        msg.SKUID,
+			Price:        msg.Price,
+			Quantity:     msg.Quantity,
+			Address:      address,
 		})
 		if err != nil {
 			return err
 		}
 		if created {
-			ok, err := c.activities.DeductStock(ctx, tx, msg.ActivityID, 1)
+			ok, err := c.activities.DeductStock(ctx, tx, msg.ActivityID, msg.Quantity)
 			if err != nil {
 				return err
 			}
@@ -232,16 +250,39 @@ func (c *SeckillOrderConsumer) adoptLegacyMessage(ctx context.Context, msg *Seck
 	}
 	orderNo := msg.OrderNo
 	pd, err := c.preDeductions.EnsureLegacyPendingOrder(ctx, &model.PreDeduction{
-		UserID: msg.UserID, ActivityID: msg.ActivityID, OrderNo: &orderNo, Quantity: 1,
+		UserID: msg.UserID, ActivityID: msg.ActivityID, OrderNo: &orderNo,
+		SKUID: activity.SKUID, Price: activity.Price, Quantity: 1,
 	})
 	if err != nil {
 		return fmt.Errorf("adopt legacy seckill message: %w", err)
 	}
 	msg.PreDeductionID = pd.ID
+	msg.SKUID = pd.SKUID
+	msg.Price = pd.Price
+	msg.Quantity = pd.Quantity
+	msg.PurchaseSlot = pd.PurchaseSlot
 	if !pd.Legacy {
 		return nil
 	}
 	return adoptLegacyReservation(ctx, c.legacyCache, c.preDeductions, pd, activity)
+}
+
+// Messages published before R05 do not carry the accepted snapshot. Their
+// durable pre-deduction row is backfilled by the migration, so replay can be
+// upgraded without rereading mutable activity pricing.
+func adoptPersistedMessageSnapshot(msg *SeckillSuccessMessage, pd *model.PreDeduction) {
+	if msg.SKUID == 0 && msg.Price == 0 && msg.Quantity == 0 && msg.PurchaseSlot == 0 {
+		msg.SKUID = pd.SKUID
+		msg.Price = pd.Price
+		msg.Quantity = pd.Quantity
+		msg.PurchaseSlot = pd.PurchaseSlot
+	}
+}
+
+func messageMatchesPreDeduction(msg *SeckillSuccessMessage, pd *model.PreDeduction) bool {
+	return pd.SKUID > 0 && pd.Price > 0 && pd.Quantity > 0 && pd.PurchaseSlot > 0 &&
+		msg.SKUID == pd.SKUID && msg.Price == pd.Price && msg.Quantity == pd.Quantity &&
+		msg.PurchaseSlot == pd.PurchaseSlot
 }
 
 type legacyReservationCache interface {
@@ -264,7 +305,7 @@ func adoptLegacyReservation(ctx context.Context, client legacyReservationCache,
 	}
 	_, err = client.AdoptLegacyFlashSaleReservationDurably(ctx, cache.FlashSaleAdoptLegacyReservationParams{
 		StockKey: stockKey(pd.ActivityID), CountKey: countKey(pd.ActivityID, pd.UserID),
-		IdempotencyKey: idemKey(pd.ActivityID, pd.UserID), ReservationKey: reservationKey(pd.ID),
+		IdempotencyKey: preDeductionIdemKey(pd), ReservationKey: reservationKey(pd.ID),
 		ReservationToken: pd.ReservationToken(), IdempotencyTTL: idemTTL,
 		TargetStock: targetStock, TargetUserCount: userQuantity, StockTTL: stockTTL,
 	}, redisAOFTimeout)

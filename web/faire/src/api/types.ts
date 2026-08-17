@@ -146,7 +146,10 @@ export interface FlashSalePurchase {
   user_id: number;
   activity_id: number;
   order_no?: string;
+  sku_id: number;
+  price: number;
   quantity: number;
+  purchase_slot: string;
   status: FlashSalePurchaseStatus;
   publish_attempts: number;
   rollback_attempts: number;
@@ -190,6 +193,7 @@ export interface Order {
   order_type: "normal" | "seckill" | string;
   status: OrderStatus | "";
   activity_id?: number;
+  purchase_slot?: number;
   total_amount: number;
   discount_amount: number;
   pay_amount: number;

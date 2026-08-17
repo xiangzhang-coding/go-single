@@ -134,22 +134,26 @@ type CreateResult struct {
 // SeckillCreateParams 秒杀异步落单参数（MQ 消费者侧组装）：
 // OrderNo 预扣时已生成（雪花）；地址为消费时固化的默认地址快照。
 type SeckillCreateParams struct {
-	OrderNo    string
-	UserID     int64
-	ActivityID int64
-	SKUID      int64
-	Price      int64 // 秒杀价快照（活动价格）
-	Quantity   int
-	Address    *usermodel.Address // 默认地址快照（用户后续改地址不影响历史订单）
+	OrderNo      string
+	UserID       int64
+	ActivityID   int64
+	PurchaseSlot int64
+	SKUID        int64
+	Price        int64 // 秒杀价快照（活动价格）
+	Quantity     int
+	Address      *usermodel.Address // 默认地址快照（用户后续改地址不影响历史订单）
 }
 
 // ExpiredSeckillOrder 是秒杀超时取消编排所需的最小订单快照。
 // order 模块负责从订单与订单项聚合该数据，flashsale 模块负责活动库存回补。
 type ExpiredSeckillOrder struct {
-	OrderNo    string
-	UserID     int64
-	ActivityID int64
-	Quantity   int
+	OrderNo      string
+	UserID       int64
+	ActivityID   int64
+	PurchaseSlot int64
+	SKUID        int64
+	Price        int64
+	Quantity     int
 }
 
 // Service order 模块的业务接口。
@@ -386,7 +390,7 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p Sec
 	if tx == nil {
 		return false, fmt.Errorf("%w: transaction required", ErrInvalidInput)
 	}
-	if p.OrderNo == "" || p.UserID <= 0 || p.ActivityID <= 0 || p.SKUID <= 0 ||
+	if p.OrderNo == "" || p.UserID <= 0 || p.ActivityID <= 0 || p.PurchaseSlot <= 0 || p.SKUID <= 0 ||
 		p.Price < 0 || p.Quantity < 1 || p.Quantity > 99 || p.Address == nil {
 		return false, fmt.Errorf("%w: invalid seckill order params", ErrInvalidInput)
 	}
@@ -409,15 +413,17 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p Sec
 
 	now := time.Now()
 	activityID := p.ActivityID
-	// 秒杀去重键（T13）：写 "user_id:activity_id"，唯一约束挡重复落单；
-	// 取消时同事务置 NULL，允许同一用户取消后再次抢购。
-	dedupKey := fmt.Sprintf("%d:%d", p.UserID, activityID)
+	purchaseSlot := p.PurchaseSlot
+	// 每次成功预扣占一个稳定购买槽位；唯一键只拦截同槽消息重投，不会把
+	// 同一用户在限购范围内的第二次购买误判为第一单重放。
+	dedupKey := fmt.Sprintf("%d:%d:%d", p.UserID, activityID, purchaseSlot)
 	order := &model.Order{
 		OrderNo:         p.OrderNo,
 		UserID:          p.UserID,
 		OrderType:       model.OrderTypeSeckill,
 		Status:          model.OrderStatusPendingPayment,
 		ActivityID:      &activityID,
+		PurchaseSlot:    &purchaseSlot,
 		TotalAmount:     p.Price * int64(p.Quantity),
 		PayAmount:       p.Price * int64(p.Quantity),
 		Receiver:        p.Address.Receiver,
@@ -448,6 +454,7 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p Sec
 			}
 			if existing != nil && existing.UserID == p.UserID &&
 				existing.ActivityID != nil && *existing.ActivityID == p.ActivityID &&
+				existing.PurchaseSlot != nil && *existing.PurchaseSlot == p.PurchaseSlot &&
 				existing.OrderType == model.OrderTypeSeckill {
 				return false, nil
 			}
@@ -902,13 +909,21 @@ func (s *orderService) ListExpiredSeckill(ctx context.Context) ([]ExpiredSeckill
 
 	result := make([]ExpiredSeckillOrder, 0, len(orders))
 	for _, o := range orders {
+		items := itemsByOrder[o.OrderNo]
 		item := ExpiredSeckillOrder{
 			OrderNo:  o.OrderNo,
 			UserID:   o.UserID,
-			Quantity: sumItemQuantity(itemsByOrder[o.OrderNo]),
+			Quantity: sumItemQuantity(items),
 		}
 		if o.ActivityID != nil {
 			item.ActivityID = *o.ActivityID
+		}
+		if o.PurchaseSlot != nil {
+			item.PurchaseSlot = *o.PurchaseSlot
+		}
+		if len(items) > 0 {
+			item.SKUID = items[0].SKUID
+			item.Price = items[0].Price
 		}
 		result = append(result, item)
 	}

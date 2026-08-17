@@ -22,8 +22,12 @@ type PreDeduction struct {
 	ID                    int64              `json:"id,string"`
 	UserID                int64              `json:"user_id"`
 	ActivityID            int64              `json:"activity_id"`
+	ClientRequestID       string             `json:"-" gorm:"column:client_request_id"`
 	OrderNo               *string            `json:"order_no,omitempty"`
+	SKUID                 int64              `json:"sku_id" gorm:"column:sku_id"`
+	Price                 int64              `json:"price"`
 	Quantity              int                `json:"quantity"`
+	PurchaseSlot          int64              `json:"purchase_slot,string" gorm:"column:purchase_slot"`
 	Status                PreDeductionStatus `json:"status"`
 	PublishAttempts       int                `json:"publish_attempts"`
 	RollbackAttempts      int                `json:"rollback_attempts"`

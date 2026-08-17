@@ -53,7 +53,7 @@
 25. 作为用户，我想抢购秒杀商品，预扣成功后立即返回"排队中"，以便快速获得抢购结果
 26. 作为用户，我想轮询订单接口（`GET /api/orders/{order_no}`，1.5s×30 次上限）得知异步落单结果
 27. 作为用户，我期望每人限购（`per_user_limit`，后台可配，默认 1）被原子强制
-28. 作为用户，我期望重复抢购被幂等键拦截（Redis 幂等键 TTL 30min + 订单表可空 `user_activity_key` 唯一约束：落单写 `user_id:activity_id`，取消/超时取消同事务置 NULL 不再占位——在挡住重复落单的同时支撑故事 29 的再次抢购，见迁移 000014）
+28. 作为用户，我期望同一 `client_request_id` 重试返回原预扣，而新的请求在 `per_user_limit` 内获得独立购买槽位；订单按 `user_id:activity_id:purchase_slot` 去重，取消只释放对应槽位
 29. 作为用户，我期望秒杀订单超时未支付取消后，库存与购买机会回补（允许再次抢购）
 30. 作为管理员，我想创建/编辑/上架/下架秒杀活动（时间窗口、独立库存、秒杀价、限购数），以便运营促销
 31. 作为系统，我期望活动上架时库存预热进 Redis（SETNX，未开始可覆盖、进行中只减不增）
@@ -131,7 +131,7 @@
 ### 订单与交易
 
 - 普通/秒杀共用状态机：待支付 → 已支付（支付回调）→ 已发货（后台发货）→ 已完成（用户确认收货）；含用户取消与超时取消；非法跃迁直接拒绝
-- 订单表含 `order_type`（normal/seckill）；秒杀订单不使用优惠券，且可空 `user_activity_key` 唯一约束（落单写 `user_id:activity_id`；取消/超时取消置 NULL 释放占位，允许同一用户再次抢购）
+- 订单表含 `order_type`（normal/seckill）；秒杀订单不使用优惠券，持久化 `purchase_slot`，可空 `user_activity_key=user_id:activity_id:purchase_slot` 唯一约束只拦同槽重投；取消置 NULL 释放该槽位
 - 普通订单：购物车/直购 → 单事务（订单+订单项+库存条件更新 `stock>=N`+地址快照+券核销+删除购物车条目）→ 待支付；超时取消回补库存+回退券
 - 幂等：`client_request_id`（Redis SETNX + TTL 15min），重复请求返回同一订单号
 - 订单号：雪花 ID（手写实现，学习点）；超时默认 普通 15min / 秒杀 10min
@@ -140,9 +140,10 @@
 
 - 活动独立库存模型：`flashsale.stock`（秒杀专属）+ `price`（秒杀价），与 `sku.stock` 互不干扰；落单扣活动库存
 - Lua 原子脚本：校验时间窗口 + `status` 下架标志 + `per_user_limit` + DECR 库存 + INCR 用户计数（limit 作为 ARGV 传入）
-- 幂等两段式：Redis 幂等键（TTL 30min）挡预扣请求重复提交；DB 唯一约束挡落单重复；消费者查 DB 订单、无则创建——预扣成功绝不丢单
+- 幂等两段式：MySQL `(user, activity, client_request_id)` 区分请求重试和新购买；Redis 槽位键（TTL 30min）保护单次预扣；DB `user_activity_key` 唯一约束挡同槽重复落单
 - MQ 异步落单：失败重投/死信 + 对账兜底；取消回补 Redis 库存 + MySQL 库存 + 用户计数（允许再次抢购）
-- 上架预热：admin 上架/编辑时 SETNX 写入（未开始可覆盖 DEL+SET，进行中只减不增）；key 约定 `flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}`
+- 预扣事实固化 SKU、成交价、数量和购买槽位，消费者不读取活动当前价格/SKU改写订单；进行中仅标题和库存减少可编辑，编辑经 Redis pause 栅栏 + MySQL 行锁重算差额，不能减到已接受预扣以下，同步失败活动自动下架
+- key 约定 `flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}:{purchase_slot}`
 - 对账分场景：活动进行中只比对告警不自动回写（Redis 预扣领先属正常，仅识别"有扣减无订单"作补单信号）；活动结束收尾对账以 MySQL 为准对齐 Redis
 - 限流：全局单机令牌桶（x/time/rate，QPS 可配）+ 秒杀接口按用户 Redis 计数（INCR+TTL）
 

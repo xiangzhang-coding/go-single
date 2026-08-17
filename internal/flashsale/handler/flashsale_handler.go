@@ -67,6 +67,10 @@ type activityRequest struct {
 	EndAt        time.Time `json:"end_at" binding:"required"`
 }
 
+type purchaseRequest struct {
+	ClientRequestID string `json:"client_request_id" binding:"required"`
+}
+
 func (h *Handler) CreateActivity(c *gin.Context) {
 	var req activityRequest
 	if !bindJSON(c, &req) {
@@ -153,7 +157,11 @@ func (h *Handler) Purchase(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 		return
 	}
-	result, err := h.svc.Seckill(c.Request.Context(), claims.UserID, id)
+	var req purchaseRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	result, err := h.svc.Seckill(c.Request.Context(), claims.UserID, id, req.ClientRequestID)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -231,8 +239,10 @@ func writeError(c *gin.Context, err error) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrRateLimited):
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrDuplicateRequest),
-		errors.Is(err, service.ErrStockIncreaseInProgress),
+	case errors.Is(err, service.ErrStockIncreaseInProgress),
+		errors.Is(err, service.ErrActivityFieldsLocked),
+		errors.Is(err, service.ErrStockBelowAcceptedReservations),
+		errors.Is(err, service.ErrReservationsUnsettled),
 		errors.Is(err, service.ErrNotInWindow),
 		errors.Is(err, service.ErrSoldOut),
 		errors.Is(err, service.ErrLimitReached),

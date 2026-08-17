@@ -54,59 +54,53 @@ func orderStatus(t *testing.T, orderNo string) string {
 	return s
 }
 
-// T13 超时取消回补 + 允许再次抢购（验收标准 1）：抢购落单 → 拨回已超时 →
-// SeckillTimeout 取消订单并回补 MySQL/Redis 库存与用户计数、释放幂等键 →
-// 同一用户再次抢购成功（生成新订单，取消订单不占去重位）。
-func TestSeckillTimeoutCancelRestoresAndAllowsRepurchase(t *testing.T) {
+// 取消只释放对应购买槽位；同一用户的另一待支付槽位保持有效，并可补购新槽位。
+func TestSeckillTimeoutCancelReleasesOnlyItsSlotAndAllowsReplacement(t *testing.T) {
 	requireEnv(t) // 初始化共享 env（adminToken/seed 依赖）
 	e := requireMQEnv(t)
 	admin := adminToken(t, env)
-	id := seedPublishedOnSale(t, admin, 10)
+	id := seedPublishedOnSale(t, admin, 10, 2)
 	token, userID := registerWithAddress(t, e, uniqueName("repurchase"))
 	stockKey, countKey := fmt.Sprintf("flashsale:stock:%d", id), fmt.Sprintf("flashsale:count:%d:%d", id, userID)
 
-	// 首次抢购 → 异步落单。
-	w, body := purchaseOn(t, e, id, token)
+	w, first := purchaseOn(t, e, id, token, "cancel-slot-1")
 	require.Equal(t, http.StatusAccepted, w.Code)
-	orderNo := body["order_no"].(string)
-	order := pollOrder(t, e, orderNo, token)
-	require.NotNil(t, order, "异步落单应在轮询窗口内完成")
-	require.Equal(t, "pending_payment", order["status"])
+	w, second := purchaseOn(t, e, id, token, "cancel-slot-2")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	firstOrderNo := first["order_no"].(string)
+	secondOrderNo := second["order_no"].(string)
+	require.NotNil(t, pollOrder(t, e, firstOrderNo, token))
+	require.NotNil(t, pollOrder(t, e, secondOrderNo, token))
+	firstSlot := first["pre_deduction_id"].(string)
+	secondSlot := second["pre_deduction_id"].(string)
+	require.Equal(t, "8", *redisGet(t, stockKey))
+	require.Equal(t, "2", *redisGet(t, countKey))
+	require.NotNil(t, redisGet(t, fmt.Sprintf("flashsale:idem:%d:%d:%s", id, userID, firstSlot)))
+	require.NotNil(t, redisGet(t, fmt.Sprintf("flashsale:idem:%d:%d:%s", id, userID, secondSlot)))
+	require.Equal(t, 8, mysqlStock(t, e, id))
 
-	// 预扣态：Redis 库存 9、用户计数 1、幂等键已占。
-	require.Equal(t, "9", *redisGet(t, stockKey))
-	require.Equal(t, "1", *redisGet(t, countKey))
-	require.NotNil(t, redisGet(t, fmt.Sprintf("flashsale:idem:%d:%d", id, userID)))
-	require.Equal(t, 9, mysqlStock(t, e, id))
-
-	// 拨回已超时 → 秒杀超时取消。
 	require.NoError(t, env.gdb.Exec("UPDATE orders SET expire_at = ? WHERE order_no = ?",
-		time.Now().Add(-time.Minute), orderNo).Error)
+		time.Now().Add(-time.Minute), firstOrderNo).Error)
 	cancelled, _, _, err := e.timeout.CancelExpired(context.Background())
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, cancelled, 1, "超时秒杀订单应被取消")
-
-	// 回补断言：订单取消 + MySQL 库存回补 + Redis 库存/计数回补 + 幂等键释放。
-	require.Equal(t, ordermodel.OrderStatusCancelled, orderStatus(t, orderNo))
-	require.Equal(t, 10, mysqlStock(t, e, id), "MySQL 活动库存应回补")
-	require.Equal(t, "10", *redisGet(t, stockKey), "Redis 库存应回补")
-	require.Equal(t, "0", *redisGet(t, countKey), "用户计数应回补")
-	require.Nil(t, redisGet(t, fmt.Sprintf("flashsale:idem:%d:%d", id, userID)), "幂等键应释放")
-
-	// 允许再次抢购：同一用户再次抢购成功（新订单号，非 409 重复请求）。
-	w, body = purchaseOn(t, e, id, token)
-	require.Equal(t, http.StatusAccepted, w.Code, "回补后应可再次抢购: %s", w.Body.String())
-	orderNo2 := body["order_no"].(string)
-	require.NotEqual(t, orderNo, orderNo2, "再次抢购应生成新订单")
-	order2 := pollOrder(t, e, orderNo2, token)
-	require.NotNil(t, order2, "第二单应异步落单")
-	require.Equal(t, "pending_payment", order2["status"])
-
-	// 两单并存（一取消一待支付），库存与订单数守恒。
-	require.Equal(t, 2, countSeckillOrders(t, e, id), "取消订单 + 新订单并存")
-	require.Equal(t, 9, mysqlStock(t, e, id), "第二单扣减回补后的库存")
+	require.GreaterOrEqual(t, cancelled, 1)
+	require.Equal(t, ordermodel.OrderStatusCancelled, orderStatus(t, firstOrderNo))
+	require.Equal(t, ordermodel.OrderStatusPendingPayment, orderStatus(t, secondOrderNo))
+	require.Equal(t, 9, mysqlStock(t, e, id))
 	require.Equal(t, "9", *redisGet(t, stockKey))
 	require.Equal(t, "1", *redisGet(t, countKey))
+	require.Nil(t, redisGet(t, fmt.Sprintf("flashsale:idem:%d:%d:%s", id, userID, firstSlot)))
+	require.NotNil(t, redisGet(t, fmt.Sprintf("flashsale:idem:%d:%d:%s", id, userID, secondSlot)))
+
+	w, replacement := purchaseOn(t, e, id, token, "replacement-slot")
+	require.Equal(t, http.StatusAccepted, w.Code, "released slot should be purchasable again: %s", w.Body.String())
+	require.NotEqual(t, firstSlot, replacement["pre_deduction_id"])
+	require.NotNil(t, pollOrder(t, e, replacement["order_no"].(string), token))
+	require.Equal(t, ordermodel.OrderStatusPendingPayment, orderStatus(t, secondOrderNo))
+	require.Equal(t, 3, countSeckillOrders(t, e, id), "cancelled, surviving, and replacement orders coexist")
+	require.Equal(t, 8, mysqlStock(t, e, id))
+	require.Equal(t, "8", *redisGet(t, stockKey))
+	require.Equal(t, "2", *redisGet(t, countKey))
 }
 
 func TestSeckillTimeoutTransactionRollsBackWhenActivityRestoreFails(t *testing.T) {

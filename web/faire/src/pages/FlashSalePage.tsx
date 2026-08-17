@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { getFlashSalePurchase, getFlashSales, purchaseFlashSale } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import type { FlashSaleActivity, FlashSalePurchaseResponse } from "../api/types";
-import { formatMoney, formatSpecs } from "../lib/format";
+import { formatMoney, formatSpecs, makeClientRequestID } from "../lib/format";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, ProductVisual, Spinner } from "../components/ui";
 
 const POLL_INTERVAL_MS = 1500;
@@ -131,8 +131,8 @@ export function FlashSalePage() {
   });
   const serverClock = useServerClock(listQuery.data?.server_time);
 
-  const purchaseMutation = useMutation({
-    mutationFn: purchaseFlashSale,
+	const purchaseMutation = useMutation({
+		mutationFn: (activityId: number) => purchaseFlashSale(activityId, makeClientRequestID()),
     onSuccess: (result, activityId) => {
       setPurchases((prev) => ({ ...prev, [activityId]: result }));
       setErrors((prev) => {

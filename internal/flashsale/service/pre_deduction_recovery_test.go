@@ -32,8 +32,19 @@ func newFakePreDeductions() *fakePreDeductions {
 func (f *fakePreDeductions) Create(_ context.Context, p *model.PreDeduction) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if p.ClientRequestID != "" {
+		for _, existing := range f.byID {
+			if existing.UserID == p.UserID && existing.ActivityID == p.ActivityID &&
+				existing.ClientRequestID == p.ClientRequestID {
+				return repository.ErrPreDeductionDuplicate
+			}
+		}
+	}
 	f.nextID++
 	p.ID = f.nextID
+	if p.PurchaseSlot == 0 {
+		p.PurchaseSlot = p.ID
+	}
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = time.Now()
 		p.UpdatedAt = p.CreatedAt
@@ -41,6 +52,18 @@ func (f *fakePreDeductions) Create(_ context.Context, p *model.PreDeduction) err
 	copy := *p
 	f.byID[p.ID] = &copy
 	return nil
+}
+
+func (f *fakePreDeductions) GetByRequestID(_ context.Context, userID, activityID int64, requestID string) (*model.PreDeduction, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.byID {
+		if p.UserID == userID && p.ActivityID == activityID && p.ClientRequestID == requestID {
+			copy := *p
+			return &copy, nil
+		}
+	}
+	return nil, nil
 }
 
 func (f *fakePreDeductions) GetByID(_ context.Context, id int64) (*model.PreDeduction, error) {
@@ -63,12 +86,16 @@ func (f *fakePreDeductions) EnsureLegacyPendingOrder(_ context.Context, seed *mo
 	defer f.mu.Unlock()
 	for _, pd := range f.byID {
 		if pd.OrderNumber() == seed.OrderNumber() {
+			if pd.PurchaseSlot == 0 {
+				pd.PurchaseSlot = pd.ID
+			}
 			copy := *pd
 			return &copy, nil
 		}
 	}
 	f.nextID++
 	seed.ID = f.nextID
+	seed.PurchaseSlot = seed.ID
 	seed.Status = model.PreDeductionStatusPendingOrder
 	seed.Legacy = true
 	seed.CreatedAt = time.Now()
@@ -86,15 +113,22 @@ func (f *fakePreDeductions) ReservationTargets(_ context.Context, activityID, us
 		if pd.ActivityID != activityID {
 			continue
 		}
-		if pd.Status == model.PreDeductionStatusPendingPublish || pd.Status == model.PreDeductionStatusPendingOrder {
+		if pd.Status == model.PreDeductionStatusPendingPublish || pd.Status == model.PreDeductionStatusPendingOrder ||
+			pd.Status == model.PreDeductionStatusPendingRollback {
 			pending += pd.Quantity
 		}
 		if pd.UserID == userID && (pd.Status == model.PreDeductionStatusPendingPublish ||
-			pd.Status == model.PreDeductionStatusPendingOrder || pd.Status == model.PreDeductionStatusOrdered) {
-			user += pd.Quantity
+			pd.Status == model.PreDeductionStatusPendingOrder || pd.Status == model.PreDeductionStatusOrdered ||
+			pd.Status == model.PreDeductionStatusPendingRollback) {
+			user++
 		}
 	}
 	return pending, user, nil
+}
+
+func (f *fakePreDeductions) PendingReservationQuantityForUpdate(ctx context.Context, _ *gorm.DB, activityID int64) (int, error) {
+	pending, _, err := f.ReservationTargets(ctx, activityID, 0)
+	return pending, err
 }
 
 func (f *fakePreDeductions) ListRecoverable(context.Context, int) ([]model.PreDeduction, error) {
@@ -109,6 +143,20 @@ func (f *fakePreDeductions) ListRecoverable(context.Context, int) ([]model.PreDe
 		}
 	}
 	return out, nil
+}
+
+func (f *fakePreDeductions) ListRecoverableByActivity(ctx context.Context, activityID int64) ([]model.PreDeduction, error) {
+	rows, err := f.ListRecoverable(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	filtered := rows[:0]
+	for i := range rows {
+		if rows[i].ActivityID == activityID {
+			filtered = append(filtered, rows[i])
+		}
+	}
+	return filtered, nil
 }
 
 func (f *fakePreDeductions) ListOrdered(context.Context, int) ([]model.PreDeduction, error) {
@@ -258,7 +306,7 @@ func newRecoveryFixture(pub *fakePublisher, nos OrderNoGenerator) *recoveryFixtu
 	pd := newFakePreDeductions()
 	base.pub = pub
 	base.svc = asTestFlashSaleService(New(
-		repository.Store{Activities: base.acts, PreDeductions: pd}, base.products, base.cache,
+		repository.Store{Activities: base.acts, PreDeductions: pd, Tx: base.acts}, base.products, base.cache,
 		limiter.RedisCounterConfig{}, pub, nos, metrics.New().Business(),
 	))
 	return &recoveryFixture{svc: base.svc, base: base, pd: pd}
@@ -275,7 +323,7 @@ func TestSeckillPersistsLifecycleAndPublishesStableIdentity(t *testing.T) {
 	fx := newRecoveryFixture(nil, nil)
 	a := fx.publishedActivity(t)
 
-	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 	require.NotZero(t, result.PreDeductionID)
 	require.NotEmpty(t, result.OrderNo)
@@ -296,7 +344,7 @@ func TestRecoverAfterMessageAcceptedButConfirmLostAndRestart(t *testing.T) {
 	fx := newRecoveryFixture(pub, nil)
 	a := fx.publishedActivity(t)
 
-	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err, "durable pre-deduction remains a queued request")
 	require.Equal(t, model.PreDeductionStatusPendingPublish, result.Status)
 	firstOrderNo := result.OrderNo
@@ -307,12 +355,12 @@ func TestRecoverAfterMessageAcceptedButConfirmLostAndRestart(t *testing.T) {
 	// already durably records pending_publish.
 	delete(fx.base.cache.stock, stockKey(a.ID))
 	delete(fx.base.cache.count, countKey(a.ID, 42))
-	delete(fx.base.cache.idem, idemKey(a.ID, 42))
-	delete(fx.base.cache.idemToken, idemKey(a.ID, 42))
+	delete(fx.base.cache.idem, slotIdemKey(a.ID, 42, result.PreDeductionID))
+	delete(fx.base.cache.idemToken, slotIdemKey(a.ID, 42, result.PreDeductionID))
 	delete(fx.base.cache.reservations, reservationKey(result.PreDeductionID))
 
 	pub.err = nil
-	restarted := New(repository.Store{Activities: fx.base.acts, PreDeductions: fx.pd}, fx.base.products, fx.base.cache,
+	restarted := New(repository.Store{Activities: fx.base.acts, PreDeductions: fx.pd, Tx: fx.base.acts}, fx.base.products, fx.base.cache,
 		limiter.RedisCounterConfig{}, pub, &fakeNos{}, metrics.New().Business())
 	stats, err := restarted.RecoverPreDeductions(context.Background())
 	require.NoError(t, err)
@@ -333,12 +381,12 @@ func TestRecoverPreDeductionAfterOrderNumberFailure(t *testing.T) {
 	fx := newRecoveryFixture(nil, failingNos{})
 	a := fx.publishedActivity(t)
 
-	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 	require.Empty(t, result.OrderNo)
 	require.Equal(t, model.PreDeductionStatusPendingPublish, result.Status)
 
-	restarted := New(repository.Store{Activities: fx.base.acts, PreDeductions: fx.pd}, fx.base.products, fx.base.cache,
+	restarted := New(repository.Store{Activities: fx.base.acts, PreDeductions: fx.pd, Tx: fx.base.acts}, fx.base.products, fx.base.cache,
 		limiter.RedisCounterConfig{}, fx.base.pub, &fakeNos{}, metrics.New().Business())
 	stats, err := restarted.RecoverPreDeductions(context.Background())
 	require.NoError(t, err)
@@ -350,7 +398,7 @@ func TestSeckillReturnsLifecycleWhenPreDeductTransitionFails(t *testing.T) {
 	a := fx.publishedActivity(t)
 	fx.pd.markPreDeductedError = errors.New("mysql transition failed")
 
-	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 	require.NotZero(t, result.PreDeductionID)
 	require.Equal(t, model.PreDeductionStatusPreparing, result.Status)
@@ -360,7 +408,7 @@ func TestSeckillReturnsLifecycleWhenPreDeductTransitionFails(t *testing.T) {
 func TestRecoverPreDeductionRetriesFailedCancellationCompensation(t *testing.T) {
 	fx := newRecoveryFixture(nil, nil)
 	a := fx.publishedActivity(t)
-	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), nil, result.PreDeductionID, "order cancelled"))
 
@@ -374,7 +422,7 @@ func TestRecoverPreDeductionRetriesFailedCancellationCompensation(t *testing.T) 
 	require.Equal(t, 1, pd.RollbackAttempts)
 
 	fx.base.cache.err = nil
-	restarted := New(repository.Store{Activities: fx.base.acts, PreDeductions: fx.pd}, fx.base.products, fx.base.cache,
+	restarted := New(repository.Store{Activities: fx.base.acts, PreDeductions: fx.pd, Tx: fx.base.acts}, fx.base.products, fx.base.cache,
 		limiter.RedisCounterConfig{}, fx.base.pub, &fakeNos{}, metrics.New().Business())
 	stats, err = restarted.RecoverPreDeductions(context.Background())
 	require.NoError(t, err)
@@ -384,14 +432,14 @@ func TestRecoverPreDeductionRetriesFailedCancellationCompensation(t *testing.T) 
 	require.Equal(t, model.PreDeductionStatusRolledBack, pd.Status)
 	require.Equal(t, 100, fx.base.cache.stock[stockKey(a.ID)])
 	require.Zero(t, fx.base.cache.count[countKey(a.ID, 42)])
-	require.False(t, fx.base.cache.idem[idemKey(a.ID, 42)])
+	require.False(t, fx.base.cache.idem[slotIdemKey(a.ID, 42, result.PreDeductionID)])
 }
 
 func TestPublishRecoveryExhaustionCompletesRollback(t *testing.T) {
 	pub := &fakePublisher{err: errors.New("rabbitmq unavailable")}
 	fx := newRecoveryFixture(pub, nil)
 	a := fx.publishedActivity(t)
-	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 
 	for i := 1; i < maxPublishAttempts; i++ {
@@ -414,7 +462,7 @@ func TestPublishRecoveryExhaustionCompletesRollback(t *testing.T) {
 func TestPendingOrderRepublishFailureDoesNotRollbackConfirmedMessage(t *testing.T) {
 	fx := newRecoveryFixture(nil, nil)
 	a := fx.publishedActivity(t)
-	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 	require.Equal(t, model.PreDeductionStatusPendingOrder, result.Status)
 	fx.base.pub.err = errors.New("rabbitmq unavailable")
@@ -432,7 +480,7 @@ func TestPendingOrderRepublishFailureDoesNotRollbackConfirmedMessage(t *testing.
 func TestRecoveryStopsWhenContextIsCancelled(t *testing.T) {
 	fx := newRecoveryFixture(nil, nil)
 	a := fx.publishedActivity(t)
-	_, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	_, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -444,13 +492,13 @@ func TestRecoveryStopsWhenContextIsCancelled(t *testing.T) {
 func TestRollbackRecoversWhenUnflushedRedisMutationIsLost(t *testing.T) {
 	fx := newRecoveryFixture(nil, nil)
 	a := fx.publishedActivity(t)
-	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), nil, result.PreDeductionID, "order cancelled"))
 	delete(fx.base.cache.stock, stockKey(a.ID))
 	delete(fx.base.cache.count, countKey(a.ID, 42))
-	delete(fx.base.cache.idem, idemKey(a.ID, 42))
-	delete(fx.base.cache.idemToken, idemKey(a.ID, 42))
+	delete(fx.base.cache.idem, slotIdemKey(a.ID, 42, result.PreDeductionID))
+	delete(fx.base.cache.idemToken, slotIdemKey(a.ID, 42, result.PreDeductionID))
 	delete(fx.base.cache.reservations, reservationKey(result.PreDeductionID))
 
 	stats, err := fx.svc.RecoverPreDeductions(context.Background())
@@ -466,7 +514,7 @@ func TestRollbackRecoversWhenUnflushedRedisMutationIsLost(t *testing.T) {
 func TestRollbackDoesNotAdvanceWhenAOFConfirmationFails(t *testing.T) {
 	fx := newRecoveryFixture(nil, nil)
 	a := fx.publishedActivity(t)
-	result, err := fx.svc.Seckill(context.Background(), 42, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), nil, result.PreDeductionID, "order cancelled"))
 
@@ -482,8 +530,8 @@ func TestRollbackDoesNotAdvanceWhenAOFConfirmationFails(t *testing.T) {
 	// earlier deducted reservation. Recovery must apply it again and restart the wait.
 	fx.base.cache.stock[stockKey(a.ID)] = 99
 	fx.base.cache.count[countKey(a.ID, 42)] = 1
-	fx.base.cache.idem[idemKey(a.ID, 42)] = true
-	fx.base.cache.idemToken[idemKey(a.ID, 42)] = pd.ReservationToken()
+	fx.base.cache.idem[slotIdemKey(a.ID, 42, pd.PurchaseSlot)] = true
+	fx.base.cache.idemToken[slotIdemKey(a.ID, 42, pd.PurchaseSlot)] = pd.ReservationToken()
 	fx.base.cache.reservations[reservationKey(pd.ID)] = pd.ReservationToken()
 	fx.base.cache.aofErr = nil
 	_, err = fx.svc.RecoverPreDeductions(context.Background())
@@ -503,7 +551,7 @@ func TestRecoveryDoesNotRollbackLivePreparingRequest(t *testing.T) {
 	}
 	require.NoError(t, fx.pd.Create(context.Background(), pd))
 	_, err := fx.base.cache.AcquireIdempotency(
-		context.Background(), idemKey(a.ID, 42), pd.ReservationToken(), idemTTL,
+		context.Background(), slotIdemKey(a.ID, 42, pd.PurchaseSlot), pd.ReservationToken(), idemTTL,
 	)
 	require.NoError(t, err)
 
@@ -511,7 +559,7 @@ func TestRecoveryDoesNotRollbackLivePreparingRequest(t *testing.T) {
 	stored, err := fx.pd.GetByID(context.Background(), pd.ID)
 	require.NoError(t, err)
 	require.Equal(t, model.PreDeductionStatusPreparing, stored.Status)
-	require.True(t, fx.base.cache.idem[idemKey(a.ID, 42)], "live request must keep its reservation")
+	require.True(t, fx.base.cache.idem[slotIdemKey(a.ID, 42, pd.PurchaseSlot)], "live request must keep its reservation")
 
 	fx.pd.mu.Lock()
 	fx.pd.byID[pd.ID].UpdatedAt = time.Now().Add(-preparingRecoveryDelay)

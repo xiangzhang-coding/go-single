@@ -63,6 +63,18 @@ type FlashSaleWarmParams struct {
 	TTL      time.Duration
 }
 
+type FlashSaleDecreaseParams struct {
+	StockKey string
+	Delta    int
+}
+
+type FlashSalePauseParams struct {
+	StockKey string
+	PauseKey string
+	Token    string
+	TTL      time.Duration
+}
+
 // FlashSalePreDeductResult is the complete outcome set of an atomic pre-deduct.
 type FlashSalePreDeductResult uint8
 
@@ -73,11 +85,13 @@ const (
 	FlashSaleNotInWindow
 	FlashSaleLimitReached
 	FlashSaleOffline
+	FlashSalePaused
 )
 
 type FlashSalePreDeductParams struct {
 	StockKey         string
 	CountKey         string
+	PauseKey         string
 	ReservationKey   string
 	ReservationToken string
 	ReservationTTL   time.Duration
@@ -157,6 +171,9 @@ type FlashSaleAdoptLegacyReservationParams struct {
 // FlashSaleStore owns the scripts that mutate flash-sale Redis state.
 type FlashSaleStore interface {
 	WarmFlashSaleStock(ctx context.Context, p FlashSaleWarmParams) (FlashSaleWarmResult, error)
+	DecreaseFlashSaleStockDurably(ctx context.Context, p FlashSaleDecreaseParams, timeout time.Duration) error
+	PauseFlashSaleStockDurably(ctx context.Context, p FlashSalePauseParams, timeout time.Duration) (int, error)
+	ReleaseFlashSalePauseDurably(ctx context.Context, pauseKey, token string, timeout time.Duration) error
 	PreDeductFlashSale(ctx context.Context, p FlashSalePreDeductParams) (FlashSalePreDeductResult, error)
 	PreDeductFlashSaleDurably(ctx context.Context, p FlashSalePreDeductParams, timeout time.Duration) (FlashSalePreDeductResult, error)
 	EnsureFlashSaleReservation(ctx context.Context, p FlashSaleEnsureReservationParams) (FlashSaleEnsureReservationResult, error)
@@ -226,6 +243,40 @@ end
 return 0
 `
 
+const decreaseFlashSaleStockScript = `
+local current = tonumber(redis.call('GET', KEYS[1]) or '-1')
+local delta = tonumber(ARGV[1])
+if current < 0 then
+    return redis.error_reply('flash-sale stock is missing during decrease')
+end
+if delta == nil or delta <= 0 then
+    return redis.error_reply('flash-sale stock decrease must be positive')
+end
+if current < delta then
+    return redis.error_reply('flash-sale stock decrease exceeds sellable stock')
+end
+redis.call('DECRBY', KEYS[1], delta)
+return 1
+`
+
+const pauseFlashSaleStockScript = `
+local stock = tonumber(redis.call('GET', KEYS[1]) or '-1')
+if stock < 0 then
+    return redis.error_reply('flash-sale stock is missing during pause')
+end
+if not redis.call('SET', KEYS[2], ARGV[2], 'NX', 'EX', ARGV[1]) then
+    return redis.error_reply('flash-sale stock is already paused')
+end
+return stock
+`
+
+const releaseFlashSalePauseScript = `
+if ARGV[1] == '' or redis.call('GET', KEYS[1]) == ARGV[1] then
+    redis.call('DEL', KEYS[1])
+end
+return 1
+`
+
 const preDeductFlashSaleScript = `
 if KEYS[3] ~= nil and KEYS[3] ~= '' then
     local reservation = redis.call('GET', KEYS[3])
@@ -251,6 +302,9 @@ if KEYS[3] ~= nil and KEYS[3] ~= '' then
     if reservation ~= false then
         return redis.error_reply('flash-sale reservation token mismatch')
     end
+end
+if KEYS[5] ~= nil and KEYS[5] ~= '' and redis.call('EXISTS', KEYS[5]) == 1 then
+    return -4
 end
 if ARGV[4] ~= '1' then
     return -3
@@ -311,6 +365,10 @@ if quantity == nil or quantity <= 0 then
     return redis.error_reply('flash-sale restore quantity is not a positive safe integer')
 end
 local scoped = KEYS[4] ~= nil and KEYS[4] ~= ''
+local count_delta = quantity
+if scoped then
+    count_delta = 1
+end
 local should_restore = not scoped
 if scoped then
     local reservation = redis.call('GET', KEYS[4])
@@ -353,7 +411,7 @@ if stock_exists then
     redis.call('INCRBY', KEYS[1], ARGV[1])
 end
 if count_exists then
-    redis.call('DECRBY', KEYS[2], ARGV[1])
+    redis.call('DECRBY', KEYS[2], count_delta)
 end
 if redis.call('GET', KEYS[3]) == ARGV[2] or not scoped then
     redis.call('DEL', KEYS[3])
@@ -403,7 +461,7 @@ if stock < quantity then
     return redis.error_reply('flash-sale stock is insufficient during reservation recovery')
 end
 redis.call('DECRBY', KEYS[1], quantity)
-redis.call('INCRBY', KEYS[2], quantity)
+redis.call('INCR', KEYS[2])
 redis.call('SET', KEYS[4], ARGV[1])
 if idem == false then
     redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[3])
@@ -441,7 +499,7 @@ if reservation == ARGV[1] then
     redis.call('SET', KEYS[4], ARGV[1])
     return 1
 end
-redis.call('INCRBY', KEYS[2], ARGV[2])
+redis.call('INCR', KEYS[2])
 redis.call('SET', KEYS[4], ARGV[1])
 if idem == false then
     redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[3])
@@ -568,6 +626,37 @@ func (r *redisCache) WarmFlashSaleStock(ctx context.Context, p FlashSaleWarmPara
 	}
 }
 
+func (r *redisCache) DecreaseFlashSaleStockDurably(ctx context.Context, p FlashSaleDecreaseParams, timeout time.Duration) error {
+	if p.StockKey == "" || p.Delta <= 0 || timeout <= 0 {
+		return fmt.Errorf("durable flash-sale stock decrease requires key, positive delta, and timeout")
+	}
+	code, err := r.evalIntAndWaitAOF(ctx, timeout, decreaseFlashSaleStockScript, []string{p.StockKey}, p.Delta)
+	if err != nil {
+		return err
+	}
+	if code != 1 {
+		return fmt.Errorf("unexpected flash-sale stock decrease result: %d", code)
+	}
+	return nil
+}
+
+func (r *redisCache) PauseFlashSaleStockDurably(ctx context.Context, p FlashSalePauseParams, timeout time.Duration) (int, error) {
+	if p.StockKey == "" || p.PauseKey == "" || p.Token == "" || p.TTL < time.Second || timeout <= 0 {
+		return 0, fmt.Errorf("durable flash-sale pause requires keys, TTL, and timeout")
+	}
+	stock, err := r.evalIntAndWaitAOF(ctx, timeout, pauseFlashSaleStockScript,
+		[]string{p.StockKey, p.PauseKey}, int64(p.TTL.Seconds()), p.Token)
+	return int(stock), err
+}
+
+func (r *redisCache) ReleaseFlashSalePauseDurably(ctx context.Context, pauseKey, token string, timeout time.Duration) error {
+	if pauseKey == "" || timeout <= 0 {
+		return fmt.Errorf("durable flash-sale pause release requires key and timeout")
+	}
+	_, err := r.evalIntAndWaitAOF(ctx, timeout, releaseFlashSalePauseScript, []string{pauseKey}, token)
+	return err
+}
+
 func (r *redisCache) PreDeductFlashSale(ctx context.Context, p FlashSalePreDeductParams) (FlashSalePreDeductResult, error) {
 	return r.preDeductFlashSale(ctx, p, 0)
 }
@@ -580,7 +669,7 @@ func (r *redisCache) PreDeductFlashSaleDurably(ctx context.Context, p FlashSaleP
 }
 
 func (r *redisCache) preDeductFlashSale(ctx context.Context, p FlashSalePreDeductParams, aofTimeout time.Duration) (FlashSalePreDeductResult, error) {
-	keys := []string{p.StockKey, p.CountKey}
+	keys := []string{p.StockKey, p.CountKey, "", "", p.PauseKey}
 	if p.ReservationKey != "" {
 		if p.ReservationToken == "" {
 			return 0, fmt.Errorf("flash-sale reservation token is required")
@@ -588,12 +677,12 @@ func (r *redisCache) preDeductFlashSale(ctx context.Context, p FlashSalePreDeduc
 		if p.ReservationTTL < 0 {
 			return 0, fmt.Errorf("flash-sale reservation TTL cannot be negative")
 		}
-		keys = append(keys, p.ReservationKey)
+		keys[2] = p.ReservationKey
 		if p.IdempotencyKey != "" {
 			if p.IdempotencyTTL < time.Second {
 				return 0, fmt.Errorf("flash-sale idempotency TTL must be at least one second")
 			}
-			keys = append(keys, p.IdempotencyKey)
+			keys[3] = p.IdempotencyKey
 		}
 	}
 	onSale := 0
@@ -619,6 +708,8 @@ func (r *redisCache) preDeductFlashSale(ctx context.Context, p FlashSalePreDeduc
 		return FlashSaleLimitReached, nil
 	case -3:
 		return FlashSaleOffline, nil
+	case -4:
+		return FlashSalePaused, nil
 	default:
 		return 0, fmt.Errorf("unexpected flash-sale pre-deduct result: %d", code)
 	}

@@ -19,12 +19,13 @@ sidebar_position: 5
 | order_type | VARCHAR(16) | `normal` / `seckill`（秒杀订单不使用优惠券） |
 | status | VARCHAR(16) | 状态机（见下） |
 | activity_id | BIGINT UNSIGNED NULL | 秒杀活动（秒杀订单专属，FK RESTRICT） |
+| purchase_slot | BIGINT UNSIGNED NULL | 秒杀预扣分配的稳定购买槽位 |
 | total_amount / discount_amount / pay_amount | BIGINT UNSIGNED | 总额 − 券额 = 应付（分） |
 | coupon_id | BIGINT UNSIGNED NULL | 核销的用户券（FK RESTRICT） |
 | receiver / phone / province / city / district / detail | VARCHAR | **地址快照**（下单时从地址簿固化，后续改地址不影响历史订单） |
 | paid_at / shipped_at / completed_at / cancelled_at | DATETIME(3) NULL | 各状态时间戳 |
 | expire_at | DATETIME(3) | 超时取消时间（普通 **15min**；秒杀 **10min**） |
-| user_activity_key | VARCHAR(64) NULL UNIQUE | **秒杀去重键**（T13）：落单写 `user_id:activity_id`，取消同事务置 NULL——MySQL 唯一索引允许多个 NULL，取消后不占位、允许再次抢购；非取消订单仍唯一挡重复落单 |
+| user_activity_key | VARCHAR(64) NULL UNIQUE | **秒杀槽位去重键**：落单写 `user_id:activity_id:purchase_slot`，取消同事务置 NULL；不同槽位可并存，同槽消息重投只命中一单 |
 
 状态机（`model.CanTransition`，仅合法跃迁，非法一律拒绝）：
 
@@ -104,7 +105,7 @@ CancelExpired（cron 每分钟 order-timeout-cancel，批量上限 500）
 flashsale.SeckillTimeout（cron 每分钟 seckill-timeout-cancel）
   → order.ListExpiredSeckill 扫描待支付秒杀订单
   → 事务：order.CancelSeckill 条件更新取消 + flashsale 活动仓储回补 MySQL 库存
-  → 事务提交后回补 Redis（库存 INCR + 用户计数 DECR + 释放幂等键，允许再次抢购；
+  → 事务提交后按订单槽位回补 Redis（库存按数量 INCR + 用户槽位计数 DECR 1 + 释放对应槽位键；
     best-effort，失败由对账 cron 兜底）
 ```
 

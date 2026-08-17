@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -65,6 +66,7 @@ type testEnv struct {
 	userHandler    *userhandler.Handler
 	productHandler *producthandler.Handler
 	flashsaleSvc   flashsaleTestService
+	publisher      *fakePublisher
 }
 
 type flashsaleTestService interface {
@@ -158,10 +160,12 @@ func buildEnv() (*testEnv, error) {
 	// MQ 用 fake 发布端口（记录消息不投递）：T11 抢购路径测试无需真实 RabbitMQ；
 	// 异步落单闭环（T12）走真实 MQ，见 seckill_order_integration_test.go。
 	pub := &fakePublisher{}
+	activityStore := flashsalerepo.NewGORMActivity(gdb)
 	flashsaleSvc := flashsalesvc.New(
 		flashsalerepo.Store{
-			Activities:    flashsalerepo.NewGORMActivity(gdb),
+			Activities:    activityStore,
 			PreDeductions: flashsalerepo.NewGORMPreDeduction(gdb),
+			Tx:            activityStore,
 		},
 		productSvc,
 		cacheClient,
@@ -188,6 +192,7 @@ func buildEnv() (*testEnv, error) {
 		userHandler:    userHandler,
 		productHandler: productHandler,
 		flashsaleSvc:   flashsaleSvc,
+		publisher:      pub,
 	}, nil
 }
 
@@ -200,6 +205,34 @@ type fakePublisher struct {
 	queue string
 	body  []byte
 	err   error
+}
+
+type failingDecreaseCache struct {
+	cache.Client
+}
+
+func (failingDecreaseCache) DecreaseFlashSaleStockDurably(context.Context, cache.FlashSaleDecreaseParams, time.Duration) error {
+	return errors.New("injected Redis stock sync failure")
+}
+
+type blockingPauseCache struct {
+	cache.Client
+	paused  chan struct{}
+	proceed chan struct{}
+}
+
+func (c blockingPauseCache) PauseFlashSaleStockDurably(ctx context.Context, p cache.FlashSalePauseParams, timeout time.Duration) (int, error) {
+	stock, err := c.Client.PauseFlashSaleStockDurably(ctx, p, timeout)
+	if err != nil {
+		return 0, err
+	}
+	close(c.paused)
+	select {
+	case <-c.proceed:
+		return stock, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
 }
 
 func (f *fakePublisher) Publish(_ context.Context, queue string, body []byte) error {
@@ -227,10 +260,12 @@ func (f *fakeNos) Next() (int64, error) {
 // handler（共享同一 gdb/verifier），供限流与抢购接口专项测试使用。
 func (e *testEnv) newFlashsaleRouter(t *testing.T, limitCfg limiter.TokenBucketConfig, rlCfg limiter.RedisCounterConfig) http.Handler {
 	t.Helper()
+	activityStore := flashsalerepo.NewGORMActivity(e.gdb)
 	svc := flashsalesvc.New(
 		flashsalerepo.Store{
-			Activities:    flashsalerepo.NewGORMActivity(e.gdb),
+			Activities:    activityStore,
 			PreDeductions: flashsalerepo.NewGORMPreDeduction(e.gdb),
+			Tx:            activityStore,
 		},
 		e.productSvc,
 		e.cacheClient,
@@ -299,9 +334,14 @@ func doJSONOn(t *testing.T, router http.Handler, method, path, body, token strin
 }
 
 // purchase 在指定路由上发起抢购请求。
-func purchase(t *testing.T, router http.Handler, activityID int64, token string) (*httptest.ResponseRecorder, map[string]any) {
+func purchase(t *testing.T, router http.Handler, activityID int64, token string, requestIDs ...string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
-	return doJSONOn(t, router, http.MethodPost, fmt.Sprintf("/api/flashsales/%d/purchase", activityID), "", token)
+	requestID := uniqueName("purchase")
+	if len(requestIDs) > 0 {
+		requestID = requestIDs[0]
+	}
+	return doJSONOn(t, router, http.MethodPost, fmt.Sprintf("/api/flashsales/%d/purchase", activityID),
+		fmt.Sprintf(`{"client_request_id":%q}`, requestID), token)
 }
 
 func adminToken(t *testing.T, env *testEnv) string {
@@ -344,8 +384,12 @@ func seedSKU(t *testing.T, env *testEnv, admin string) int64 {
 
 // activityBody 构造活动请求体；偏移单位均为分钟。
 func activityBody(skuID int64, title string, price int64, stock, perUserLimit int, fromOffset, untilOffset time.Duration) string {
-	from := time.Now().Add(fromOffset).Format(time.RFC3339)
-	until := time.Now().Add(untilOffset).Format(time.RFC3339)
+	return activityBodyAt(skuID, title, price, stock, perUserLimit, time.Now().Add(fromOffset), time.Now().Add(untilOffset))
+}
+
+func activityBodyAt(skuID int64, title string, price int64, stock, perUserLimit int, startAt, endAt time.Time) string {
+	from := startAt.Format(time.RFC3339Nano)
+	until := endAt.Format(time.RFC3339Nano)
 	return fmt.Sprintf(`{"sku_id":%d,"title":%q,"price":%d,"stock":%d,"per_user_limit":%d,"start_at":%q,"end_at":%q}`,
 		skuID, title, price, stock, perUserLimit, from, until)
 }
@@ -366,8 +410,8 @@ func stockKey(id int64) string { return fmt.Sprintf("flashsale:stock:%d", id) }
 func countKey(id, userID int64) string {
 	return fmt.Sprintf("flashsale:count:%d:%d", id, userID)
 }
-func idemKey(id, userID int64) string {
-	return fmt.Sprintf("flashsale:idem:%d:%d", id, userID)
+func slotIdemKey(id, userID, purchaseSlot int64) string {
+	return fmt.Sprintf("flashsale:idem:%d:%d:%d", id, userID, purchaseSlot)
 }
 func rlKey(userID int64) string { return fmt.Sprintf("flashsale:rl:%d", userID) }
 
@@ -449,8 +493,10 @@ func TestFlashSaleLifecycleClosedLoop(t *testing.T) {
 	require.Equal(t, 120, redisStock(t, env, id))
 
 	// 编辑已上架活动 → 204（覆盖已上架场景）。
+	current, err := flashsalerepo.NewGORMActivity(env.gdb).GetByID(context.Background(), id)
+	require.NoError(t, err)
 	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/flashsales/%d", id),
-		activityBody(skuID, uniqueName("再编辑"), 8800, 100, 2, -time.Minute, time.Hour), admin)
+		activityBodyAt(skuID, uniqueName("再编辑"), 8800, 100, 2, current.StartAt, current.EndAt), admin)
 	require.Equal(t, http.StatusNoContent, w.Code)
 	require.Equal(t, 100, redisStock(t, env, id))
 }
@@ -492,10 +538,12 @@ func TestInProgressStockOnlyDecreases(t *testing.T) {
 	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 4, id))
 	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 5, id))
 	require.Equal(t, 95, redisStock(t, env, id))
+	current, err := flashsalerepo.NewGORMActivity(env.gdb).GetByID(context.Background(), id)
+	require.NoError(t, err)
 
 	// 调高库存 → 409；DB 与 Redis 均不变。
 	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/flashsales/%d", id),
-		activityBody(skuID, "调高", 9900, 200, 1, -time.Minute, time.Hour), admin)
+		activityBodyAt(skuID, "调高", 9900, 200, 1, current.StartAt, current.EndAt), admin)
 	require.Equal(t, http.StatusConflict, w.Code)
 	require.Equal(t, 95, redisStock(t, env, id))
 	var dbStock int
@@ -504,11 +552,90 @@ func TestInProgressStockOnlyDecreases(t *testing.T) {
 
 	// 调低库存 → 204；DB 与 Redis 同步降低。
 	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/flashsales/%d", id),
-		activityBody(skuID, "调低", 9900, 90, 1, -time.Minute, time.Hour), admin)
+		activityBodyAt(skuID, "调低", 9900, 90, 1, current.StartAt, current.EndAt), admin)
 	require.Equal(t, http.StatusNoContent, w.Code)
-	require.Equal(t, 90, redisStock(t, env, id))
+	require.Equal(t, 85, redisStock(t, env, id), "Redis preserves the five accepted pre-deductions")
 	require.NoError(t, env.gdb.Table("flashsale_activities").Select("stock").Where("id = ?", id).Scan(&dbStock).Error)
 	require.Equal(t, 90, dbStock)
+}
+
+func TestInProgressEditSyncFailureFailsClosed(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	skuID := seedSKU(t, env, admin)
+	id := createActivity(t, env, admin, skuID, 100, 1, -time.Minute, time.Hour)
+	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", id), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+
+	activities := flashsalerepo.NewGORMActivity(env.gdb)
+	current, err := activities.GetByID(context.Background(), id)
+	require.NoError(t, err)
+	svc := flashsalesvc.New(
+		flashsalerepo.Store{Activities: activities, PreDeductions: flashsalerepo.NewGORMPreDeduction(env.gdb), Tx: activities},
+		env.productSvc, failingDecreaseCache{Client: env.cacheClient}, limiter.RedisCounterConfig{},
+		&fakePublisher{}, &fakeNos{next: time.Now().UnixNano()}, metrics.New().Business(),
+	)
+	h := flashsalehandler.New(svc, env.verifier)
+	router := gin.New()
+	h.RegisterRoutes(router.Group("/api"), allowAll)
+
+	w, _ = doJSONOn(t, router, http.MethodPut, fmt.Sprintf("/api/admin/flashsales/%d", id),
+		activityBodyAt(skuID, "同步失败", 9900, 90, 1, current.StartAt, current.EndAt), admin)
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	var stored struct {
+		Stock  int
+		Status string
+	}
+	require.NoError(t, env.gdb.Table("flashsale_activities").Select("stock", "status").Where("id = ?", id).Scan(&stored).Error)
+	require.Equal(t, 90, stored.Stock, "MySQL stock commits offline before Redis synchronization")
+	require.Equal(t, "off_sale", stored.Status, "sync failure must persistently fail closed")
+	_, err = env.redis.Get(context.Background(), stockKey(id)).Result()
+	require.ErrorIs(t, err, redis.Nil, "stale sellable stock must be removed")
+
+	user := registerAndToken(t, env, uniqueName("syncfail"))
+	w, _ = purchase(t, router, id, user)
+	require.Equal(t, http.StatusConflict, w.Code, "failed synchronization must not continue selling")
+}
+
+func TestInProgressEditRecomputesDeltaAfterConcurrentConsumer(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	skuID := seedSKU(t, env, admin)
+	id := createActivity(t, env, admin, skuID, 100, 1, -time.Minute, time.Hour)
+	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", id), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	require.NoError(t, env.flashsaleSvc.PreDeduct(context.Background(), 987654, id))
+	require.Equal(t, 99, redisStock(t, env, id))
+
+	activities := flashsalerepo.NewGORMActivity(env.gdb)
+	paused := make(chan struct{})
+	proceed := make(chan struct{})
+	svc := flashsalesvc.New(
+		flashsalerepo.Store{Activities: activities, PreDeductions: flashsalerepo.NewGORMPreDeduction(env.gdb), Tx: activities},
+		env.productSvc, blockingPauseCache{Client: env.cacheClient, paused: paused, proceed: proceed},
+		limiter.RedisCounterConfig{}, &fakePublisher{}, &fakeNos{next: time.Now().UnixNano()}, metrics.New().Business(),
+	)
+	current, err := activities.GetByID(context.Background(), id)
+	require.NoError(t, err)
+	editDone := make(chan error, 1)
+	go func() {
+		editDone <- svc.UpdateActivity(context.Background(), id, flashsalesvc.ActivityParams{
+			SKUID: current.SKUID, Title: current.Title, Price: current.Price, Stock: 90,
+			PerUserLimit: current.PerUserLimit, StartAt: current.StartAt, EndAt: current.EndAt,
+		})
+	}()
+	<-paused
+	require.NoError(t, activities.WithinTx(context.Background(), func(tx *gorm.DB) error {
+		ok, deductErr := activities.DeductStock(context.Background(), tx, id, 1)
+		require.True(t, ok)
+		return deductErr
+	}))
+	close(proceed)
+	require.NoError(t, <-editDone)
+	var mysqlRemaining int
+	require.NoError(t, env.gdb.Table("flashsale_activities").Select("stock").Where("id = ?", id).Scan(&mysqlRemaining).Error)
+	require.Equal(t, 90, mysqlRemaining)
+	require.Equal(t, 90, redisStock(t, env, id), "delta must be recomputed from the row-locked MySQL stock")
 }
 
 // 预扣边界（真实 Redis Lua）：抢光 / 超限购 / 窗口外 / 不存在的活动。

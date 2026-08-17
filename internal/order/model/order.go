@@ -19,7 +19,7 @@ const (
 // 订单类型。
 const (
 	OrderTypeNormal  = "normal"  // 普通订单
-	OrderTypeSeckill = "seckill" // 秒杀订单（不使用优惠券，(user_id, activity_id) 唯一）
+	OrderTypeSeckill = "seckill" // 秒杀订单（不使用优惠券，按购买槽位去重）
 )
 
 // 状态机迁移表：仅允许合法跃迁，其余一律拒绝（如 待支付→已完成）。
@@ -40,6 +40,7 @@ type Order struct {
 	OrderType      string     `json:"order_type"`
 	Status         string     `json:"status"`
 	ActivityID     *int64     `json:"activity_id,omitempty" gorm:"column:activity_id"`
+	PurchaseSlot   *int64     `json:"purchase_slot,omitempty" gorm:"column:purchase_slot"`
 	TotalAmount    int64      `json:"total_amount" gorm:"column:total_amount"`
 	DiscountAmount int64      `json:"discount_amount" gorm:"column:discount_amount"`
 	PayAmount      int64      `json:"pay_amount" gorm:"column:pay_amount"`
@@ -57,9 +58,9 @@ type Order struct {
 	ExpireAt       time.Time  `json:"expire_at" gorm:"column:expire_at"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
-	// UserActivityKey 秒杀订单去重键（T13）：落单写 "user_id:activity_id"，
-	// 取消/超时取消同事务置 NULL（MySQL 唯一索引允许多个 NULL——取消后允许
-	// 再次抢购，不再占 (user, activity) 去重位）；非取消订单仍唯一挡重复落单。
+	// UserActivityKey 秒杀订单去重键：落单写 "user_id:activity_id:purchase_slot"，
+	// 取消/超时取消同事务置 NULL（MySQL 唯一索引允许多个 NULL）；同一用户可
+	// 占用活动限购范围内的多个槽位，同槽消息重投仍只命中一单。
 	// 普通订单恒 NULL（JSON 不暴露内部键）。
 	UserActivityKey *string `json:"-" gorm:"column:user_activity_key"`
 }

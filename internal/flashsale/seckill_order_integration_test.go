@@ -217,9 +217,14 @@ func buildMQEnv() (*mqEnv, error) {
 // ---- 请求助手（复用 integration_test.go 的 doJSONOn）----
 
 // purchaseOn 在 mqEnv 路由上抢购，返回响应与 body。
-func purchaseOn(t *testing.T, e *mqEnv, activityID int64, token string) (*httptest.ResponseRecorder, map[string]any) {
+func purchaseOn(t *testing.T, e *mqEnv, activityID int64, token string, requestIDs ...string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
-	return doJSONOn(t, e.router, http.MethodPost, fmt.Sprintf("/api/flashsales/%d/purchase", activityID), "", token)
+	requestID := uniqueName("mq-purchase")
+	if len(requestIDs) > 0 {
+		requestID = requestIDs[0]
+	}
+	return doJSONOn(t, e.router, http.MethodPost, fmt.Sprintf("/api/flashsales/%d/purchase", activityID),
+		fmt.Sprintf(`{"client_request_id":%q}`, requestID), token)
 }
 
 // registerWithAddress 注册用户并创建默认地址（秒杀落单固化的地址快照来源），
@@ -256,7 +261,7 @@ func pollOrder(t *testing.T, e *mqEnv, orderNo, token string) map[string]any {
 	return nil
 }
 
-// countSeckillOrders 统计活动已落单数（(user_id, activity_id) 唯一约束下即有效订单数）。
+// countSeckillOrders 统计活动已落单数（含不同购买槽位和已取消历史订单）。
 func countSeckillOrders(t *testing.T, e *mqEnv, activityID int64) int {
 	t.Helper()
 	var n int64
@@ -286,7 +291,7 @@ func waitSeckillOrders(t *testing.T, e *mqEnv, activityID int64, n int, timeout 
 // seedPublishedOnSale 创建并上架进行中活动（库存 stock），并确保底层商品上架：
 // 秒杀落单快照经商品详情（GetDetail 仅上架可见，与普通下单同规则）。
 // admin 操作走 env.router，落单走 mqEnv 路由——两者共享同一 gdb/Redis。
-func seedPublishedOnSale(t *testing.T, admin string, stock int) int64 {
+func seedPublishedOnSale(t *testing.T, admin string, stock int, limits ...int) int64 {
 	t.Helper()
 	skuID := seedSKU(t, env, admin)
 	var productID int64
@@ -294,7 +299,11 @@ func seedPublishedOnSale(t *testing.T, admin string, stock int) int64 {
 	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/products/%d/publish", productID), "", admin)
 	require.Equal(t, http.StatusNoContent, w.Code, "商品应上架: %s", w.Body.String())
 
-	id := createActivity(t, env, admin, skuID, stock, 1, -time.Minute, time.Hour)
+	limit := 1
+	if len(limits) > 0 {
+		limit = limits[0]
+	}
+	id := createActivity(t, env, admin, skuID, stock, limit, -time.Minute, time.Hour)
 	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", id), "", admin)
 	require.Equal(t, http.StatusNoContent, w.Code)
 	return id
@@ -336,6 +345,40 @@ func TestSeckillOrderFullLoop(t *testing.T) {
 	require.Equal(t, 1, countSeckillOrders(t, e, id))
 }
 
+func TestSeckillOrderUsesSnapshotAcceptedBeforeSKUAndPriceEdit(t *testing.T) {
+	requireEnv(t)
+	e := requireMQEnv(t)
+	admin := adminToken(t, env)
+	id := seedPublishedOnSale(t, admin, 10)
+	var acceptedSKUID int64
+	require.NoError(t, env.gdb.Table("flashsale_activities").Select("sku_id").Where("id = ?", id).Scan(&acceptedSKUID).Error)
+	token, _ := registerWithAddress(t, e, uniqueName("snapshot"))
+
+	w, response := purchase(t, env.router, id, token, "snapshot-request")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	env.publisher.mu.Lock()
+	acceptedMessage := append([]byte(nil), env.publisher.body...)
+	env.publisher.mu.Unlock()
+	require.NotEmpty(t, acceptedMessage)
+
+	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/unpublish", id), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	newSKUID := seedSKU(t, env, admin)
+	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/flashsales/%d", id),
+		activityBody(newSKUID, "换绑后的活动", 7700, 10, 1, -time.Minute, time.Hour), admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+
+	require.NoError(t, e.consumer.Handle(context.Background(), acceptedMessage))
+	order := pollOrder(t, e, response["order_no"].(string), token)
+	require.NotNil(t, order)
+	item := order["items"].([]any)[0].(map[string]any)
+	require.Equal(t, float64(acceptedSKUID), item["sku_id"])
+	require.Equal(t, float64(9900), item["price"])
+	purchaseSlot, err := strconv.ParseInt(response["pre_deduction_id"].(string), 10, 64)
+	require.NoError(t, err)
+	require.Equal(t, float64(purchaseSlot), order["purchase_slot"])
+}
+
 func TestSeckillOrderTransactionRollsBackWhenActivityStockDeductionFails(t *testing.T) {
 	requireEnv(t)
 	e := requireMQEnv(t)
@@ -345,14 +388,18 @@ func TestSeckillOrderTransactionRollsBackWhenActivityStockDeductionFails(t *test
 	require.NoError(t, env.gdb.Exec(
 		"UPDATE flashsale_activities SET stock = 0 WHERE id = ?", id,
 	).Error)
+	activity, err := e.activities.GetByID(context.Background(), id)
+	require.NoError(t, err)
 	orderNo := fmt.Sprintf("%d", time.Now().UnixNano())
 	pd := &flashsalemodel.PreDeduction{
-		UserID: userID, ActivityID: id, OrderNo: &orderNo, Quantity: 1,
+		UserID: userID, ActivityID: id, ClientRequestID: uniqueName("rollback-create"),
+		OrderNo: &orderNo, SKUID: activity.SKUID, Price: activity.Price, Quantity: 1,
 		Status: flashsalemodel.PreDeductionStatusPendingOrder,
 	}
 	require.NoError(t, e.preDeductions.Create(context.Background(), pd))
 	body, err := json.Marshal(flashsalesvc.SeckillSuccessMessage{
 		PreDeductionID: pd.ID, OrderNo: orderNo, UserID: userID, ActivityID: id,
+		SKUID: pd.SKUID, Price: pd.Price, Quantity: pd.Quantity, PurchaseSlot: pd.PurchaseSlot,
 	})
 	require.NoError(t, err)
 
@@ -406,31 +453,44 @@ func TestSeckillOrderConcurrentNoDuplicate(t *testing.T) {
 	require.Len(t, seen, 20, "恰 20 个预扣成功")
 }
 
-// 重复投递幂等：同一"抢购成功"消息发布两次 → 消费者只建一单（唯一约束 + 不重复扣减库存）。
-func TestSeckillOrderRedeliveryIdempotent(t *testing.T) {
+// 两个合法槽位分别成单；每个槽位的重复投递只命中自己的订单。
+func TestSeckillOrderRedeliveryIsPurchaseSlotScoped(t *testing.T) {
 	requireEnv(t) // 初始化共享 env（adminToken/seed 依赖）
 	e := requireMQEnv(t)
 	admin := adminToken(t, env)
-	id := seedPublishedOnSale(t, admin, 10)
+	id := seedPublishedOnSale(t, admin, 10, 2)
 	token, userID := registerWithAddress(t, e, uniqueName("dup_msg"))
-	w, response := purchaseOn(t, e, id, token)
+	w, first := purchaseOn(t, e, id, token, "mq-slot-1")
 	require.Equal(t, http.StatusAccepted, w.Code)
-	orderNo := response["order_no"].(string)
-	require.NotNil(t, pollOrder(t, e, orderNo, token))
-	pdID, err := strconv.ParseInt(response["pre_deduction_id"].(string), 10, 64)
+	w, second := purchaseOn(t, e, id, token, "mq-slot-2")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.NotNil(t, pollOrder(t, e, first["order_no"].(string), token))
+	require.NotNil(t, pollOrder(t, e, second["order_no"].(string), token))
+
+	firstID, err := strconv.ParseInt(first["pre_deduction_id"].(string), 10, 64)
+	require.NoError(t, err)
+	secondID, err := strconv.ParseInt(second["pre_deduction_id"].(string), 10, 64)
+	require.NoError(t, err)
+	firstPD, err := e.preDeductions.GetByID(context.Background(), firstID)
+	require.NoError(t, err)
+	secondPD, err := e.preDeductions.GetByID(context.Background(), secondID)
 	require.NoError(t, err)
 
-	body, _ := json.Marshal(flashsalesvc.SeckillSuccessMessage{
-		PreDeductionID: pdID, OrderNo: orderNo, UserID: userID, ActivityID: id,
-	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
-	require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
+	for _, pd := range []*flashsalemodel.PreDeduction{firstPD, secondPD} {
+		body, marshalErr := json.Marshal(flashsalesvc.SeckillSuccessMessage{
+			PreDeductionID: pd.ID, OrderNo: pd.OrderNumber(), UserID: userID, ActivityID: id,
+			SKUID: pd.SKUID, Price: pd.Price, Quantity: pd.Quantity, PurchaseSlot: pd.PurchaseSlot,
+		})
+		require.NoError(t, marshalErr)
+		require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
+		require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
+	}
 
-	time.Sleep(500 * time.Millisecond) // 给第二条（重复）消息处理时间
-	require.Equal(t, 1, countSeckillOrders(t, e, id), "重复投递不得重复建单")
-	require.Equal(t, 9, mysqlStock(t, e, id), "重复投递不得重复扣减库存")
+	time.Sleep(500 * time.Millisecond)
+	require.Equal(t, 2, countSeckillOrders(t, e, id), "两个槽位各一单，重复投递不增单")
+	require.Equal(t, 8, mysqlStock(t, e, id), "每个槽位只扣减一次库存")
 }
 
 // 永久失败先持久化回退意图，消息进入 DLQ 后被自动消费，恢复任务完整回退。

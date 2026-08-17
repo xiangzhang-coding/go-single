@@ -53,8 +53,26 @@ func (f *fakeActivities) Update(_ context.Context, a *model.Activity) error {
 	return nil
 }
 
+func (f *fakeActivities) UpdateInTx(ctx context.Context, _ *gorm.DB, a *model.Activity) error {
+	if err := f.Update(ctx, a); err != nil {
+		return err
+	}
+	if v, ok := f.byID[a.ID]; ok {
+		v.Status = a.Status
+	}
+	return nil
+}
+
 func (f *fakeActivities) GetByID(_ context.Context, id int64) (*model.Activity, error) {
 	return f.byID[id], nil
+}
+
+func (f *fakeActivities) GetByIDForUpdate(ctx context.Context, _ *gorm.DB, id int64) (*model.Activity, error) {
+	return f.GetByID(ctx, id)
+}
+
+func (f *fakeActivities) WithinTx(_ context.Context, fn func(tx *gorm.DB) error) error {
+	return fn(nil)
 }
 
 func (f *fakeActivities) List(context.Context) ([]model.Activity, error) {
@@ -129,12 +147,14 @@ type fakeCache struct {
 	mu           sync.Mutex
 	stock        map[string]int  // flashsale:stock:{id} → 余量
 	count        map[string]int  // flashsale:count:{id}:{user} → 已购数
-	idem         map[string]bool // flashsale:idem:{id}:{user} → 幂等键
+	idem         map[string]bool // flashsale:idem:{id}:{user}:{slot} → 槽位所有权键
 	idemToken    map[string]string
 	reservations map[string]string
 	rl           map[string]int // flashsale:rl:{user} → 限流计数
 	err          error
 	aofErr       error
+	decreaseErr  error
+	paused       map[string]string
 	// deductErr 仅作用于预扣能力（模拟预扣时基础设施故障）。
 	deductErr error
 }
@@ -147,6 +167,7 @@ func newFakeCache() *fakeCache {
 		idemToken:    map[string]string{},
 		reservations: map[string]string{},
 		rl:           map[string]int{},
+		paused:       map[string]string{},
 	}
 }
 
@@ -193,6 +214,7 @@ func (f *fakeCache) Del(_ context.Context, key string) error {
 	delete(f.idemToken, key)
 	delete(f.reservations, key)
 	delete(f.rl, key)
+	delete(f.paused, key)
 	return nil
 }
 
@@ -245,6 +267,46 @@ func (f *fakeCache) WarmFlashSaleStock(_ context.Context, p cache.FlashSaleWarmP
 	return cache.FlashSaleStockRetained, nil
 }
 
+func (f *fakeCache) DecreaseFlashSaleStockDurably(_ context.Context, p cache.FlashSaleDecreaseParams, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.decreaseErr != nil {
+		return f.decreaseErr
+	}
+	stock, ok := f.stock[p.StockKey]
+	if !ok || stock < p.Delta {
+		return errors.New("flash-sale stock decrease exceeds sellable stock")
+	}
+	f.stock[p.StockKey] = stock - p.Delta
+	return nil
+}
+
+func (f *fakeCache) PauseFlashSaleStockDurably(_ context.Context, p cache.FlashSalePauseParams, _ time.Duration) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	if f.paused[p.PauseKey] != "" {
+		return 0, errors.New("flash-sale stock is already paused")
+	}
+	stock, ok := f.stock[p.StockKey]
+	if !ok {
+		return 0, errors.New("flash-sale stock is missing during pause")
+	}
+	f.paused[p.PauseKey] = p.Token
+	return stock, nil
+}
+
+func (f *fakeCache) ReleaseFlashSalePauseDurably(_ context.Context, pauseKey, token string, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if token == "" || f.paused[pauseKey] == token {
+		delete(f.paused, pauseKey)
+	}
+	return nil
+}
+
 func (f *fakeCache) PreDeductFlashSale(_ context.Context, p cache.FlashSalePreDeductParams) (cache.FlashSalePreDeductResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -263,6 +325,9 @@ func (f *fakeCache) PreDeductFlashSale(_ context.Context, p cache.FlashSalePreDe
 			f.idemToken[p.IdempotencyKey] = p.ReservationToken
 		}
 		return cache.FlashSaleAlreadyPreDeducted, nil
+	}
+	if f.paused[p.PauseKey] != "" {
+		return cache.FlashSalePaused, nil
 	}
 	if !p.OnSale {
 		return cache.FlashSaleOffline, nil
@@ -317,7 +382,7 @@ func (f *fakeCache) EnsureFlashSaleReservation(_ context.Context, p cache.FlashS
 		return 0, errors.New("insufficient stock during reservation recovery")
 	}
 	f.stock[p.StockKey] -= p.Quantity
-	f.count[p.CountKey] += p.Quantity
+	f.count[p.CountKey]++
 	f.reservations[p.ReservationKey] = p.ReservationToken
 	f.idem[p.IdempotencyKey] = true
 	f.idemToken[p.IdempotencyKey] = p.ReservationToken
@@ -347,7 +412,7 @@ func (f *fakeCache) EnsureOrderedFlashSaleReservation(_ context.Context, p cache
 	if token := f.idemToken[p.IdempotencyKey]; token != "" && token != p.ReservationToken {
 		return 0, errors.New("ordered idempotency token mismatch")
 	}
-	f.count[p.CountKey] += p.Quantity
+	f.count[p.CountKey]++
 	f.reservations[p.ReservationKey] = p.ReservationToken
 	f.idem[p.IdempotencyKey] = true
 	f.idemToken[p.IdempotencyKey] = p.ReservationToken
@@ -418,7 +483,11 @@ func (f *fakeCache) RestoreFlashSale(_ context.Context, p cache.FlashSaleRestore
 			f.stock[p.StockKey] += p.Quantity
 		}
 		if _, ok := f.count[p.CountKey]; ok {
-			f.count[p.CountKey] -= p.Quantity
+			if p.ReservationKey == "" {
+				f.count[p.CountKey] -= p.Quantity
+			} else {
+				f.count[p.CountKey]--
+			}
 		}
 		if p.ReservationKey != "" {
 			f.reservations[p.ReservationKey] = "rolled_back:" + p.ReservationToken
@@ -458,7 +527,7 @@ func strToInt(s string) int {
 
 // discardSeckill 只断言错误的抢购调用（成功时返回的订单号在发布测试中断言）。
 func discardSeckill(svc Service, ctx context.Context, userID, activityID int64) error {
-	_, err := svc.Seckill(ctx, userID, activityID)
+	_, err := svc.Seckill(ctx, userID, activityID, "test-"+strconv.FormatInt(time.Now().UnixNano(), 10))
 	return err
 }
 
@@ -533,7 +602,7 @@ func newFixture() *fixture {
 	fc := newFakeCache()
 	pub := &fakePublisher{}
 	pd := newFakePreDeductions()
-	svc := asTestFlashSaleService(New(repository.Store{Activities: acts, PreDeductions: pd}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{}, metrics.New().Business()))
+	svc := asTestFlashSaleService(New(repository.Store{Activities: acts, PreDeductions: pd, Tx: acts}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{}, metrics.New().Business()))
 	return &fixture{svc: svc, acts: acts, preDeductions: pd, products: products, cache: fc, pub: pub}
 }
 
@@ -545,7 +614,7 @@ func newFixtureLimited(max int, window time.Duration) *fixture {
 	pub := &fakePublisher{}
 	pd := newFakePreDeductions()
 	svc := asTestFlashSaleService(New(
-		repository.Store{Activities: acts, PreDeductions: pd}, products, fc,
+		repository.Store{Activities: acts, PreDeductions: pd, Tx: acts}, products, fc,
 		limiter.RedisCounterConfig{Max: max, Window: window}, pub, &fakeNos{}, metrics.New().Business(),
 	))
 	return &fixture{svc: svc, acts: acts, preDeductions: pd, products: products, cache: fc, pub: pub}
@@ -705,7 +774,7 @@ func TestUpdateInProgressRejectsIncrease(t *testing.T) {
 	require.Equal(t, 100, updated.Stock)
 }
 
-// 进行中编辑库存调低：DB 与 Redis 同步降低。
+// 进行中编辑库存调低：Redis 按 MySQL 配置差额降低，保留未落单预扣量。
 func TestUpdateInProgressDecreases(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
@@ -713,13 +782,13 @@ func TestUpdateInProgressDecreases(t *testing.T) {
 	fx.cache.stock[stockKey(a.ID)] = 50
 
 	p := ActivityParams{
-		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: 30,
+		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: 80,
 		PerUserLimit: a.PerUserLimit, StartAt: a.StartAt, EndAt: a.EndAt,
 	}
 	require.NoError(t, fx.svc.UpdateActivity(context.Background(), a.ID, p))
 
 	updated, _ := fx.acts.GetByID(context.Background(), a.ID)
-	require.Equal(t, 30, updated.Stock)
+	require.Equal(t, 80, updated.Stock)
 	require.Equal(t, 30, fx.cache.stock[stockKey(a.ID)])
 }
 
@@ -736,29 +805,91 @@ func TestUpdateWindowShiftCannotBypass(t *testing.T) {
 		StartAt:      time.Now().Add(time.Hour),
 		EndAt:        time.Now().Add(2 * time.Hour),
 	}
-	require.ErrorIs(t, fx.svc.UpdateActivity(context.Background(), a.ID, p), ErrStockIncreaseInProgress)
+	require.ErrorIs(t, fx.svc.UpdateActivity(context.Background(), a.ID, p), ErrActivityFieldsLocked)
 
 	updated, _ := fx.acts.GetByID(context.Background(), a.ID)
 	require.Equal(t, 100, updated.Stock, "DB 不应被调高")
 	require.Equal(t, 100, fx.cache.stock[stockKey(a.ID)])
 }
 
-// 进行中编辑库存不低于 Redis 存量：保持存量（只减不增）。
-func TestUpdateInProgressBetweenKeepsRedis(t *testing.T) {
+func TestUpdateOnSaleFutureActivityCannotMoveIntoProgress(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, func(p *ActivityParams) {
+		p.StartAt = time.Now().Add(time.Hour)
+		p.EndAt = time.Now().Add(2 * time.Hour)
+	})
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	p := ActivityParams{
+		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: a.Stock,
+		PerUserLimit: a.PerUserLimit, StartAt: time.Now().Add(-time.Minute), EndAt: time.Now().Add(time.Hour),
+	}
+	require.ErrorIs(t, fx.svc.UpdateActivity(context.Background(), a.ID, p), ErrActivityFieldsLocked)
+	require.Equal(t, 100, fx.cache.stock[stockKey(a.ID)])
+}
+
+func TestUpdateInProgressImmutableFieldsRejected(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
-	fx.cache.stock[stockKey(a.ID)] = 50
+	fx.products.seed(2)
+
+	tests := []struct {
+		name string
+		mut  func(*ActivityParams)
+	}{
+		{"sku", func(p *ActivityParams) { p.SKUID = 2 }},
+		{"price", func(p *ActivityParams) { p.Price-- }},
+		{"limit", func(p *ActivityParams) { p.PerUserLimit++ }},
+		{"start", func(p *ActivityParams) { p.StartAt = p.StartAt.Add(time.Minute) }},
+		{"end", func(p *ActivityParams) { p.EndAt = p.EndAt.Add(time.Minute) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := ActivityParams{
+				SKUID: a.SKUID, Title: "允许改标题", Price: a.Price, Stock: a.Stock,
+				PerUserLimit: a.PerUserLimit, StartAt: a.StartAt, EndAt: a.EndAt,
+			}
+			tc.mut(&p)
+			require.ErrorIs(t, fx.svc.UpdateActivity(context.Background(), a.ID, p), ErrActivityFieldsLocked)
+		})
+	}
+}
+
+func TestUpdateSyncFailureFailsClosed(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.cache.decreaseErr = errors.New("redis sync failed")
 
 	p := ActivityParams{
-		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: 80,
+		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: 90,
 		PerUserLimit: a.PerUserLimit, StartAt: a.StartAt, EndAt: a.EndAt,
 	}
-	// 80 < DB 100 但 > Redis 50：DB 调低、Redis 保持。
-	require.NoError(t, fx.svc.UpdateActivity(context.Background(), a.ID, p))
-	require.Equal(t, 50, fx.cache.stock[stockKey(a.ID)])
-	updated, _ := fx.acts.GetByID(context.Background(), a.ID)
-	require.Equal(t, 80, updated.Stock)
+	require.Error(t, fx.svc.UpdateActivity(context.Background(), a.ID, p))
+	updated, err := fx.acts.GetByID(context.Background(), a.ID)
+	require.NoError(t, err)
+	require.Equal(t, 90, updated.Stock, "MySQL stock commits offline before Redis synchronization")
+	require.Equal(t, model.ActivityStatusOffSale, updated.Status)
+	_, exists := fx.cache.stock[stockKey(a.ID)]
+	require.False(t, exists, "fail-closed edit must remove stale sellable stock")
+}
+
+func TestUpdateCannotReduceStockBelowAcceptedReservations(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.cache.stock[stockKey(a.ID)] = 5
+
+	p := ActivityParams{
+		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: 1,
+		PerUserLimit: a.PerUserLimit, StartAt: a.StartAt, EndAt: a.EndAt,
+	}
+	require.ErrorIs(t, fx.svc.UpdateActivity(context.Background(), a.ID, p), ErrStockBelowAcceptedReservations)
+	updated, err := fx.acts.GetByID(context.Background(), a.ID)
+	require.NoError(t, err)
+	require.Equal(t, 100, updated.Stock)
+	require.Equal(t, model.ActivityStatusOnSale, updated.Status)
+	require.Equal(t, 5, fx.cache.stock[stockKey(a.ID)])
 }
 
 // 未开始的已上架活动编辑：可覆盖 Redis 存量（DEL+SET）。
@@ -953,12 +1084,12 @@ func TestSeckillOK(t *testing.T) {
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 
-	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 7, a.ID, "ok")
 	require.NoError(t, err)
 	require.NotEmpty(t, result.OrderNo, "抢购成功应返回订单号供前端轮询")
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)])
 	require.Equal(t, 1, fx.cache.count[countKey(a.ID, 7)])
-	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "预扣成功应保留幂等键")
+	require.True(t, fx.cache.idem[slotIdemKey(a.ID, 7, result.PreDeductionID)], "预扣成功应保留槽位幂等键")
 
 	require.Equal(t, SeckillOrderQueue, fx.pub.queue, "消息应发布到异步落单队列")
 	var msg SeckillSuccessMessage
@@ -967,6 +1098,10 @@ func TestSeckillOK(t *testing.T) {
 	require.Equal(t, result.PreDeductionID, msg.PreDeductionID)
 	require.Equal(t, int64(7), msg.UserID)
 	require.Equal(t, a.ID, msg.ActivityID)
+	require.Equal(t, a.SKUID, msg.SKUID)
+	require.Equal(t, a.Price, msg.Price)
+	require.Equal(t, 1, msg.Quantity)
+	require.Equal(t, result.PreDeductionID, msg.PurchaseSlot)
 }
 
 // MQ 发布失败：保留幂等键与 pending_publish 事实，不重复预扣；后台恢复接管。
@@ -976,12 +1111,12 @@ func TestSeckillPublishFailureKeepsIdemKey(t *testing.T) {
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.pub.err = errors.New("rabbitmq down")
 
-	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 7, a.ID, "publish-failure")
 	require.NoError(t, err)
 	require.Equal(t, model.PreDeductionStatusPendingPublish, result.Status)
-	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "发布失败应保留幂等键（防重复预扣）")
+	require.True(t, fx.cache.idem[slotIdemKey(a.ID, 7, result.PreDeductionID)], "发布失败应保留槽位幂等键")
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)], "预扣已生效，库存不再变动")
-	retryResult, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	retryResult, err := fx.svc.Seckill(context.Background(), 7, a.ID, "publish-failure")
 	require.NoError(t, err)
 	require.Equal(t, result.PreDeductionID, retryResult.PreDeductionID,
 		"幂等重试返回原生命周期，不会二次预扣")
@@ -995,7 +1130,7 @@ func TestSeckillPublishRetriesOnTransientFailure(t *testing.T) {
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.pub.fails = 2 // 前两次失败，第三次成功
 
-	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 7, a.ID, "publish-retry")
 	require.NoError(t, err, "瞬时失败应重试成功")
 	require.Equal(t, 3, fx.pub.attemptsCount(), "重试次数受限：恰好 Attempts 次")
 	var msg SeckillSuccessMessage
@@ -1010,10 +1145,10 @@ func TestSeckillPublishRetryExhaustedKeepsIdemKey(t *testing.T) {
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.pub.fails = 99 // 持续失败，重试耗尽
 
-	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 7, a.ID, "publish-exhausted")
 	require.NoError(t, err)
 	require.Equal(t, 3, fx.pub.attemptsCount(), "重试耗尽即停止，次数受限")
-	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "重试耗尽仍失败 → 保留幂等键，对账兜底")
+	require.True(t, fx.cache.idem[slotIdemKey(a.ID, 7, result.PreDeductionID)], "重试耗尽仍失败 → 保留槽位幂等键")
 	require.Equal(t, model.PreDeductionStatusPendingPublish, result.Status)
 }
 
@@ -1025,7 +1160,7 @@ func newFixtureWithRetry(t *testing.T, attempts int) *fixture {
 	fc := newFakeCache()
 	pub := &fakePublisher{}
 	pd := newFakePreDeductions()
-	svc := asTestFlashSaleService(New(repository.Store{Activities: acts, PreDeductions: pd}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{},
+	svc := asTestFlashSaleService(New(repository.Store{Activities: acts, PreDeductions: pd, Tx: acts}, products, fc, limiter.RedisCounterConfig{}, pub, &fakeNos{},
 		metrics.New().Business(), retry.Config{
 			Attempts:       attempts,
 			InitialBackoff: time.Millisecond,
@@ -1040,15 +1175,15 @@ func TestSeckillOrderNoFailureKeepsIdemKey(t *testing.T) {
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.svc = asTestFlashSaleService(New(
-		repository.Store{Activities: fx.acts, PreDeductions: fx.preDeductions}, fx.products, fx.cache,
+		repository.Store{Activities: fx.acts, PreDeductions: fx.preDeductions, Tx: fx.acts}, fx.products, fx.cache,
 		limiter.RedisCounterConfig{}, fx.pub, &failingNos{}, metrics.New().Business(),
 	))
 
-	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 7, a.ID, "order-no-failure")
 	require.NoError(t, err)
 	require.Empty(t, result.OrderNo)
 	require.Equal(t, model.PreDeductionStatusPendingPublish, result.Status)
-	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "订单号生成失败应保留幂等键")
+	require.True(t, fx.cache.idem[slotIdemKey(a.ID, 7, result.PreDeductionID)], "订单号生成失败应保留槽位幂等键")
 }
 
 // failingNos 恒失败订单号生成器。
@@ -1056,15 +1191,15 @@ type failingNos struct{}
 
 func (failingNos) Next() (int64, error) { return 0, errors.New("clock rollback") }
 
-// 重复抢购：返回原生命周期，库存不再扣。
+// 同一 client_request_id 重试：返回原生命周期，库存不再扣。
 func TestSeckillDuplicateReturnsExistingLifecycle(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 
-	first, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	first, err := fx.svc.Seckill(context.Background(), 7, a.ID, "request-1")
 	require.NoError(t, err)
-	second, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	second, err := fx.svc.Seckill(context.Background(), 7, a.ID, "request-1")
 	require.NoError(t, err)
 	require.Equal(t, first.PreDeductionID, second.PreDeductionID)
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)], "重复请求不得再次预扣")
@@ -1076,17 +1211,36 @@ func TestSeckillDuplicateReturnsExistingLifecycle(t *testing.T) {
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a2.ID))
 }
 
+func TestSeckillPerUserLimitAllocatesIndependentPurchaseSlots(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, func(p *ActivityParams) { p.PerUserLimit = 2 })
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+
+	first, err := fx.svc.Seckill(context.Background(), 7, a.ID, "request-1")
+	require.NoError(t, err)
+	second, err := fx.svc.Seckill(context.Background(), 7, a.ID, "request-2")
+	require.NoError(t, err)
+	require.NotEqual(t, first.PreDeductionID, second.PreDeductionID)
+	require.Equal(t, 2, fx.cache.count[countKey(a.ID, 7)])
+	require.True(t, fx.cache.idem[slotIdemKey(a.ID, 7, first.PreDeductionID)])
+	require.True(t, fx.cache.idem[slotIdemKey(a.ID, 7, second.PreDeductionID)])
+
+	_, err = fx.svc.Seckill(context.Background(), 7, a.ID, "request-3")
+	require.ErrorIs(t, err, ErrLimitReached)
+	require.Equal(t, 98, fx.cache.stock[stockKey(a.ID)])
+}
+
 func TestSeckillIdempotencyCacheErrorReturnsLifecycle(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.cache.err = context.DeadlineExceeded
 
-	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 7, a.ID, "cache-error")
 	require.NoError(t, err)
 	require.NotZero(t, result.PreDeductionID)
 	require.Equal(t, model.PreDeductionStatusPreparing, result.Status)
-	require.False(t, fx.cache.idem[idemKey(a.ID, 7)])
+	require.False(t, fx.cache.idem[slotIdemKey(a.ID, 7, result.PreDeductionID)])
 	require.Equal(t, 100, fx.cache.stock[stockKey(a.ID)], "幂等抢占失败不得预扣")
 }
 
@@ -1099,11 +1253,46 @@ func TestSeckillPerUserRateLimited(t *testing.T) {
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a.ID))
 	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 7, a.ID), ErrRateLimited)
 	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)], "限流拒绝不得预扣")
-	_, ok := fx.cache.idem[idemKey(a.ID, 7)]
-	require.True(t, ok, "首次请求已落幂等键；第二次被限流拒绝发生在幂等键抢占之前，不改变既有键")
+	require.Len(t, fx.cache.idem, 1, "第二次被限流拒绝不得改变首次请求的槽位键")
 
 	// 不同用户互不影响。
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 8, a.ID))
+}
+
+func TestSeckillIdempotentRetryBypassesRateLimit(t *testing.T) {
+	fx := newFixtureLimited(1, time.Minute)
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+
+	first, err := fx.svc.Seckill(context.Background(), 7, a.ID, "same-request")
+	require.NoError(t, err)
+	replay, err := fx.svc.Seckill(context.Background(), 7, a.ID, "same-request")
+	require.NoError(t, err)
+	require.Equal(t, first.PreDeductionID, replay.PreDeductionID)
+	_, err = fx.svc.Seckill(context.Background(), 7, a.ID, "new-request")
+	require.ErrorIs(t, err, ErrRateLimited)
+}
+
+func TestSeckillConcurrentIdempotentRetryConvergesBeforeRateLimit(t *testing.T) {
+	fx := newFixtureLimited(1, time.Minute)
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+
+	results := make([]*PurchaseResult, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = fx.svc.Seckill(context.Background(), 7, a.ID, "concurrent-same-request")
+		}(i)
+	}
+	wg.Wait()
+	require.NoError(t, errs[0])
+	require.NoError(t, errs[1])
+	require.Equal(t, results[0].PreDeductionID, results[1].PreDeductionID)
+	require.Equal(t, 99, fx.cache.stock[stockKey(a.ID)])
 }
 
 // 限流配置关闭（Max<=0）：不限流——同一用户跨活动请求不被限流拦截
@@ -1115,10 +1304,10 @@ func TestSeckillRateLimitDisabled(t *testing.T) {
 	a2 := fx.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a2.ID))
 
-	first, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	first, err := fx.svc.Seckill(context.Background(), 7, a.ID, "rate-disabled")
 	require.NoError(t, err)
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a2.ID), "关闭限流后同一用户可继续抢购其他活动")
-	retryResult, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	retryResult, err := fx.svc.Seckill(context.Background(), 7, a.ID, "rate-disabled")
 	require.NoError(t, err)
 	require.Equal(t, first.PreDeductionID, retryResult.PreDeductionID)
 }
@@ -1132,7 +1321,7 @@ func TestSeckillBusinessRejectReleasesIdemKey(t *testing.T) {
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), soldOut.ID))
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 1, soldOut.ID))
 	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 2, soldOut.ID), ErrSoldOut)
-	require.False(t, fx.cache.idem[idemKey(soldOut.ID, 2)], "抢光拒绝应释放幂等键")
+	require.Len(t, fx.cache.idem, 1, "抢光拒绝应释放自身槽位键，仅保留首个成功槽位")
 	require.Equal(t, 0, fx.cache.stock[stockKey(soldOut.ID)])
 
 	// 未开始：拒绝并释放幂等键；窗口开始后可重抢成功。
@@ -1142,14 +1331,14 @@ func TestSeckillBusinessRejectReleasesIdemKey(t *testing.T) {
 	})
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), future.ID))
 	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 3, future.ID), ErrNotInWindow)
-	require.False(t, fx.cache.idem[idemKey(future.ID, 3)])
+	require.Len(t, fx.cache.idem, 1, "窗口拒绝应释放自身槽位键")
 }
 
 // 活动不存在：视为业务拒绝，释放幂等键。
 func TestSeckillActivityNotFound(t *testing.T) {
 	fx := newFixture()
 	require.ErrorIs(t, discardSeckill(fx.svc, context.Background(), 1, 999), ErrActivityNotFound)
-	require.False(t, fx.cache.idem[idemKey(999, 1)], "活动不存在应释放幂等键")
+	require.Empty(t, fx.cache.idem, "活动不存在不应创建槽位键")
 }
 
 // 预扣基础设施结果不确定：返回持久生命周期供查询，避免客户端丢失关联。
@@ -1159,11 +1348,11 @@ func TestSeckillInfraFailureReturnsRecoverableLifecycle(t *testing.T) {
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	fx.cache.deductErr = errors.New("redis down")
 
-	result, err := fx.svc.Seckill(context.Background(), 7, a.ID)
+	result, err := fx.svc.Seckill(context.Background(), 7, a.ID, "infra-failure")
 	require.NoError(t, err)
 	require.NotZero(t, result.PreDeductionID)
 	require.Equal(t, model.PreDeductionStatusPreparing, result.Status)
-	require.True(t, fx.cache.idem[idemKey(a.ID, 7)], "基础设施失败应保留幂等键")
+	require.True(t, fx.cache.idem[slotIdemKey(a.ID, 7, result.PreDeductionID)], "基础设施失败应保留槽位幂等键")
 	require.Equal(t, 100, fx.cache.stock[stockKey(a.ID)], "失败不得预扣")
 }
 
@@ -1199,9 +1388,9 @@ func TestSeckillConcurrentNoOversell(t *testing.T) {
 	// 同一用户再次提交（不同活动）：独立幂等键，仍可抢购。
 	dup := fx.createActivity(t, func(p *ActivityParams) { p.Stock = 1 })
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), dup.ID))
-	first, err := fx.svc.Seckill(context.Background(), 1, dup.ID)
+	first, err := fx.svc.Seckill(context.Background(), 1, dup.ID, "concurrent-duplicate")
 	require.NoError(t, err)
-	retryResult, err := fx.svc.Seckill(context.Background(), 1, dup.ID)
+	retryResult, err := fx.svc.Seckill(context.Background(), 1, dup.ID, "concurrent-duplicate")
 	require.NoError(t, err)
 	require.Equal(t, first.PreDeductionID, retryResult.PreDeductionID)
 }
