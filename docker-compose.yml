@@ -1,4 +1,6 @@
 # 根级入口：仓库根 `docker compose up` 即起全部依赖。
 # 规范文件位于 deploy/docker-compose.yml，本文件仅作 include 桥。
+name: deploy
+
 include:
   - deploy/docker-compose.yml

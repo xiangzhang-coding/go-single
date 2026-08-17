@@ -1,3 +1,6 @@
+# 固定 project 名，确保从仓库根或 deploy/ 启动时复用同一组资源。
+name: deploy
+
 services:
   mysql:
     image: mysql:8
@@ -18,12 +21,28 @@ services:
       retries: 20
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
     container_name: go_single_redis
-    # 集成测试按包隔离 Redis 库（15-20），需 21 个逻辑库（默认 16）。
-    command: ["redis-server", "--databases", "21"]
+    # AOF everysec 为主（约 1 秒 RPO），RDB 为恢复兜底；集成测试需 21 个逻辑库。
+    command:
+      - redis-server
+      - --databases
+      - "21"
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "3600"
+      - "1"
+      - "300"
+      - "100"
+      - "60"
+      - "10000"
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -31,11 +50,17 @@ services:
       retries: 20
 
   rabbitmq:
-    image: rabbitmq:3-management
+    image: rabbitmq:3.13.7-management@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69
     container_name: go_single_rabbitmq
+    hostname: go-single-rabbitmq
+    environment:
+      # 固定节点名，确保容器重建后继续读取同一 Mnesia 数据目录。
+      RABBITMQ_NODENAME: rabbit@go-single-rabbitmq
     ports:
       - "5672:5672"
       - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
@@ -159,6 +184,10 @@ services:
 
 volumes:
   mysql_data:
+  redis_data:
+    name: go_single_redis_data
+  rabbitmq_data:
+    name: go_single_rabbitmq_data
   minio_data:
   prometheus_data:
   grafana_data:

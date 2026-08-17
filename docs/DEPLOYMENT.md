@@ -1,4 +1,4 @@
-# 部署指南（T28 部署收尾）
+# 部署指南
 
 部署三件套：**本地 HTTPS 演示**（Nginx SSL 终止 + 安全头）、**云端静态资源**（Cloudflare Pages 接线 web/ 主题 + website/ 文档站）、**后端云平台选型**（VPS + Docker Compose，见 ADR-0005）。
 
@@ -36,10 +36,10 @@ website 构建链 `@docusaurus/mdx-loader@3.10.2 → image-size@2.0.2` 的
 
 ```bash
 # 1) 生成自签证书（certs/ 不入库，有效 365 天）
-cd deploy/nginx && ./gen-certs.sh
+./deploy/nginx/gen-certs.sh
 
 # 2) 起 Nginx（8081:80 跳转，8443:443 业务）
-cd ../ && docker compose up -d nginx
+docker compose up -d nginx
 
 # 3) 演示 80 → 301 跳转
 curl -sI http://127.0.0.1:8081/ | head -2
@@ -117,13 +117,168 @@ npx wrangler pages project create go-single-website
 # 4) 起服务：docker compose up -d（mysql/redis/rabbitmq/minio/nginx + 可观测全家桶）
 # 5) 后端守护：systemd unit 跑 go 构建产物（bin/server），开机自启 + 崩溃重启
 # 6) 域名解析：api.example.com → VPS；Pages 前端 VITE_API_BASE 指向它
-# 7) 备份与监控：MySQL 定时 dump（cron）+ 对象存储；Prometheus/Grafana/Loki 已在 compose 预置
+# 7) 备份与监控：MySQL 定时 dump + Redis/RabbitMQ 卷快照；Prometheus/Grafana/Loki 已预置
 ```
 
 秒杀等在线业务不在此演示范围（单实例）；多实例负载均衡（upstream 双实例示例已预写在 deploy/nginx/nginx.conf）为 backlog 演进项。
 
-## 4. 验收对照
+## 4. Redis 与 RabbitMQ 持久化运维
+
+`deploy/docker-compose.yml` 是规范编排，根目录 `docker-compose.yml` 仅作 include 入口。新部署的 Compose project 固定为 `deploy`，所有命令统一从仓库根运行；Redis/RabbitMQ 卷另用全局固定名，避免工作目录改变后选中空卷。旧环境若曾从根目录启动，project 可能是 `go_single`，首次升级必须按下节保留原 project 名，否则 MySQL、MinIO 和可观测组件的 project-scoped 卷会被误认为空卷。
+
+| 服务 | 命名卷与数据目录 | 持久化策略 | 恢复目标 |
+|---|---|---|---|
+| Redis | `go_single_redis_data:/data` | AOF `appendonly=yes` + `appendfsync=everysec` 为主，RDB `3600/1 300/100 60/10000` 为兜底 | 容器重建后保留未过期的订单幂等、秒杀预扣和优惠券计数；正常故障约 1 秒 RPO |
+| RabbitMQ | `go_single_rabbitmq_data:/var/lib/rabbitmq` | 固定 `rabbit@go-single-rabbitmq` 节点名；应用声明 durable 主队列/DLQ，以 delivery mode 2 发布并等待 publisher confirm | 容器重建后 durable 队列和已确认的 persistent 消息仍可消费 |
+
+`docker compose down` 默认保留命名卷；`docker compose down -v`、`docker volume rm go_single_redis_data` 和 `docker volume rm go_single_rabbitmq_data` 会销毁业务状态，日常部署禁止使用。Redis 未配置淘汰上限，因为这些键包含业务状态而不只是可重建缓存；容量不足时应扩容或拆分实例，不能改成 LRU 静默淘汰。
+
+### 首次从旧匿名卷迁移
+
+R14 之前的镜像会为数据目录创建匿名卷。演练脚本检测到匿名卷会直接失败，避免升级时静默切到空命名卷。首次迁移安排维护窗口，先停止后端发布和消费，并在同一个 shell 会话中固定历史 project 名：
+
+```bash
+set -euo pipefail
+
+# 1) 保留历史 project 名，避免切换 MySQL/MinIO 等已有 project-scoped 卷
+existing_project="$(docker inspect go_single_mysql --format '{{index .Config.Labels "com.docker.compose.project"}}')"
+case "$existing_project" in
+  deploy) ;;
+  go_single)
+    export COMPOSE_PROJECT_NAME=go_single
+    # 后续会话也要在仓库根 .env 中保留 COMPOSE_PROJECT_NAME=go_single；不要覆盖已有 .env 内容。
+    ;;
+  *) printf '未知 Compose project: %s\n' "$existing_project" >&2; exit 1 ;;
+esac
+
+# 2) 绑定旧卷名，供归档和 Redis 数据复制使用
+export OLD_REDIS_VOLUME="$(docker inspect go_single_redis --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')"
+export OLD_RABBITMQ_VOLUME="$(docker inspect go_single_rabbitmq --format '{{range .Mounts}}{{if eq .Destination "/var/lib/rabbitmq"}}{{.Name}}{{end}}{{end}}')"
+test -n "$OLD_REDIS_VOLUME"
+test -n "$OLD_RABBITMQ_VOLUME"
+
+# 3) RabbitMQ 必须先排空 ready/unacked 消息；DLQ 先处理或另行归档
+docker exec go_single_rabbitmq rabbitmqctl list_queues name durable messages_ready messages_unacknowledged
+docker exec go_single_rabbitmq rabbitmqctl export_definitions /tmp/definitions.json
+docker cp go_single_rabbitmq:/tmp/definitions.json "$HOME/go-single-rabbitmq-definitions.json"
+
+# 4) 停服务并归档旧卷；不要删除归档或旧匿名卷，直到恢复验收完成
+docker stop go_single_redis go_single_rabbitmq
+export MIGRATION_BACKUP_DIR="$HOME/go-single-backups/pre-r14-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$MIGRATION_BACKUP_DIR" && chmod 700 "$MIGRATION_BACKUP_DIR"
+docker run --rm -v "$OLD_REDIS_VOLUME:/source:ro" -v "$MIGRATION_BACKUP_DIR:/backup" \
+  alpine:3.21 tar -czf /backup/redis-anonymous-volume.tgz -C /source .
+docker run --rm -v "$OLD_RABBITMQ_VOLUME:/source:ro" -v "$MIGRATION_BACKUP_DIR:/backup" \
+  alpine:3.21 tar -czf /backup/rabbitmq-anonymous-volume.tgz -C /source .
+tar -tzf "$MIGRATION_BACKUP_DIR/redis-anonymous-volume.tgz" >/dev/null
+tar -tzf "$MIGRATION_BACKUP_DIR/rabbitmq-anonymous-volume.tgz" >/dev/null
+```
+
+Redis 匿名卷可按下一节的卷归档方法复制到 `go_single_redis_data`，保留全部 DB 和 TTL。RabbitMQ definitions 不含排队消息，且旧容器的随机节点名不能直接当作新固定节点的数据目录；必须先排空消息，再在新节点导入 definitions。若无法排空，不要继续迁移，应先建立临时消费者/转发流程并验证消息数归零。
+
+```bash
+# 移除旧容器但保留其匿名卷，由 Compose 创建正确归属的命名卷容器
+docker rm go_single_redis go_single_rabbitmq
+docker compose create redis rabbitmq
+
+# 新 Redis 容器尚未启动，可安全复制旧卷的全部 DB、RDB 和 TTL
+docker run --rm \
+  -v "$OLD_REDIS_VOLUME:/source:ro" \
+  -v go_single_redis_data:/target \
+  alpine:3.21 sh -c 'cp -a /source/. /target/'
+
+# 启动固定节点名的 RabbitMQ，导入已排空消息后的 definitions
+docker compose up -d --wait redis rabbitmq
+docker cp "$HOME/go-single-rabbitmq-definitions.json" go_single_rabbitmq:/tmp/definitions.json
+docker exec go_single_rabbitmq rabbitmqctl import_definitions /tmp/definitions.json
+```
+
+完成下方持久化演练并检查业务后再启动后端。至少保留旧匿名卷和 definitions 归档一个备份周期，确认无需回滚后再人工清理。
+
+### 备份与恢复
+
+基线方案是维护窗口内停止两个服务后对卷做文件级归档，可同时覆盖 Redis AOF/RDB、RabbitMQ definitions 和排队消息。备份包含业务数据、RabbitMQ cookie 等敏感内容，应存入权限受控且加密的异机/对象存储。
+
+```bash
+set -euo pipefail
+backup_dir="$HOME/go-single-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$backup_dir" && chmod 700 "$backup_dir"
+
+docker compose stop redis rabbitmq
+docker run --rm -v go_single_redis_data:/source:ro -v "$backup_dir:/backup" \
+  alpine:3.21 tar -czf /backup/redis-volume.tgz -C /source .
+docker run --rm -v go_single_rabbitmq_data:/source:ro -v "$backup_dir:/backup" \
+  alpine:3.21 tar -czf /backup/rabbitmq-volume.tgz -C /source .
+docker compose up -d --wait redis rabbitmq
+```
+
+恢复会覆盖当前数据，必须先停后端并保存当前卷快照。RabbitMQ 应先用备份时相同的镜像版本和固定节点名恢复，确认消息后再升级；不要用较低版本 RabbitMQ 打开高版本数据目录。
+
+```bash
+set -euo pipefail
+: "${BACKUP_DIR:?先 export BACKUP_DIR=/path/to/verified-backup}"
+backup_dir="$BACKUP_DIR"
+test -f "$backup_dir/redis-volume.tgz"
+test -f "$backup_dir/rabbitmq-volume.tgz"
+tar -tzf "$backup_dir/redis-volume.tgz" >/dev/null
+tar -tzf "$backup_dir/rabbitmq-volume.tgz" >/dev/null
+
+docker compose down
+docker volume rm go_single_redis_data go_single_rabbitmq_data
+docker compose create redis rabbitmq
+
+docker run --rm -v go_single_redis_data:/target -v "$backup_dir:/backup:ro" \
+  alpine:3.21 tar -xzf /backup/redis-volume.tgz -C /target
+docker run --rm -v go_single_rabbitmq_data:/target -v "$backup_dir:/backup:ro" \
+  alpine:3.21 tar -xzf /backup/rabbitmq-volume.tgz -C /target
+docker compose up -d
+docker compose up -d --wait redis rabbitmq
+```
+
+恢复后运行 `redis-cli INFO persistence`、`rabbitmq-diagnostics -q ping`、队列消息数检查和本节演练。仅有备份文件不算完成，至少每季度在隔离 VPS 做一次恢复演练并记录耗时。
+
+### 容量与升级
+
+```bash
+# Redis：内存、AOF/RDB 状态和重写失败
+docker compose exec -T redis redis-cli INFO memory
+docker compose exec -T redis redis-cli INFO persistence
+
+# RabbitMQ：持久消息积压、未确认消息和磁盘/内存告警
+docker compose exec -T rabbitmq rabbitmqctl list_queues \
+  name durable messages_ready messages_unacknowledged message_bytes_persistent
+docker compose exec -T rabbitmq rabbitmq-diagnostics alarms
+
+# Docker 卷与宿主机总体空间
+docker system df -v
+df -h
+```
+
+Redis 至少预留当前 AOF 两倍的可用磁盘供重写，并监控 `aof_last_write_status`、`aof_last_bgrewrite_status` 和内存增长。RabbitMQ 对持续增长的 `messages_ready`/DLQ、任何 resource alarm 告警；VPS 数据盘达到 70% 时预警，80% 前扩容或处理积压。备份容量不与生产卷共盘计算。
+
+升级时先停后端写入与消费者，运行演练并备份，再一次只改一个服务的固定 tag/digest。Redis 升级前检查 AOF/RDB 格式兼容性；RabbitMQ 按官方支持路径逐小版本/大版本升级，先恢复到原版本验证后再前进，禁止直接降级复用数据目录。每次只启动对应服务，健康检查、数据读取和队列深度都通过后再继续，最后重新运行演练。
+
+### 容器重建演练
+
+脚本写入代表性的订单幂等、秒杀预扣/计数和优惠券计数状态，声明 durable 测试队列并发布 delivery mode 2 消息，然后删除并重建 Redis/RabbitMQ 容器，验证 TTL、值、队列和消息后清理测试数据。脚本会中断已有连接，只在本地或维护窗口运行，且绝不使用 `down -v`。
+
+```bash
+bash scripts/persistence-drill.sh
+
+# 上线后修改了 Redis/RabbitMQ 凭据时
+PERSISTENCE_DRILL_REDIS_PASSWORD='redis-password' \
+PERSISTENCE_DRILL_RABBITMQ_USER=shop \
+PERSISTENCE_DRILL_RABBITMQ_PASSWORD='rabbitmq-password' \
+  bash scripts/persistence-drill.sh
+```
+
+成功终态为：`[persistence-drill] 通过：Redis 关键状态和 RabbitMQ 持久消息均跨容器重建保留`。
+
+## 5. 验收对照
 
 - [x] 本地 HTTPS 与安全头可演示：§1 命令可复现（301 跳转 + 安全头齐全 + /api 反代联通）
 - [x] 前端与文档站可部署到 Cloudflare Pages：§2 接线 + workflow，构建产物可直接部署
 - [x] 后端云部署方案选型确定并文档化：ADR-0005 + §3
+- [x] Redis/RabbitMQ 使用固定命名卷与明确持久化配置：§4 + `deploy/docker-compose.yml`
+- [x] durable 队列、persistent 消息和 Redis 关键状态跨容器重建保留：`scripts/persistence-drill.sh`
+- [x] 备份、恢复、容量、首次迁移和升级注意事项已记录：§4
