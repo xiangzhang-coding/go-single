@@ -2,7 +2,7 @@
 // httptest 完整路由 + 常驻消费者，覆盖完整闭环——抢购（202 排队中 + order_no）
 // → MQ 异步落单（消费者幂等建单 + 同事务扣活动库存）→ 订单可轮询查询；
 // 并发不重复建单（唯一约束）、重复投递幂等、永久失败进死信。
-// 需要 RabbitMQ 就绪（docker compose up -d），不可达时整体跳过。
+// 需要 RabbitMQ 就绪（docker compose up -d），不可达时本地跳过、CI 失败。
 package flashsale_test
 
 import (
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -35,21 +36,50 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
+	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
 )
 
 const (
-	rabbitURL  = "amqp://guest:guest@127.0.0.1:5672/"
 	pollRounds = 60 // 轮询上限（每 100ms 一次，共 6s）
 )
+
+func testRabbitURL() string {
+	return envOr("GO_SINGLE_MQ_URL", "amqp://guest:guest@127.0.0.1:5672/")
+}
+
+func testSeckillQueue() string {
+	runID := envOr("GO_SINGLE_MQ_RUN_ID", fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()))
+	return fmt.Sprintf("%s.test.%s", flashsalesvc.SeckillOrderQueue, runID)
+}
+
+type isolatedQueueMQ struct {
+	mq.MQ
+	queue string
+}
+
+func (m isolatedQueueMQ) Publish(ctx context.Context, queue string, body []byte) error {
+	if queue == flashsalesvc.SeckillOrderQueue {
+		queue = m.queue
+	}
+	return m.MQ.Publish(ctx, queue, body)
+}
+
+func (m isolatedQueueMQ) Consume(ctx context.Context, queue string, handler mq.MessageHandler) error {
+	if queue == flashsalesvc.SeckillOrderQueue {
+		queue = m.queue
+	}
+	return m.MQ.Consume(ctx, queue, handler)
+}
 
 // mqEnv 秒杀异步落单测试环境：真实 MQ 发布 + 常驻消费者 + 完整路由。
 // 复用 integration_test.go 的 testEnv（MySQL/Redis/verifier/product 等）。
 type mqEnv struct {
 	router    http.Handler
 	mqClient  mq.MQ
+	queue     string
 	orderSvc  ordersvc.Service
 	reconcile flashsalesvc.Reconciliation
 }
@@ -60,13 +90,11 @@ var (
 	mqEnvErr  error
 )
 
-// requireMQEnv 构建秒杀异步落单环境；MySQL/Redis/RabbitMQ 任一不可达整体跳过。
+// requireMQEnv 构建秒杀异步落单环境；任一依赖不可达时本地跳过、CI 失败。
 func requireMQEnv(t *testing.T) *mqEnv {
 	t.Helper()
 	mqEnvOnce.Do(func() { mqEnvVal, mqEnvErr = buildMQEnv() })
-	if mqEnvErr != nil {
-		t.Skipf("MySQL/Redis/RabbitMQ 不可达，跳过 T12 集成测试（先 docker compose up -d）：%v", mqEnvErr)
-	}
+	testsupport.RequireDependency(t, "MySQL/Redis/RabbitMQ", mqEnvErr)
 	return mqEnvVal
 }
 
@@ -76,10 +104,12 @@ func buildMQEnv() (*mqEnv, error) {
 		return nil, err
 	}
 
-	mqClient, err := mq.NewRabbitMQ(rabbitURL)
+	rabbitMQ, err := mq.NewRabbitMQ(testRabbitURL())
 	if err != nil {
 		return nil, fmt.Errorf("RabbitMQ 连接失败: %w", err)
 	}
+	queue := testSeckillQueue()
+	mqClient := isolatedQueueMQ{MQ: rabbitMQ, queue: queue}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := mqClient.Ping(ctx); err != nil {
@@ -87,7 +117,7 @@ func buildMQEnv() (*mqEnv, error) {
 		return nil, err
 	}
 	// 清空主队列与死信队列：避免上次运行的遗留消息污染断言。
-	if err := purgeQueue(ctx, flashsalesvc.SeckillOrderQueue); err != nil {
+	if err := purgeQueue(ctx, queue); err != nil {
 		mqClient.Close()
 		return nil, err
 	}
@@ -146,7 +176,7 @@ func buildMQEnv() (*mqEnv, error) {
 	flashsaleHandler.RegisterRoutes(api, allowAll)
 	orderHandler.RegisterRoutes(api)
 
-	return &mqEnv{router: r, mqClient: mqClient, orderSvc: orderSvc, reconcile: reconcile}, nil
+	return &mqEnv{router: r, mqClient: mqClient, queue: queue, orderSvc: orderSvc, reconcile: reconcile}, nil
 }
 
 // ---- 请求助手（复用 integration_test.go 的 doJSONOn）----
@@ -344,7 +374,7 @@ func TestSeckillOrderDeadLetter(t *testing.T) {
 	defer cancel()
 	require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
 
-	got := receiveFromDLQ(t, flashsalesvc.SeckillOrderQueue)
+	got := receiveFromDLQ(t, e.queue)
 	require.NotNil(t, got, "永久失败消息应进死信队列")
 	var msg flashsalesvc.SeckillSuccessMessage
 	require.NoError(t, json.Unmarshal(got, &msg))
@@ -355,7 +385,7 @@ func TestSeckillOrderDeadLetter(t *testing.T) {
 
 // purgeQueue 清空主队列与其死信队列的遗留消息（测试环境隔离，避免跨运行污染）。
 func purgeQueue(ctx context.Context, queue string) error {
-	conn, err := amqp.Dial(rabbitURL)
+	conn, err := amqp.Dial(testRabbitURL())
 	if err != nil {
 		return err
 	}
@@ -398,7 +428,7 @@ func purgeQueue(ctx context.Context, queue string) error {
 
 func receiveFromDLQ(t *testing.T, queue string) []byte {
 	t.Helper()
-	conn, err := amqp.Dial(rabbitURL)
+	conn, err := amqp.Dial(testRabbitURL())
 	require.NoError(t, err)
 	defer conn.Close()
 	ch, err := conn.Channel()

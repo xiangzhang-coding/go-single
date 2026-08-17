@@ -4,20 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/require"
+
+	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 )
+
+func testRabbitURL() string {
+	if url := os.Getenv("GO_SINGLE_MQ_URL"); url != "" {
+		return url
+	}
+	return "amqp://guest:guest@127.0.0.1:5672/"
+}
 
 // 集成测试：需要本地 RabbitMQ 就绪（deploy/docker-compose.yml）。
 func TestRabbitMQPing(t *testing.T) {
-	m, err := NewRabbitMQ("amqp://guest:guest@127.0.0.1:5672/")
-	if err != nil {
-		t.Skipf("RabbitMQ 不可用，跳过: %v", err)
-	}
+	m, err := NewRabbitMQ(testRabbitURL())
+	testsupport.RequireDependency(t, "RabbitMQ", err)
 	defer m.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -30,13 +38,11 @@ func TestRabbitMQUnavailable(t *testing.T) {
 	require.Error(t, err)
 }
 
-// newTestMQ 连接测试 RabbitMQ；不可用则跳过测试。
+// newTestMQ 连接测试 RabbitMQ；不可达时本地跳过、CI 失败。
 func newTestMQ(t *testing.T) MQ {
 	t.Helper()
-	m, err := NewRabbitMQ("amqp://guest:guest@127.0.0.1:5672/")
-	if err != nil {
-		t.Skipf("RabbitMQ 不可用，跳过: %v", err)
-	}
+	m, err := NewRabbitMQ(testRabbitURL())
+	testsupport.RequireDependency(t, "RabbitMQ", err)
 	t.Cleanup(func() { m.Close() })
 	return m
 }
@@ -51,7 +57,7 @@ func uniqueQueue(prefix string) string {
 func cleanupQueue(t *testing.T, queue string) {
 	t.Helper()
 	t.Cleanup(func() {
-		conn, err := amqp.Dial("amqp://guest:guest@127.0.0.1:5672/")
+		conn, err := amqp.Dial(testRabbitURL())
 		if err != nil {
 			return // broker 不可达时无残留可清
 		}
@@ -71,7 +77,7 @@ func cleanupQueue(t *testing.T, queue string) {
 // 测试直连 amqp：Consume 为常驻循环，验收场景直接读队列更直接。
 func receiveOne(t *testing.T, queue string) []byte {
 	t.Helper()
-	conn, err := amqp.Dial("amqp://guest:guest@127.0.0.1:5672/")
+	conn, err := amqp.Dial(testRabbitURL())
 	require.NoError(t, err)
 	defer conn.Close()
 	ch, err := conn.Channel()

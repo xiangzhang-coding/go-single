@@ -47,6 +47,7 @@ import (
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
+	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
@@ -72,7 +73,7 @@ func (noopActivity) DeductStock(context.Context, *gorm.DB, int64, int) (bool, er
 func (noopActivity) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
 func (noopActivity) RestoreRedis(context.Context, int64, int64, int) error    { return nil }
 
-// testEnv 每个测试包只构建一次；MySQL 或 Redis 不可达时整体跳过。
+// testEnv 每个测试包只构建一次；MySQL 或 Redis 不可达时本地跳过、CI 失败。
 type testEnv struct {
 	router   http.Handler
 	verifier auth.TokenVerifier
@@ -90,9 +91,7 @@ var (
 func requireEnv(t *testing.T) *testEnv {
 	t.Helper()
 	envOnce.Do(func() { env, envErr = buildEnv() })
-	if envErr != nil {
-		t.Skipf("MySQL/Redis 不可达，跳过集成测试（先 docker compose up -d）：%v", envErr)
-	}
+	testsupport.RequireDependency(t, "MySQL/Redis", envErr)
 	return env
 }
 

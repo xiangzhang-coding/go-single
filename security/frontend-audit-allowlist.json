@@ -1,0 +1,32 @@
+[
+  {
+    "workspace": "website",
+    "package": "image-size",
+    "advisory": "GHSA-5p2g-fcmc-qvqq",
+    "cve": "CVE-2025-71329",
+    "severity": "high",
+    "dependencyPath": [
+      { "package": "@docusaurus/mdx-loader", "version": "3.10.2" },
+      { "package": "image-size", "version": "2.0.2" }
+    ],
+    "rationale": "Build-time only: Docusaurus parses repository-controlled documentation images; image-size is not shipped in the browser bundle. No patched version exists.",
+    "owner": "xiangzhang-coding",
+    "reviewedOn": "2026-08-17",
+    "expiresOn": "2026-11-17"
+  },
+  {
+    "workspace": "website",
+    "package": "image-size",
+    "advisory": "GHSA-w3rx-r6r6-pgpr",
+    "cve": "CVE-2025-71330",
+    "severity": "high",
+    "dependencyPath": [
+      { "package": "@docusaurus/mdx-loader", "version": "3.10.2" },
+      { "package": "image-size", "version": "2.0.2" }
+    ],
+    "rationale": "Build-time only: Docusaurus parses repository-controlled documentation images; image-size is not shipped in the browser bundle. No patched version exists.",
+    "owner": "xiangzhang-coding",
+    "reviewedOn": "2026-08-17",
+    "expiresOn": "2026-11-17"
+  }
+]

@@ -1,6 +1,6 @@
 // T02 个人资料集成测试（主 seam）：PATCH /api/users/me 修改昵称/头像 + 回读、
 // 非法输入 400、归属校验（token 即本人）；头像走真实 MinIO 上传 e2e
-// （复用 platform/file 的 POST /api/files），MinIO 未就绪时该用例跳过。
+// （复用 platform/file 的 POST /api/files），MinIO 未就绪时本地跳过、CI 失败。
 package user_test
 
 import (
@@ -19,6 +19,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/file"
+	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
@@ -134,7 +135,7 @@ func TestUpdateProfileValidation(t *testing.T) {
 }
 
 // 头像上传 e2e：POST /api/files（真实 MinIO）取回 URL → PATCH 写入 avatar_url →
-// GET /users/me 回读。MinIO 不可达时跳过（先 docker compose up -d minio）。
+// GET /users/me 回读。MinIO 不可达时本地跳过、CI 失败。
 func TestAvatarUploadThenSetProfile(t *testing.T) {
 	env := requireEnv(t)
 
@@ -146,9 +147,7 @@ func TestAvatarUploadThenSetProfile(t *testing.T) {
 		UseSSL:    false,
 		PublicURL: envOr("GO_SINGLE_MINIO_PUBLIC_URL", "http://127.0.0.1:19000"),
 	})
-	if err != nil {
-		t.Skipf("MinIO 不可达，跳过头像上传 e2e（先 docker compose up -d minio）：%v", err)
-	}
+	testsupport.RequireDependency(t, "MinIO", err)
 
 	// 独立路由：user + file 同挂，走同库同 JWT。
 	gin.SetMode(gin.TestMode)

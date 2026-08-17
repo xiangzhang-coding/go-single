@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 )
 
 // errTransient 测试用瞬时失败（模拟基础设施故障）。
@@ -168,10 +170,8 @@ func TestCircuitBreakerPublishPingPassthrough(t *testing.T) {
 // 模拟 MQ 故障——消费者处理失败（重投循环）连续达阈值 → 熔断打开 → 快速失败
 // （handler 不再执行）→ 故障恢复 → 冷却后半开探活成功 → 闭合恢复消费。
 func TestCircuitBreakerRabbitMQFailRecover(t *testing.T) {
-	m, err := NewRabbitMQ("amqp://guest:guest@127.0.0.1:5672/")
-	if err != nil {
-		t.Skipf("RabbitMQ 不可用，跳过: %v", err)
-	}
+	m, err := NewRabbitMQ(testRabbitURL())
+	testsupport.RequireDependency(t, "RabbitMQ", err)
 	defer m.Close()
 
 	// 故障期快速失败、恢复期正常：timeout 1s 让半开探活尽快发生。

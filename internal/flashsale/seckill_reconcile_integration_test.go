@@ -5,7 +5,7 @@
 //   - 进行中对账：Redis 有扣减无订单 → 补单信号告警，Redis 不被写回；
 //   - 收尾对账：刚结束活动以 MySQL 为准对齐 Redis。
 //
-// 需要 RabbitMQ 就绪（docker compose up -d），不可达时整体跳过。
+// 需要 RabbitMQ 就绪（docker compose up -d），不可达时本地跳过、CI 失败。
 package flashsale_test
 
 import (

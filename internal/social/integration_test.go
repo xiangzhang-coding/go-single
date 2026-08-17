@@ -40,6 +40,7 @@ import (
 	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
 	socialrepo "github.com/xiangzhang-coding/go-single/internal/social/repository"
 	socialsvc "github.com/xiangzhang-coding/go-single/internal/social/service"
+	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
@@ -51,7 +52,7 @@ const (
 	migrationsDir = "../../migrations"
 )
 
-// testEnv 每个测试包只构建一次；MySQL 不可达时测试整体跳过。
+// testEnv 每个测试包只构建一次；MySQL 不可达时本地跳过、CI 失败。
 type testEnv struct {
 	router   http.Handler
 	verifier auth.TokenVerifier
@@ -67,9 +68,7 @@ var (
 func requireEnv(t *testing.T) *testEnv {
 	t.Helper()
 	envOnce.Do(func() { env, envErr = buildEnv() })
-	if envErr != nil {
-		t.Skipf("MySQL 不可达，跳过集成测试（先 docker compose up -d mysql）：%v", envErr)
-	}
+	testsupport.RequireDependency(t, "MySQL", envErr)
 	return env
 }
 

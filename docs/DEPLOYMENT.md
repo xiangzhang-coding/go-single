@@ -20,9 +20,13 @@
 | 7 | Grafana/Prometheus 访问 | 无认证 | 加认证或内网隔离 |
 | 8 | 秒杀 `worker_id` | 1 | 多实例时每实例唯一（0-1023） |
 
-依赖版本安全：`go run golang.org/x/vuln/cmd/govulncheck@latest ./...`（CI 已内置）。
+依赖版本安全：`go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...` 与
+`bun run scripts/frontend-audit.ts`（CI 已内置，版本均固定）。
 已知项：`golang.org/x/crypto/openpgp` 为上游弃用包（无修复版，代码未调用，仅经依赖链引入）；
-website 构建链 `image-size` 漏洞上游无修复版（仅 CI 构建期执行，不进入产物）。
+website 构建链 `@docusaurus/mdx-loader@3.10.2 → image-size@2.0.2` 的
+`GHSA-5p2g-fcmc-qvqq` / `CVE-2025-71329` 与 `GHSA-w3rx-r6r6-pgpr` / `CVE-2025-71330`
+上游无修复版，仅处理仓库内受控图片且不进入浏览器产物。例外按精确版本、依赖路径和复查期限记录在
+`security/frontend-audit-allowlist.json`；新增漏洞、路径变化、例外消失或过期均使 CI 失败。
 
 ## 1. 本地 HTTPS 与安全头演示
 
@@ -72,7 +76,7 @@ curl -sk https://127.0.0.1:8443/api/products
 
 ### 构建环境变量
 
-- **web/faire**：`VITE_API_BASE`（后端绝对地址，如 `https://api.example.com`；缺省 `/api` 同源）、`VITE_WS_BASE`（WebSocket 地址，缺省 `/ws`）。跨源时后端 `platform/cors` 按白名单放行（见 configs/config.yaml `cors.allowed_origins`）。
+- **web/faire**：Cloudflare 构建必须提供 `VITE_API_BASE`（后端 HTTPS 绝对地址，如 `https://api.example.com`）和 `VITE_WS_BASE`（后端 WSS 绝对地址，如 `wss://api.example.com/ws`），缺失或协议错误时 workflow 在安装依赖前失败。本地 Nginx 构建仍可省略并使用 `/api`、`/ws` 同源回退。跨源时后端 `platform/cors` 按白名单放行（见 configs/config.yaml `cors.allowed_origins`）。
 - **website**：无环境变量。
 
 ### 域名 / HTTPS

@@ -6,15 +6,15 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 )
 
 // 集成测试：需要本地 Redis 就绪（deploy/docker-compose.yml）。
-// 未就绪时自动跳过，不影响单元测试。
+// 未就绪时本地跳过、CI 失败。
 func TestRedisPing(t *testing.T) {
 	c, err := NewRedis("127.0.0.1:6379", "", 0)
-	if err != nil {
-		t.Skipf("Redis 不可用，跳过: %v", err)
-	}
+	testsupport.RequireDependency(t, "Redis", err)
 	defer c.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -30,9 +30,7 @@ func TestRedisUnavailable(t *testing.T) {
 // Get/Set/Del 与 ErrMiss 语义（测试用独立 DB，避免污染）。
 func TestRedisGetSetDel(t *testing.T) {
 	c, err := NewRedis("127.0.0.1:6379", "", 15)
-	if err != nil {
-		t.Skipf("Redis 不可用，跳过: %v", err)
-	}
+	testsupport.RequireDependency(t, "Redis", err)
 	defer c.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

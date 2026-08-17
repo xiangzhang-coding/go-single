@@ -1,6 +1,6 @@
 // 文件上传集成测试（主 seam）：真实 MinIO + httptest 起完整路由，
 // 覆盖 合法图片返回 URL、非法类型/超限被拒、未授权 401、私有桶匿名不可读。
-// MinIO 未就绪（deploy/docker-compose.yml）时整体跳过。
+// MinIO 未就绪时本地跳过、CI 失败（服务见 deploy/docker-compose.yml）。
 package file_test
 
 import (
@@ -24,6 +24,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/file"
+	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 )
 
 // png1x1 一张合法 1×1 像素 PNG。
@@ -39,7 +40,7 @@ var png1x1 = []byte{
 	0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 }
 
-// testEnv 每个测试包只构建一次；MinIO 不可达时测试整体跳过。
+// testEnv 每个测试包只构建一次；MinIO 不可达时本地跳过、CI 失败。
 type testEnv struct {
 	router   http.Handler
 	bucket   string
@@ -56,9 +57,7 @@ var (
 func requireEnv(t *testing.T) *testEnv {
 	t.Helper()
 	envOnce.Do(func() { env, envErr = buildEnv() })
-	if envErr != nil {
-		t.Skipf("MinIO 不可达，跳过集成测试（先 docker compose up -d minio）：%v", envErr)
-	}
+	testsupport.RequireDependency(t, "MinIO", envErr)
 	return env
 }
 
