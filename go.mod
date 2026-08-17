@@ -1,6 +1,6 @@
 module github.com/xiangzhang-coding/go-single
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/gabriel-vasile/mimetype v1.4.12
