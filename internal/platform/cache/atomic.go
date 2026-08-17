@@ -76,7 +76,7 @@ type FlashSalePreDeductParams struct {
 	Now          time.Time
 	StartAt      time.Time
 	EndAt        time.Time
-	Status       string
+	OnSale       bool
 	PerUserLimit int
 }
 
@@ -144,7 +144,7 @@ return 0
 `
 
 const preDeductFlashSaleScript = `
-if ARGV[4] ~= 'on_sale' then
+if ARGV[4] ~= '1' then
     return -3
 end
 if ARGV[1] < ARGV[2] or ARGV[1] > ARGV[3] then
@@ -164,10 +164,34 @@ return 1
 `
 
 const restoreFlashSaleScript = `
-if redis.call('EXISTS', KEYS[1]) == 1 then
+local function parse_safe_integer(value)
+    if value ~= '0' and value ~= '-0' and
+       string.match(value, '^[1-9]%d*$') == nil and
+       string.match(value, '^%-[1-9]%d*$') == nil then
+        return nil
+    end
+    local number = tonumber(value)
+    if number == nil or number > 9007199254740991 or number < -9007199254740991 then
+        return nil
+    end
+    return number
+end
+local quantity = parse_safe_integer(ARGV[1])
+if quantity == nil or quantity <= 0 then
+    return redis.error_reply('flash-sale restore quantity is not a positive safe integer')
+end
+local stock_exists = redis.call('EXISTS', KEYS[1]) == 1
+local count_exists = redis.call('EXISTS', KEYS[2]) == 1
+if stock_exists and parse_safe_integer(redis.call('GET', KEYS[1])) == nil then
+    return redis.error_reply('flash-sale stock is not a safe integer')
+end
+if count_exists and parse_safe_integer(redis.call('GET', KEYS[2])) == nil then
+    return redis.error_reply('flash-sale count is not a safe integer')
+end
+if stock_exists then
     redis.call('INCRBY', KEYS[1], ARGV[1])
 end
-if redis.call('EXISTS', KEYS[2]) == 1 then
+if count_exists then
     redis.call('DECRBY', KEYS[2], ARGV[1])
 end
 redis.call('DEL', KEYS[3])
@@ -233,8 +257,12 @@ func (r *redisCache) WarmFlashSaleStock(ctx context.Context, p FlashSaleWarmPara
 }
 
 func (r *redisCache) PreDeductFlashSale(ctx context.Context, p FlashSalePreDeductParams) (FlashSalePreDeductResult, error) {
+	onSale := 0
+	if p.OnSale {
+		onSale = 1
+	}
 	code, err := r.evalInt(ctx, preDeductFlashSaleScript, []string{p.StockKey, p.CountKey},
-		p.Now.UnixMilli(), p.StartAt.UnixMilli(), p.EndAt.UnixMilli(), p.Status, p.PerUserLimit)
+		p.Now.UnixMilli(), p.StartAt.UnixMilli(), p.EndAt.UnixMilli(), onSale, p.PerUserLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -255,6 +283,9 @@ func (r *redisCache) PreDeductFlashSale(ctx context.Context, p FlashSalePreDeduc
 }
 
 func (r *redisCache) RestoreFlashSale(ctx context.Context, p FlashSaleRestoreParams) error {
+	if p.Quantity <= 0 {
+		return fmt.Errorf("flash-sale restore quantity must be positive: %d", p.Quantity)
+	}
 	code, err := r.evalInt(ctx, restoreFlashSaleScript,
 		[]string{p.StockKey, p.CountKey, p.IdempotencyKey}, p.Quantity)
 	if err != nil {

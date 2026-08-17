@@ -10,6 +10,9 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 )
 
+// redisTestDB 供 cache 包独占，避免与业务集成测试的 DB 15-20 并行污染。
+const redisTestDB = 14
+
 // 集成测试：需要本地 Redis 就绪（deploy/docker-compose.yml）。
 // 未就绪时本地跳过、CI 失败。
 func TestRedisPing(t *testing.T) {
@@ -29,7 +32,7 @@ func TestRedisUnavailable(t *testing.T) {
 
 // Get/Set/Del 与 ErrMiss 语义（测试用独立 DB，避免污染）。
 func TestRedisGetSetDel(t *testing.T) {
-	c, err := NewRedis("127.0.0.1:6379", "", 15)
+	c, err := NewRedis("127.0.0.1:6379", "", redisTestDB)
 	testsupport.RequireDependency(t, "Redis", err)
 	defer c.Close()
 

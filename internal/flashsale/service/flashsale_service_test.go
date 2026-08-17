@@ -228,7 +228,7 @@ func (f *fakeCache) PreDeductFlashSale(_ context.Context, p cache.FlashSalePreDe
 	if f.deductErr != nil {
 		return 0, f.deductErr
 	}
-	if p.Status != model.ActivityStatusOnSale {
+	if !p.OnSale {
 		return cache.FlashSaleOffline, nil
 	}
 	if p.Now.Before(p.StartAt) || p.Now.After(p.EndAt) {

@@ -513,7 +513,8 @@ func (s *flashsaleService) PreDeduct(ctx context.Context, userID, activityID int
 	now := time.Now()
 	result, err := s.cache.PreDeductFlashSale(ctx, cache.FlashSalePreDeductParams{
 		StockKey: stockKey(a.ID), CountKey: countKey(a.ID, userID), Now: now,
-		StartAt: a.StartAt, EndAt: a.EndAt, Status: a.Status, PerUserLimit: a.PerUserLimit,
+		StartAt: a.StartAt, EndAt: a.EndAt, OnSale: a.Status == model.ActivityStatusOnSale,
+		PerUserLimit: a.PerUserLimit,
 	})
 	if err != nil {
 		s.preDeductFailed()

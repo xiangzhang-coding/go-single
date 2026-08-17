@@ -14,7 +14,7 @@ import (
 
 func newAtomicRedis(t *testing.T) Client {
 	t.Helper()
-	c, err := NewRedis("127.0.0.1:6379", "", 15)
+	c, err := NewRedis("127.0.0.1:6379", "", redisTestDB)
 	testsupport.RequireDependency(t, "Redis", err)
 	t.Cleanup(func() { require.NoError(t, c.Close()) })
 	return c
@@ -250,7 +250,7 @@ func TestPreDeductFlashSaleResultsAndState(t *testing.T) {
 		{
 			name: "offline", stock: 5, want: FlashSaleOffline,
 			wantStock: 5, wantCount: 0,
-			mutate: func(p *FlashSalePreDeductParams) { p.Status = "off_sale" },
+			mutate: func(p *FlashSalePreDeductParams) { p.OnSale = false },
 		},
 	}
 
@@ -271,7 +271,7 @@ func TestPreDeductFlashSaleResultsAndState(t *testing.T) {
 			params := FlashSalePreDeductParams{
 				StockKey: stockKey, CountKey: countKey, Now: now,
 				StartAt: now.Add(-time.Minute), EndAt: now.Add(time.Hour),
-				Status: "on_sale", PerUserLimit: 2,
+				OnSale: true, PerUserLimit: 2,
 			}
 			if tc.mutate != nil {
 				tc.mutate(&params)
@@ -308,7 +308,7 @@ func TestPreDeductFlashSaleIsAtomicUnderContention(t *testing.T) {
 			results[i], errs[i] = c.PreDeductFlashSale(context.Background(), FlashSalePreDeductParams{
 				StockKey: stockKey, CountKey: countKey, Now: now,
 				StartAt: now.Add(-time.Minute), EndAt: now.Add(time.Hour),
-				Status: "on_sale", PerUserLimit: 1,
+				OnSale: true, PerUserLimit: 1,
 			})
 		}(i)
 	}
@@ -343,7 +343,7 @@ func TestPreDeductFlashSalePropagatesRedisError(t *testing.T) {
 	_, err := c.PreDeductFlashSale(ctx, FlashSalePreDeductParams{
 		StockKey: stockKey, CountKey: countKey, Now: now,
 		StartAt: now.Add(-time.Minute), EndAt: now.Add(time.Hour),
-		Status: "on_sale", PerUserLimit: 1,
+		OnSale: true, PerUserLimit: 1,
 	})
 	require.ErrorIs(t, err, context.Canceled)
 	requireCacheState(t, c, stockKey, "5", true)
@@ -416,6 +416,100 @@ func TestRestoreFlashSalePropagatesRedisError(t *testing.T) {
 		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
 	})
 	require.ErrorIs(t, err, context.Canceled)
+	requireCacheState(t, c, stockKey, "8", true)
+	requireCacheState(t, c, countKey, "2", true)
+	requireCacheState(t, c, idemKey, "1", true)
+}
+
+func TestRestoreFlashSaleRejectsInvalidStateBeforeMutation(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-restore-invalid-stock")
+	countKey := atomicTestKey(t, "flashsale-restore-invalid-count")
+	idemKey := atomicTestKey(t, "flashsale-restore-invalid-idem")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), stockKey))
+		require.NoError(t, c.Del(context.Background(), countKey))
+		require.NoError(t, c.Del(context.Background(), idemKey))
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "8", 0))
+	require.NoError(t, c.(*redisCache).client.HSet(context.Background(), countKey, "invalid", "state").Err())
+	require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
+
+	err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
+	})
+	require.ErrorContains(t, err, "WRONGTYPE")
+	requireCacheState(t, c, stockKey, "8", true)
+	requireCacheState(t, c, idemKey, "1", true)
+	typ, typeErr := c.(*redisCache).client.Type(context.Background(), countKey).Result()
+	require.NoError(t, typeErr)
+	require.Equal(t, "hash", typ)
+}
+
+func TestRestoreFlashSaleRejectsNonIntegerBeforeMutation(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-restore-decimal-stock")
+	countKey := atomicTestKey(t, "flashsale-restore-decimal-count")
+	idemKey := atomicTestKey(t, "flashsale-restore-decimal-idem")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), stockKey))
+		require.NoError(t, c.Del(context.Background(), countKey))
+		require.NoError(t, c.Del(context.Background(), idemKey))
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "8", 0))
+	require.NoError(t, c.Set(context.Background(), countKey, "1.5", 0))
+	require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
+
+	err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
+	})
+	require.ErrorContains(t, err, "safe integer")
+	requireCacheState(t, c, stockKey, "8", true)
+	requireCacheState(t, c, countKey, "1.5", true)
+	requireCacheState(t, c, idemKey, "1", true)
+}
+
+func TestRestoreFlashSaleRejectsOverflowBeforeMutation(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-restore-overflow-stock")
+	countKey := atomicTestKey(t, "flashsale-restore-overflow-count")
+	idemKey := atomicTestKey(t, "flashsale-restore-overflow-idem")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), stockKey))
+		require.NoError(t, c.Del(context.Background(), countKey))
+		require.NoError(t, c.Del(context.Background(), idemKey))
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "9223372036854775807", 0))
+	require.NoError(t, c.Set(context.Background(), countKey, "2", 0))
+	require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
+
+	err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey, Quantity: 2,
+	})
+	require.ErrorContains(t, err, "safe integer")
+	requireCacheState(t, c, stockKey, "9223372036854775807", true)
+	requireCacheState(t, c, countKey, "2", true)
+	requireCacheState(t, c, idemKey, "1", true)
+}
+
+func TestRestoreFlashSaleRejectsInvalidQuantityBeforeMutation(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-restore-quantity-stock")
+	countKey := atomicTestKey(t, "flashsale-restore-quantity-count")
+	idemKey := atomicTestKey(t, "flashsale-restore-quantity-idem")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), stockKey))
+		require.NoError(t, c.Del(context.Background(), countKey))
+		require.NoError(t, c.Del(context.Background(), idemKey))
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "8", 0))
+	require.NoError(t, c.Set(context.Background(), countKey, "2", 0))
+	require.NoError(t, c.Set(context.Background(), idemKey, "1", time.Minute))
+
+	err := c.RestoreFlashSale(context.Background(), FlashSaleRestoreParams{
+		StockKey: stockKey, CountKey: countKey, IdempotencyKey: idemKey,
+	})
+	require.ErrorContains(t, err, "must be positive")
 	requireCacheState(t, c, stockKey, "8", true)
 	requireCacheState(t, c, countKey, "2", true)
 	requireCacheState(t, c, idemKey, "1", true)
