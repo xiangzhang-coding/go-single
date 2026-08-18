@@ -34,7 +34,7 @@ sidebar_position: 3
 | id | BIGINT UNSIGNED PK | SKU ID |
 | product_id | BIGINT UNSIGNED FK | 所属商品（CASCADE） |
 | specs | VARCHAR(255) | 规格组合 JSON（如 `{"color":"红","size":"M"}`） |
-| price | BIGINT UNSIGNED | 售价（分） |
+| price | BIGINT UNSIGNED | 售价（分），应用与数据库共同限制为 0–100,000,000 分（100 万元） |
 | stock | INT UNSIGNED | 普通订单库存 |
 
 约束注意：`skus` 被 `order_items`、`flashsale_activities`、`posts` 以 FK RESTRICT 引用——**有订单/活动/动态历史的 SKU 不可删除**（历史可追溯）。
@@ -92,4 +92,4 @@ DeductStock(tx, skuID, qty)
 RestoreStock(tx, skuID, qty)  ← 取消订单回补，随后失效缓存
 ```
 
-权威源：[docs/DESIGN.md 普通订单流程](https://github.com/xiangzhang-coding/go-single/blob/main/docs/DESIGN.md)、迁移 `000003_products`。
+权威源：[docs/DESIGN.md 普通订单流程](https://github.com/xiangzhang-coding/go-single/blob/main/docs/DESIGN.md)、迁移 `000003_products` / `000019_order_payment_invariants`。

@@ -10,6 +10,8 @@ import (
 const (
 	ProductStatusOffSale = "off_sale"
 	ProductStatusOnSale  = "on_sale"
+	// MaxPriceCents 是 SKU 与秒杀成交价共同遵守的数据库业务上限：100 万元。
+	MaxPriceCents int64 = 100_000_000
 )
 
 // Category 商品类目，组织商品结构。

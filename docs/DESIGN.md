@@ -135,7 +135,8 @@ go_single/
 ```
 
 - **库存扣减时机**：下单即扣（与秒杀同原则：下单即扣、超时回补）；扣减用条件更新（`UPDATE sku SET stock=stock-N WHERE stock>=N`）防超卖
-- **幂等**：下单接口携带 `client_request_id`（类型化缓存能力封装 Redis SETNX + TTL 15min），重复请求返回同一订单号
+- **幂等**：下单接口携带 `client_request_id`；MySQL 唯一约束 `(user_id, client_request_id)` 保存持久请求事实，Redis SETNX + TTL 15min 仅协调在途请求。Redis 丢失或 TTL 到期后重试仍返回原订单
+- **金额安全**：SKU 与秒杀成交价上限为 100,000,000 分（100 万元）；订单项乘法与订单总额累加使用检查运算，金额关系和逐项小计在扣库存前验证，并由数据库 `CHECK` 约束兜底
 - **订单号**：雪花 ID（手写实现，学习点）
 - **地址快照**：下单时从地址簿选择地址固化为订单副本，用户后续改地址不影响历史订单
 - **超时取消**：默认 普通订单 15min / 秒杀订单 10min（实现期可调）
@@ -179,7 +180,7 @@ go_single/
 ## 模拟支付
 
 - 接口形态：外部 API 端点 `POST /api/payments/mock {order_id, payment_id, amount, result: success|fail}`（前端订单详情页"模拟支付"按钮或 curl 调用）→ payment handler → payment service → 进程内调用 order service 驱动状态流转；`payment_id` 为客户端生成的支付流水号（每次尝试重新生成），`amount` 为回调申报金额（分）
-- 成功：状态机校验（仅 待支付→已支付 合法）+ 支付流水表唯一约束（payment_id，重复回调 409）+ 金额核对（回调金额 = 应付金额，不符 409）
+- 成功：状态机校验（仅 待支付→已支付 合法）+ 支付流水表唯一约束（payment_id，重复回调 409）+ 金额核对（回调金额 = 应付金额，不符 409）+ 支付期限校验（`expire_at > paid_at`）；状态、金额和期限在同一条件更新中原子裁决
 - 失败：订单停留待支付，记录失败流水，允许重试支付（待支付 状态内可重复发起，重试须用新 payment_id）
 - 归属：owner 校验先于流水检查（防 IDOR，他人订单 403）；流水落库与订单状态迁移同一事务
 
@@ -223,7 +224,7 @@ go_single/
 ## 限流与幂等
 
 - 限流：全局令牌桶中间件（golang.org/x/time/rate，QPS 可配，单实例）+ 秒杀接口按用户限流（Redis 计数 INCR+TTL，跨请求状态）；backlog 的"Redis 分布式限流"指替代全局单机令牌桶的多实例方案
-- 幂等键 TTL：秒杀幂等键 30min；下单 `client_request_id` 15min
+- 幂等键 TTL：秒杀幂等键 30min；普通下单 Redis 在途键 15min（持久幂等事实无 TTL，保存在 MySQL）
 
 ## 可观测性
 

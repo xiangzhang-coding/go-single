@@ -468,7 +468,7 @@ func validateSKU(specs json.RawMessage, price int64, stock int) error {
 	if len(specs) == 0 || !json.Valid(specs) || len(specs) > 255 {
 		return fmt.Errorf("%w: invalid specs", ErrInvalidInput)
 	}
-	if price < 0 {
+	if price < 0 || price > model.MaxPriceCents {
 		return fmt.Errorf("%w: invalid price", ErrInvalidInput)
 	}
 	if stock < 0 {

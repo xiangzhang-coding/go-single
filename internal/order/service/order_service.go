@@ -3,7 +3,8 @@
 //
 // 下单为单事务（订单 + 订单项 + 库存条件更新 stock>=N + 地址快照 + 券核销 +
 // 删除购物车条目），事务由 order 仓储开启，跨模块写操作经各模块 service 的
-// tx 参数汇入同一事务；client_request_id 幂等（Redis SETNX + TTL 15min）。
+// tx 参数汇入同一事务；client_request_id 以 MySQL 唯一事实保证持久幂等，
+// Redis SETNX + TTL 15min 协调在途请求。
 package service
 
 import (
@@ -57,7 +58,7 @@ var (
 const (
 	normalExpire  = 15 * time.Minute
 	seckillExpire = 10 * time.Minute
-	// 幂等键 TTL：与规格一致（15min），超时后允许同一 client_request_id 重新下单。
+	// 幂等键 TTL 仅协调在途请求；过期后仍由数据库请求身份返回原订单。
 	idemTTL = 15 * time.Minute
 	// 分页上限与默认页大小。
 	defaultPageSize = 20
@@ -189,7 +190,7 @@ type Service interface {
 	// 提供最小只读状态；非秒杀或不存在返回 found=false。
 	SeckillOrderStatus(ctx context.Context, orderNo string) (status string, found bool, err error)
 	// MarkPaid 支付成功状态迁移：待支付 → 已支付（支付模块事务内条件更新；
-	// WHERE 同时校验 status 与 pay_amount，false = 状态已变或金额不符）。
+	// WHERE 同时校验 status、pay_amount 与 expire_at）。
 	MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error)
 	// Ship 后台发货：已支付 → 已发货（admin）。
 	Ship(ctx context.Context, orderNo string) error
@@ -214,6 +215,7 @@ type lineSnapshot struct {
 	specs     json.RawMessage
 	price     int64
 	quantity  int
+	subtotal  int64
 }
 
 type idempotencyCache interface {
@@ -262,7 +264,7 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 }
 
 // createOrder 下单流程：
-//  1. 生成雪花订单号并原子抢占幂等键（SETNX client_request_id，重复请求返回同一订单号）
+//  1. 查询持久请求身份；未命中再生成订单号并以 Redis SETNX 协调在途请求
 //  2. 读取地址（固化为快照）→ 组装订单项（购物车/直购）→ 校验券可用
 //  3. 读取 SKU 价格与上架状态，累计商品总额，计算券额与应付
 //  4. 单事务：条件扣减库存 → 核销券 → 建订单+订单项 → 删除已购购物车条目
@@ -281,6 +283,9 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 	}
 	if err := validateItems(&p); err != nil {
 		return nil, err
+	}
+	if existing, err := s.replayNormalRequest(ctx, userID, p.ClientRequestID); err != nil || existing != nil {
+		return existing, err
 	}
 
 	orderNo, acquired, err := s.acquireIdempotency(ctx, userID, p.ClientRequestID)
@@ -368,10 +373,15 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 		if err != nil {
 			return err
 		}
-		order, items = buildOrder(userID, orderNo, address, snapshots, total, discount, pay, coupon)
+		order, items = buildOrder(userID, orderNo, p.ClientRequestID, address, snapshots, total, discount, pay, coupon)
 		return s.persistOrder(ctx, tx, userID, p.CouponID, coupon, snapshots, order, items, cartItemIDs)
 	})
 	if err != nil {
+		if errors.Is(err, repository.ErrOrderDuplicate) {
+			if existing, replayErr := s.replayNormalRequest(ctx, userID, p.ClientRequestID); replayErr != nil || existing != nil {
+				return existing, replayErr
+			}
+		}
 		return nil, err
 	}
 
@@ -391,8 +401,12 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p Sec
 		return false, fmt.Errorf("%w: transaction required", ErrInvalidInput)
 	}
 	if p.OrderNo == "" || p.UserID <= 0 || p.ActivityID <= 0 || p.PurchaseSlot <= 0 || p.SKUID <= 0 ||
-		p.Price < 0 || p.Quantity < 1 || p.Quantity > 99 || p.Address == nil {
+		p.Price <= 0 || p.Price > productmodel.MaxPriceCents || p.Quantity < 1 || p.Quantity > 99 || p.Address == nil {
 		return false, fmt.Errorf("%w: invalid seckill order params", ErrInvalidInput)
+	}
+	amount, err := checkedAmountMul(p.Price, p.Quantity)
+	if err != nil {
+		return false, err
 	}
 
 	// 商品快照（标题/规格），跨模块经 product 服务读取（同普通下单）。
@@ -424,8 +438,8 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p Sec
 		Status:          model.OrderStatusPendingPayment,
 		ActivityID:      &activityID,
 		PurchaseSlot:    &purchaseSlot,
-		TotalAmount:     p.Price * int64(p.Quantity),
-		PayAmount:       p.Price * int64(p.Quantity),
+		TotalAmount:     amount,
+		PayAmount:       amount,
 		Receiver:        p.Address.Receiver,
 		Phone:           p.Address.Phone,
 		Province:        p.Address.Province,
@@ -443,7 +457,10 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p Sec
 		Specs:     sku.Specs,
 		Price:     p.Price,
 		Quantity:  p.Quantity,
-		Subtotal:  p.Price * int64(p.Quantity),
+		Subtotal:  amount,
+	}
+	if err := validateAmountConsistency(order, []model.OrderItem{item}); err != nil {
+		return false, err
 	}
 
 	if err := s.store.Orders.Create(ctx, tx, order); err != nil {
@@ -472,6 +489,9 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p Sec
 func (s *orderService) persistOrder(ctx context.Context, tx *gorm.DB, userID, couponID int64,
 	coupon *couponmodel.UserCouponView, snapshots []lineSnapshot, order *model.Order,
 	items []model.OrderItem, cartItemIDs []int64) error {
+	if err := validateAmountConsistency(order, items); err != nil {
+		return err
+	}
 	for _, sn := range snapshots {
 		ok, err := s.products.DeductStock(ctx, tx, sn.skuID, sn.quantity)
 		if err != nil {
@@ -554,6 +574,21 @@ func (s *orderService) replayIdempotent(ctx context.Context, orderNo string) (*C
 		}, nil
 	}
 	return &CreateResult{Order: view, Idempotent: true}, nil
+}
+
+func (s *orderService) replayNormalRequest(ctx context.Context, userID int64, clientRequestID string) (*CreateResult, error) {
+	order, err := s.store.Orders.GetNormalByClientRequestID(ctx, userID, clientRequestID)
+	if err != nil || order == nil {
+		return nil, err
+	}
+	items, err := s.store.Items.ListByOrder(ctx, order.OrderNo)
+	if err != nil {
+		return nil, err
+	}
+	return &CreateResult{
+		Order:      &model.OrderView{Order: *order, Items: items},
+		Idempotent: true,
+	}, nil
 }
 
 // translateCouponError 跨模块错误翻译为本模块业务错误（handler 据此映射 HTTP 状态码）。
@@ -683,6 +718,17 @@ func (s *orderService) loadSnapshots(ctx context.Context, tx *gorm.DB, lines []o
 		if sku == nil {
 			return nil, 0, ErrSKUNotFound
 		}
+		if sku.Price < 0 || sku.Price > productmodel.MaxPriceCents {
+			return nil, 0, fmt.Errorf("%w: invalid sku price", ErrInvalidInput)
+		}
+		subtotal, err := checkedAmountMul(sku.Price, l.quantity)
+		if err != nil {
+			return nil, 0, err
+		}
+		total, err = checkedAmountAdd(total, subtotal)
+		if err != nil {
+			return nil, 0, err
+		}
 		detail, err := s.products.GetDetail(ctx, sku.ProductID)
 		if err != nil {
 			if errors.Is(err, productsvc.ErrProductNotFound) {
@@ -697,31 +743,32 @@ func (s *orderService) loadSnapshots(ctx context.Context, tx *gorm.DB, lines []o
 			specs:     sku.Specs,
 			price:     sku.Price,
 			quantity:  l.quantity,
+			subtotal:  subtotal,
 		})
-		total += sku.Price * int64(l.quantity)
 	}
 	return snapshots, total, nil
 }
 
 // buildOrder 组装订单与订单项（含地址快照与金额）。
-func buildOrder(userID int64, orderNo string, address *usermodel.Address,
+func buildOrder(userID int64, orderNo, clientRequestID string, address *usermodel.Address,
 	snapshots []lineSnapshot, total, discount, pay int64, coupon *couponmodel.UserCouponView) (*model.Order, []model.OrderItem) {
 
 	order := &model.Order{
-		OrderNo:        orderNo,
-		UserID:         userID,
-		OrderType:      model.OrderTypeNormal,
-		Status:         model.OrderStatusPendingPayment,
-		TotalAmount:    total,
-		DiscountAmount: discount,
-		PayAmount:      pay,
-		Receiver:       address.Receiver,
-		Phone:          address.Phone,
-		Province:       address.Province,
-		City:           address.City,
-		District:       address.District,
-		Detail:         address.Detail,
-		ExpireAt:       time.Now().Add(normalExpire),
+		OrderNo:         orderNo,
+		UserID:          userID,
+		ClientRequestID: &clientRequestID,
+		OrderType:       model.OrderTypeNormal,
+		Status:          model.OrderStatusPendingPayment,
+		TotalAmount:     total,
+		DiscountAmount:  discount,
+		PayAmount:       pay,
+		Receiver:        address.Receiver,
+		Phone:           address.Phone,
+		Province:        address.Province,
+		City:            address.City,
+		District:        address.District,
+		Detail:          address.Detail,
+		ExpireAt:        time.Now().Add(normalExpire),
 	}
 	if coupon != nil {
 		order.CouponID = &coupon.ID
@@ -737,7 +784,7 @@ func buildOrder(userID int64, orderNo string, address *usermodel.Address,
 			Specs:     sn.specs,
 			Price:     sn.price,
 			Quantity:  sn.quantity,
-			Subtotal:  sn.price * int64(sn.quantity),
+			Subtotal:  sn.subtotal,
 		})
 	}
 	return order, items
@@ -990,8 +1037,8 @@ func (s *orderService) cancelInTx(ctx context.Context, tx *gorm.DB, view *model.
 }
 
 // MarkPaid 支付成功状态迁移：待支付 → 已支付（事务由支付模块开启）。
-// 状态机（仅 待支付→已支付）与金额核对（pay_amount = 回调金额）由条件更新
-// WHERE 原子兜底；false 表示状态已变或金额不符，由支付模块区分错误。
+// 状态机、金额核对与支付期限由条件更新 WHERE 原子兜底；false 表示状态、
+// 金额或期限不再允许支付，由支付模块统一按订单已变化处理。
 func (s *orderService) MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error) {
 	ok, err := s.store.Orders.MarkPaid(ctx, tx, orderNo, payAmount)
 	if ok {

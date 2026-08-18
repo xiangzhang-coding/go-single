@@ -35,29 +35,30 @@ func CanTransition(from, to string) bool { return transitions[from][to] }
 // Order 订单：一次购买的完整记录；金额单位均为分。
 // 地址字段为下单时从地址簿固化的地址快照，用户后续改地址不影响历史订单。
 type Order struct {
-	OrderNo        string     `json:"order_no"`
-	UserID         int64      `json:"user_id"`
-	OrderType      string     `json:"order_type"`
-	Status         string     `json:"status"`
-	ActivityID     *int64     `json:"activity_id,omitempty" gorm:"column:activity_id"`
-	PurchaseSlot   *int64     `json:"purchase_slot,omitempty" gorm:"column:purchase_slot"`
-	TotalAmount    int64      `json:"total_amount" gorm:"column:total_amount"`
-	DiscountAmount int64      `json:"discount_amount" gorm:"column:discount_amount"`
-	PayAmount      int64      `json:"pay_amount" gorm:"column:pay_amount"`
-	CouponID       *int64     `json:"coupon_id,omitempty" gorm:"column:coupon_id"`
-	Receiver       string     `json:"receiver"`
-	Phone          string     `json:"phone"`
-	Province       string     `json:"province"`
-	City           string     `json:"city"`
-	District       string     `json:"district"`
-	Detail         string     `json:"detail"`
-	PaidAt         *time.Time `json:"paid_at,omitempty" gorm:"column:paid_at"`
-	ShippedAt      *time.Time `json:"shipped_at,omitempty" gorm:"column:shipped_at"`
-	CompletedAt    *time.Time `json:"completed_at,omitempty" gorm:"column:completed_at"`
-	CancelledAt    *time.Time `json:"cancelled_at,omitempty" gorm:"column:cancelled_at"`
-	ExpireAt       time.Time  `json:"expire_at" gorm:"column:expire_at"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	OrderNo         string     `json:"order_no"`
+	UserID          int64      `json:"user_id"`
+	ClientRequestID *string    `json:"-" gorm:"column:client_request_id"`
+	OrderType       string     `json:"order_type"`
+	Status          string     `json:"status"`
+	ActivityID      *int64     `json:"activity_id,omitempty" gorm:"column:activity_id"`
+	PurchaseSlot    *int64     `json:"purchase_slot,omitempty" gorm:"column:purchase_slot"`
+	TotalAmount     int64      `json:"total_amount" gorm:"column:total_amount"`
+	DiscountAmount  int64      `json:"discount_amount" gorm:"column:discount_amount"`
+	PayAmount       int64      `json:"pay_amount" gorm:"column:pay_amount"`
+	CouponID        *int64     `json:"coupon_id,omitempty" gorm:"column:coupon_id"`
+	Receiver        string     `json:"receiver"`
+	Phone           string     `json:"phone"`
+	Province        string     `json:"province"`
+	City            string     `json:"city"`
+	District        string     `json:"district"`
+	Detail          string     `json:"detail"`
+	PaidAt          *time.Time `json:"paid_at,omitempty" gorm:"column:paid_at"`
+	ShippedAt       *time.Time `json:"shipped_at,omitempty" gorm:"column:shipped_at"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty" gorm:"column:completed_at"`
+	CancelledAt     *time.Time `json:"cancelled_at,omitempty" gorm:"column:cancelled_at"`
+	ExpireAt        time.Time  `json:"expire_at" gorm:"column:expire_at"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 	// UserActivityKey 秒杀订单去重键：落单写 "user_id:activity_id:purchase_slot"，
 	// 取消/超时取消同事务置 NULL（MySQL 唯一索引允许多个 NULL）；同一用户可
 	// 占用活动限购范围内的多个槽位，同槽消息重投仍只命中一单。

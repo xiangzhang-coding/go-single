@@ -128,7 +128,7 @@ npx wrangler pages project create go-single-website
 
 | 服务 | 命名卷与数据目录 | 持久化策略 | 恢复目标 |
 |---|---|---|---|
-| Redis | `go_single_redis_data:/data` | AOF `appendonly=yes` + `appendfsync=everysec` 为主，RDB `3600/1 300/100 60/10000` 为兜底 | 容器重建后保留未过期的订单幂等、秒杀预扣和优惠券计数；正常故障约 1 秒 RPO |
+| Redis | `go_single_redis_data:/data` | AOF `appendonly=yes` + `appendfsync=everysec` 为主，RDB `3600/1 300/100 60/10000` 为兜底 | 容器重建后尽量保留订单在途协调键、秒杀预扣和优惠券计数；普通订单持久幂等事实仍以 MySQL 为准；正常故障约 1 秒 RPO |
 | RabbitMQ | `go_single_rabbitmq_data:/var/lib/rabbitmq` | 固定 `rabbit@go-single-rabbitmq` 节点名；应用声明 durable 主队列/DLQ，以 delivery mode 2 发布并等待 publisher confirm | 容器重建后 durable 队列和已确认的 persistent 消息仍可消费 |
 
 MySQL 的 `flashsale_pre_deductions` 是 Redis 预扣与 RabbitMQ 消息之间的恢复事实源，必须随订单表一起备份。应用启动恢复和 ordered reservation 修复各有 10s 超时，失败后由每分钟 cron 继续；预扣、重建和回补 Lua 使用专用 Redis 连接并紧跟 `WAITAOF 1 0 2000`，只有本地 AOF 明确 fsync 后才推进 MySQL 终态，覆盖 `appendfsync=everysec` 的 pre-fsync 重启窗口。生产 Redis 必须为 7.2+ 且启用 AOF，否则秒杀生命周期会保持可恢复状态而不冒险落单。监控 `pending_publish`、`pending_order`、`pending_rollback` 的数量和最老 `updated_at`，不能只观察聚合库存或 DLQ 深度。

@@ -4,7 +4,7 @@ sidebar_position: 7
 
 # payment — 模拟支付
 
-**定位**：不接真实渠道，由内部接口模拟支付成功/失败回调驱动订单状态流转；owner 校验、金额核对、payment_id 唯一约束防重复回调。
+**定位**：不接真实渠道，由内部接口模拟支付成功/失败回调驱动订单状态流转；owner 校验、金额与支付期限核对、payment_id 唯一约束防重复回调。
 
 实现：`internal/payment/`。
 
@@ -43,7 +43,7 @@ POST /api/payments/mock
   [4] 状态机校验：仅待支付订单可发起支付（成功/失败一致——失败回调不得污染已流转订单）
   [5] 成功回调：金额核对（回调金额 = 订单 pay_amount，不符 409）
   [6] 单事务：创建支付流水 → 成功则 order.MarkPaid 条件更新 待支付→已支付
-      （WHERE 同时校验 status 与 pay_amount；false = 并发状态已变 → 回滚整体拒绝）
+      （WHERE 同时校验 status、pay_amount 与 expire_at；false = 状态已变、金额不符或已过期 → 回滚整体拒绝）
 ```
 
 幂等（payment_id 唯一约束）+ 事务原子 ⇒ 基础设施瞬时故障可有限重试 + 退避；业务拒绝（重复/金额不符/非法跃迁）不重试。

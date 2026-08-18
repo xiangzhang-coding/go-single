@@ -34,12 +34,13 @@ import (
 // ---- fake 订单仓储 ----
 
 type fakeOrders struct {
-	byID       map[string]*model.Order
-	txLog      []string
-	getErr     error
-	skipCancel map[string]bool // 模拟并发下状态已变：Cancel 返回未更新
-	duplicate  map[string]bool // 模拟唯一约束命中：Create 返回 ErrOrderDuplicate
-	createLog  []*model.Order  // 建单流水（含重复尝试），供幂等断言
+	byID          map[string]*model.Order
+	txLog         []string
+	getErr        error
+	requestGetErr error
+	skipCancel    map[string]bool // 模拟并发下状态已变：Cancel 返回未更新
+	duplicate     map[string]bool // 模拟唯一约束命中：Create 返回 ErrOrderDuplicate
+	createLog     []*model.Order  // 建单流水（含重复尝试），供幂等断言
 }
 
 func newFakeOrders() *fakeOrders {
@@ -61,6 +62,14 @@ func (f *fakeOrders) Create(_ context.Context, _ *gorm.DB, o *model.Order) error
 			}
 		}
 	}
+	if o.ClientRequestID != nil {
+		for _, existing := range f.byID {
+			if existing.UserID == o.UserID && existing.ClientRequestID != nil &&
+				*existing.ClientRequestID == *o.ClientRequestID {
+				return repository.ErrOrderDuplicate
+			}
+		}
+	}
 	f.byID[o.OrderNo] = o
 	return nil
 }
@@ -70,6 +79,19 @@ func (f *fakeOrders) GetByNo(_ context.Context, orderNo string) (*model.Order, e
 		return nil, f.getErr
 	}
 	return f.byID[orderNo], nil
+}
+
+func (f *fakeOrders) GetNormalByClientRequestID(_ context.Context, userID int64, clientRequestID string) (*model.Order, error) {
+	if f.requestGetErr != nil {
+		return nil, f.requestGetErr
+	}
+	for _, o := range f.byID {
+		if o.OrderType == model.OrderTypeNormal && o.UserID == userID && o.ClientRequestID != nil &&
+			*o.ClientRequestID == clientRequestID {
+			return o, nil
+		}
+	}
+	return nil, nil
 }
 
 func (f *fakeOrders) GetByNoInTx(ctx context.Context, _ *gorm.DB, orderNo string) (*model.Order, error) {
@@ -174,7 +196,7 @@ func (f *fakeOrders) Cancel(_ context.Context, tx *gorm.DB, orderNo string) (boo
 
 func (f *fakeOrders) MarkPaid(_ context.Context, _ *gorm.DB, orderNo string, payAmount int64) (bool, error) {
 	o, ok := f.byID[orderNo]
-	if !ok || o.Status != model.OrderStatusPendingPayment || o.PayAmount != payAmount {
+	if !ok || o.Status != model.OrderStatusPendingPayment || o.PayAmount != payAmount || !o.ExpireAt.After(time.Now()) {
 		return false, nil
 	}
 	o.Status = model.OrderStatusPaid
@@ -610,6 +632,31 @@ func TestCreateDirectHappyPath(t *testing.T) {
 	require.Equal(t, 8, fx.prods.skus[1].Stock, "库存应扣减 2")
 }
 
+func TestCreateMaximumPriceBoundary(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.prods.seed(3, 1, 100_000_000, 99)
+
+	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("max-price", 3, 99))
+	require.NoError(t, err)
+	require.Equal(t, int64(9_900_000_000), res.Order.TotalAmount)
+	require.Equal(t, int64(9_900_000_000), res.Order.Items[0].Subtotal)
+	require.Equal(t, 0, fx.prods.skus[3].Stock)
+}
+
+func TestCreateRejectsZeroWrappingAmountBeforeStockDeduction(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	// 2^62 * 4 wraps to zero with unchecked int64 multiplication.
+	fx.prods.seed(3, 1, int64(1)<<62, 4)
+
+	_, err := fx.svc.Create(context.Background(), 42, fx.directParams("zero-wrap", 3, 4))
+	require.ErrorIs(t, err, ErrInvalidInput)
+	require.Zero(t, fx.prods.deductCalls, "金额拒绝必须发生在扣库存前")
+	require.Empty(t, fx.orders.byID)
+	require.Equal(t, 4, fx.prods.skus[3].Stock)
+}
+
 // 购物车结算：读取购物车条目、金额累计、结算后清空购物车。
 func TestCreateFromCart(t *testing.T) {
 	fx := newFixture()
@@ -643,6 +690,22 @@ func TestCreateIdempotent(t *testing.T) {
 	require.Equal(t, first.Order.OrderNo, second.Order.OrderNo)
 	require.Len(t, fx.orders.byID, 1, "只应生成一单")
 	require.Equal(t, 9, fx.prods.skus[1].Stock, "库存只扣一次")
+}
+
+func TestCreateReplaysPersistedRequestWithoutCache(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	first, err := fx.svc.Create(context.Background(), 42, fx.directParams("durable-request", 1, 1))
+	require.NoError(t, err)
+	fx.cache.keys = map[string]idemEntry{}
+
+	second, err := fx.svc.Create(context.Background(), 42, fx.directParams("durable-request", 1, 1))
+	require.NoError(t, err)
+	require.True(t, second.Idempotent)
+	require.Equal(t, first.Order.OrderNo, second.Order.OrderNo)
+	require.Len(t, fx.orders.byID, 1)
+	require.Equal(t, 9, fx.prods.skus[1].Stock)
 }
 
 // 幂等键在途：键已存在但订单未落库（并发）→ 返回订单号供轮询。
@@ -1108,6 +1171,20 @@ func TestMarkPaidEnforcesAmountAndStateMachine(t *testing.T) {
 	ok, err = fx.svc.MarkPaid(context.Background(), nil, "999", 1)
 	require.NoError(t, err)
 	require.False(t, ok)
+}
+
+func TestMarkPaidRejectsExpiredPendingOrder(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+
+	res, err := fx.svc.Create(context.Background(), 42, fx.directParams("expired-pay", 1, 1))
+	require.NoError(t, err)
+	fx.orders.byID[res.Order.OrderNo].ExpireAt = time.Now().Add(-time.Second)
+
+	ok, err := fx.svc.MarkPaid(context.Background(), nil, res.Order.OrderNo, res.Order.PayAmount)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, model.OrderStatusPendingPayment, fx.orders.byID[res.Order.OrderNo].Status)
 }
 
 // owner 校验（防 IDOR）：他人订单的详情/取消/确认收货被拒。

@@ -404,6 +404,12 @@ func TestCreateSKUValidation(t *testing.T) {
 	_, err = fx.svc.CreateSKU(context.Background(), p.ID, json.RawMessage(`{}`), 100, -1)
 	require.ErrorIs(t, err, ErrInvalidInput)
 
+	// 商品价格上限为 100 万元（金额单位为分）。
+	_, err = fx.svc.CreateSKU(context.Background(), p.ID, json.RawMessage(`{"tier":"max"}`), 100_000_000, 1)
+	require.NoError(t, err)
+	_, err = fx.svc.CreateSKU(context.Background(), p.ID, json.RawMessage(`{"tier":"over"}`), 100_000_001, 1)
+	require.ErrorIs(t, err, ErrInvalidInput)
+
 	sku, err := fx.svc.CreateSKU(context.Background(), p.ID, json.RawMessage(`{"color":"红"}`), 9900, 10)
 	require.NoError(t, err)
 	assert.Equal(t, p.ID, sku.ProductID)

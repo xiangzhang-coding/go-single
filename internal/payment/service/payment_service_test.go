@@ -81,7 +81,8 @@ func (f *fakeOrderSvc) MarkPaid(_ context.Context, _ *gorm.DB, orderNo string, p
 		return f.markPaid(orderNo, payAmount)
 	}
 	view, ok := f.views[orderNo]
-	if !ok || view.Status != ordermodel.OrderStatusPendingPayment || view.PayAmount != payAmount {
+	if !ok || view.Status != ordermodel.OrderStatusPendingPayment || view.PayAmount != payAmount ||
+		!view.ExpireAt.After(time.Now()) {
 		return false, nil
 	}
 	view.Status = ordermodel.OrderStatusPaid
@@ -272,6 +273,17 @@ func TestMockPayRollsBackOnOrderChanged(t *testing.T) {
 	require.ErrorIs(t, err, ErrOrderChanged)
 	require.Equal(t, ordermodel.OrderStatusPendingPayment, view.Status)
 	require.Empty(t, fx.pays.byID, "条件更新失败应回滚流水，不产生孤儿记录")
+}
+
+func TestMockPayExpiredOrderRollsBackLedger(t *testing.T) {
+	fx := newFixture()
+	view := fx.seedOrder(42, "1001", 9900)
+	view.ExpireAt = time.Now().Add(-time.Second)
+
+	_, err := fx.svc.MockPay(context.Background(), 42, params("expired-payment"))
+	require.ErrorIs(t, err, ErrOrderChanged)
+	require.Equal(t, ordermodel.OrderStatusPendingPayment, view.Status)
+	require.Empty(t, fx.pays.byID, "过期订单拒付必须回滚支付流水")
 }
 
 // ---- owner 校验与订单存在性 ----

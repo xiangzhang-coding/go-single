@@ -36,9 +36,8 @@ func (s *GORMOrderStore) WithinTx(ctx context.Context, fn func(tx *gorm.DB) erro
 	return s.db.WithContext(ctx).Transaction(fn)
 }
 
-// Create 创建订单；MySQL 1062（order_no 主键 / user_activity_key 唯一约束，
-// 后者仅秒杀订单非取消态）映射为 ErrOrderDuplicate（秒杀落单幂等命中），
-// 其余错误原样返回。
+// Create 创建订单；MySQL 1062（订单号、普通订单请求身份或秒杀购买槽位）
+// 映射为 ErrOrderDuplicate，由服务层读取对应持久事实判定是否幂等命中。
 func (s *GORMOrderStore) Create(ctx context.Context, tx *gorm.DB, order *model.Order) error {
 	err := tx.WithContext(ctx).Create(order).Error
 	if err == nil {
@@ -53,6 +52,20 @@ func (s *GORMOrderStore) Create(ctx context.Context, tx *gorm.DB, order *model.O
 
 func (s *GORMOrderStore) GetByNo(ctx context.Context, orderNo string) (*model.Order, error) {
 	return s.getByNo(s.db.WithContext(ctx), orderNo)
+}
+
+func (s *GORMOrderStore) GetNormalByClientRequestID(ctx context.Context, userID int64, clientRequestID string) (*model.Order, error) {
+	var o model.Order
+	err := s.db.WithContext(ctx).
+		Where("user_id = ? AND client_request_id = ? AND order_type = ?", userID, clientRequestID, model.OrderTypeNormal).
+		First(&o).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
 }
 
 func (s *GORMOrderStore) GetByNoInTx(ctx context.Context, tx *gorm.DB, orderNo string) (*model.Order, error) {
@@ -162,16 +175,18 @@ func (s *GORMOrderStore) Cancel(ctx context.Context, tx *gorm.DB, orderNo string
 	return res.RowsAffected == 1, nil
 }
 
-// MarkPaid 条件更新 待支付→已支付（支付回调）；WHERE 同时校验 status 与
-// pay_amount：RowsAffected=0 表示状态已变（并发/非法跃迁）或回调金额与应付不符。
+// MarkPaid 条件更新 待支付→已支付（支付回调）；WHERE 同时校验 status、
+// pay_amount 与 expire_at。过期订单即使 cron 尚未扫描也不能支付成功。
 func (s *GORMOrderStore) MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error) {
 	exec := tx
 	if exec == nil {
 		exec = s.db.WithContext(ctx)
 	}
+	paidAt := time.Now()
 	res := exec.Model(&model.Order{}).
-		Where("order_no = ? AND status = ? AND pay_amount = ?", orderNo, model.OrderStatusPendingPayment, payAmount).
-		Updates(map[string]any{"status": model.OrderStatusPaid, "paid_at": time.Now()})
+		Where("order_no = ? AND status = ? AND pay_amount = ? AND expire_at > ?",
+			orderNo, model.OrderStatusPendingPayment, payAmount, paidAt).
+		Updates(map[string]any{"status": model.OrderStatusPaid, "paid_at": paidAt})
 	if res.Error != nil {
 		return false, res.Error
 	}

@@ -1119,7 +1119,7 @@ func validateActivity(p *ActivityParams) error {
 	if p.SKUID <= 0 {
 		return fmt.Errorf("%w: invalid sku_id", ErrInvalidInput)
 	}
-	if p.Price <= 0 {
+	if p.Price <= 0 || p.Price > productmodel.MaxPriceCents {
 		return fmt.Errorf("%w: invalid price", ErrInvalidInput)
 	}
 	if p.Stock < 1 {

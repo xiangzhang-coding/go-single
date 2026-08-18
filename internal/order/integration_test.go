@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/go-sql-driver/mysql"
+	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/mysql"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
@@ -422,6 +422,21 @@ func TestOrderDirectBuyHappyPath(t *testing.T) {
 	require.Equal(t, orderNo, list["orders"].([]any)[0].(map[string]any)["order_no"])
 }
 
+func TestOrderMaximumPriceAndQuantityBoundary(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("maxamount"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 100_000_000, 99)
+
+	w, body := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 99, 0)
+	require.Equal(t, http.StatusCreated, w.Code, "最大金额边界下单失败: %s", w.Body.String())
+	require.Equal(t, float64(9_900_000_000), body["total_amount"])
+	require.Equal(t, float64(9_900_000_000), body["pay_amount"])
+	item := body["items"].([]any)[0].(map[string]any)
+	require.Equal(t, float64(9_900_000_000), item["subtotal"])
+	require.Zero(t, skuStock(t, env, skuID))
+}
+
 // 幂等：同一 client_request_id 重复提交只生成一单并返回同一订单号。
 func TestOrderIdempotency(t *testing.T) {
 	env := requireEnv(t)
@@ -448,6 +463,33 @@ func TestOrderIdempotency(t *testing.T) {
 	_, sku2 := onSaleSKU(t, env, 100, 5)
 	w, _ = createOrder(t, env, other, rid, addr2, sku2, 1, 0)
 	require.Equal(t, http.StatusCreated, w.Code, "不同用户相同 client_request_id 不应冲突")
+}
+
+func TestOrderIdempotencySurvivesRedisLoss(t *testing.T) {
+	env := requireEnv(t)
+	username := uniqueName("durable-idem")
+	token := registerAndToken(t, env, username)
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+	rid := uniqueName("durable-request")
+
+	w, first := createOrder(t, env, token, rid, addrID, skuID, 2, 0)
+	require.Equal(t, http.StatusCreated, w.Code, "首次下单失败: %s", w.Body.String())
+	require.NoError(t, env.redis.FlushDB(context.Background()).Err())
+
+	w, replay := createOrder(t, env, token, rid, addrID, skuID, 2, 0)
+	require.Equal(t, http.StatusOK, w.Code, "Redis 丢失后应由 MySQL 返回原订单: %s", w.Body.String())
+	require.Equal(t, first["order_no"], replay["order_no"])
+	require.Equal(t, int64(1), countOrdersByUser(t, env, username))
+	require.Equal(t, 8, skuStock(t, env, skuID), "库存只应扣一次")
+
+	duplicate := orderByNo(t, env, first["order_no"].(string))
+	duplicate.OrderNo = fmt.Sprintf("%d", time.Now().UnixNano())
+	err := env.gdb.Create(&duplicate).Error
+	require.Error(t, err, "数据库唯一约束必须拒绝同用户和 client_request_id 的第二单")
+	var mysqlErr *drivermysql.MySQLError
+	require.ErrorAs(t, err, &mysqlErr)
+	require.Equal(t, uint16(1062), mysqlErr.Number)
 }
 
 // 库存不足：下单失败 409，库存不变，不生成订单。
@@ -1166,4 +1208,67 @@ func TestOrderTimeoutCancelSkipsPaidOrder(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, n)
 	require.Equal(t, model.OrderStatusPaid, orderByNo(t, env, orderNo).Status)
+}
+
+func TestOrderExpiredPaymentIsRejected(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("expiredpay"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+
+	w, body := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 1, 0)
+	require.Equal(t, http.StatusCreated, w.Code)
+	orderNo := body["order_no"].(string)
+	require.NoError(t, env.gdb.Exec("UPDATE orders SET expire_at = ? WHERE order_no = ?", time.Now().Add(-time.Second), orderNo).Error)
+
+	w, _ = doJSON(t, env, http.MethodPost, "/api/payments/mock",
+		fmt.Sprintf(`{"order_id":%q,"payment_id":%q,"amount":9900,"result":"success"}`, orderNo, uniqueName("pay")), token)
+	require.Equal(t, http.StatusConflict, w.Code, "已过期的待支付订单不能支付成功: %s", w.Body.String())
+	require.Equal(t, model.OrderStatusPendingPayment, orderByNo(t, env, orderNo).Status)
+
+	var paymentCount int64
+	require.NoError(t, env.gdb.Table("payments").Where("order_no = ?", orderNo).Count(&paymentCount).Error)
+	require.Zero(t, paymentCount, "被拒支付的流水必须随事务回滚")
+}
+
+func TestOrderExpiredPaymentRacesTimeoutCancellation(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("payrace"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+
+	w, body := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 1, 0)
+	require.Equal(t, http.StatusCreated, w.Code)
+	orderNo := body["order_no"].(string)
+	require.NoError(t, env.gdb.Exec("UPDATE orders SET expire_at = ? WHERE order_no = ?", time.Now().Add(-time.Second), orderNo).Error)
+
+	start := make(chan struct{})
+	paymentResult := make(chan *httptest.ResponseRecorder, 1)
+	cancelResult := make(chan error, 1)
+	go func() {
+		<-start
+		paymentResult <- performJSON(env, http.MethodPost, "/api/payments/mock",
+			fmt.Sprintf(`{"order_id":%q,"payment_id":%q,"amount":9900,"result":"success"}`, orderNo, uniqueName("pay")), token)
+	}()
+	go func() {
+		<-start
+		_, _, err := env.orderSvc.CancelExpired(context.Background())
+		cancelResult <- err
+	}()
+	close(start)
+
+	payResponse := <-paymentResult
+	require.Equal(t, http.StatusConflict, payResponse.Code, "过期支付不得在超时取消竞态中成功: %s", payResponse.Body.String())
+	require.NoError(t, <-cancelResult)
+
+	if orderByNo(t, env, orderNo).Status == model.OrderStatusPendingPayment {
+		_, _, err := env.orderSvc.CancelExpired(context.Background())
+		require.NoError(t, err)
+	}
+	require.Equal(t, model.OrderStatusCancelled, orderByNo(t, env, orderNo).Status)
+	require.Equal(t, 10, skuStock(t, env, skuID), "取消仅回补一次库存")
+
+	var paymentCount int64
+	require.NoError(t, env.gdb.Table("payments").Where("order_no = ?", orderNo).Count(&paymentCount).Error)
+	require.Zero(t, paymentCount, "被拒支付的流水必须随事务回滚")
 }

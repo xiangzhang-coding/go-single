@@ -663,6 +663,7 @@ func TestCreateActivityValidation(t *testing.T) {
 		{"空白标题", func(p *ActivityParams) { p.Title = "  " }},
 		{"SKU 为 0", func(p *ActivityParams) { p.SKUID = 0 }},
 		{"秒杀价为 0", func(p *ActivityParams) { p.Price = 0 }},
+		{"秒杀价超过 100 万元", func(p *ActivityParams) { p.Price = 100_000_001 }},
 		{"库存为 0", func(p *ActivityParams) { p.Stock = 0 }},
 		{"限购为 0", func(p *ActivityParams) { p.PerUserLimit = 0 }},
 		{"时间窗口倒置", func(p *ActivityParams) { p.EndAt = p.StartAt.Add(-time.Hour) }},
@@ -685,6 +686,11 @@ func TestCreateActivityValidation(t *testing.T) {
 	a, err := fx.svc.CreateActivity(context.Background(), base)
 	require.NoError(t, err)
 	require.Equal(t, model.ActivityStatusOffSale, a.Status)
+
+	base.Price = 100_000_000
+	a, err = fx.svc.CreateActivity(context.Background(), base)
+	require.NoError(t, err)
+	require.Equal(t, int64(100_000_000), a.Price)
 }
 
 // ---- 上架预热 ----

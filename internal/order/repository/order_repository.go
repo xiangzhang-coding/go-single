@@ -13,8 +13,8 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
 )
 
-// ErrOrderDuplicate 重复键（MySQL 1062）：order_no 主键或 user_activity_key
-// 唯一约束命中——秒杀异步落单的幂等命中（重复投递/并发消费），视为成功。
+// ErrOrderDuplicate 重复键（MySQL 1062）：order_no、普通订单请求身份或
+// user_activity_key 唯一约束命中。
 var ErrOrderDuplicate = errors.New("order duplicate")
 
 // TxRunner 事务运行器：开启跨模块单事务（订单 + 订单项 + 库存扣减 +
@@ -26,10 +26,12 @@ type TxRunner interface {
 // OrderRepository 订单数据访问接口。
 type OrderRepository interface {
 	// Create 事务内创建订单（order_no 为主键，雪花 ID）。
-	// 重复键（order_no 或秒杀 user_activity_key）返回 ErrOrderDuplicate。
+	// 重复键（order_no、普通订单请求身份或秒杀 user_activity_key）返回 ErrOrderDuplicate。
 	Create(ctx context.Context, tx *gorm.DB, order *model.Order) error
 	// GetByNo 按订单号读取（不含归属过滤，归属校验在 service 层）。
 	GetByNo(ctx context.Context, orderNo string) (*model.Order, error)
+	// GetNormalByClientRequestID 按普通订单持久请求身份读取；不存在返回 nil。
+	GetNormalByClientRequestID(ctx context.Context, userID int64, clientRequestID string) (*model.Order, error)
 	// GetByNoInTx 在调用方事务内核验重复键是否确为同一订单。
 	GetByNoInTx(ctx context.Context, tx *gorm.DB, orderNo string) (*model.Order, error)
 	// List 我的订单：状态筛选（空 = 全部）+ 分页，返回条目与总数。
@@ -49,7 +51,7 @@ type OrderRepository interface {
 	// Cancel 事务内条件更新 待支付→已取消；返回是否更新成功。
 	Cancel(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error)
 	// MarkPaid 事务内条件更新 待支付→已支付（支付回调）；WHERE 同时校验
-	// status 与 pay_amount（状态机 + 金额核对原子兜底），返回是否更新成功。
+	// status、pay_amount 与 expire_at（状态机 + 金额 + 期限原子兜底）。
 	MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error)
 	// Ship 事务内条件更新 已支付→已发货（admin 发货）。
 	Ship(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error)

@@ -381,7 +381,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	startConsumer(flashsalesvc.SeckillOrderDeadLetterQueue, "秒杀死信消费者", seckillConsumer.HandleDeadLetter)
 
 	// payment 模块：模拟支付回调（成功/失败），流水唯一约束（payment_id）挡重复回调，
-	// 成功路径单事务（流水 + 订单 待支付→已支付，WHERE 校验状态机与金额）；
+	// 成功路径单事务（流水 + 订单 待支付→已支付，WHERE 校验状态机、金额与期限）；
 	// 订单读取与状态迁移经 order 服务进程内调用。
 	paymentStore := paymentrepo.NewGORMPayment(db)
 	paymentHandler := paymenthandler.New(

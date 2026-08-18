@@ -133,7 +133,8 @@
 - 普通/秒杀共用状态机：待支付 → 已支付（支付回调）→ 已发货（后台发货）→ 已完成（用户确认收货）；含用户取消与超时取消；非法跃迁直接拒绝
 - 订单表含 `order_type`（normal/seckill）；秒杀订单不使用优惠券，持久化 `purchase_slot`，可空 `user_activity_key=user_id:activity_id:purchase_slot` 唯一约束只拦同槽重投；取消置 NULL 释放该槽位
 - 普通订单：购物车/直购 → 单事务（订单+订单项+库存条件更新 `stock>=N`+地址快照+券核销+删除购物车条目）→ 待支付；超时取消回补库存+回退券
-- 幂等：`client_request_id`（Redis SETNX + TTL 15min），重复请求返回同一订单号
+- 幂等：MySQL `(user_id, client_request_id)` 唯一事实保证持久重放，Redis SETNX + TTL 15min 仅协调在途请求；Redis 丢失或 TTL 到期后仍返回原订单
+- 金额：SKU/秒杀价上限 100,000,000 分；价格乘数量与订单总额累加使用检查运算，订单总额、优惠额、应付额和订单项小计在扣库存前验证，并由数据库约束兜底
 - 订单号：雪花 ID（手写实现，学习点）；超时默认 普通 15min / 秒杀 10min
 
 ### 秒杀
@@ -149,7 +150,7 @@
 
 ### 支付 / 优惠券
 
-- 模拟支付：外部 API 端点 `POST /api/payments/mock {order_id, result}` → payment service → 进程内调用 order service；成功需状态机校验 + 支付流水唯一约束 + 金额核对；失败留待支付可重付
+- 模拟支付：外部 API 端点 `POST /api/payments/mock {order_id, result}` → payment service → 进程内调用 order service；成功需状态机校验 + 支付流水唯一约束 + 金额核对，条件更新同时要求 `expire_at` 未过；失败留待支付可重付
 - 优惠券：券模板（直减/满减/面额/门槛/总量/限领/有效期）；Redis Lua 快速计数并从 MySQL 事实重建，MySQL 模板行锁事务作为防超发最终约束；一单一张、结算校验门槛、事务内核销、取消回退；与秒杀互斥、全场券；订单记 `discount_amount`，应付 = 总额 − 券额
 
 ### 认证与安全
