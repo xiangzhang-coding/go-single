@@ -52,6 +52,22 @@ func TestJWTRejectExpiredToken(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidToken)
 }
 
+func TestJWTRejectTokenWithoutExpiration(t *testing.T) {
+	j := newTestJWT(2 * time.Hour)
+	claims := jwtClaims{
+		Role: "user",
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:  "1",
+			IssuedAt: jwt.NewNumericDate(time.Now()),
+		},
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(testSecret))
+	require.NoError(t, err)
+
+	_, err = j.Verify(context.Background(), token)
+	require.ErrorIs(t, err, ErrInvalidToken)
+}
+
 func TestJWTRejectTamperedToken(t *testing.T) {
 	j := newTestJWT(2 * time.Hour)
 

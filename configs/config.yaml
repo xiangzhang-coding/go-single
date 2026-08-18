@@ -9,6 +9,8 @@ server:
   trusted_proxies:
     - 127.0.0.1
     - ::1
+    # deploy compose 为 Nginx 固定的地址；生产应改为实际反代出口 IP。
+    - 172.30.0.10
 
 log:
   level: info
@@ -71,6 +73,10 @@ ws:
   # WebSocket 长连接心跳保活：Ping 间隔（pong_wait = 2× 间隔）与单条写超时。
   heartbeat_interval: 30s
   write_wait: 10s
+  # 单进程连接配额：总数 / 单用户 / 单来源 IP；升级中的握手同样占用配额。
+  max_connections: 1000
+  max_connections_per_user: 5
+  max_connections_per_ip: 50
   # 握手 Origin 白名单；空 = 允许所有（演示取舍，生产配置前端域名）。
   allow_origins: []
 

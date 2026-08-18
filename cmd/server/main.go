@@ -124,12 +124,15 @@ func run() error {
 		return err
 	}
 
-	// WebSocket 实时通道（T18）：连接管理 + 心跳保活；握手经 query token 鉴权
-	// （token 进访问日志的风险为演示取舍）；关闭在 HTTP 优雅关闭之后执行。
+	// WebSocket 实时通道：JWT 授权期限、连接配额与心跳共同约束会话生命周期；
+	// 关闭在 HTTP 优雅关闭之后执行。
 	wsHub := ws.New(ws.Config{
-		HeartbeatInterval: cfg.WS.HeartbeatInterval,
-		WriteWait:         cfg.WS.WriteWait,
-		AllowOrigins:      cfg.WS.AllowOrigins,
+		HeartbeatInterval:     cfg.WS.HeartbeatInterval,
+		WriteWait:             cfg.WS.WriteWait,
+		AllowOrigins:          cfg.WS.AllowOrigins,
+		MaxConnections:        cfg.WS.MaxConnections,
+		MaxConnectionsPerUser: cfg.WS.MaxConnectionsPerUser,
+		MaxConnectionsPerIP:   cfg.WS.MaxConnectionsPerIP,
 	}, log)
 
 	router, cronRegistry := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient, fileSvc, wsHub)
@@ -213,11 +216,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	r := gin.New()
 	// 可信反代白名单（安全收尾）：命中才采信 X-Forwarded-For/X-Real-IP，
 	// 还原 Nginx 反代后的真实客户端 IP（requestLogger 的 client_ip 与指标维度）。
-	if len(cfg.Server.TrustedProxies) > 0 {
-		if err := r.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
-			log.Error("设置可信反代白名单失败（继续按不采信代理头运行）", zap.Error(err))
-		}
-	}
+	configureTrustedProxies(r, cfg.Server.TrustedProxies, log)
 	// metrics 在最外层：panic 被 Recovery 恢复为 500 后仍能完成计数。
 	metricRegistry := metrics.New()
 	// 业务指标（T19c）：秒杀预扣/库存余量、订单创建/状态/支付、MQ 发布消费、
@@ -237,7 +236,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// CORS（T26）：跨源场景（云端前端独立部署）按配置白名单放行；
 	// 置于 requestLogger 之后，使预检 OPTIONS 也进入访问日志（排障可见），
 	// 同时仍先于路由匹配（Use 中间件均在 handler 前执行）。
-	r.Use(metricRegistry.GinMiddleware(), gin.Recovery(), requestLogger(log), platformcors.Middleware(cfg.CORS.AllowOrigins))
+	r.Use(metricRegistry.GinMiddleware(), safeRecovery(log), requestLogger(log), platformcors.Middleware(cfg.CORS.AllowOrigins))
 
 	r.GET("/metrics", gin.WrapH(metricRegistry.Handler()))
 
@@ -397,7 +396,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
 	fileHandler := file.NewHandler(fileSvc, verifier, mediaAccessAuthorizer{users: userSvc, posts: postSvc, chat: chatSvc})
 
-	// WebSocket 实时通道（T18）：GET /ws?token=<jwt>（token 进日志风险为演示取舍）。
+	// WebSocket 实时通道：JWT 经 Sec-WebSocket-Protocol 携带，不进入请求 URL。
 	r.GET("/ws", wsHub.Handler(verifier))
 
 	// 业务 API 组：挂全链路请求超时（T20），超时快速失败（504）；

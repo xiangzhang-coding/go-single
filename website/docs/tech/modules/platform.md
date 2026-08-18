@@ -21,7 +21,7 @@ sidebar_position: 11
 | cron | 定时任务注册表（robfig/cron 薄封装） | `SkipIfStillRunning` 防重叠 + panic 兜底；单次执行超时可配（5min）；优雅停止等待执行中任务 |
 | mq | RabbitMQ 消息层（ADR-0003 seam） | 发布确认（publisher confirm）+ 持久化消息；队列自动声明（幂等）+ **死信队列 `<queue>.dlq`**；消费端 QoS 预取 1、单条消息超时 15s；Ack / Nack 重投（瞬时）/ Nack 拒收进死信（`ErrPermanent`）；**消费者熔断**（gobreaker，连续失败打开→半开探活，仅包消费） |
 | cache | Redis 缓存层（ADR-0003 seam） | 接口隔离 go-redis；订单幂等、领券/计数重建、秒杀预热/预扣/回补、固定窗口计数均以类型化能力暴露，Lua 文本与返回码协议仅存在于适配器内 |
-| ws | WebSocket 实时通道 | Hub 管理在线连接（userID → 连接集合）；`PushToUser` 单向推送（缓冲满 = 慢消费者，关闭连接）；心跳保活（Ping 30s / pong_wait 2× / 写超时 10s）；`GET /ws?token=` 握手鉴权 |
+| ws | WebSocket 实时通道 | Hub 管理在线连接（userID → 连接集合）；JWT 经 `Sec-WebSocket-Protocol` 鉴权并在到期时主动关闭；单进程总连接/单用户/单来源 IP 配额；`PushToUser` 单向推送（缓冲满 = 慢消费者，关闭连接）；心跳保活（Ping 30s / pong_wait 2× / 写超时 10s） |
 | file | MinIO 私有媒体代理 | `POST /api/files`（multipart `file` + `kind=image/file`，Bearer）返回绑定上传者和类型的 `/files/<opaque-ref>`；图片魔数白名单 png/jpeg/webp/gif + ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD + ≤20 MiB；`GET /api/files/:reference` 鉴权代理读取，非上传者由头像/好友圈/聊天业务动态授权；桶匿名不可读，浏览器不直连 MinIO |
 | snowflake | 手写雪花 ID（学习点） | 41bit 毫秒时间戳（纪元 2024-01-01）+ 10bit worker + 12bit 序列号 = 63bit int64；单实例单调递增；**时钟回拨拒绝生成**；同毫秒序列号耗尽自旋 |
 | retry | 有限重试 + 指数退避（T20） | **仅幂等操作可重试**（普通下单 / 支付回调 / 秒杀消息发布）；`retry.Stop` 标记业务拒绝不重试；退避可被 ctx 取消；默认 3 次、100ms 起、上限 1s |
@@ -34,7 +34,7 @@ sidebar_position: 11
 | --- | --- | --- |
 | GET | /metrics | Prometheus 抓取（HTTP 三件套 + Go runtime + 业务指标） |
 | GET | /healthz | 依赖健康检查（mysql/redis/mq） |
-| GET | /ws | WebSocket 握手（query 携带 JWT，见 [chat](./chat) 实时通道） |
+| GET | /ws | WebSocket 握手（子协议携带 JWT，见 [chat](./chat) 实时通道） |
 | POST | /api/files | 媒体上传代理（`kind` 默认 image；返回托管引用及文件元数据） |
 | GET | /api/files/:reference | 私有媒体授权读取/下载（Bearer；图片 inline、普通文件 attachment） |
 

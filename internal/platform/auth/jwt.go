@@ -54,8 +54,8 @@ func (j *JWT) Verify(_ context.Context, token string) (*Claims, error) {
 			return nil, fmt.Errorf("unexpected signing method %s", t.Method.Alg())
 		}
 		return j.secret, nil
-	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
-	if err != nil || !parsed.Valid {
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
+	if err != nil || !parsed.Valid || claims.ExpiresAt == nil {
 		return nil, ErrInvalidToken
 	}
 

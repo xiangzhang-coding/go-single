@@ -101,6 +101,10 @@ services:
     extra_hosts:
       # 后端以宿主机进程运行，容器内经该主机名访问宿主 :8080（与 prometheus 同法）。
       - "host.docker.internal:host-gateway"
+    networks:
+      default:
+        # 与 configs/config.yaml 的 server.trusted_proxies 对齐，避免信任整个容器网段。
+        ipv4_address: 172.30.0.10
     healthcheck:
       # 经 HTTPS /api 反代探活（--no-check-certificate：自签证书）：后端宕机时 nginx 回 502 → unhealthy
       # （验证 SSL 终止 + 反代联通，而非仅静态文件）。
@@ -115,7 +119,7 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -135,7 +139,7 @@ services:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -157,7 +161,7 @@ services:
     command:
       - -config.file=/etc/loki/local-config.yaml
     ports:
-      - "3100:3100"
+      - "127.0.0.1:3100:3100"
     volumes:
       - ./monitoring/loki/config.yml:/etc/loki/local-config.yaml:ro
       - loki_data:/loki
@@ -193,3 +197,9 @@ volumes:
   grafana_data:
   loki_data:
   promtail_data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

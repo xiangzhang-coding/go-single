@@ -10,9 +10,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -31,25 +31,78 @@ const (
 	receiveDeadline = 3 * time.Second
 )
 
-// fakeVerifier 仅接受固定 token，其余返回鉴权失败。
-type fakeVerifier struct{}
+// fakeVerifier 接受测试 token，并为短令牌返回固定截止时间。
+type fakeVerifier struct{ shortExpiry time.Time }
 
-func (fakeVerifier) Verify(_ context.Context, token string) (*auth.Claims, error) {
-	if token != "valid-token" {
+func (v fakeVerifier) Verify(_ context.Context, token string) (*auth.Claims, error) {
+	switch token {
+	case "valid-token":
+		return &auth.Claims{UserID: 42, ExpiresAt: time.Now().Add(time.Hour)}, nil
+	case "user-43-token":
+		return &auth.Claims{UserID: 43, ExpiresAt: time.Now().Add(time.Hour)}, nil
+	case "user-44-token":
+		return &auth.Claims{UserID: 44, ExpiresAt: time.Now().Add(time.Hour)}, nil
+	case "short-token":
+		return &auth.Claims{UserID: 42, ExpiresAt: v.shortExpiry}, nil
+	case "no-expiration-token":
+		return &auth.Claims{UserID: 42}, nil
+	default:
 		return nil, auth.ErrInvalidToken
 	}
-	return &auth.Claims{UserID: 42}, nil
 }
 
 // newTestHub 构造带短心跳的 Hub 与路由。
 func newTestHub(t *testing.T) (*Hub, http.Handler) {
 	t.Helper()
-	hub := New(Config{HeartbeatInterval: heartbeat, WriteWait: writeWait}, zap.NewNop())
+	return newTestHubWithConfig(t, Config{})
+}
+
+func newTestHubWithConfig(t *testing.T, cfg Config) (*Hub, http.Handler) {
+	t.Helper()
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = heartbeat
+	}
+	if cfg.WriteWait == 0 {
+		cfg.WriteWait = writeWait
+	}
+	hub := New(cfg, zap.NewNop())
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/ws", hub.Handler(fakeVerifier{}))
+	require.NoError(t, r.SetTrustedProxies([]string{"127.0.0.1"}))
+	r.GET("/ws", hub.Handler(fakeVerifier{shortExpiry: time.Now().Add(500 * time.Millisecond)}))
 	return hub, r
+}
+
+func dialHub(t *testing.T, handler http.Handler, token, sourceIP string) (*websocket.Conn, *http.Response, error) {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	protocols := []string{authSubprotocol}
+	if token != "" {
+		protocols = append(protocols, token)
+	}
+	header := http.Header{}
+	if sourceIP != "" {
+		header.Set("X-Forwarded-For", sourceIP)
+	}
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second, Subprotocols: protocols}
+	return dialer.Dial("ws://"+srv.Listener.Addr().String()+"/ws", header)
+}
+
+func dialRejected(t *testing.T, handler http.Handler, token string, status int) string {
+	t.Helper()
+	conn, resp, err := dialHub(t, handler, token, "")
+	if conn != nil {
+		conn.Close()
+	}
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	defer resp.Body.Close()
+	require.Equal(t, status, resp.StatusCode)
+	body, readErr := io.ReadAll(resp.Body)
+	require.NoError(t, readErr)
+	return string(body)
 }
 
 // wsClient 测试客户端：后台读循环（控制帧自动处理，Ping→Pong 维持保活），
@@ -64,11 +117,12 @@ type wsClient struct {
 // setup 在读循环启动前执行（如覆盖 PingHandler 模拟死连接）。
 func dialClient(t *testing.T, handler http.Handler, token string, setup ...func(*websocket.Conn)) *wsClient {
 	t.Helper()
-	srv := httptest.NewServer(handler)
-	t.Cleanup(srv.Close)
+	return dialClientFromIP(t, handler, token, "", setup...)
+}
 
-	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
-	conn, resp, err := dialer.Dial("ws://"+srv.Listener.Addr().String()+"/ws?token="+url.QueryEscape(token), nil)
+func dialClientFromIP(t *testing.T, handler http.Handler, token, sourceIP string, setup ...func(*websocket.Conn)) *wsClient {
+	t.Helper()
+	conn, resp, err := dialHub(t, handler, token, sourceIP)
 	if err != nil {
 		if resp != nil {
 			require.Equal(t, http.StatusUnauthorized, resp.StatusCode, "握手失败: %v", err)
@@ -122,6 +176,52 @@ func TestHubHandshakeRequiresToken(t *testing.T) {
 	_, handler := newTestHub(t)
 	require.Nil(t, dialClient(t, handler, ""), "缺 token 握手应被拒")
 	require.Nil(t, dialClient(t, handler, "invalid-token"), "非法 token 握手应被拒")
+	require.Nil(t, dialClient(t, handler, "no-expiration-token"), "缺过期时间的 token 握手应被拒")
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+	_, resp, err := websocket.DefaultDialer.Dial("ws://"+srv.Listener.Addr().String()+"/ws?token=valid-token", nil)
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode, "query token 不再作为凭据")
+}
+
+func TestHubClosesConnectionWhenAuthorizationExpires(t *testing.T) {
+	hub, handler := newTestHub(t)
+	client := dialClient(t, handler, "short-token")
+	require.NotNil(t, client)
+	require.Eventually(t, func() bool { return hub.ConnectedCount() == 1 }, time.Second, 10*time.Millisecond)
+	pushStop := make(chan struct{})
+	pushDone := make(chan struct{})
+	defer func() {
+		close(pushStop)
+		<-pushDone
+	}()
+	go func() {
+		defer close(pushDone)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				hub.PushToUser(42, EventNewMessage, "until-expiry")
+			case <-pushStop:
+				return
+			}
+		}
+	}()
+
+	select {
+	case err := <-client.errs:
+		var closeErr *websocket.CloseError
+		require.ErrorAs(t, err, &closeErr)
+		require.Equal(t, closeCodeTokenExpired, closeErr.Code)
+	case <-time.After(time.Second):
+		t.Fatal("token 到期后服务端未主动关闭连接")
+	}
+	require.Eventually(t, func() bool { return hub.ConnectedCount() == 0 }, time.Second, 10*time.Millisecond)
+	require.Nil(t, dialClient(t, handler, "short-token"), "重新连接必须重新鉴权")
 }
 
 func TestHubRegisterAndPush(t *testing.T) {
@@ -149,6 +249,116 @@ func TestHubPushToAllConnsOfUser(t *testing.T) {
 		event, data := c.nextEvent(t)
 		require.Equal(t, EventNewMessage, event, "第 %d 个连接", i)
 		require.Equal(t, "payload", data)
+	}
+}
+
+func TestHubEnforcesConnectionLimitsAndReleasesSlots(t *testing.T) {
+	t.Run("per user", func(t *testing.T) {
+		hub, handler := newTestHubWithConfig(t, Config{
+			MaxConnections:        10,
+			MaxConnectionsPerUser: 2,
+			MaxConnectionsPerIP:   10,
+		})
+		c1 := dialClient(t, handler, "valid-token")
+		c2 := dialClient(t, handler, "valid-token")
+		require.NotNil(t, c1)
+		require.NotNil(t, c2)
+		require.Eventually(t, func() bool { return hub.ConnectedCount() == 2 }, time.Second, 10*time.Millisecond)
+		require.JSONEq(t, `{"error":"websocket connection limit exceeded","scope":"user"}`,
+			dialRejected(t, handler, "valid-token", http.StatusTooManyRequests))
+
+		require.NoError(t, c1.conn.Close())
+		require.Eventually(t, func() bool { return hub.ConnectedCount() == 1 }, time.Second, 10*time.Millisecond)
+		replacement := dialClient(t, handler, "valid-token")
+		require.NotNil(t, replacement, "连接关闭后必须释放用户配额")
+	})
+
+	t.Run("per source IP", func(t *testing.T) {
+		_, handler := newTestHubWithConfig(t, Config{
+			MaxConnections:        10,
+			MaxConnectionsPerUser: 10,
+			MaxConnectionsPerIP:   2,
+		})
+		require.NotNil(t, dialClient(t, handler, "valid-token"))
+		require.NotNil(t, dialClient(t, handler, "user-43-token"))
+		require.JSONEq(t, `{"error":"websocket connection limit exceeded","scope":"ip"}`,
+			dialRejected(t, handler, "user-44-token", http.StatusTooManyRequests))
+
+		_, independentHandler := newTestHubWithConfig(t, Config{
+			MaxConnections:        10,
+			MaxConnectionsPerUser: 10,
+			MaxConnectionsPerIP:   1,
+		})
+		require.NotNil(t, dialClientFromIP(t, independentHandler, "valid-token", "198.51.100.1"))
+		require.NotNil(t, dialClientFromIP(t, independentHandler, "user-43-token", "198.51.100.2"),
+			"不同来源 IP 应各自拥有连接配额")
+	})
+
+	t.Run("global", func(t *testing.T) {
+		_, handler := newTestHubWithConfig(t, Config{
+			MaxConnections:        2,
+			MaxConnectionsPerUser: 10,
+			MaxConnectionsPerIP:   10,
+		})
+		require.NotNil(t, dialClient(t, handler, "valid-token"))
+		require.NotNil(t, dialClient(t, handler, "user-43-token"))
+		require.JSONEq(t, `{"error":"websocket connection limit exceeded","scope":"global"}`,
+			dialRejected(t, handler, "user-44-token", http.StatusTooManyRequests))
+	})
+}
+
+func TestHubConcurrentFloodCannotExceedGlobalLimit(t *testing.T) {
+	const (
+		limit    = 3
+		attempts = 24
+	)
+	hub, handler := newTestHubWithConfig(t, Config{
+		HeartbeatInterval:     2 * time.Second,
+		MaxConnections:        limit,
+		MaxConnectionsPerUser: attempts,
+		MaxConnectionsPerIP:   attempts,
+	})
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	start := make(chan struct{})
+	statuses := make(chan int, attempts)
+	connections := make(chan *websocket.Conn, attempts)
+	var wg sync.WaitGroup
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second, Subprotocols: []string{authSubprotocol, "valid-token"}}
+			conn, resp, err := dialer.Dial("ws://"+srv.Listener.Addr().String()+"/ws", nil)
+			if err == nil {
+				statuses <- http.StatusSwitchingProtocols
+				connections <- conn
+				return
+			}
+			if resp == nil {
+				statuses <- 0
+				return
+			}
+			resp.Body.Close()
+			statuses <- resp.StatusCode
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(statuses)
+	close(connections)
+
+	counts := map[int]int{}
+	for status := range statuses {
+		counts[status]++
+	}
+	require.Equal(t, limit, counts[http.StatusSwitchingProtocols])
+	require.Equal(t, attempts-limit, counts[http.StatusTooManyRequests])
+	require.LessOrEqual(t, hub.ConnectedCount(), limit)
+	for conn := range connections {
+		conn.Close()
 	}
 }
 
@@ -182,8 +392,8 @@ func TestHubSlowConsumerClosed(t *testing.T) {
 	// 不带读循环：客户端不读取，作为慢消费者。
 	srv := httptest.NewServer(handler)
 	defer srv.Close()
-	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
-	conn, _, err := dialer.Dial("ws://"+srv.Listener.Addr().String()+"/ws?token=valid-token", nil)
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second, Subprotocols: []string{authSubprotocol, "valid-token"}}
+	conn, _, err := dialer.Dial("ws://"+srv.Listener.Addr().String()+"/ws", nil)
 	require.NoError(t, err)
 	defer conn.Close()
 	require.Eventually(t, func() bool { return hub.ConnectedCount() == 1 }, 2*time.Second, 10*time.Millisecond)
@@ -271,8 +481,7 @@ func TestHubCloseAll(t *testing.T) {
 	require.Eventually(t, func() bool { return hub.ConnectedCount() == 2 }, 2*time.Second, 10*time.Millisecond)
 
 	hub.Close()
-	require.Eventually(t, func() bool { return hub.ConnectedCount() == 0 }, 2*time.Second, 10*time.Millisecond,
-		"Close 应断开全部连接")
+	require.Zero(t, hub.ConnectedCount(), "Close 返回前应等待写泵退出并清理 Hub 记录")
 }
 
 func TestHubHandlerRejectsNonUpgradeRequest(t *testing.T) {
@@ -281,7 +490,10 @@ func TestHubHandlerRejectsNonUpgradeRequest(t *testing.T) {
 	defer srv.Close()
 
 	// 普通 GET（无 Upgrade 头）：升级失败返回 400，绝不返回 101。
-	resp, err := http.Get(srv.URL + "/ws?token=valid-token")
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/ws", nil)
+	require.NoError(t, err)
+	req.Header.Set("Sec-WebSocket-Protocol", authSubprotocol+", valid-token")
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)

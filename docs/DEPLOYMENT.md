@@ -14,11 +14,17 @@
 | 1 | `auth.secret`（JWT 签名密钥） | `dev-secret-change-me` | **强随机**（≥32 字节）；泄露可伪造任意角色 token |
 | 2 | MySQL / RabbitMQ / MinIO 凭据 | `shop123` / `guest:guest` / `minioadmin` | 全部改强密码（compose 与 configs 同步） |
 | 3 | `cors.allow_origins` / `ws.allow_origins` | 空（允许所有 Origin） | 配置前端域名白名单 |
-| 4 | `server.trusted_proxies` | 127.0.0.1/::1（本地 Nginx） | 改为反代出口 IP（client_ip 日志/指标才真实） |
-| 5 | compose 端口暴露（MySQL 3306 / RabbitMQ 5672 / Redis 6379 / MinIO 19000） | 0.0.0.0 | ufw 只放 22/80/443 |
+| 4 | `server.trusted_proxies` | 回环地址 + Compose 固定 Nginx 地址 `172.30.0.10` | 改为实际反代出口 IP（client_ip 日志与 WS 来源 IP 配额才真实）；Nginx 必须覆盖而非追加 X-Forwarded-For |
+| 5 | compose 业务依赖端口（MySQL 3306 / RabbitMQ 5672 / Redis 6379 / MinIO 19000） | 0.0.0.0 | 改为私网/回环绑定，并以 ufw 只放 22/80/443 兜底 |
 | 6 | `server.mode` | `debug` | `release` |
-| 7 | Grafana/Prometheus 访问 | 无认证 | 加认证或内网隔离 |
+| 7 | Grafana / Prometheus / Loki 访问 | 默认仅绑定 `127.0.0.1`；Loki 无认证 | 只允许 VPN、私网或 SSH 隧道访问；Grafana 改强密码，禁止把 3000/9090/3100 暴露到公网 |
 | 8 | 秒杀 `worker_id` | 1 | 多实例时每实例唯一（0-1023） |
+
+WebSocket JWT 经 `Sec-WebSocket-Protocol` 而非 URL query 携带；Nginx 的 `safe` access log 不记录 query/请求头，应用 recovery 不转储请求，Promtail 的所有采集作业在写入 Loki 前再次替换 JWT。修改这些配置后只影响新日志，历史 Loki chunk 不会被重写；若旧环境曾采集 query token，应在隔离窗口轮换 `auth.secret`、按留存策略清理旧日志并验证 Loki 查询无原始凭据。
+
+Grafana、Prometheus 和 Loki 的 compose 端口默认绑定回环地址，供本机浏览器或 `ssh -L 3000:127.0.0.1:3000 <vps>` 访问。生产不要为方便排障改成 `0.0.0.0`；需要团队访问时应通过受控管理网/VPN，并在其入口增加认证和访问审计。Grafana 管理密码必须通过部署环境覆盖，不能保留 `admin/admin`。
+
+R09 为 Nginx 固定了 Compose 地址 `172.30.0.10`，并让应用只信任该代理。已有 `deploy_default` 网络不会原地变更 IPAM；首次升级需在维护窗口执行 `docker compose down && docker compose up -d` 重建网络（命名卷会保留，严禁加 `-v`），再确认后端日志中的 `client_ip` 与外部请求源一致。生产若改 Compose 子网或使用宿主 Nginx，必须同步更新 `server.trusted_proxies`，且只填实际反代出口 IP。
 
 依赖版本安全：`go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...` 与
 `bun run scripts/frontend-audit.ts`（CI 已内置，版本均固定）。
@@ -117,7 +123,7 @@ npx wrangler pages project create go-single-website
 # 4) 起服务：docker compose up -d（mysql/redis/rabbitmq/minio/nginx + 可观测全家桶）
 # 5) 后端守护：systemd unit 跑 go 构建产物（bin/server），开机自启 + 崩溃重启
 # 6) 域名解析：api.example.com → VPS；Pages 前端 VITE_API_BASE 指向它
-# 7) 备份与监控：MySQL 定时 dump + Redis/RabbitMQ 卷快照；Prometheus/Grafana/Loki 已预置
+# 7) 备份与监控：MySQL 定时 dump + Redis/RabbitMQ 卷快照；Prometheus/Grafana/Loki 已预置且仅回环可达，通过 SSH 隧道/VPN 访问
 ```
 
 秒杀等在线业务不在此演示范围（单实例）；多实例负载均衡（upstream 双实例示例已预写在 deploy/nginx/nginx.conf）为 backlog 演进项。
@@ -284,3 +290,4 @@ PERSISTENCE_DRILL_RABBITMQ_PASSWORD='rabbitmq-password' \
 - [x] Redis/RabbitMQ 使用固定命名卷与明确持久化配置：§4 + `deploy/docker-compose.yml`
 - [x] durable 队列、persistent 消息和 Redis 关键状态跨容器重建保留：`scripts/persistence-drill.sh`
 - [x] 备份、恢复、容量、首次迁移和升级注意事项已记录：§4
+- [x] WS 凭据不进入 URL，Nginx/应用/Promtail 三层防泄漏；Grafana/Loki 默认仅受控网络可达

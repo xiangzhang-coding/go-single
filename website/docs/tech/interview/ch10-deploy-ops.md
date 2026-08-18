@@ -79,6 +79,7 @@ func main() {
 
 - 前端静态文件由 Nginx 托管，`try_files $uri /index.html` 做 SPA 回退。
 - `/api` 反代到后端；`/ws` 需要 `Upgrade` 头转发 + `proxy_read_timeout` 放宽。
+- WS JWT 走 `Sec-WebSocket-Protocol`；Nginx access log 只记录 `$uri`，不能记录 `$request`、`$request_uri`、`$args` 或协议头。
 - 静态资源（assets）加长缓存头，减少回源。
 - 后端 CORS 白名单与 nginx 反代配合：浏览器只看到 nginx 域。
 
@@ -118,7 +119,7 @@ func main() {
 
 ```
 
-**项目位置**：`deploy/nginx/nginx.conf`——静态托管 `web/faire/dist` + `/api` 反代 + `/ws` upgrade（read_timeout 90s）+ try_files 回退；compose nginx 挂载 dist。
+**项目位置**：`deploy/nginx/nginx.conf`——静态托管 `web/faire/dist` + `/api` 反代 + `/ws` upgrade（read_timeout 90s）+ safe access log + try_files 回退；compose nginx 挂载 dist。
 
 ## Q3. 优雅重启与信号处理
 

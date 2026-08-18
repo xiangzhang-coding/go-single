@@ -23,6 +23,10 @@ scrape_configs:
         target_label: logstream
     pipeline_stages:
       - docker: {}
+      # 防御性脱敏：即使上游误把 JWT 写入日志，也不把原值送入 Loki。
+      - replace:
+          expression: '(eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)'
+          replace: '[REDACTED_JWT]'
 
   - job_name: go-single
     static_configs:
@@ -30,3 +34,7 @@ scrape_configs:
         labels:
           app: go-single
           __path__: /var/log/go-single/*.log
+    pipeline_stages:
+      - replace:
+          expression: '(eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)'
+          replace: '[REDACTED_JWT]'

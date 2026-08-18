@@ -145,7 +145,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/platform/mq/rabbitmq.go` 的 `Publish`/`Consume` 内 `defer ch.Close()`；WS `client.send` 通道关闭由 defer 保证（`internal/platform/ws/hub.go`）。
+**项目位置**：`internal/platform/mq/rabbitmq.go` 的 `Publish`/`Consume` 内 `defer ch.Close()`；WS 写泵 defer 停止 ticker/到期 timer 并关闭 `stopped`，Hub 等待写泵退出后再释放连接记录（`internal/platform/ws/hub.go`）。
 
 ## Q4. 接口的鸭子类型与动态派发
 

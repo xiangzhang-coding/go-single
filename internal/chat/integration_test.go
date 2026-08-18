@@ -138,7 +138,13 @@ func buildEnv() (*testEnv, error) {
 	postSvc := socialsvc.NewPostsWithMedia(socialStore, userSvc, stubOrders{}, fileSvc)
 
 	chatConversationRepo := chatrepo.NewGORMConversation(gdb)
-	wsHub := ws.New(ws.Config{HeartbeatInterval: wsHeartbeat, WriteWait: 2 * time.Second}, zap.NewNop())
+	wsHub := ws.New(ws.Config{
+		HeartbeatInterval:     wsHeartbeat,
+		WriteWait:             2 * time.Second,
+		MaxConnections:        100,
+		MaxConnectionsPerUser: 5,
+		MaxConnectionsPerIP:   100,
+	}, zap.NewNop())
 	chatSvc := chatsvc.NewWithMedia(chatrepo.Store{
 		Conversations: chatConversationRepo,
 		Messages:      chatrepo.NewGORMMessage(gdb),

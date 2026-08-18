@@ -248,7 +248,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/platform/ws/hub.go` 用 `sync.Once` 保证 `client.send` 只被 `close` 一次（重复 close 会 panic）。
+**项目位置**：`internal/platform/ws/hub.go` 用 `sync.Once` 保证 `client.done` 与底层连接只关闭一次；`send` 不主动关闭，避免并发推送快照向已关闭 channel 发送而 panic。
 
 ## Q6. 原子操作 atomic：无锁计数
 

@@ -34,7 +34,12 @@ func TestLoad(t *testing.T) {
 	require.False(t, cfg.MinIO.UseSSL)
 	require.Equal(t, "./migrations", cfg.Migrations.Path)
 	require.Equal(t, int64(1), cfg.Snowflake.WorkerID)
+	require.Contains(t, cfg.Server.TrustedProxies, "172.30.0.10")
+	require.NotContains(t, cfg.Server.TrustedProxies, "172.16.0.0/12")
 	require.Empty(t, cfg.WS.AllowOrigins)
+	require.Equal(t, 1000, cfg.WS.MaxConnections)
+	require.Equal(t, 5, cfg.WS.MaxConnectionsPerUser)
+	require.Equal(t, 50, cfg.WS.MaxConnectionsPerIP)
 	require.Empty(t, cfg.CORS.AllowOrigins)
 }
 
@@ -47,6 +52,7 @@ func TestLoadEnvOverride(t *testing.T) {
 	t.Setenv("GO_SINGLE_SERVER_PORT", "9090")
 	t.Setenv("GO_SINGLE_REDIS_ADDR", "10.0.0.1:6379")
 	t.Setenv("GO_SINGLE_SNOWFLAKE_WORKER_ID", "7")
+	t.Setenv("GO_SINGLE_WS_MAX_CONNECTIONS", "321")
 
 	root := repoRoot(t)
 	cfg, err := LoadFrom(filepath.Join(root, "configs"), root)
@@ -54,4 +60,5 @@ func TestLoadEnvOverride(t *testing.T) {
 	require.Equal(t, 9090, cfg.Server.Port)
 	require.Equal(t, "10.0.0.1:6379", cfg.Redis.Addr)
 	require.Equal(t, int64(7), cfg.Snowflake.WorkerID)
+	require.Equal(t, 321, cfg.WS.MaxConnections)
 }

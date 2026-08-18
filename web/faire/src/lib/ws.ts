@@ -8,14 +8,15 @@ export interface ChatSocketEvent {
 export type ChatSocketHandler = (event: ChatSocketEvent) => void;
 
 const WS_BASE = import.meta.env.VITE_WS_BASE || "/ws";
+const TOKEN_EXPIRED_CLOSE_CODE = 4001;
 
 type SocketStatus = "idle" | "connecting" | "open" | "closed";
 
 /**
- * 聊天实时通道单例：GET /ws?token=<jwt>（后端约定 token 走 query）。
+ * 聊天实时通道单例：JWT 通过 Sec-WebSocket-Protocol 传递，不进入 URL。
  * 仅接收服务端推送（new_message）；断线自动指数退避重连（30s 上限），
  * 登出时 disconnect 停止。连接由登录态驱动：chat-hooks 在 token 变化时
- * connect/disconnect（WS 无 token 失效推送，重连至会话结束为止）。
+ * connect/disconnect；服务端以 4001 关闭到期会话并触发重新登录。
  */
 class ChatSocket {
   private socket: WebSocket | null = null;
@@ -63,8 +64,7 @@ class ChatSocket {
   private open() {
     if (!this.token) return;
     this.setStatus("connecting");
-    const url = `${WS_BASE}?token=${encodeURIComponent(this.token)}`;
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(WS_BASE, ["bearer", this.token]);
     this.socket = socket;
 
     socket.onopen = () => {
@@ -86,9 +86,15 @@ class ChatSocket {
       }
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       this.socket = null;
       this.setStatus("closed");
+      if (event.code === TOKEN_EXPIRED_CLOSE_CODE) {
+        this.closing = true;
+        this.token = null;
+        window.dispatchEvent(new Event("faire:session-expired"));
+        return;
+      }
       if (this.closing || !this.token) return;
       // 指数退避重连：1s → 2s → 4s → … 上限 30s。
       const delay = Math.min(30_000, 1_000 * 2 ** this.retry);

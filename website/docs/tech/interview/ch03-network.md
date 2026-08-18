@@ -55,7 +55,7 @@ func main() {
 
 ```
 
-**项目位置**：`cmd/server/main.go` 装配链——`metricRegistry.GinMiddleware() → gin.Recovery() → requestLogger → platformcors.Middleware`；`/api` 组再挂 `requestTimeout`；鉴权 `auth.Middleware`/`auth.RequireAdmin()` 按路由挂载。
+**项目位置**：`cmd/server/main.go` 装配链——`metricRegistry.GinMiddleware() → safeRecovery → requestLogger → platformcors.Middleware`；`safeRecovery` 不转储请求行/请求头，避免凭据进入日志；`/api` 组再挂 `requestTimeout`；鉴权 `auth.Middleware`/`auth.RequireAdmin()` 按路由挂载。
 
 ## Q2. Bearer Token 解析与鉴权中间件
 
@@ -64,7 +64,7 @@ func main() {
 - 规范格式 `Authorization: Bearer <token>`，前缀大小写不敏感，需校验"恰好两段、token 非空"。
 - 解析失败 → 401；解析成功 → 验签 → 把 claims 塞进请求上下文供业务取用。
 - 校验失败不区分"过期/篡改/格式错"细节（防探测）。
-- WS 场景无法带自定义头，项目用 `?token=` 查询参数（有日志泄漏取舍，需注明）。
+- 浏览器 WS API 无法设置任意请求头，但可以声明子协议；项目发送 `Sec-WebSocket-Protocol: bearer, <jwt>`，服务端只协商 `bearer`，避免 JWT 进入 URL 和访问日志。
 
 **可运行代码**
 

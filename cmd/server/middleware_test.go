@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,7 +11,95 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+func testLogger() (*zap.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+		zapcore.AddSync(&buf),
+		zap.DebugLevel,
+	)
+	return zap.New(core), &buf
+}
+
+func TestRequestLogsDoNotContainWebSocketCredentials(t *testing.T) {
+	const token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiJ9.sensitive-signature"
+	log, output := testLogger()
+	r := gin.New()
+	r.Use(requestLogger(log))
+	r.GET("/ws", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	req := httptest.NewRequest(http.MethodGet, "/ws?token="+token, nil)
+	req.Header.Set("Sec-WebSocket-Protocol", "bearer, "+token)
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	require.NotContains(t, output.String(), token)
+	require.Contains(t, output.String(), `"path":"/ws"`)
+}
+
+func TestRecoveryLogsDoNotContainWebSocketCredentials(t *testing.T) {
+	const token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiJ9.sensitive-signature"
+	log, output := testLogger()
+	r := gin.New()
+	r.Use(safeRecovery(log))
+	r.GET("/ws", func(*gin.Context) { panic("boom") })
+
+	req := httptest.NewRequest(http.MethodGet, "/ws?token="+token, nil)
+	req.Header.Set("Sec-WebSocket-Protocol", "bearer, "+token)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.NotContains(t, output.String(), token)
+	require.Contains(t, output.String(), `"path":"/ws"`)
+}
+
+func TestTrustedProxyConfigurationFailsClosed(t *testing.T) {
+	for _, proxies := range [][]string{nil, {"not-a-cidr"}} {
+		r := gin.New()
+		configureTrustedProxies(r, proxies, zap.NewNop())
+		r.GET("/ip", func(c *gin.Context) { c.String(http.StatusOK, c.ClientIP()) })
+
+		req := httptest.NewRequest(http.MethodGet, "/ip", nil)
+		req.RemoteAddr = "192.0.2.10:1234"
+		req.Header.Set("X-Forwarded-For", "203.0.113.99")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		require.Equal(t, "192.0.2.10", rec.Body.String())
+	}
+}
+
+func TestTrustedProxyRestoresSourceIP(t *testing.T) {
+	r := gin.New()
+	configureTrustedProxies(r, []string{"192.0.2.10"}, zap.NewNop())
+	r.GET("/ip", func(c *gin.Context) { c.String(http.StatusOK, c.ClientIP()) })
+
+	req := httptest.NewRequest(http.MethodGet, "/ip", nil)
+	req.RemoteAddr = "192.0.2.10:1234"
+	req.Header.Set("X-Forwarded-For", "203.0.113.99")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, "203.0.113.99", rec.Body.String())
+}
+
+func TestUntrustedDockerPeerCannotSpoofSourceIP(t *testing.T) {
+	r := gin.New()
+	configureTrustedProxies(r, []string{"172.30.0.10"}, zap.NewNop())
+	r.GET("/ip", func(c *gin.Context) { c.String(http.StatusOK, c.ClientIP()) })
+
+	req := httptest.NewRequest(http.MethodGet, "/ip", nil)
+	req.RemoteAddr = "172.30.0.11:1234"
+	req.Header.Set("X-Forwarded-For", "203.0.113.99")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, "172.30.0.11", rec.Body.String())
+}
 
 func TestRequestTimeoutFastFail(t *testing.T) {
 	gin.SetMode(gin.TestMode)

@@ -204,7 +204,9 @@ func main() {
 
 - 一条日志 = 结构化 JSON 行（zap）：时间、级别、消息、业务字段。
 - 采集链：应用输出（stdout/文件）→ promtail（容器 + 文件作业）→ Loki → Grafana。
+- 敏感数据在源头不记录；Promtail 的每个 scrape job 再用 replace stage 防御性替换 JWT，避免误日志进入 Loki。
 - Loki 以标签索引 + 内容全文检索（`{job="go-single"} |~ "关键词"`），比 ES 轻量。
+- Loki 无内置认证的本地配置只能位于受控网络；项目 compose 默认把 Loki/Grafana 端口绑定到 `127.0.0.1`，生产经 VPN/SSH 隧道访问。
 - 日志与指标分工：日志看单笔细节，指标看整体分布。
 
 **可运行代码**

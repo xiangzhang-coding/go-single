@@ -47,7 +47,7 @@ type CORS struct {
 	AllowOrigins []string `mapstructure:"allow_origins"`
 }
 
-// WS WebSocket 实时通道配置（T18）：长连接心跳保活与写超时参数。
+// WS WebSocket 实时通道配置：长连接生命周期与单进程连接配额。
 type WS struct {
 	// HeartbeatInterval 心跳 Ping 间隔（保活；客户端 pong_wait = 2× 间隔内
 	// 未收到任何帧即判定断开）。
@@ -56,6 +56,12 @@ type WS struct {
 	WriteWait time.Duration `mapstructure:"write_wait"`
 	// AllowOrigins 握手 Origin 白名单；空 = 允许所有（演示取舍，生产应配置前端域名）。
 	AllowOrigins []string `mapstructure:"allow_origins"`
+	// MaxConnections 单进程连接总数上限。
+	MaxConnections int `mapstructure:"max_connections"`
+	// MaxConnectionsPerUser 单用户连接数上限。
+	MaxConnectionsPerUser int `mapstructure:"max_connections_per_user"`
+	// MaxConnectionsPerIP 单来源 IP 连接数上限。
+	MaxConnectionsPerIP int `mapstructure:"max_connections_per_ip"`
 }
 
 // FlashSale 秒杀配置：抢购接口限流参数。
@@ -91,7 +97,8 @@ type Server struct {
 	RequestTimeout time.Duration `mapstructure:"request_timeout"`
 	// TrustedProxies 可信反代 IP 白名单（gin SetTrustedProxies）：
 	// 命中才采信 X-Forwarded-For/X-Real-IP 得到真实客户端 IP（日志/指标）。
-	// 默认信任本机（Nginx 容器经 host-gateway 转发）；云部署时改为反代出口 IP。
+	// 默认信任本机与 compose 中固定的 Nginx 地址（容器经 host-gateway 转发）；
+	// 云部署时应收紧为实际反代出口 IP。
 	// 空 = 不信任任何代理头（ClientIP 返回直连地址，日志失真但更安全）。
 	TrustedProxies []string `mapstructure:"trusted_proxies"`
 }
@@ -223,5 +230,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ws.heartbeat_interval", "30s")
 	v.SetDefault("ws.write_wait", "10s")
 	v.SetDefault("ws.allow_origins", []string{})
+	v.SetDefault("ws.max_connections", 1000)
+	v.SetDefault("ws.max_connections_per_user", 5)
+	v.SetDefault("ws.max_connections_per_ip", 50)
 	v.SetDefault("cors.allow_origins", []string{})
 }

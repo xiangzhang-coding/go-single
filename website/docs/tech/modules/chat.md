@@ -52,8 +52,9 @@ sidebar_position: 10
 
 ### 实时通道（platform/ws，`GET /ws`）
 
-- 握手：`GET /ws?token=<jwt>`（浏览器 WS API 无法自定义 header，token 进访问日志为演示取舍）；鉴权失败升级前 401
+- 握手：`GET /ws`，浏览器以子协议列表 `bearer, <jwt>` 携带 JWT，凭据不进入 URL；鉴权失败升级前 401，连接配额超限返回 429 + `scope`
 - 事件：`{"event":"new_message","data":{Message}}`——消息落库成功后推送给**在线接收方**；离线为无操作（落库 + 上线 REST 补拉兜底）
+- 生命周期：JWT 到期时服务端以 4001 主动关闭，前端停止使用旧凭据重连并回到登录；总连接、单用户和单来源 IP 上限均可配置
 - 心跳：Ping 间隔 `ws.heartbeat_interval`（默认 30s），pong_wait = 2× 间隔判定断线；写超时 `ws.write_wait`（默认 10s）；每连接发送缓冲 64 条，**慢消费者关闭连接**（客户端重连后 REST 补拉）
 
 ## 关键流程

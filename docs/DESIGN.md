@@ -105,7 +105,7 @@ go_single/
 - **状态管理**：TanStack Query（服务端状态：API 数据缓存、秒杀轮询、好友圈分页）+ zustand（客户端状态：登录态、用户信息、聊天连接）
 - **API client**：axios + 拦截器——统一携带 JWT（Authorization 头）、401 统一跳登录、错误统一处理
 - **JWT 存储**：localStorage（学习项目取舍；cookie 方案与 CSRF 讨论进 backlog）
-- **WS 握手**：token 经 query 参数传递（浏览器 WS API 无法自定义 header），注明 token 可能进入访问日志的风险为演示取舍
+- **WS 握手**：浏览器以 `Sec-WebSocket-Protocol: bearer, <jwt>` 携带凭据，JWT 不进入 URL；Nginx 访问日志只记录 path，Promtail 入 Loki 前再次脱敏
 - **组件策略**：手写组件 + 语义化 Tailwind 类（主题定制自由，与四件套主题机制契合）；shadcn/ui 进 backlog
 - **TS 类型**：api 层手写类型对齐后端 json tag（tsc 构建期校验）+ HTTP 集成测试固定响应形状（ADR-0006）；openapi-typescript 自动生成进 backlog
 - 布局策略：桌面优先，不做移动端适配（演示项目）
@@ -197,7 +197,7 @@ go_single/
 - JWT 自签（HS256）+ bcrypt 密码哈希；`platform/auth` 定义 TokenVerifier 接口（轻量 seam，不属于 ADR-0003 三类；自签实现，OIDC/第三方认证服务器换实现即可，进 backlog）
 - JWT 有效期 2h，无 refresh（refresh token 进 backlog）
 - `user.role`（`user`/`admin`）+ admin 路由中间件校验，不另起认证体系；admin 账号由 migration 种入默认管理员
-- WebSocket 握手携带 JWT 校验身份
+- WebSocket 握手携带 JWT 校验身份；已建立连接在 JWT 到期时以关闭码 4001 主动断开，重连必须重新鉴权
 
 ## 安全设计
 
@@ -205,7 +205,7 @@ go_single/
 - **HTTPS 与安全头**：Nginx 终止 SSL（本地演示可自签证书）；响应加 `X-Content-Type-Options` / `X-Frame-Options` / `Content-Security-Policy` 等安全头
 - **上传安全**：`POST /api/files` 不信任客户端 MIME，图片按魔数校验 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB；返回托管引用而非 MinIO URL。头像、动态和消息拒绝外部 URL、他人引用与媒体类型错配；MinIO 桶保持匿名不可读，授权读取统一走 `GET /api/files/:reference`
 - **输入与注入**：validator 参数校验（设计已含）；GORM 参数化查询防 SQL 注入（设计已含）；React 默认转义防 XSS（设计已含）
-- **敏感数据**：密码 bcrypt（设计已含）；日志不记录密码与 token
+- **敏感数据**：密码 bcrypt（设计已含）；日志不记录密码与 token；应用恢复日志不转储请求，Nginx 不记录 query/协议头，Promtail 在写入 Loki 前防御性替换 JWT
 - 登出黑名单 / 密码复杂度策略 / 双因素认证进 backlog
 
 ## 社交
@@ -219,7 +219,7 @@ go_single/
 - 消息类型：`text` / `image` / `file`（image/file 经私有 MinIO 上传，消息仅保存发送者拥有且类型匹配的托管引用；读取/下载仅限发送方与接收方）
 - 会话标识：`conversation_key = min(uidA, uidB):max(uidA, uidB)` 有序用户对，消息表含会话键
 - **三通道**：发送走 REST（`POST /api/messages`，可幂等重试）；实时接收走 WebSocket 推送；离线消息落库，上线 REST 按会话游标分页拉取
-- 连接：WebSocket 长连接 + 心跳保活（`ws.heartbeat_interval` 默认 30s，pong_wait = 2× 间隔；写超时 `ws.write_wait` 默认 10s）
+- 连接：WebSocket 长连接 + 心跳保活（`ws.heartbeat_interval` 默认 30s，pong_wait = 2× 间隔；写超时 `ws.write_wait` 默认 10s）；单进程总连接、单用户和单来源 IP 上限分别由 `ws.max_connections`、`ws.max_connections_per_user`、`ws.max_connections_per_ip` 配置，升级中的握手同样占用配额
 
 ## 限流与幂等
 

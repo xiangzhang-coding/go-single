@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -24,6 +25,34 @@ func requestLogger(log *zap.Logger) gin.HandlerFunc {
 			zap.Duration("latency", time.Since(start)),
 			zap.String("client_ip", c.ClientIP()),
 		)
+	}
+}
+
+// safeRecovery 恢复 panic，但不转储请求行或请求头，避免 WS JWT 进入应用日志。
+func safeRecovery(log *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		defer func() {
+			if recover() == nil {
+				return
+			}
+			log.Error("panic recovered",
+				zap.String("path", c.Request.URL.Path),
+				zap.ByteString("stack", debug.Stack()),
+			)
+			if !c.Writer.Written() {
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+			c.Abort()
+		}()
+		c.Next()
+	}
+}
+
+func configureTrustedProxies(r *gin.Engine, proxies []string, log *zap.Logger) {
+	if err := r.SetTrustedProxies(proxies); err != nil {
+		log.Error("设置可信反代白名单失败，已禁用代理头", zap.Error(err))
+		_ = r.SetTrustedProxies(nil)
 	}
 }
 

@@ -17,9 +17,9 @@ package chat_test
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -37,15 +37,23 @@ type wsClient struct {
 	errs chan error
 }
 
+func dialWSConn(t *testing.T, env *testEnv, token string) (*websocket.Conn, *http.Response, error) {
+	t.Helper()
+	srv := httptest.NewServer(env.router)
+	t.Cleanup(srv.Close)
+	protocols := []string{"bearer"}
+	if token != "" {
+		protocols = append(protocols, token)
+	}
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second, Subprotocols: protocols}
+	return dialer.Dial("ws://"+srv.Listener.Addr().String()+"/ws", nil)
+}
+
 // dialWS 起真实 HTTP 服务并以指定 token 拨号 /ws；握手失败（401）返回 nil。
 // setup 在读循环启动前执行。
 func dialWS(t *testing.T, env *testEnv, token string, setup ...func(*websocket.Conn)) *wsClient {
 	t.Helper()
-	srv := httptest.NewServer(env.router)
-	t.Cleanup(srv.Close)
-
-	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
-	conn, resp, err := dialer.Dial("ws://"+srv.Listener.Addr().String()+"/ws?token="+url.QueryEscape(token), nil)
+	conn, resp, err := dialWSConn(t, env, token)
 	if err != nil {
 		if resp != nil {
 			require.Equal(t, http.StatusUnauthorized, resp.StatusCode, "握手失败: %v", err)
@@ -68,6 +76,21 @@ func dialWS(t *testing.T, env *testEnv, token string, setup ...func(*websocket.C
 	}()
 	t.Cleanup(func() { conn.Close() })
 	return c
+}
+
+func dialWSRejected(t *testing.T, env *testEnv, token string, status int) string {
+	t.Helper()
+	conn, resp, err := dialWSConn(t, env, token)
+	if conn != nil {
+		conn.Close()
+	}
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	defer resp.Body.Close()
+	require.Equal(t, status, resp.StatusCode)
+	body, readErr := io.ReadAll(resp.Body)
+	require.NoError(t, readErr)
+	return string(body)
 }
 
 // nextEvent 读取一条推送并解码为事件信封。
@@ -102,6 +125,17 @@ func TestWSHandshakeRejectsUnauthorized(t *testing.T) {
 
 	require.Nil(t, dialWS(t, env, ""), "缺 token 的握手应被拒")
 	require.Nil(t, dialWS(t, env, "not-a-jwt"), "非法 token 的握手应被拒")
+}
+
+func TestWSHandshakeRejectsPerUserConnectionOverflow(t *testing.T) {
+	env := requireEnv(t)
+	_, token := register(t, env, "ws_limit")
+
+	for range 5 {
+		require.NotNil(t, dialWS(t, env, token))
+	}
+	require.JSONEq(t, `{"error":"websocket connection limit exceeded","scope":"user"}`,
+		dialWSRejected(t, env, token, http.StatusTooManyRequests))
 }
 
 // ---- 验收 ①：双方在线实时互聊 ----

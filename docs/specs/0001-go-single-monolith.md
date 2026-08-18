@@ -88,7 +88,7 @@
 51. 作为用户，我期望在线时实时收到消息（WebSocket 推送），以便即时沟通
 52. 作为用户，我期望离线消息在上线后可拉取，以便不错过消息
 53. 作为用户，我期望发送消息走 REST（可幂等重试），以便可靠投递
-54. 作为用户，我期望 WebSocket 连接携带 JWT 鉴权（query 传 token，注明日志风险为演示取舍）
+54. 作为用户，我期望 WebSocket 连接携带 JWT 鉴权，凭据不进入 URL 或日志，连接不超过 JWT 授权寿命
 55. 作为用户，我想标记会话已读并查看未读数（`POST /api/conversations/{key}/read` 推进已读游标 + 会话列表未读计数），以便跟进未读消息
 
 ### 后台管理
@@ -164,7 +164,7 @@
 
 - 好友：申请/通过流程（关系仓储接口化，免申请实现可切换进 backlog）
 - 动态：仅好友可见；购买成功后分享（引用已购 SKU + 文案 + 托管图片）；拉取式时间线分页，图片读取权限跟随好友关系
-- IM：单聊；`conversation_key = min(uidA,uidB):max(uidA,uidB)`；图片/文件消息只保存发送者拥有且类型匹配的托管引用，读取仅限会话双方；消息三通道——发送 REST（可幂等重试）、实时接收 WS 推送、离线 REST 按会话游标分页拉取；WS 握手 JWT（query 传 token，注明日志风险取舍）；已读回执为会话粒度已读游标（`POST /api/conversations/{key}/read` 推进，未读数 = 我收到且 id > 游标的消息数）
+- IM：单聊；`conversation_key = min(uidA,uidB):max(uidA,uidB)`；图片/文件消息只保存发送者拥有且类型匹配的托管引用，读取仅限会话双方；消息三通道——发送 REST（可幂等重试）、实时接收 WS 推送、离线 REST 按会话游标分页拉取；WS 握手 JWT 经 `Sec-WebSocket-Protocol` 携带，到期主动断开，单进程总连接/单用户/单来源 IP 均有限额；已读回执为会话粒度已读游标（`POST /api/conversations/{key}/read` 推进，未读数 = 我收到且 id > 游标的消息数）
 
 ### 可观测性与容错
 
