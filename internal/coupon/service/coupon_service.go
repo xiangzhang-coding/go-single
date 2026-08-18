@@ -33,18 +33,26 @@ var (
 
 // 可领券列表的状态取值。
 const (
-	stateClaimable    = "claimable"
-	stateNotStarted   = "not_started"
-	stateEnded        = "ended"
-	stateSoldOut      = "sold_out"
-	stateLimitReached = "limit_reached"
+	stateClaimable      = "claimable"
+	stateNotStarted     = "not_started"
+	stateEnded          = "ended"
+	stateSoldOut        = "sold_out"
+	stateLimitReached   = "limit_reached"
+	couponCacheTimeout  = 250 * time.Millisecond
+	couponRepairTimeout = 2 * time.Second
 )
 
 // Redis key 约定：coupon:claimed:{template_id}（总量计数）/
-// coupon:peruser:{template_id}:{user_id}（每人限领计数）。
+// coupon:peruser:{template_id}:{user_id}（每人限领计数）/
+// coupon:version:{template_id}（总计数的 MySQL 版本）/
+// coupon:peruser-version:{template_id}:{user_id}（用户计数的 MySQL 版本）。
 func claimedKey(templateID int64) string { return fmt.Sprintf("coupon:claimed:%d", templateID) }
 func perUserKey(templateID, userID int64) string {
 	return fmt.Sprintf("coupon:peruser:%d:%d", templateID, userID)
+}
+func versionKey(templateID int64) string { return fmt.Sprintf("coupon:version:%d", templateID) }
+func perUserVersionKey(templateID, userID int64) string {
+	return fmt.Sprintf("coupon:peruser-version:%d:%d", templateID, userID)
 }
 
 // TemplateParams 券模板参数（创建/编辑共用）。
@@ -71,7 +79,7 @@ type Service interface {
 	// ---- 用户 ----
 	// ListClaimable 可领券列表（含当前用户视角的领取状态）。
 	ListClaimable(ctx context.Context, userID int64) ([]model.CouponTemplateView, error)
-	// Claim 领取：缓存原子校验（有效期/总量/每人限领）后 DB 落库为最终态。
+	// Claim 领取：Redis 快速计数，MySQL 事务作为总量与每人限领的最终约束。
 	Claim(ctx context.Context, userID, templateID int64) (*model.UserCoupon, error)
 	// ListMine 我的券（status 空 = 全部；unused/used/expired 筛选）。
 	ListMine(ctx context.Context, userID int64, status string, page, pageSize int) ([]model.UserCouponView, int64, error)
@@ -163,7 +171,7 @@ func (s *couponService) ListTemplates(ctx context.Context) ([]model.CouponTempla
 // ListClaimable 状态判定：
 // not_started（未开始）/ ended（已结束）/ sold_out（总量已领完）/
 // limit_reached（用户已达每人限领）/ claimable（可领）。
-// 计数取 DB 已领数，仅作展示；防超发的强制校验由缓存适配器原子完成。
+// 计数取 DB 已领数；领取时同一数据库事实也作为缓存重建基线和最终约束。
 func (s *couponService) ListClaimable(ctx context.Context, userID int64) ([]model.CouponTemplateView, error) {
 	templates, err := s.store.Template.List(ctx)
 	if err != nil {
@@ -205,8 +213,9 @@ func (s *couponService) ListClaimable(ctx context.Context, userID int64) ([]mode
 	return views, nil
 }
 
-// Claim 领取流程：DB 读模板（含有效期快照）→ 缓存原子计数 → DB 落库最终态。
-// 模板过期/不存在由 DB 校验，其余并发条件由缓存适配器原子强制。
+// Claim 领取流程：读取 DB 事实作为 Redis 重建基线 → 缓存原子计数 →
+// MySQL 锁定模板并在同一事务内重查总量、每人限领与有效期后落库。
+// Redis 的拒绝或故障不单独决定结果，避免缓存丢失或陈旧造成超发/虚假售罄。
 func (s *couponService) Claim(ctx context.Context, userID, templateID int64) (*model.UserCoupon, error) {
 	t, err := s.store.Template.GetByID(ctx, templateID)
 	if err != nil {
@@ -215,36 +224,77 @@ func (s *couponService) Claim(ctx context.Context, userID, templateID int64) (*m
 	if t == nil {
 		return nil, ErrTemplateNotFound
 	}
-
-	now := time.Now()
-	result, err := s.cache.ClaimCoupon(ctx, cache.CouponClaimParams{
-		ClaimedKey: claimedKey(templateID), PerUserKey: perUserKey(templateID, userID),
-		Now: now, Total: t.Total, ValidFrom: t.ValidFrom,
-		ValidUntil: t.ValidUntil, PerUserLimit: t.PerUserLimit,
-	})
+	claimedCount, err := s.store.UserCoupon.CountByTemplate(ctx, templateID)
+	if err != nil {
+		return nil, err
+	}
+	perUserCount, err := s.store.UserCoupon.CountUserByTemplate(ctx, userID, templateID)
 	if err != nil {
 		return nil, err
 	}
 
-	switch result {
-	case cache.CouponClaimed:
-	case cache.CouponSoldOut:
-		return nil, ErrSoldOut
-	case cache.CouponNotInWindow:
-		return nil, ErrNotInWindow
-	case cache.CouponLimitReached:
-		return nil, ErrClaimLimitReached
-	default:
-		return nil, fmt.Errorf("%w: unexpected claim result %d", ErrInvalidInput, result)
-	}
+	now := time.Now()
+	cacheCtx, cancelCache := context.WithTimeout(ctx, couponCacheTimeout)
+	_, _ = s.cache.ClaimCoupon(cacheCtx, cache.CouponClaimParams{
+		ClaimedKey: claimedKey(templateID), PerUserKey: perUserKey(templateID, userID),
+		VersionKey: versionKey(templateID), PerUserVersionKey: perUserVersionKey(templateID, userID),
+		Now: now, Total: t.Total, ValidFrom: t.ValidFrom,
+		ValidUntil: t.ValidUntil, PerUserLimit: t.PerUserLimit,
+		ClaimedCount: claimedCount, PerUserCount: perUserCount,
+	})
+	cancelCache()
 
-	c := &model.UserCoupon{UserID: userID, TemplateID: templateID, Status: model.CouponStatusUnused}
-	if err := s.store.UserCoupon.Create(ctx, c); err != nil {
+	outcome, err := s.store.UserCoupon.Claim(ctx, userID, templateID)
+	if err != nil {
+		s.repairCouponCounts(ctx, templateID, userID)
 		return nil, err
 	}
-	// 发放打点（T19c）：领取成功落库后计数。
-	s.metrics.CouponIssued()
-	return c, nil
+	s.syncCouponCounts(ctx, templateID, userID, outcome.ClaimedCount, outcome.PerUserCount)
+
+	switch outcome.Result {
+	case repository.ClaimCreated:
+		// 发放打点（T19c）：领取成功落库后计数。
+		s.metrics.CouponIssued()
+		return outcome.Coupon, nil
+	case repository.ClaimTemplateNotFound:
+		return nil, ErrTemplateNotFound
+	case repository.ClaimSoldOut:
+		return nil, ErrSoldOut
+	case repository.ClaimNotInWindow:
+		return nil, ErrNotInWindow
+	case repository.ClaimLimitReached:
+		return nil, ErrClaimLimitReached
+	default:
+		return nil, fmt.Errorf("%w: unexpected claim result %d", ErrInvalidInput, outcome.Result)
+	}
+}
+
+func (s *couponService) syncCouponCounts(parent context.Context, templateID, userID, claimedCount, perUserCount int64) {
+	ctx, cancel := context.WithTimeout(parent, couponRepairTimeout)
+	defer cancel()
+	_ = s.cache.SyncCouponCounts(ctx, cache.CouponCountParams{
+		ClaimedKey: claimedKey(templateID), PerUserKey: perUserKey(templateID, userID),
+		VersionKey: versionKey(templateID), PerUserVersionKey: perUserVersionKey(templateID, userID),
+		ClaimedCount: claimedCount, PerUserCount: perUserCount,
+	})
+}
+
+func (s *couponService) repairCouponCounts(parent context.Context, templateID, userID int64) {
+	ctx, cancel := context.WithTimeout(parent, couponRepairTimeout)
+	defer cancel()
+	claimedCount, err := s.store.UserCoupon.CountByTemplate(ctx, templateID)
+	if err != nil {
+		return
+	}
+	perUserCount, err := s.store.UserCoupon.CountUserByTemplate(ctx, userID, templateID)
+	if err != nil {
+		return
+	}
+	_ = s.cache.SyncCouponCounts(ctx, cache.CouponCountParams{
+		ClaimedKey: claimedKey(templateID), PerUserKey: perUserKey(templateID, userID),
+		VersionKey: versionKey(templateID), PerUserVersionKey: perUserVersionKey(templateID, userID),
+		ClaimedCount: claimedCount, PerUserCount: perUserCount,
+	})
 }
 
 func (s *couponService) ListMine(ctx context.Context, userID int64, status string, page, pageSize int) ([]model.UserCouponView, int64, error) {

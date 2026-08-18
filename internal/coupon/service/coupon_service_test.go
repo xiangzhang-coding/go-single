@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"testing"
@@ -61,25 +62,60 @@ func (f *fakeTemplates) List(context.Context) ([]model.CouponTemplate, error) {
 }
 
 type fakeUserCoupons struct {
-	byID  map[int64]*model.UserCoupon
-	tmpls *fakeTemplates
-	order int64
-	mu    sync.Mutex
-	nowFn func() time.Time
+	byID      map[int64]*model.UserCoupon
+	tmpls     *fakeTemplates
+	order     int64
+	mu        sync.Mutex
+	nowFn     func() time.Time
+	createErr error
 }
 
 func newFakeUserCoupons(tmpls *fakeTemplates) *fakeUserCoupons {
 	return &fakeUserCoupons{byID: map[int64]*model.UserCoupon{}, tmpls: tmpls, nowFn: time.Now}
 }
 
-func (f *fakeUserCoupons) Create(_ context.Context, c *model.UserCoupon) error {
+func (f *fakeUserCoupons) Claim(_ context.Context, userID, templateID int64) (repository.ClaimOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.order++
-	c.ID = f.order
-	c.CreatedAt = time.Now()
-	f.byID[c.ID] = c
-	return nil
+
+	template, ok := f.tmpls.byID[templateID]
+	if !ok {
+		return repository.ClaimOutcome{Result: repository.ClaimTemplateNotFound}, nil
+	}
+	var claimedCount, perUserCount int64
+	for _, coupon := range f.byID {
+		if coupon.TemplateID == templateID {
+			claimedCount++
+			if coupon.UserID == userID {
+				perUserCount++
+			}
+		}
+	}
+	outcome := repository.ClaimOutcome{ClaimedCount: claimedCount, PerUserCount: perUserCount}
+	now := time.Now()
+	switch {
+	case now.Before(template.ValidFrom) || now.After(template.ValidUntil):
+		outcome.Result = repository.ClaimNotInWindow
+	case claimedCount >= int64(template.Total):
+		outcome.Result = repository.ClaimSoldOut
+	case perUserCount >= int64(template.PerUserLimit):
+		outcome.Result = repository.ClaimLimitReached
+	default:
+		if f.createErr != nil {
+			return repository.ClaimOutcome{}, f.createErr
+		}
+		f.order++
+		coupon := &model.UserCoupon{
+			ID: f.order, UserID: userID, TemplateID: templateID,
+			Status: model.CouponStatusUnused, CreatedAt: now, UpdatedAt: now,
+		}
+		f.byID[coupon.ID] = coupon
+		outcome.Result = repository.ClaimCreated
+		outcome.Coupon = coupon
+		outcome.ClaimedCount++
+		outcome.PerUserCount++
+	}
+	return outcome, nil
 }
 
 // ListByUser 模拟 GORM 实现：JOIN 模板 + 派生状态（used → used；未用过期 → expired）。
@@ -120,6 +156,8 @@ func (f *fakeUserCoupons) ListByUser(_ context.Context, userID int64, status str
 }
 
 func (f *fakeUserCoupons) CountByTemplate(_ context.Context, templateID int64) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var n int64
 	for _, c := range f.byID {
 		if c.TemplateID == templateID {
@@ -130,6 +168,8 @@ func (f *fakeUserCoupons) CountByTemplate(_ context.Context, templateID int64) (
 }
 
 func (f *fakeUserCoupons) CountUserByTemplate(_ context.Context, userID, templateID int64) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var n int64
 	for _, c := range f.byID {
 		if c.UserID == userID && c.TemplateID == templateID {
@@ -219,14 +259,16 @@ func slicePage[T any](in []T, offset, limit int) []T {
 // ---- fake 类型化缓存（互斥锁模拟原子性）----
 
 type fakeClaimCache struct {
-	mu      sync.Mutex
-	claimed map[string]int
-	perUser map[string]int
-	err     error
+	mu         sync.Mutex
+	claimed    map[string]int
+	perUser    map[string]int
+	versions   map[string]int
+	err        error
+	claimDelay time.Duration
 }
 
 func newFakeClaimCache() *fakeClaimCache {
-	return &fakeClaimCache{claimed: map[string]int{}, perUser: map[string]int{}}
+	return &fakeClaimCache{claimed: map[string]int{}, perUser: map[string]int{}, versions: map[string]int{}}
 }
 
 func (f *fakeClaimCache) Ping(context.Context) error { return nil }
@@ -237,7 +279,14 @@ func (f *fakeClaimCache) Get(context.Context, string) (string, error) {
 func (f *fakeClaimCache) Set(context.Context, string, string, time.Duration) error { return nil }
 func (f *fakeClaimCache) Del(context.Context, string) error                        { return nil }
 
-func (f *fakeClaimCache) ClaimCoupon(_ context.Context, p cache.CouponClaimParams) (cache.CouponClaimResult, error) {
+func (f *fakeClaimCache) ClaimCoupon(ctx context.Context, p cache.CouponClaimParams) (cache.CouponClaimResult, error) {
+	if f.claimDelay > 0 {
+		select {
+		case <-time.After(f.claimDelay):
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
@@ -245,6 +294,18 @@ func (f *fakeClaimCache) ClaimCoupon(_ context.Context, p cache.CouponClaimParam
 	}
 	if p.Now.Before(p.ValidFrom) || p.Now.After(p.ValidUntil) {
 		return cache.CouponNotInWindow, nil
+	}
+	if f.claimed[p.ClaimedKey] < int(p.ClaimedCount) {
+		f.claimed[p.ClaimedKey] = int(p.ClaimedCount)
+	}
+	if f.perUser[p.PerUserKey] < int(p.PerUserCount) {
+		f.perUser[p.PerUserKey] = int(p.PerUserCount)
+	}
+	if f.versions[p.VersionKey] < int(p.ClaimedCount) {
+		f.versions[p.VersionKey] = int(p.ClaimedCount)
+	}
+	if f.versions[p.PerUserVersionKey] < int(p.PerUserCount) {
+		f.versions[p.PerUserVersionKey] = int(p.PerUserCount)
 	}
 	if f.claimed[p.ClaimedKey] >= p.Total {
 		return cache.CouponSoldOut, nil
@@ -255,6 +316,23 @@ func (f *fakeClaimCache) ClaimCoupon(_ context.Context, p cache.CouponClaimParam
 	f.claimed[p.ClaimedKey]++
 	f.perUser[p.PerUserKey]++
 	return cache.CouponClaimed, nil
+}
+
+func (f *fakeClaimCache) SyncCouponCounts(_ context.Context, p cache.CouponCountParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if int(p.ClaimedCount) >= f.versions[p.VersionKey] {
+		f.claimed[p.ClaimedKey] = int(p.ClaimedCount)
+		f.versions[p.VersionKey] = int(p.ClaimedCount)
+	}
+	if int(p.PerUserCount) >= f.versions[p.PerUserVersionKey] {
+		f.perUser[p.PerUserKey] = int(p.PerUserCount)
+		f.versions[p.PerUserVersionKey] = int(p.PerUserCount)
+	}
+	return nil
 }
 
 // ---- 测试夹具 ----
@@ -423,14 +501,107 @@ func TestClaimFailures(t *testing.T) {
 		require.ErrorIs(t, err, ErrNotInWindow)
 	})
 
-	t.Run("缓存故障", func(t *testing.T) {
+	t.Run("缓存故障降级到数据库领取", func(t *testing.T) {
 		fx := newFixture()
 		tmpl := fx.createTemplate(t, nil)
 		fx.cache.err = context.DeadlineExceeded
-		_, err := fx.svc.Claim(context.Background(), 1, tmpl.ID)
-		require.Error(t, err)
-		require.NotErrorIs(t, err, ErrInvalidInput)
+		coupon, err := fx.svc.Claim(context.Background(), 1, tmpl.ID)
+		require.NoError(t, err)
+		require.NotNil(t, coupon)
 	})
+}
+
+func TestClaimDatabaseFailureRestoresQuota(t *testing.T) {
+	fx := newFixture()
+	tmpl := fx.createTemplate(t, nil)
+	dbErr := errors.New("insert failed")
+	fx.coups.createErr = dbErr
+
+	_, err := fx.svc.Claim(context.Background(), 42, tmpl.ID)
+	require.ErrorIs(t, err, dbErr)
+	require.Equal(t, 0, fx.cache.claimed[claimedKey(tmpl.ID)])
+	require.Equal(t, 0, fx.cache.perUser[perUserKey(tmpl.ID, 42)])
+
+	fx.coups.createErr = nil
+	_, err = fx.svc.Claim(context.Background(), 42, tmpl.ID)
+	require.NoError(t, err, "数据库恢复后不得被泄漏的 Redis 额度永久阻塞")
+}
+
+func TestClaimRebuildsLostCacheFromDatabaseFacts(t *testing.T) {
+	fx := newFixture()
+	tmpl := fx.createTemplate(t, nil)
+
+	_, err := fx.svc.Claim(context.Background(), 42, tmpl.ID)
+	require.NoError(t, err)
+	fx.cache.claimed = map[string]int{}
+	fx.cache.perUser = map[string]int{}
+	fx.cache.versions = map[string]int{}
+
+	_, err = fx.svc.Claim(context.Background(), 42, tmpl.ID)
+	require.ErrorIs(t, err, ErrClaimLimitReached)
+	require.Len(t, fx.coups.byID, 1)
+	require.Equal(t, 1, fx.cache.claimed[claimedKey(tmpl.ID)])
+	require.Equal(t, 1, fx.cache.perUser[perUserKey(tmpl.ID, 42)])
+}
+
+func TestClaimRepairsStaleCacheEvenWhenBothStoresAccept(t *testing.T) {
+	fx := newFixture()
+	tmpl := fx.createTemplate(t, func(p *TemplateParams) { p.PerUserLimit = 2 })
+
+	_, err := fx.svc.Claim(context.Background(), 42, tmpl.ID)
+	require.NoError(t, err)
+	fx.cache.claimed[claimedKey(tmpl.ID)] = 2
+
+	_, err = fx.svc.Claim(context.Background(), 42, tmpl.ID)
+	require.NoError(t, err)
+	require.Equal(t, 2, fx.cache.claimed[claimedKey(tmpl.ID)], "成功路径也应按最新数据库事实修复泄漏额度")
+	require.Equal(t, 2, fx.cache.perUser[perUserKey(tmpl.ID, 42)])
+}
+
+func TestClaimConcurrentDatabaseGuardWhenCacheUnavailable(t *testing.T) {
+	const (
+		workers = 20
+		total   = 5
+	)
+	fx := newFixture()
+	tmpl := fx.createTemplate(t, func(p *TemplateParams) { p.Total = total })
+	fx.cache.err = context.DeadlineExceeded
+
+	var wg sync.WaitGroup
+	results := make([]error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, results[i] = fx.svc.Claim(context.Background(), int64(100+i), tmpl.ID)
+		}(i)
+	}
+	wg.Wait()
+
+	succeeded := 0
+	for _, err := range results {
+		if err == nil {
+			succeeded++
+		} else {
+			require.ErrorIs(t, err, ErrSoldOut)
+		}
+	}
+	require.Equal(t, total, succeeded)
+	require.Len(t, fx.coups.byID, total)
+}
+
+func TestClaimPreservesDatabaseBudgetWhenCacheIsSlow(t *testing.T) {
+	fx := newFixture()
+	tmpl := fx.createTemplate(t, nil)
+	fx.cache.claimDelay = time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	coupon, err := fx.svc.Claim(ctx, 42, tmpl.ID)
+	require.NoError(t, err)
+	require.NotNil(t, coupon)
+	require.Less(t, time.Since(started), 700*time.Millisecond, "Redis 不得耗尽留给 MySQL 的请求预算")
 }
 
 // 并发领券不超发：总量与每人限领均原子强制（fake 缓存以锁模拟原子性）。

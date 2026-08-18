@@ -39,7 +39,7 @@ import type {
   SKU,
   User,
   UpdateProfileRequest,
-  UserCouponView,
+  UserCoupon,
   UserSearchResult,
 } from "./types";
 
@@ -144,7 +144,7 @@ export async function getClaimableCoupons() {
 }
 
 export async function claimCoupon(templateId: number) {
-  const { data } = await api.post<UserCouponView>(`/coupons/${templateId}/claim`);
+  const { data } = await api.post<UserCoupon>(`/coupons/${templateId}/claim`);
   return data;
 }
 

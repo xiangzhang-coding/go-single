@@ -266,7 +266,7 @@ func main() {
 
 ```
 
-**项目位置**：脚本文本与整数返回码协议统一封装在 `internal/platform/cache/atomic.go`；业务模块只调用 `AcquireIdempotency` / `ClaimCoupon` / `WarmFlashSaleStock` / `PreDeductFlashSale` / `RestoreFlashSale` / `IncrementFixedWindow` 类型化能力，不能直接 `Eval`。
+**项目位置**：脚本文本与整数返回码协议统一封装在 `internal/platform/cache/atomic.go`；业务模块只调用 `AcquireIdempotency` / `ClaimCoupon` / `SyncCouponCounts` / `WarmFlashSaleStock` / `PreDeductFlashSale` / `RestoreFlashSale` / `IncrementFixedWindow` 类型化能力，不能直接 `Eval`。领券计数可由 MySQL 事实重建，MySQL 模板行锁事务是最终防超发约束。
 
 ## Q5. 固定窗口限流（INCR + TTL）
 

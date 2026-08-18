@@ -118,9 +118,13 @@ func TestClaimCouponResultsAndState(t *testing.T) {
 			c := newAtomicRedis(t)
 			claimedKey := atomicTestKey(t, "coupon-claimed")
 			perUserKey := atomicTestKey(t, "coupon-per-user")
+			versionKey := atomicTestKey(t, "coupon-version")
+			perUserVersionKey := atomicTestKey(t, "coupon-per-user-version")
 			t.Cleanup(func() {
 				require.NoError(t, c.Del(context.Background(), claimedKey))
 				require.NoError(t, c.Del(context.Background(), perUserKey))
+				require.NoError(t, c.Del(context.Background(), versionKey))
+				require.NoError(t, c.Del(context.Background(), perUserVersionKey))
 			})
 			if tc.seedClaimed != "" {
 				require.NoError(t, c.Set(context.Background(), claimedKey, tc.seedClaimed, 0))
@@ -131,6 +135,7 @@ func TestClaimCouponResultsAndState(t *testing.T) {
 
 			params := CouponClaimParams{
 				ClaimedKey: claimedKey, PerUserKey: perUserKey,
+				VersionKey: versionKey, PerUserVersionKey: perUserVersionKey,
 				Now: now, Total: 2, ValidFrom: now.Add(-time.Minute),
 				ValidUntil: now.Add(time.Hour), PerUserLimit: 1,
 			}
@@ -150,9 +155,13 @@ func TestClaimCouponPropagatesRedisError(t *testing.T) {
 	c := newAtomicRedis(t)
 	claimedKey := atomicTestKey(t, "coupon-error-claimed")
 	perUserKey := atomicTestKey(t, "coupon-error-per-user")
+	versionKey := atomicTestKey(t, "coupon-error-version")
+	perUserVersionKey := atomicTestKey(t, "coupon-error-per-user-version")
 	t.Cleanup(func() {
 		require.NoError(t, c.Del(context.Background(), claimedKey))
 		require.NoError(t, c.Del(context.Background(), perUserKey))
+		require.NoError(t, c.Del(context.Background(), versionKey))
+		require.NoError(t, c.Del(context.Background(), perUserVersionKey))
 	})
 
 	now := time.Now()
@@ -160,12 +169,159 @@ func TestClaimCouponPropagatesRedisError(t *testing.T) {
 	cancel()
 	_, err := c.ClaimCoupon(ctx, CouponClaimParams{
 		ClaimedKey: claimedKey, PerUserKey: perUserKey,
+		VersionKey: versionKey, PerUserVersionKey: perUserVersionKey,
 		Now: now, Total: 2, ValidFrom: now.Add(-time.Minute),
 		ValidUntil: now.Add(time.Hour), PerUserLimit: 1,
 	})
 	require.ErrorIs(t, err, context.Canceled)
 	requireCacheState(t, c, claimedKey, "", false)
 	requireCacheState(t, c, perUserKey, "", false)
+}
+
+func TestClaimCouponRebuildsMissingOrStaleCountsFromDatabaseFacts(t *testing.T) {
+	tests := []struct {
+		name         string
+		seedClaimed  string
+		seedPerUser  string
+		claimedCount int64
+		perUserCount int64
+		wantClaimed  string
+		wantPerUser  string
+	}{
+		{
+			name: "missing counters", claimedCount: 3, perUserCount: 1,
+			wantClaimed: "4", wantPerUser: "2",
+		},
+		{
+			name: "stale counters", seedClaimed: "1", seedPerUser: "0",
+			claimedCount: 3, perUserCount: 1, wantClaimed: "4", wantPerUser: "2",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newAtomicRedis(t)
+			claimedKey := atomicTestKey(t, "coupon-rebuild-claimed")
+			perUserKey := atomicTestKey(t, "coupon-rebuild-per-user")
+			versionKey := atomicTestKey(t, "coupon-rebuild-version")
+			perUserVersionKey := atomicTestKey(t, "coupon-rebuild-per-user-version")
+			t.Cleanup(func() {
+				require.NoError(t, c.Del(context.Background(), claimedKey))
+				require.NoError(t, c.Del(context.Background(), perUserKey))
+				require.NoError(t, c.Del(context.Background(), versionKey))
+				require.NoError(t, c.Del(context.Background(), perUserVersionKey))
+			})
+			if tc.seedClaimed != "" {
+				require.NoError(t, c.Set(context.Background(), claimedKey, tc.seedClaimed, 0))
+			}
+			if tc.seedPerUser != "" {
+				require.NoError(t, c.Set(context.Background(), perUserKey, tc.seedPerUser, 0))
+			}
+
+			now := time.Now()
+			result, err := c.ClaimCoupon(context.Background(), CouponClaimParams{
+				ClaimedKey: claimedKey, PerUserKey: perUserKey,
+				VersionKey: versionKey, PerUserVersionKey: perUserVersionKey,
+				Now: now, Total: 10, ValidFrom: now.Add(-time.Minute), ValidUntil: now.Add(time.Hour),
+				PerUserLimit: 3, ClaimedCount: tc.claimedCount, PerUserCount: tc.perUserCount,
+			})
+			require.NoError(t, err)
+			require.Equal(t, CouponClaimed, result)
+			requireCacheState(t, c, claimedKey, tc.wantClaimed, true)
+			requireCacheState(t, c, perUserKey, tc.wantPerUser, true)
+		})
+	}
+}
+
+func TestSyncCouponCountsAtomicallyUsesDatabaseFacts(t *testing.T) {
+	c := newAtomicRedis(t)
+	claimedKey := atomicTestKey(t, "coupon-sync-claimed")
+	perUserKey := atomicTestKey(t, "coupon-sync-per-user")
+	versionKey := atomicTestKey(t, "coupon-sync-version")
+	perUserVersionKey := atomicTestKey(t, "coupon-sync-per-user-version")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), claimedKey))
+		require.NoError(t, c.Del(context.Background(), perUserKey))
+		require.NoError(t, c.Del(context.Background(), versionKey))
+		require.NoError(t, c.Del(context.Background(), perUserVersionKey))
+	})
+	require.NoError(t, c.Set(context.Background(), claimedKey, "9", 0))
+	require.NoError(t, c.Set(context.Background(), perUserKey, "4", 0))
+
+	err := c.SyncCouponCounts(context.Background(), CouponCountParams{
+		ClaimedKey: claimedKey, PerUserKey: perUserKey,
+		VersionKey: versionKey, PerUserVersionKey: perUserVersionKey,
+		ClaimedCount: 2, PerUserCount: 1,
+	})
+	require.NoError(t, err)
+	requireCacheState(t, c, claimedKey, "2", true)
+	requireCacheState(t, c, perUserKey, "1", true)
+}
+
+func TestSyncCouponCountsIgnoresOlderDatabaseSnapshot(t *testing.T) {
+	c := newAtomicRedis(t)
+	claimedKey := atomicTestKey(t, "coupon-versioned-sync-claimed")
+	perUserKey := atomicTestKey(t, "coupon-versioned-sync-per-user")
+	versionKey := atomicTestKey(t, "coupon-versioned-sync-version")
+	perUserVersionKey := atomicTestKey(t, "coupon-versioned-sync-per-user-version")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), claimedKey))
+		require.NoError(t, c.Del(context.Background(), perUserKey))
+		require.NoError(t, c.Del(context.Background(), versionKey))
+		require.NoError(t, c.Del(context.Background(), perUserVersionKey))
+	})
+
+	require.NoError(t, c.SyncCouponCounts(context.Background(), CouponCountParams{
+		ClaimedKey: claimedKey, PerUserKey: perUserKey,
+		VersionKey: versionKey, PerUserVersionKey: perUserVersionKey,
+		ClaimedCount: 4, PerUserCount: 2,
+	}))
+	require.NoError(t, c.SyncCouponCounts(context.Background(), CouponCountParams{
+		ClaimedKey: claimedKey, PerUserKey: perUserKey,
+		VersionKey: versionKey, PerUserVersionKey: perUserVersionKey,
+		ClaimedCount: 3, PerUserCount: 1,
+	}))
+
+	requireCacheState(t, c, claimedKey, "4", true)
+	requireCacheState(t, c, perUserKey, "2", true)
+	requireCacheState(t, c, versionKey, "4", true)
+}
+
+func TestSyncCouponCountsRepairsUserCounterAfterAnotherUserAdvancesTemplateVersion(t *testing.T) {
+	c := newAtomicRedis(t)
+	claimedKey := atomicTestKey(t, "coupon-cross-user-claimed")
+	versionKey := atomicTestKey(t, "coupon-cross-user-version")
+	userAKey := atomicTestKey(t, "coupon-cross-user-a")
+	userAVersionKey := atomicTestKey(t, "coupon-cross-user-a-version")
+	userBKey := atomicTestKey(t, "coupon-cross-user-b")
+	userBVersionKey := atomicTestKey(t, "coupon-cross-user-b-version")
+	keys := []string{claimedKey, versionKey, userAKey, userAVersionKey, userBKey, userBVersionKey}
+	t.Cleanup(func() {
+		for _, key := range keys {
+			require.NoError(t, c.Del(context.Background(), key))
+		}
+	})
+
+	require.NoError(t, c.SyncCouponCounts(context.Background(), CouponCountParams{
+		ClaimedKey: claimedKey, PerUserKey: userAKey,
+		VersionKey: versionKey, PerUserVersionKey: userAVersionKey,
+		ClaimedCount: 3, PerUserCount: 0,
+	}))
+	require.NoError(t, c.Set(context.Background(), userAKey, "1", 0), "模拟 user A Redis 预占后 DB 写失败")
+	require.NoError(t, c.SyncCouponCounts(context.Background(), CouponCountParams{
+		ClaimedKey: claimedKey, PerUserKey: userBKey,
+		VersionKey: versionKey, PerUserVersionKey: userBVersionKey,
+		ClaimedCount: 4, PerUserCount: 1,
+	}))
+	require.NoError(t, c.SyncCouponCounts(context.Background(), CouponCountParams{
+		ClaimedKey: claimedKey, PerUserKey: userAKey,
+		VersionKey: versionKey, PerUserVersionKey: userAVersionKey,
+		ClaimedCount: 3, PerUserCount: 0,
+	}))
+
+	requireCacheState(t, c, claimedKey, "4", true)
+	requireCacheState(t, c, userAKey, "0", true)
+	requireCacheState(t, c, userBKey, "1", true)
 }
 
 func TestWarmFlashSaleStockResultsAndTTL(t *testing.T) {

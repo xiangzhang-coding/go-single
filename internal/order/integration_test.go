@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -216,6 +217,16 @@ func envOr(key, def string) string {
 
 func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
+	w := performJSON(env, method, path, body, token)
+
+	var parsed map[string]any
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
+	}
+	return w, parsed
+}
+
+func performJSON(env *testEnv, method, path, body, token string) *httptest.ResponseRecorder {
 	var r *http.Request
 	if body == "" {
 		r = httptest.NewRequest(method, path, nil)
@@ -228,12 +239,7 @@ func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*http
 	}
 	w := httptest.NewRecorder()
 	env.router.ServeHTTP(w, r)
-
-	var parsed map[string]any
-	if w.Body.Len() > 0 {
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
-	}
-	return w, parsed
+	return w
 }
 
 func adminToken(t *testing.T, env *testEnv) string {
@@ -313,12 +319,15 @@ func createTemplate(t *testing.T, env *testEnv, typ string, value, minAmount int
 // createOrder 直购下单，返回订单响应。
 func createOrder(t *testing.T, env *testEnv, token, rid string, addrID int64, skuID int64, quantity int, couponID int64) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
+	return doJSON(t, env, http.MethodPost, "/api/orders", orderRequestBody(rid, addrID, skuID, quantity, couponID), token)
+}
+
+func orderRequestBody(rid string, addrID int64, skuID int64, quantity int, couponID int64) string {
 	couponPart := ""
 	if couponID > 0 {
 		couponPart = fmt.Sprintf(`,"coupon_id":%d`, couponID)
 	}
-	body := fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"items":[{"sku_id":%d,"quantity":%d}]%s}`, rid, addrID, skuID, quantity, couponPart)
-	return doJSON(t, env, http.MethodPost, "/api/orders", body, token)
+	return fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"items":[{"sku_id":%d,"quantity":%d}]%s}`, rid, addrID, skuID, quantity, couponPart)
 }
 
 func skuStock(t *testing.T, env *testEnv, skuID int64) int {
@@ -554,6 +563,33 @@ func TestOrderCouponUnusableHTTP(t *testing.T) {
 			"(SELECT template_id FROM user_coupons WHERE id = ?)", time.Now().Add(-time.Minute), couponID2).Error)
 	w, _ = createOrder(t, env, token, uniqueName("req3"), addrID, skuID, 1, couponID2)
 	require.Equal(t, http.StatusConflict, w.Code)
+}
+
+func TestOrderConcurrentCouponUseOnlyOnce(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("coupon-race"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+	couponID := thresholdCoupon(t, env, token, 5000, 5000)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := orderRequestBody(uniqueName(fmt.Sprintf("coupon-use-%d", i)), addrID, skuID, 1, couponID)
+			w := performJSON(env, http.MethodPost, "/api/orders", body, token)
+			codes[i] = w.Code
+		}(i)
+	}
+	wg.Wait()
+
+	sort.Ints(codes)
+	require.Equal(t, []int{http.StatusCreated, http.StatusConflict}, codes)
+	var orderCount int64
+	require.NoError(t, env.gdb.Table("orders").Where("coupon_id = ?", couponID).Count(&orderCount).Error)
+	require.Equal(t, int64(1), orderCount, "同一张优惠券并发核销只能创建一个订单")
 }
 
 // 券归属校验：用户不能在订单中使用他人的券（防止跨用户越权）。

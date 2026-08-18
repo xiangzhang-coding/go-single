@@ -84,6 +84,16 @@ export interface UserCouponView {
   created_at: string;
 }
 
+export interface UserCoupon {
+  id: number;
+  user_id: number;
+  template_id: number;
+  status: "unused" | "used" | string;
+  used_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export type CouponTemplateState = "claimable" | "not_started" | "ended" | "sold_out" | "limit_reached";
 
 export interface CouponTemplateView {

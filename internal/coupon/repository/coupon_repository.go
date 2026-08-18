@@ -9,6 +9,25 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 )
 
+// ClaimResult is the complete outcome set of an authoritative database claim.
+type ClaimResult uint8
+
+const (
+	ClaimCreated ClaimResult = iota + 1
+	ClaimTemplateNotFound
+	ClaimNotInWindow
+	ClaimSoldOut
+	ClaimLimitReached
+)
+
+// ClaimOutcome includes the committed database counts used to repair Redis.
+type ClaimOutcome struct {
+	Result       ClaimResult
+	Coupon       *model.UserCoupon
+	ClaimedCount int64
+	PerUserCount int64
+}
+
 // CouponTemplateRepository 券模板数据访问接口。
 type CouponTemplateRepository interface {
 	Create(ctx context.Context, t *model.CouponTemplate) error
@@ -19,8 +38,8 @@ type CouponTemplateRepository interface {
 
 // UserCouponRepository 用户券数据访问接口。
 type UserCouponRepository interface {
-	// Create 落库一条领取记录（领券的最终态）。
-	Create(ctx context.Context, c *model.UserCoupon) error
+	// Claim locks the template and atomically rechecks limits before inserting.
+	Claim(ctx context.Context, userID, templateID int64) (ClaimOutcome, error)
 	// ListByUser 我的券（JOIN 模板，SQL 内派生状态）；status 为空返回全部，
 	// 否则按派生状态筛选（unused/used/expired），返回条目与总数。
 	ListByUser(ctx context.Context, userID int64, status string, offset, limit int) ([]model.UserCouponView, int64, error)

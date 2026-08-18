@@ -160,6 +160,16 @@ func envOr(key, def string) string {
 
 func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
+	w := performJSON(env, method, path, body, token)
+
+	var parsed map[string]any
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
+	}
+	return w, parsed
+}
+
+func performJSON(env *testEnv, method, path, body, token string) *httptest.ResponseRecorder {
 	var r *http.Request
 	if body == "" {
 		r = httptest.NewRequest(method, path, nil)
@@ -172,12 +182,7 @@ func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*http
 	}
 	w := httptest.NewRecorder()
 	env.router.ServeHTTP(w, r)
-
-	var parsed map[string]any
-	if w.Body.Len() > 0 {
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
-	}
-	return w, parsed
+	return w
 }
 
 func adminToken(t *testing.T, env *testEnv) string {
@@ -259,8 +264,22 @@ func TestCouponLifecycleClosedLoop(t *testing.T) {
 	// 领取 → 201。
 	w, claimed := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", user)
 	require.Equal(t, http.StatusCreated, w.Code, "领券失败: %s", w.Body.String())
+	require.ElementsMatch(t,
+		[]string{"id", "user_id", "template_id", "status", "created_at", "updated_at"},
+		mapKeys(claimed),
+		"领券响应形状必须与前端 UserCoupon 类型一致",
+	)
 	require.Equal(t, float64(tmplID), claimed["template_id"])
 	require.Equal(t, "unused", claimed["status"])
+	require.IsType(t, float64(0), claimed["id"])
+	require.IsType(t, float64(0), claimed["user_id"])
+	require.IsType(t, float64(0), claimed["template_id"])
+	for _, field := range []string{"created_at", "updated_at"} {
+		value, ok := claimed[field].(string)
+		require.True(t, ok, "%s 必须是时间字符串", field)
+		_, err := time.Parse(time.RFC3339Nano, value)
+		require.NoError(t, err, "%s 必须是 RFC3339 时间", field)
+	}
 
 	// 我的券列表：1 张，含模板信息。
 	w, mine := doJSON(t, env, http.MethodGet, "/api/coupons/mine", "", user)
@@ -280,6 +299,54 @@ func TestCouponLifecycleClosedLoop(t *testing.T) {
 	require.Equal(t, "limit_reached", item["state"])
 }
 
+func TestClaimRealDatabaseWriteFailureRestoresRedisQuota(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	username := uniqueName("dbfail")
+	user := registerAndToken(t, env, username)
+	tmplID := createTemplate(t, env, admin, uniqueName("写失败券"), 1, 1, 500, 0, -time.Minute, time.Hour)
+	triggerName := fmt.Sprintf("test_coupon_insert_fail_%d", tmplID)
+	rootDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=Local",
+		envOr("GO_SINGLE_MYSQL_ROOT_USER", "root"), envOr("GO_SINGLE_MYSQL_ROOT_PASSWORD", "root123"),
+		envOr("GO_SINGLE_MYSQL_HOST", "127.0.0.1"), envOr("GO_SINGLE_MYSQL_PORT", "3306"), testDBName))
+	require.NoError(t, err)
+	dropTrigger := func() { _, _ = rootDB.Exec("DROP TRIGGER IF EXISTS " + triggerName) }
+	dropTrigger()
+	t.Cleanup(func() {
+		dropTrigger()
+		_ = rootDB.Close()
+	})
+	_, err = rootDB.Exec(fmt.Sprintf(`
+CREATE TRIGGER %s BEFORE INSERT ON user_coupons
+FOR EACH ROW
+BEGIN
+    IF NEW.template_id = %d THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'forced coupon insert failure';
+    END IF;
+END`, triggerName, tmplID))
+	require.NoError(t, err)
+
+	w := performJSON(env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", user)
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	var dbCount int64
+	require.NoError(t, env.gdb.Table("user_coupons").Where("template_id = ?", tmplID).Count(&dbCount).Error)
+	require.Zero(t, dbCount)
+	var userID int64
+	require.NoError(t, env.gdb.Table("users").Where("username = ?", username).Select("id").Scan(&userID).Error)
+	rc := redis.NewClient(&redis.Options{Addr: redisAddr, DB: redisTestDB})
+	defer rc.Close()
+	claimed, err := rc.Get(context.Background(), fmt.Sprintf("coupon:claimed:%d", tmplID)).Int64()
+	require.NoError(t, err)
+	require.Zero(t, claimed)
+	perUser, err := rc.Get(context.Background(), fmt.Sprintf("coupon:peruser:%d:%d", tmplID, userID)).Int64()
+	require.NoError(t, err)
+	require.Zero(t, perUser)
+
+	dropTrigger()
+	w = performJSON(env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", user)
+	require.Equal(t, http.StatusCreated, w.Code, "数据库恢复后不得被泄漏额度阻塞: %s", w.Body.String())
+}
+
 // findItem 在 items 中按 id 查找条目。
 func findItem(t *testing.T, body map[string]any, id int64, msg string) map[string]any {
 	t.Helper()
@@ -291,6 +358,14 @@ func findItem(t *testing.T, body map[string]any, id int64, msg string) map[strin
 	}
 	require.Fail(t, msg)
 	return nil
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 // 并发领券不超发：20 个用户抢 total=5，恰好 5 人成功，其余 409，DB 落库 5 张。
@@ -315,7 +390,7 @@ func TestClaimConcurrentNoOversell(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", tokens[i])
+			w := performJSON(env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", tokens[i])
 			codes[i] = w.Code
 		}(i)
 	}
@@ -358,7 +433,7 @@ func TestClaimConcurrentPerUserLimit(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", user)
+			w := performJSON(env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", user)
 			codes[i] = w.Code
 		}(i)
 	}
@@ -377,6 +452,147 @@ func TestClaimConcurrentPerUserLimit(t *testing.T) {
 	var dbCount int64
 	require.NoError(t, env.gdb.Table("user_coupons").Where("template_id = ?", tmplID).Count(&dbCount).Error)
 	require.Equal(t, int64(2), dbCount)
+}
+
+// Redis 重启丢失计数后，领取从 MySQL 事实重建；并发请求仍由数据库事务兜底。
+func TestClaimRebuildsCountsAfterRedisStateLoss(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	ctx := context.Background()
+	rc := redis.NewClient(&redis.Options{Addr: redisAddr, DB: redisTestDB})
+	defer rc.Close()
+
+	t.Run("模板总量", func(t *testing.T) {
+		const workers = 10
+		tmplID := createTemplate(t, env, admin, uniqueName("重建总量券"), 2, 1, 500, 0, -time.Minute, time.Hour)
+		first := registerAndToken(t, env, uniqueName("rf"))
+		w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", first)
+		require.Equal(t, http.StatusCreated, w.Code)
+		require.NoError(t, rc.FlushDB(ctx).Err(), "模拟 Redis 重启后内存计数丢失")
+
+		tokens := make([]string, workers)
+		for i := range tokens {
+			tokens[i] = registerAndToken(t, env, uniqueName(fmt.Sprintf("rt%d", i)))
+		}
+		codes := claimConcurrently(t, env, tmplID, tokens)
+		require.Equal(t, 1, countStatus(codes, http.StatusCreated))
+		require.Equal(t, workers-1, countStatus(codes, http.StatusConflict))
+
+		var dbCount int64
+		require.NoError(t, env.gdb.Table("user_coupons").Where("template_id = ?", tmplID).Count(&dbCount).Error)
+		require.Equal(t, int64(2), dbCount)
+		claimed, err := rc.Get(ctx, fmt.Sprintf("coupon:claimed:%d", tmplID)).Int64()
+		require.NoError(t, err)
+		require.Equal(t, dbCount, claimed)
+		version, err := rc.Get(ctx, fmt.Sprintf("coupon:version:%d", tmplID)).Int64()
+		require.NoError(t, err)
+		require.Equal(t, dbCount, version)
+	})
+
+	t.Run("每人限领", func(t *testing.T) {
+		const workers = 10
+		tmplID := createTemplate(t, env, admin, uniqueName("重建限领券"), 100, 2, 500, 0, -time.Minute, time.Hour)
+		user := registerAndToken(t, env, uniqueName("ru"))
+		w, firstClaim := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", user)
+		require.Equal(t, http.StatusCreated, w.Code, "首次领取失败: %v", firstClaim)
+		require.NoError(t, rc.FlushDB(ctx).Err(), "模拟 Redis 重启后内存计数丢失")
+
+		tokens := make([]string, workers)
+		for i := range tokens {
+			tokens[i] = user
+		}
+		codes := claimConcurrently(t, env, tmplID, tokens)
+		require.Equal(t, 1, countStatus(codes, http.StatusCreated))
+		require.Equal(t, workers-1, countStatus(codes, http.StatusConflict))
+
+		var userID int64
+		require.NoError(t, env.gdb.Table("user_coupons").
+			Where("template_id = ?", tmplID).Select("user_id").Limit(1).Scan(&userID).Error)
+		var dbCount int64
+		require.NoError(t, env.gdb.Table("user_coupons").
+			Where("template_id = ? AND user_id = ?", tmplID, userID).Count(&dbCount).Error)
+		require.Equal(t, int64(2), dbCount)
+		perUser, err := rc.Get(ctx, fmt.Sprintf("coupon:peruser:%d:%d", tmplID, userID)).Int64()
+		require.NoError(t, err)
+		require.Equal(t, dbCount, perUser)
+		perUserVersion, err := rc.Get(ctx, fmt.Sprintf("coupon:peruser-version:%d:%d", tmplID, userID)).Int64()
+		require.NoError(t, err)
+		require.Equal(t, dbCount, perUserVersion)
+	})
+}
+
+func TestClaimRechecksValidityAfterWaitingForTemplateLock(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	user := registerAndToken(t, env, uniqueName("lock-expire"))
+	tmplID := createTemplate(t, env, admin, uniqueName("锁等待过期券"), 10, 1, 500, 0, -time.Minute, time.Hour)
+	validUntil := time.Now().Add(time.Second)
+	require.NoError(t, env.gdb.Table("coupon_templates").
+		Where("id = ?", tmplID).Update("valid_until", validUntil).Error)
+
+	lockTx := env.gdb.Begin()
+	require.NoError(t, lockTx.Error)
+	defer lockTx.Rollback()
+	var lockedID int64
+	require.NoError(t, lockTx.Raw("SELECT id FROM coupon_templates WHERE id = ? FOR UPDATE", tmplID).Scan(&lockedID).Error)
+	require.Equal(t, tmplID, lockedID)
+
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		result <- performJSON(env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", tmplID), "", user)
+	}()
+	rc := redis.NewClient(&redis.Options{Addr: redisAddr, DB: redisTestDB})
+	defer rc.Close()
+	require.Eventually(t, func() bool {
+		exists, err := rc.Exists(context.Background(), fmt.Sprintf("coupon:claimed:%d", tmplID)).Result()
+		return err == nil && exists == 1
+	}, 750*time.Millisecond, 10*time.Millisecond, "请求应先完成 Redis 计数并等待模板行锁")
+	select {
+	case w := <-result:
+		t.Fatalf("模板行尚未解锁，领券不应提前完成，状态码=%d", w.Code)
+	default:
+	}
+	if wait := time.Until(validUntil) + 100*time.Millisecond; wait > 0 {
+		time.Sleep(wait)
+	}
+	require.NoError(t, lockTx.Commit().Error)
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("模板行解锁后领券请求未完成")
+	}
+	require.Equal(t, http.StatusConflict, w.Code, "获取模板锁后已过期，不得继续发券")
+
+	var count int64
+	require.NoError(t, env.gdb.Table("user_coupons").Where("template_id = ?", tmplID).Count(&count).Error)
+	require.Zero(t, count)
+}
+
+func claimConcurrently(t *testing.T, env *testEnv, templateID int64, tokens []string) []int {
+	t.Helper()
+	var wg sync.WaitGroup
+	codes := make([]int, len(tokens))
+	for i := range tokens {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			w := performJSON(env, http.MethodPost, fmt.Sprintf("/api/coupons/%d/claim", templateID), "", tokens[i])
+			codes[i] = w.Code
+		}(i)
+	}
+	wg.Wait()
+	return codes
+}
+
+func countStatus(codes []int, status int) int {
+	count := 0
+	for _, code := range codes {
+		if code == status {
+			count++
+		}
+	}
+	return count
 }
 
 // 过期券正确标识：领取后有效期流逝，我的券派生为 expired，unused 筛选不含它。

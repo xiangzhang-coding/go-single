@@ -35,18 +35,33 @@ const (
 )
 
 type CouponClaimParams struct {
-	ClaimedKey   string
-	PerUserKey   string
-	Now          time.Time
-	Total        int
-	ValidFrom    time.Time
-	ValidUntil   time.Time
-	PerUserLimit int
+	ClaimedKey        string
+	PerUserKey        string
+	VersionKey        string
+	PerUserVersionKey string
+	Now               time.Time
+	Total             int
+	ValidFrom         time.Time
+	ValidUntil        time.Time
+	PerUserLimit      int
+	ClaimedCount      int64
+	PerUserCount      int64
 }
 
-// CouponStore atomically enforces a coupon template's total and per-user limit.
+type CouponCountParams struct {
+	ClaimedKey        string
+	PerUserKey        string
+	VersionKey        string
+	PerUserVersionKey string
+	ClaimedCount      int64
+	PerUserCount      int64
+}
+
+// CouponStore maintains reconstructible coupon counters without exposing Lua
+// or Redis return codes to the coupon module.
 type CouponStore interface {
 	ClaimCoupon(ctx context.Context, p CouponClaimParams) (CouponClaimResult, error)
+	SyncCouponCounts(ctx context.Context, p CouponCountParams) error
 }
 
 // FlashSaleWarmResult reports whether live Redis stock was updated or kept.
@@ -221,17 +236,52 @@ const claimCouponScript = `
 if ARGV[1] < ARGV[3] or ARGV[1] > ARGV[4] then
     return -1
 end
+local claimed_floor = tonumber(ARGV[6])
+local version = tonumber(redis.call('GET', KEYS[3]) or '-1')
+if claimed_floor > version then
+    redis.call('SET', KEYS[3], claimed_floor)
+end
+local per_user_version = tonumber(redis.call('GET', KEYS[4]) or '-1')
+local per_user_floor = tonumber(ARGV[7])
+if per_user_floor > per_user_version then
+    redis.call('SET', KEYS[4], per_user_floor)
+end
 local claimed = tonumber(redis.call('GET', KEYS[1]) or '0')
+if claimed < claimed_floor then
+    claimed = claimed_floor
+    redis.call('SET', KEYS[1], claimed)
+end
 if claimed >= tonumber(ARGV[2]) then
     return 0
 end
 local per_user = tonumber(redis.call('GET', KEYS[2]) or '0')
+if per_user < per_user_floor then
+    per_user = per_user_floor
+    redis.call('SET', KEYS[2], per_user)
+end
 if per_user >= tonumber(ARGV[5]) then
     return -2
 end
 redis.call('INCR', KEYS[1])
 redis.call('INCR', KEYS[2])
 return 1
+`
+
+const syncCouponCountsScript = `
+local updated = 0
+local version = tonumber(redis.call('GET', KEYS[3]) or '-1')
+if tonumber(ARGV[1]) >= version then
+    redis.call('SET', KEYS[1], ARGV[1])
+    redis.call('SET', KEYS[3], ARGV[1])
+    updated = 1
+end
+local per_user_version = tonumber(redis.call('GET', KEYS[4]) or '-1')
+if tonumber(ARGV[2]) >= per_user_version then
+    redis.call('SET', KEYS[2], ARGV[2])
+    redis.call('SET', KEYS[4], ARGV[2])
+    updated = 1
+end
+return updated
 `
 
 const warmFlashSaleStockScript = `
@@ -592,8 +642,12 @@ func (r *redisCache) ReleaseIdempotencyDurably(ctx context.Context, key, value s
 }
 
 func (r *redisCache) ClaimCoupon(ctx context.Context, p CouponClaimParams) (CouponClaimResult, error) {
-	code, err := r.evalInt(ctx, claimCouponScript, []string{p.ClaimedKey, p.PerUserKey},
-		p.Now.UnixMilli(), p.Total, p.ValidFrom.UnixMilli(), p.ValidUntil.UnixMilli(), p.PerUserLimit)
+	if p.ClaimedKey == "" || p.PerUserKey == "" || p.VersionKey == "" || p.PerUserVersionKey == "" || p.ClaimedCount < 0 || p.PerUserCount < 0 {
+		return 0, fmt.Errorf("coupon claim requires keys and non-negative database counts")
+	}
+	code, err := r.evalInt(ctx, claimCouponScript, []string{p.ClaimedKey, p.PerUserKey, p.VersionKey, p.PerUserVersionKey},
+		p.Now.UnixMilli(), p.Total, p.ValidFrom.UnixMilli(), p.ValidUntil.UnixMilli(), p.PerUserLimit,
+		p.ClaimedCount, p.PerUserCount)
 	if err != nil {
 		return 0, err
 	}
@@ -609,6 +663,20 @@ func (r *redisCache) ClaimCoupon(ctx context.Context, p CouponClaimParams) (Coup
 	default:
 		return 0, fmt.Errorf("unexpected coupon claim result: %d", code)
 	}
+}
+
+func (r *redisCache) SyncCouponCounts(ctx context.Context, p CouponCountParams) error {
+	if p.ClaimedKey == "" || p.PerUserKey == "" || p.VersionKey == "" || p.PerUserVersionKey == "" || p.ClaimedCount < 0 || p.PerUserCount < 0 {
+		return fmt.Errorf("coupon count sync requires keys and non-negative counts")
+	}
+	code, err := r.evalInt(ctx, syncCouponCountsScript, []string{p.ClaimedKey, p.PerUserKey, p.VersionKey, p.PerUserVersionKey}, p.ClaimedCount, p.PerUserCount)
+	if err != nil {
+		return err
+	}
+	if code != 0 && code != 1 {
+		return fmt.Errorf("unexpected coupon count sync result: %d", code)
+	}
+	return nil
 }
 
 func (r *redisCache) WarmFlashSaleStock(ctx context.Context, p FlashSaleWarmParams) (FlashSaleWarmResult, error) {

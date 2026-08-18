@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 )
@@ -83,8 +84,49 @@ func NewGORMUserCoupon(db *gorm.DB) *GORMUserCouponRepository {
 	return &GORMUserCouponRepository{db: db}
 }
 
-func (r *GORMUserCouponRepository) Create(ctx context.Context, c *model.UserCoupon) error {
-	return r.db.WithContext(ctx).Create(c).Error
+func (r *GORMUserCouponRepository) Claim(ctx context.Context, userID, templateID int64) (ClaimOutcome, error) {
+	var outcome ClaimOutcome
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var template model.CouponTemplate
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&template, templateID).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			outcome.Result = ClaimTemplateNotFound
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		if err := tx.Model(&model.UserCoupon{}).Where("template_id = ?", templateID).Count(&outcome.ClaimedCount).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.UserCoupon{}).
+			Where("user_id = ? AND template_id = ?", userID, templateID).
+			Count(&outcome.PerUserCount).Error; err != nil {
+			return err
+		}
+
+		now := time.Now()
+		switch {
+		case now.Before(template.ValidFrom) || now.After(template.ValidUntil):
+			outcome.Result = ClaimNotInWindow
+		case outcome.ClaimedCount >= int64(template.Total):
+			outcome.Result = ClaimSoldOut
+		case outcome.PerUserCount >= int64(template.PerUserLimit):
+			outcome.Result = ClaimLimitReached
+		default:
+			coupon := &model.UserCoupon{UserID: userID, TemplateID: templateID, Status: model.CouponStatusUnused}
+			if err := tx.Create(coupon).Error; err != nil {
+				return err
+			}
+			outcome.Result = ClaimCreated
+			outcome.Coupon = coupon
+			outcome.ClaimedCount++
+			outcome.PerUserCount++
+		}
+		return nil
+	})
+	return outcome, err
 }
 
 // ListByUser 单条 SQL 完成 JOIN + 派生状态 + 筛选，避免服务层 N+1 查询模板。
