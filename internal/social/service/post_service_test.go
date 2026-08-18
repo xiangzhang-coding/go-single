@@ -5,6 +5,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -56,6 +58,18 @@ func (f *fakePosts) GetByID(_ context.Context, id int64) (*model.Post, error) {
 	if p, ok := f.byID[id]; ok {
 		cp := *p
 		return &cp, nil
+	}
+	return nil, nil
+}
+
+func (f *fakePosts) GetByImageURL(_ context.Context, reference string) (*model.Post, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, post := range f.byID {
+		if post.ImageURL == reference {
+			cp := *post
+			return &cp, nil
+		}
 	}
 	return nil, nil
 }
@@ -128,6 +142,15 @@ type postFixture struct {
 	orders *fakeOrders
 }
 
+type fakePostMedia struct{}
+
+func (fakePostMedia) IsOwned(_ context.Context, ownerID int64, reference, kind string) (bool, error) {
+	if kind != "image" || reference != fmt.Sprintf("/files/user-%d-image", ownerID) {
+		return false, nil
+	}
+	return true, nil
+}
+
 func newPostFixture() *postFixture {
 	users := newFakeUsers()
 	users.add(1, "alice")
@@ -137,7 +160,7 @@ func newPostFixture() *postFixture {
 	posts := newFakePosts()
 	orders := &fakeOrders{purchased: map[int64]bool{}}
 	store := repository.Store{Requests: newFakeRequests(), Friendships: fs, Posts: posts}
-	svc := NewPosts(store, users, orders)
+	svc := NewPostsWithMedia(store, users, orders, fakePostMedia{})
 	return &postFixture{svc: svc, users: users, fs: fs, posts: posts, orders: orders}
 }
 
@@ -165,13 +188,13 @@ func TestShareRequiresPurchase(t *testing.T) {
 	post, err := fx.svc.Share(context.Background(), 1, ShareParams{
 		SKUID:    10,
 		Content:  "好好用",
-		ImageURL: "https://minio.example/x.png",
+		ImageURL: "/files/user-1-image",
 	})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), post.UserID)
 	require.Equal(t, int64(10), post.SKUID)
 	require.Equal(t, "好好用", post.Content)
-	require.Equal(t, "https://minio.example/x.png", post.ImageURL)
+	require.Equal(t, "/files/user-1-image", post.ImageURL)
 }
 
 func TestShareValidation(t *testing.T) {
@@ -192,11 +215,52 @@ func TestShareValidation(t *testing.T) {
 	_, err = fx.svc.Share(context.Background(), 1, ShareParams{SKUID: 10, Content: strings.Repeat("好", maxPostContent)})
 	require.NoError(t, err)
 
-	// 可选图片须为 http/https URL。
+	// 可选图片须为发布者拥有的系统托管图片。
 	_, err = fx.svc.Share(context.Background(), 1, ShareParams{SKUID: 10, ImageURL: "javascript:alert(1)"})
 	require.ErrorIs(t, err, ErrInvalidInput)
 	_, err = fx.svc.Share(context.Background(), 1, ShareParams{SKUID: 10, ImageURL: "https://minio.example/x.png"})
+	require.ErrorIs(t, err, ErrInvalidInput)
+	_, err = fx.svc.Share(context.Background(), 1, ShareParams{SKUID: 10, ImageURL: "/files/user-2-image"})
+	require.ErrorIs(t, err, ErrInvalidInput)
+	_, err = fx.svc.Share(context.Background(), 1, ShareParams{SKUID: 10, ImageURL: "/files/user-1-image"})
 	require.NoError(t, err)
+}
+
+type failingPostMedia struct{ err error }
+
+func (f failingPostMedia) IsOwned(context.Context, int64, string, string) (bool, error) {
+	return false, f.err
+}
+
+func TestShareMediaErrorPropagates(t *testing.T) {
+	fx := newPostFixture()
+	fx.orders.purchased[10] = true
+	wantErr := errors.New("minio unavailable")
+	store := repository.Store{Requests: newFakeRequests(), Friendships: fx.fs, Posts: fx.posts}
+	svc := NewPostsWithMedia(store, fx.users, fx.orders, failingPostMedia{err: wantErr})
+	_, err := svc.Share(context.Background(), 1, ShareParams{SKUID: 10, ImageURL: "/files/ref"})
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestCanReadPostImageFollowsFeedVisibility(t *testing.T) {
+	fx := newPostFixture()
+	fx.orders.purchased[10] = true
+	reference := "/files/user-2-image"
+	_, err := fx.svc.Share(context.Background(), 2, ShareParams{SKUID: 10, ImageURL: reference})
+	require.NoError(t, err)
+
+	allowed, err := fx.svc.CanReadImage(context.Background(), 1, reference)
+	require.NoError(t, err)
+	require.False(t, allowed)
+
+	require.NoError(t, fx.fs.CreatePair(context.Background(), 1, 2))
+	allowed, err = fx.svc.CanReadImage(context.Background(), 1, reference)
+	require.NoError(t, err)
+	require.True(t, allowed)
+
+	allowed, err = fx.svc.CanReadImage(context.Background(), 3, reference)
+	require.NoError(t, err)
+	require.False(t, allowed)
 }
 
 // ---- 时间线：仅好友可见 ----

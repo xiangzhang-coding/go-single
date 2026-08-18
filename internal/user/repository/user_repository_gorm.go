@@ -54,6 +54,12 @@ func (r *GORMUserRepository) UpdateProfile(ctx context.Context, u *model.User) e
 	return nil
 }
 
+func (r *GORMUserRepository) HasAvatarURL(ctx context.Context, reference string) (bool, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&model.User{}).Where("avatar_url = ?", reference).Limit(1).Count(&count).Error
+	return count > 0, err
+}
+
 // SearchByUsername 前缀搜索：username LIKE 'prefix%'，id 升序限量返回。
 func (r *GORMUserRepository) SearchByUsername(ctx context.Context, prefix string, limit int) ([]model.User, error) {
 	if prefix == "" || limit <= 0 {

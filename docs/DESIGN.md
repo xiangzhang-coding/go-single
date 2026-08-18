@@ -94,7 +94,7 @@ go_single/
 - **主题资产**：四件套放 `web/<theme>/design/`——DESIGN.md（设计规范，供人/AI 参考）/ CSS_Variables.css / Design_Tokens.json（W3C DTCG）/ Tailwind_V4.css（`@theme`）；组件代码一律用语义化 Tailwind 类，不写死颜色
 - **工具链**：bun（`bun install` / `bun run dev` / `bun run build`）；Vite dev proxy 把 `/api`、`/ws` 转发到后端 :8080
 - **API 对接**：HTTP base 由 `VITE_API_BASE` 控制（dev 用 `/api` 代理，云端构建传后端绝对地址）；WebSocket 地址由 `VITE_WS_BASE` 控制（dev 用 `/ws` 代理）；后端 `platform/cors` 中间件允许前端域名（跨源场景）
-- **文件上传**：统一后端代理——前端 `POST /api/files` → platform/file 转存 MinIO 返回 URL；类型白名单 png/jpeg/webp/gif，大小 ≤5MB；前端不直连 MinIO（presigned 直传明确不做）
+- **私有媒体**：统一后端代理——`POST /api/files` 将图片（png/jpeg/webp/gif，魔数校验，≤5 MiB）或普通文件（PDF/ZIP/TXT/CSV/MD，≤20 MiB）写入 MinIO 私有桶，返回 `/files/<opaque-ref>` 托管引用；引用固化上传者与 `image/file` 类型，头像/动态/消息保存前校验归属与类型。`GET /api/files/:reference` 经 Bearer 代理读取：头像对登录用户可见，动态图片跟随好友关系，聊天媒体仅会话双方可读；前端以 Axios 拉取 Blob 展示/下载，不直连 MinIO（presigned 直传明确不做）
 - **页面清单**（演示前端功能范围，各主题通用）：
   - 登录/注册 → user；首页（商品列表）→ product；商品详情 → product + cart；购物车 → cart + product
   - 结算（下单）→ order + user(地址簿) + coupon；订单列表/详情 → order；秒杀页 → flashsale
@@ -203,7 +203,7 @@ go_single/
 
 - **对象级授权（越权防护）**：所有资源查询/变更强制校验归属——订单、购物车、地址簿、聊天消息、好友操作均校验 `owner_id`，禁止跨用户访问（IDOR）
 - **HTTPS 与安全头**：Nginx 终止 SSL（本地演示可自签证书）；响应加 `X-Content-Type-Options` / `X-Frame-Options` / `Content-Security-Policy` 等安全头
-- **上传安全**：`POST /api/files` 校验文件类型白名单 + 大小限制；MinIO 桶私有
+- **上传安全**：`POST /api/files` 不信任客户端 MIME，图片按魔数校验 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB；返回托管引用而非 MinIO URL。头像、动态和消息拒绝外部 URL、他人引用与媒体类型错配；MinIO 桶保持匿名不可读，授权读取统一走 `GET /api/files/:reference`
 - **输入与注入**：validator 参数校验（设计已含）；GORM 参数化查询防 SQL 注入（设计已含）；React 默认转义防 XSS（设计已含）
 - **敏感数据**：密码 bcrypt（设计已含）；日志不记录密码与 token
 - 登出黑名单 / 密码复杂度策略 / 双因素认证进 backlog
@@ -211,12 +211,12 @@ go_single/
 ## 社交
 
 - **好友**：申请/通过流程（好友申请 待处理→通过/拒绝）；关系仓储接口化，"免申请互加"实现可切换（backlog）
-- **动态**：仅好友可见；购买成功后"分享到好友圈"按钮生成动态（引用已购 SKU + 可选文案 + 可选图片）
+- **动态**：仅好友可见；购买成功后"分享到好友圈"按钮生成动态（引用已购 SKU + 可选文案 + 可选托管图片）；图片读取权限动态跟随好友关系，动态删除后授权立即失效
 - **时间线**：拉取式——好友列表 join 动态表按时间倒序分页
 
 ## 即时通信
 
-- 消息类型：`text` / `image` / `file`（image/file 经 MinIO 上传，消息引用 URL）
+- 消息类型：`text` / `image` / `file`（image/file 经私有 MinIO 上传，消息仅保存发送者拥有且类型匹配的托管引用；读取/下载仅限发送方与接收方）
 - 会话标识：`conversation_key = min(uidA, uidB):max(uidA, uidB)` 有序用户对，消息表含会话键
 - **三通道**：发送走 REST（`POST /api/messages`，可幂等重试）；实时接收走 WebSocket 推送；离线消息落库，上线 REST 按会话游标分页拉取
 - 连接：WebSocket 长连接 + 心跳保活（`ws.heartbeat_interval` 默认 30s，pong_wait = 2× 间隔；写超时 `ws.write_wait` 默认 10s）

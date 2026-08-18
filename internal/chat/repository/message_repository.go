@@ -42,6 +42,8 @@ type MessageRepository interface {
 	GetByIdempotencyKey(ctx context.Context, senderID int64, requestID string) (*model.Message, error)
 	// GetByIDs 批量取消息（会话列表预览用），返回 id → 消息。
 	GetByIDs(ctx context.Context, ids []int64) (map[int64]model.Message, error)
+	// CanAccessMedia 判断用户是否为引用该媒体的任一消息参与方。
+	CanAccessMedia(ctx context.Context, userID int64, reference string) (bool, error)
 	// ListAfter 游标分页：id > afterID 的消息（ASC，limit 条）。
 	ListAfter(ctx context.Context, key string, afterID int64, limit int) ([]model.Message, error)
 	// ListBefore 游标分页：id < beforeID 的消息（DESC，limit 条；调用方反转成正序）。

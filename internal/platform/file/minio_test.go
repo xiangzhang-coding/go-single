@@ -6,8 +6,9 @@ package file_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
-	"fmt"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -68,7 +69,6 @@ func buildEnv() (*testEnv, error) {
 		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"),
 		Bucket:    envOr("GO_SINGLE_MINIO_BUCKET", "go-shop-test"),
 		UseSSL:    false,
-		PublicURL: envOr("GO_SINGLE_MINIO_PUBLIC_URL", "http://127.0.0.1:19000"),
 	}
 	svc, err := file.NewMinIO(cfg)
 	if err != nil {
@@ -87,7 +87,7 @@ func buildEnv() (*testEnv, error) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	api := r.Group("/api")
-	file.NewHandler(svc, verifier).RegisterRoutes(api)
+	file.NewHandler(svc, verifier, nil).RegisterRoutes(api)
 	return &testEnv{router: r, bucket: cfg.Bucket, endpoint: cfg.Endpoint, client: client}, nil
 }
 
@@ -100,9 +100,16 @@ func envOr(key, def string) string {
 
 // uploadFile 以 multipart 上传一个文件，返回响应。
 func uploadFile(t *testing.T, e *testEnv, token, filename string, content []byte) *httptest.ResponseRecorder {
+	return uploadFileKind(t, e, token, filename, content, "")
+}
+
+func uploadFileKind(t *testing.T, e *testEnv, token, filename string, content []byte, kind string) *httptest.ResponseRecorder {
 	t.Helper()
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
+	if kind != "" {
+		require.NoError(t, mw.WriteField("kind", kind))
+	}
 	fw, err := mw.CreateFormFile("file", filename)
 	require.NoError(t, err)
 	_, err = fw.Write(content)
@@ -120,21 +127,25 @@ func uploadFile(t *testing.T, e *testEnv, token, filename string, content []byte
 }
 
 func token(t *testing.T) string {
+	return tokenFor(t, 1, 2*time.Hour)
+}
+
+func tokenFor(t *testing.T, userID int64, ttl time.Duration) string {
 	t.Helper()
-	j := auth.NewJWT(auth.JWTConfig{Secret: "integration-test-secret", TTL: 2 * time.Hour})
-	tk, err := j.Issue(1, "user")
+	j := auth.NewJWT(auth.JWTConfig{Secret: "integration-test-secret", TTL: ttl})
+	tk, err := j.Issue(userID, "user")
 	require.NoError(t, err)
 	return tk
 }
 
-// objectKey 从返回 URL 中提取对象 key（{public}/{bucket}/{key}）。
-func objectKey(t *testing.T, e *testEnv, url string) string {
+// objectKey 从后端托管引用中解出私有对象 key。
+func objectKey(t *testing.T, _ *testEnv, reference string) string {
 	t.Helper()
-	prefix := fmt.Sprintf("http://%s/%s/", e.endpoint, e.bucket)
-	require.True(t, strings.HasPrefix(url, prefix), "URL 应为可引用地址: %s", url)
-	key := strings.TrimPrefix(url, prefix)
+	require.True(t, strings.HasPrefix(reference, "/files/"), "应返回后端托管引用: %s", reference)
+	key, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(reference, "/files/"))
+	require.NoError(t, err)
 	require.NotEmpty(t, key)
-	return key
+	return string(key)
 }
 
 // ---- 合法图片上传返回 URL ----
@@ -149,7 +160,12 @@ func TestUploadValidImageReturnsURL(t *testing.T) {
 	url, ok := body["url"].(string)
 	require.True(t, ok)
 	require.NotEmpty(t, url)
-	require.True(t, strings.HasSuffix(url, ".png"), "URL 应带正确扩展名: %s", url)
+	require.True(t, strings.HasPrefix(url, "/files/"), "应返回后端托管引用: %s", url)
+	require.NotContains(t, url, e.endpoint, "引用不得暴露 MinIO 地址")
+	require.Equal(t, file.KindImage, body["kind"])
+	require.Equal(t, "avatar.png", body["filename"])
+	require.Equal(t, "image/png", body["content_type"])
+	require.Equal(t, float64(len(png1x1)), body["size"])
 
 	// 对象确实落库且内容一致。
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -158,6 +174,49 @@ func TestUploadValidImageReturnsURL(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(len(png1x1)), obj.Size)
 	require.Equal(t, "image/png", obj.ContentType)
+}
+
+func TestAuthorizedReadStreamsPrivateObject(t *testing.T) {
+	e := requireEnv(t)
+	ownerToken := tokenFor(t, 41, 2*time.Hour)
+	w := uploadFile(t, e, ownerToken, "头像.png", png1x1)
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	reference := mustURL(t, w)
+
+	read := readFile(t, e, reference, ownerToken)
+	require.Equal(t, http.StatusOK, read.Code)
+	require.Equal(t, png1x1, read.Body.Bytes())
+	require.Equal(t, "image/png", read.Header().Get("Content-Type"))
+	disposition, params, err := mime.ParseMediaType(read.Header().Get("Content-Disposition"))
+	require.NoError(t, err)
+	require.Equal(t, "inline", disposition)
+	require.Equal(t, "头像.png", params["filename"])
+	require.Equal(t, "nosniff", read.Header().Get("X-Content-Type-Options"))
+
+	require.Equal(t, http.StatusUnauthorized, readFile(t, e, reference, "").Code)
+	require.Equal(t, http.StatusForbidden, readFile(t, e, reference, tokenFor(t, 42, 2*time.Hour)).Code)
+	expired := tokenFor(t, 41, -time.Hour)
+	require.Equal(t, http.StatusUnauthorized, readFile(t, e, reference, expired).Code)
+}
+
+func TestFileMessageUploadAndDownloadPolicy(t *testing.T) {
+	e := requireEnv(t)
+	ownerToken := tokenFor(t, 51, 2*time.Hour)
+	pdf := []byte("%PDF-1.7\nprivate document\n")
+	w := uploadFileKind(t, e, ownerToken, "manual.pdf", pdf, file.KindFile)
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+
+	read := readFile(t, e, mustURL(t, w), ownerToken)
+	require.Equal(t, http.StatusOK, read.Code)
+	require.Equal(t, pdf, read.Body.Bytes())
+	require.Equal(t, "application/pdf", read.Header().Get("Content-Type"))
+	require.Contains(t, read.Header().Get("Content-Disposition"), "attachment")
+	require.Contains(t, read.Header().Get("Content-Disposition"), "manual.pdf")
+
+	w = uploadFileKind(t, e, ownerToken, "attack.html", []byte("<script>alert(1)</script>"), file.KindFile)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	w = uploadFileKind(t, e, ownerToken, "manual.pdf", pdf, "video")
+	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 // ---- 非法类型被拒 ----
@@ -178,7 +237,7 @@ func TestUploadInvalidTypeRejected(t *testing.T) {
 func TestUploadTooLargeRejected(t *testing.T) {
 	e := requireEnv(t)
 	// 5MB 合法 PNG 前缀 + 填充至超过上限 → 400。
-	oversize := append(append([]byte{}, png1x1...), make([]byte, file.MaxFileSize)...)
+	oversize := append(append([]byte{}, png1x1...), make([]byte, file.MaxImageSize)...)
 	w := uploadFile(t, e, token(t), "big.png", oversize)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
@@ -228,9 +287,9 @@ func TestExistingPublicBucketRejected(t *testing.T) {
 	if exists, _ := e.client.BucketExists(ctx, bucket); !exists {
 		require.NoError(t, e.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}))
 	}
-	// 显式设置公开读策略。
+	// 即使只公开真实上传前缀 users/*，也必须在启动时被拒绝。
 	publicPolicy := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},` +
-		`"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::` + bucket + `/*"]}]}`
+		`"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::` + bucket + `/users/*"]}]}`
 	require.NoError(t, e.client.SetBucketPolicy(ctx, bucket, publicPolicy))
 	t.Cleanup(func() {
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
@@ -244,10 +303,20 @@ func TestExistingPublicBucketRejected(t *testing.T) {
 		AccessKey: envOr("GO_SINGLE_MINIO_ACCESS_KEY", "minioadmin"),
 		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"),
 		Bucket:    bucket,
-		PublicURL: "http://127.0.0.1:19000",
 	})
 	require.Error(t, err, "公开桶应被拒绝")
-	require.Contains(t, err.Error(), "非私有")
+	require.Contains(t, err.Error(), "访问策略")
+}
+
+func readFile(t *testing.T, e *testEnv, reference, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api"+reference, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	e.router.ServeHTTP(w, req)
+	return w
 }
 
 func mustURL(t *testing.T, w *httptest.ResponseRecorder) string {

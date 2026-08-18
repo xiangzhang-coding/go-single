@@ -158,13 +158,13 @@
 - JWT 自签 HS256（2h，无 refresh）+ bcrypt；TokenVerifier 接口（自签实现，OIDC 换实现进 backlog）
 - `user.role`（user/admin）+ admin 中间件；admin 种子账号 admin/admin123（migration 种入）
 - 对象级授权：订单/购物车/地址簿/聊天/好友操作强制校验 `owner_id`，防 IDOR
-- HTTPS 与安全头（Nginx 终止 SSL + X-Content-Type-Options/X-Frame-Options/CSP）；上传类型白名单 png/jpeg/webp/gif 且 ≤5MB；MinIO 桶私有；日志不记录密码与 token
+- HTTPS 与安全头（Nginx 终止 SSL + X-Content-Type-Options/X-Frame-Options/CSP）；图片按魔数限定 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB；上传返回绑定上传者与类型的托管引用，业务拒绝外链/他人引用/类型错配；MinIO 桶私有，读取经 Bearer 后端代理并按头像、好友关系或会话参与者授权；日志不记录密码与 token
 
 ### 社交 / 即时通信
 
 - 好友：申请/通过流程（关系仓储接口化，免申请实现可切换进 backlog）
-- 动态：仅好友可见；购买成功后分享（引用已购 SKU + 文案 + 图片）；拉取式时间线分页
-- IM：单聊；`conversation_key = min(uidA,uidB):max(uidA,uidB)`；消息三通道——发送 REST（可幂等重试）、实时接收 WS 推送、离线 REST 按会话游标分页拉取；WS 握手 JWT（query 传 token，注明日志风险取舍）；已读回执为会话粒度已读游标（`POST /api/conversations/{key}/read` 推进，未读数 = 我收到且 id > 游标的消息数）
+- 动态：仅好友可见；购买成功后分享（引用已购 SKU + 文案 + 托管图片）；拉取式时间线分页，图片读取权限跟随好友关系
+- IM：单聊；`conversation_key = min(uidA,uidB):max(uidA,uidB)`；图片/文件消息只保存发送者拥有且类型匹配的托管引用，读取仅限会话双方；消息三通道——发送 REST（可幂等重试）、实时接收 WS 推送、离线 REST 按会话游标分页拉取；WS 握手 JWT（query 传 token，注明日志风险取舍）；已读回执为会话粒度已读游标（`POST /api/conversations/{key}/read` 推进，未读数 = 我收到且 id > 游标的消息数）
 
 ### 可观测性与容错
 
@@ -177,7 +177,7 @@
 - 工程级插拔：每套主题 = `web/<theme>/` 独立 Vite 工程（bun），共享后端 REST 接口契约；换主题 = 部署时选一套构建；第二套主题克隆骨架；`web/shared/` 出现第二套再抽
 - 主题资产：四件套 `web/<theme>/design/`（DESIGN.md 规范参考 / CSS_Variables.css / Design_Tokens.json W3C DTCG / Tailwind_V4.css @theme）；组件一律语义化 Tailwind 类
 - 工程选型：react-router v7（admin 按角色分组 + role 守卫）、TanStack Query（服务端状态）+ zustand（客户端状态）、axios 拦截器（JWT 头 + 401 跳登录）、JWT 存 localStorage、手写组件、TS 类型手写对齐后端 json tag（ADR-0006）
-- 对接：`VITE_API_BASE` / `VITE_WS_BASE`（dev 用 /api、/ws 代理到 :8080）；文件上传 `POST /api/files` 后端代理（presigned 明确不做）
+- 对接：`VITE_API_BASE` / `VITE_WS_BASE`（dev 用 /api、/ws 代理到 :8080）；媒体上传 `POST /api/files`、授权读取 `GET /api/files/:reference` 均走后端代理，前端通过 Axios 获取 Blob 后展示/下载并复用统一 401 处理（presigned 明确不做）
 - 页面清单（13 页）：登录/注册、首页、商品详情、购物车、结算、订单列表/详情、秒杀页、优惠券中心、好友列表/申请、好友圈、聊天、个人中心（地址簿）、后台管理
 - 交互约定：秒杀排队中轮询订单接口 1.5s×30；倒计时由轮询接口带服务端时间；401 跳登录；支付为订单详情页内动作（不设独立页）
 - 部署双路径：本地 Nginx（托管选定主题 dist + /api 反代 + try_files + upstream 双实例示例）；云端 Cloudflare Pages（`public/_redirects` + `VITE_API_BASE` 跨源 + 后端 CORS）
@@ -197,7 +197,7 @@
 
 ## Testing Decisions
 
-- **主 seam（最高点）：HTTP API 层黑盒集成测试**——`httptest` 起完整路由 + 真实 MySQL/Redis（docker compose 或 testcontainers）；覆盖完整业务流程（注册→登录→加购→下单→支付→发货→确认收货）、秒杀全链路（限流→Lua 预扣→MQ 落单→轮询→超时回补）、幂等（client_request_id、秒杀幂等键+唯一约束）、状态机非法跃迁拒绝、金额计算与支付核对、对象级授权（跨用户访问拒绝）
+- **主 seam（最高点）：HTTP API 层黑盒集成测试**——`httptest` 起完整路由 + 真实 MySQL/Redis/MinIO（docker compose 或 testcontainers）；覆盖完整业务流程（注册→登录→加购→下单→支付→发货→确认收货）、秒杀全链路（限流→Lua 预扣→MQ 落单→轮询→超时回补）、媒体上传→业务绑定→授权读取闭环、幂等（client_request_id、秒杀幂等键+唯一约束）、状态机非法跃迁拒绝、金额计算与支付核对、对象级授权（跨用户访问拒绝）
 - **中间 seam：service 层单元测试**——各模块 service + fake repository（复用 ADR-0003 仓储接口 seam，测试替身成本低）；覆盖状态机流转、限购/门槛校验、券核销与回退、好友申请流转
 - **底层 seam：Lua 脚本测试**——Redis 内直接执行脚本验证原子性、超卖防护（并发抢空）、限购边界
 - 只测外部行为（接口输入输出与状态迁移），不测实现细节；工具 testing + testify

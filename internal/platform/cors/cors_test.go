@@ -44,6 +44,7 @@ func TestAllowedOriginGetsHeaders(t *testing.T) {
 	require.Equal(t, "https://shop.example.com", w.Header().Get("Access-Control-Allow-Origin"))
 	require.Contains(t, w.Header().Get("Access-Control-Allow-Methods"), "OPTIONS")
 	require.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "Authorization")
+	require.Contains(t, w.Header().Get("Access-Control-Expose-Headers"), "Content-Disposition")
 }
 
 func TestDisallowedOriginNoHeaders(t *testing.T) {

@@ -147,12 +147,10 @@ type MinIO struct {
 	// AccessKey / SecretKey 管理员凭据（演示环境固定，生产用环境变量注入）。
 	AccessKey string `mapstructure:"access_key"`
 	SecretKey string `mapstructure:"secret_key"`
-	// Bucket 私有桶名，上传对象仅经业务接口引用。
+	// Bucket 私有桶名，上传与读取均经后端业务接口代理。
 	Bucket string `mapstructure:"bucket"`
 	// UseSSL 是否启用 TLS（本地 compose 为 false）。
 	UseSSL bool `mapstructure:"use_ssl"`
-	// PublicURL 对外可引用地址基址，用于拼接上传返回的 URL。
-	PublicURL string `mapstructure:"public_url"`
 }
 
 type Migrations struct {
@@ -211,7 +209,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("minio.secret_key", "minioadmin")
 	v.SetDefault("minio.bucket", "go-shop")
 	v.SetDefault("minio.use_ssl", false)
-	v.SetDefault("minio.public_url", "http://127.0.0.1:19000")
 	v.SetDefault("migrations.path", "./migrations")
 	v.SetDefault("auth.secret", "dev-secret-change-me")
 	v.SetDefault("auth.ttl", "2h")

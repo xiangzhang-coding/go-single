@@ -25,9 +25,9 @@ sidebar_position: 10
 | id | BIGINT UNSIGNED PK | 消息 ID（游标） |
 | conversation_key | VARCHAR(64) FK | 所属会话（CASCADE） |
 | sender_id / recipient_id | BIGINT UNSIGNED FK | 发送方 / 接收方 |
-| type | VARCHAR(16) | `text`（用 content）/ `image` / `file`（用 url，MinIO URL） |
+| type | VARCHAR(16) | `text`（用 content）/ `image` / `file`（用 url 托管引用） |
 | content | VARCHAR(2000) | text 内容（1–2000 字符） |
-| url | VARCHAR(500) | image/file 内容（http/https，1–500 字符） |
+| url | VARCHAR(500) | image/file 托管引用（发送者上传、类型匹配，1–500 字符） |
 | client_request_id | VARCHAR(64) NULL | 幂等键（可空；NULL 不参与唯一约束，非幂等发送多次落库多行） |
 
 **UNIQUE (sender_id, client_request_id)**：同一发送方同一幂等键仅一条消息（重放返回原消息）。
@@ -62,13 +62,15 @@ sidebar_position: 10
 
 ```text
 POST /api/messages {to_user_id, type, ...}
-  → 参数校验（text 必填 content；image/file 必填 http(s) URL；自聊 400）
+  → 参数校验（text 必填 content；image/file 必填发送者拥有且类型匹配的托管引用；自聊 400）
   → 接收方存在校验（user.GetByID，跨模块）
   → 好友关系校验（social.AreFriends，仅好友可单聊；非好友 403）
   → 单事务：Ensure 会话（不存在则建）→ 消息落库 → Touch 会话最近消息
   → 撞唯一键 (sender_id, client_request_id) → 回滚后查既有消息返回（幂等重放，不重复推送）
   → 落库成功（首次）→ MessageNotifier.NotifyMessageSent → WS Hub 向在线接收方推送
       （实现为 cmd/server 的 wsMessageNotifier 适配器；非阻塞投递）
+GET /api/files/:reference
+  → 仅引用该媒体消息的发送方与接收方可读取/下载，第三人 403
 ```
 
 ### 会话与消息查询

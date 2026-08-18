@@ -21,6 +21,8 @@ type UserRepository interface {
 	GetByID(ctx context.Context, id int64) (*model.User, error)
 	// UpdateProfile 按主键更新个人资料字段（nickname/avatar_url，零值生效允许清空）。
 	UpdateProfile(ctx context.Context, u *model.User) error
+	// HasAvatarURL 判断托管引用是否仍绑定为用户头像。
+	HasAvatarURL(ctx context.Context, reference string) (bool, error)
 	// SearchByUsername 按用户名前缀搜索（"加好友"发现入口），id 升序
 	// 返回至多 limit 条；prefix 为空或 limit <= 0 返回空列表，不触达数据库。
 	SearchByUsername(ctx context.Context, prefix string, limit int) ([]model.User, error)

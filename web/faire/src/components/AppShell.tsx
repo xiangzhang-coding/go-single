@@ -1,9 +1,9 @@
-import { useState } from "react";
 import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { getCart } from "../api/endpoints";
 import { Icon } from "./ui";
+import { AuthorizedImage } from "./AuthorizedMedia";
 import { useAuthStore } from "../store/auth";
 import { totalUnread, useChatStore } from "../store/chat";
 
@@ -19,8 +19,6 @@ export function AppShell() {
   });
   const cartCount = cartQuery.data?.items.reduce((sum, item) => sum + item.quantity, 0) || 0;
   const unreadCount = totalUnread(useChatStore((state) => state.conversations));
-  // 私有桶头像匿名不可直读，加载失败隐藏（保留文字昵称）。
-  const [avatarBroken, setAvatarBroken] = useState(false);
 
   function signOut() {
     logout();
@@ -49,12 +47,12 @@ export function AppShell() {
             {user ? (
               <>
                 <Link to="/profile" className="header-user" title="个人中心">
-                  {user.avatar_url && !avatarBroken ? (
-                    <img
-                      src={user.avatar_url}
+                  {user.avatar_url ? (
+                    <AuthorizedImage
+                      reference={user.avatar_url}
                       alt=""
                       className="header-avatar"
-                      onError={() => setAvatarBroken(true)}
+                      fallback={null}
                     />
                   ) : null}
                   {user.nickname || user.username}

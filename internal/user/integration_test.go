@@ -297,7 +297,7 @@ func TestUserSearchByPrefix(t *testing.T) {
 	env := requireEnv(t)
 	uid := time.Now().UnixNano()
 
-	prefix := fmt.Sprintf("sea_%d", uid%1_000_000)
+	prefix := fmt.Sprintf("sea_%d", uid)
 	userA := prefix + "_a"
 	userB := prefix + "_b"
 	other := "zz_" + fmt.Sprint(uid)

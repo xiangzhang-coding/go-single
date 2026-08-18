@@ -61,7 +61,7 @@ curl -sk https://127.0.0.1:8443/api/products
 
 浏览器访问 `https://127.0.0.1:8443`（自签证书需手动信任；IP 地址访问不受 HSTS 影响）。生产证书：Nginx 终止 SSL 不变，仅把自签证书换成 Let's Encrypt（certbot 或云厂商证书），见 §4。
 
-安全头清单（本地与云端**头名称一致、值按部署路径调整**，DESIGN「安全设计 → HTTPS 与安全头」）：`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Strict-Transport-Security`（HSTS，仅域名生效）、`Content-Security-Policy`（本地：同源脚本/样式 + MinIO 图片直连 + WS 通道；云端：放开 `https:` / `wss:`，见 §2）。
+安全头清单（本地与云端**头名称一致、值按部署路径调整**，DESIGN「安全设计 → HTTPS 与安全头」）：`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Strict-Transport-Security`（HSTS，仅域名生效）、`Content-Security-Policy`（媒体经后端鉴权读取为 `blob:`，浏览器不直连 MinIO；云端 API/WS 放开 `https:` / `wss:`，见 §2）。
 
 ## 2. Cloudflare Pages 接线（web/ 主题 + website/ 文档站）
 

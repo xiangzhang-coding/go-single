@@ -29,9 +29,9 @@ api.interceptors.request.use((config) => {
 
 api.interceptors.response.use(
   (response) => response,
-  (error: AxiosError<{ error?: string }>) => {
+  async (error: AxiosError<{ error?: string } | Blob>) => {
     const status = error.response?.status;
-    const message = error.response?.data?.error || "请求失败，请稍后再试";
+    const message = await responseErrorMessage(error.response?.data);
     const requestError = new ApiRequestError(message, status);
 
     if (status === 401 && typeof window !== "undefined") {
@@ -46,6 +46,18 @@ api.interceptors.response.use(
     return Promise.reject(requestError);
   },
 );
+
+async function responseErrorMessage(data: { error?: string } | Blob | undefined): Promise<string> {
+  if (data instanceof Blob) {
+    try {
+      const parsed = JSON.parse(await data.text()) as { error?: string };
+      return parsed.error || "请求失败，请稍后再试";
+    } catch {
+      return "请求失败，请稍后再试";
+    }
+  }
+  return data?.error || "请求失败，请稍后再试";
+}
 
 export function getApiErrorMessage(
   error: unknown,

@@ -39,6 +39,8 @@ import type {
   SKU,
   User,
   UpdateProfileRequest,
+  UploadedMedia,
+  MediaKind,
   UserCoupon,
   UserSearchResult,
 } from "./types";
@@ -298,13 +300,38 @@ export async function markConversationRead(conversationKey: string, lastMessageI
 
 // ---- 文件上传（图片消息 / 动态配图）----
 
-export async function uploadFile(file: File) {
+export async function uploadFile(file: File, kind: MediaKind = "image") {
   const form = new FormData();
   form.append("file", file);
-  const { data } = await api.post<{ url: string }>("/files", form, {
+  form.append("kind", kind);
+  const { data } = await api.post<UploadedMedia>("/files", form, {
     headers: { "Content-Type": "multipart/form-data" },
   });
-  return data.url;
+  return data;
+}
+
+export async function getMedia(reference: string) {
+  if (!reference.startsWith("/files/")) {
+    throw new Error("无效的媒体引用");
+  }
+  const response = await api.get<Blob>(reference, { responseType: "blob" });
+  return {
+    blob: response.data,
+    filename: filenameFromDisposition(response.headers["content-disposition"]),
+  };
+}
+
+function filenameFromDisposition(value?: string): string {
+  if (!value) return "download";
+  const encoded = value.match(/filename\*=utf-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return "download";
+    }
+  }
+  return value.match(/filename="?([^";]+)"?/i)?.[1] || "download";
 }
 
 // ---- 后台管理（T25，admin 角色；后端 RequireAdmin 兜底）----

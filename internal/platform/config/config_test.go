@@ -32,7 +32,6 @@ func TestLoad(t *testing.T) {
 	require.Equal(t, "127.0.0.1:19000", cfg.MinIO.Endpoint)
 	require.Equal(t, "go-shop", cfg.MinIO.Bucket)
 	require.False(t, cfg.MinIO.UseSSL)
-	require.Equal(t, "http://127.0.0.1:19000", cfg.MinIO.PublicURL)
 	require.Equal(t, "./migrations", cfg.Migrations.Path)
 	require.Equal(t, int64(1), cfg.Snowflake.WorkerID)
 	require.Empty(t, cfg.WS.AllowOrigins)

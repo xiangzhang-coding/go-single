@@ -12,6 +12,8 @@ type PostRepository interface {
 	Create(ctx context.Context, post *model.Post) error
 	// GetByID 按 ID 读取；不存在返回 (nil, nil)。
 	GetByID(ctx context.Context, id int64) (*model.Post, error)
+	// GetByImageURL 按托管图片引用读取一条动态；不存在返回 (nil, nil)。
+	GetByImageURL(ctx context.Context, reference string) (*model.Post, error)
 	// ListByUsers 好友圈时间线：仅指定用户（好友）的动态，
 	// 时间倒序（created_at DESC, id DESC 稳定分页），返回条目与总数。
 	// userIDs 为空返回空列表（总数为 0），不触达数据库。

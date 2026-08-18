@@ -119,7 +119,6 @@ func run() error {
 		SecretKey: cfg.MinIO.SecretKey,
 		Bucket:    cfg.MinIO.Bucket,
 		UseSSL:    cfg.MinIO.UseSSL,
-		PublicURL: cfg.MinIO.PublicURL,
 	})
 	if err != nil {
 		return err
@@ -252,7 +251,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 
 	// user 模块：注册/登录/鉴权 + 地址簿（默认地址唯一由 users.default_address_id 指针保证）。
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: cfg.Auth.Secret, TTL: cfg.Auth.TTL})
-	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(db), Addresses: userrepo.NewGORMAddress(db)}, verifier)
+	userSvc := usersvc.NewWithMedia(userrepo.Store{Users: userrepo.NewGORM(db), Addresses: userrepo.NewGORMAddress(db)}, verifier, fileSvc)
 	userHandler := userhandler.New(userSvc, verifier)
 	addressHandler := userhandler.NewAddress(userSvc, verifier)
 
@@ -327,11 +326,8 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// 好友圈动态：分享购买校验经 orderSvc（已支付/已发货/已完成订单含该 SKU）。
 	socialStore := socialrepo.Store{Requests: socialrepo.NewGORMRequest(db), Friendships: socialrepo.NewGORMFriendship(db), Posts: socialrepo.NewGORMPost(db)}
 	socialSvc := socialsvc.New(socialStore, userSvc)
-	socialHandler := socialhandler.New(
-		socialSvc,
-		socialsvc.NewPosts(socialStore, userSvc, orderSvc),
-		verifier,
-	)
+	postSvc := socialsvc.NewPostsWithMedia(socialStore, userSvc, orderSvc, fileSvc)
+	socialHandler := socialhandler.New(socialSvc, postSvc, verifier)
 
 	// chat 模块（T17 REST 通道）：发送消息（text/image/file，client_request_id 幂等）、
 	// 会话列表（最近消息 + 未读数）与消息列表（游标分页）、已读推进（离线消息上线可拉取）；
@@ -344,7 +340,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		Reads:         chatrepo.NewGORMReadState(db),
 		Tx:            chatConversationRepo,
 	}
-	chatSvc := chatsvc.New(chatStore, userSvc, socialSvc, wsMessageNotifier{hub: wsHub})
+	chatSvc := chatsvc.NewWithMedia(chatStore, userSvc, socialSvc, wsMessageNotifier{hub: wsHub}, fileSvc)
 	chatHandler := chathandler.New(chatSvc, verifier)
 
 	// T12 秒杀异步落单消费者：订阅"抢购成功"消息 → 查活动/默认地址 →
@@ -399,7 +395,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	cronRegistry.Start()
 
 	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
-	fileHandler := file.NewHandler(fileSvc, verifier)
+	fileHandler := file.NewHandler(fileSvc, verifier, mediaAccessAuthorizer{users: userSvc, posts: postSvc, chat: chatSvc})
 
 	// WebSocket 实时通道（T18）：GET /ws?token=<jwt>（token 进日志风险为演示取舍）。
 	r.GET("/ws", wsHub.Handler(verifier))
@@ -458,6 +454,40 @@ func (n wsMessageNotifier) NotifyMessageSent(_ context.Context, msg *chatmodel.M
 }
 
 var _ chatsvc.MessageNotifier = wsMessageNotifier{}
+
+// mediaAccessAuthorizer 聚合各业务模块的最小授权查询：已绑定头像对登录用户
+// 可见，动态图片跟随好友关系，聊天媒体仅会话双方可读。
+type mediaAccessAuthorizer struct {
+	users avatarMediaAccess
+	posts postMediaAccess
+	chat  chatMediaAccess
+}
+
+type avatarMediaAccess interface {
+	CanReadAvatar(ctx context.Context, reference string) (bool, error)
+}
+
+type postMediaAccess interface {
+	CanReadImage(ctx context.Context, userID int64, reference string) (bool, error)
+}
+
+type chatMediaAccess interface {
+	CanReadMedia(ctx context.Context, userID int64, reference string) (bool, error)
+}
+
+func (a mediaAccessAuthorizer) CanRead(ctx context.Context, userID int64, reference string) (bool, error) {
+	allowed, err := a.users.CanReadAvatar(ctx, reference)
+	if err != nil || allowed {
+		return allowed, err
+	}
+	allowed, err = a.posts.CanReadImage(ctx, userID, reference)
+	if err != nil || allowed {
+		return allowed, err
+	}
+	return a.chat.CanReadMedia(ctx, userID, reference)
+}
+
+var _ file.AccessAuthorizer = mediaAccessAuthorizer{}
 
 // registerCron 注册全部定时任务并返回调度器（Start 由调用方执行）。
 func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsalesvc.PreDeductionRecovery,

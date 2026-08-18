@@ -6,39 +6,85 @@ package file
 
 import (
 	"errors"
+	"path/filepath"
+	"strings"
 
 	"github.com/gabriel-vasile/mimetype"
 )
 
-// MaxFileSize 上传大小上限：5MB。
-const MaxFileSize = 5 << 20
+const (
+	// KindImage 为头像、动态配图和图片消息使用的图片对象。
+	KindImage = "image"
+	// KindFile 为聊天普通文件消息使用的对象。
+	KindFile = "file"
+
+	// MaxImageSize 图片上传大小上限：5 MiB。
+	MaxImageSize = 5 << 20
+	// MaxMessageFileSize 文件消息上传大小上限：20 MiB。
+	MaxMessageFileSize = 20 << 20
+)
 
 // 业务错误：handler 据此映射 HTTP 状态码。
 var (
 	// ErrInvalidType 类型不在白名单（png/jpeg/webp/gif）内。
-	ErrInvalidType = errors.New("unsupported file type, allowed: png/jpeg/webp/gif")
-	// ErrTooLarge 超过 5MB 大小上限。
-	ErrTooLarge = errors.New("file too large, max 5MB")
+	ErrInvalidType = errors.New("unsupported file type")
+	// ErrInvalidKind 上传 kind 不是 image/file。
+	ErrInvalidKind = errors.New("file kind must be image or file")
+	// ErrTooLarge 超过对应媒体类型的大小上限。
+	ErrTooLarge = errors.New("file too large")
 )
 
 // allowedTypes 类型白名单：检测到的 MIME → 对象扩展名。
-var allowedTypes = map[string]string{
+var allowedImageTypes = map[string]string{
 	"image/png":  "png",
 	"image/jpeg": "jpg",
 	"image/webp": "webp",
 	"image/gif":  "gif",
 }
 
-// validate 校验类型白名单与大小上限，返回对象扩展名与规范化 MIME。
-// header 为内容头部字节（供魔数嗅探），不信任客户端声明。
-func validate(header []byte, size int64) (string, string, error) {
-	if size > MaxFileSize {
+var allowedTextExtensions = map[string]string{
+	".txt": "text/plain; charset=utf-8",
+	".csv": "text/csv; charset=utf-8",
+	".md":  "text/markdown; charset=utf-8",
+}
+
+// validateUpload 只信任内容魔数，并对普通文件额外校验扩展名。
+// 图片允许 png/jpeg/webp/gif 且不超过 5 MiB；普通文件允许 PDF、ZIP 和
+// txt/csv/md 文本且不超过 20 MiB。图片不能伪装成普通文件绕过图片策略。
+func validateUpload(kind string, header []byte, size int64, filename string) (string, string, error) {
+	if kind != KindImage && kind != KindFile {
+		return "", "", ErrInvalidKind
+	}
+	limit := int64(MaxImageSize)
+	if kind == KindFile {
+		limit = MaxMessageFileSize
+	}
+	if size > limit {
 		return "", "", ErrTooLarge
 	}
-	mime := mimetype.Detect(header).String()
-	ext, ok := allowedTypes[mime]
-	if !ok {
+	if size <= 0 || len(header) == 0 {
 		return "", "", ErrInvalidType
 	}
-	return ext, mime, nil
+
+	detected := mimetype.Detect(header)
+	mime := detected.String()
+	if kind == KindImage {
+		ext, ok := allowedImageTypes[mime]
+		if !ok {
+			return "", "", ErrInvalidType
+		}
+		return ext, mime, nil
+	}
+
+	ext := strings.ToLower(filepath.Ext(filename))
+	switch {
+	case ext == ".pdf" && detected.Is("application/pdf"):
+		return "pdf", "application/pdf", nil
+	case ext == ".zip" && detected.Is("application/zip"):
+		return "zip", "application/zip", nil
+	case allowedTextExtensions[ext] != "" && (detected.Is("text/plain") || detected.Is(strings.Split(allowedTextExtensions[ext], ";")[0])):
+		return strings.TrimPrefix(ext, "."), allowedTextExtensions[ext], nil
+	default:
+		return "", "", ErrInvalidType
+	}
 }

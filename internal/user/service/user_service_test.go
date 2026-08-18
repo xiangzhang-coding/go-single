@@ -64,6 +64,15 @@ func (f *fakeUsers) UpdateProfile(_ context.Context, u *model.User) error {
 	return nil
 }
 
+func (f *fakeUsers) HasAvatarURL(_ context.Context, reference string) (bool, error) {
+	for _, u := range f.byID {
+		if u.AvatarURL == reference {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *fakeUsers) SearchByUsername(_ context.Context, prefix string, limit int) ([]model.User, error) {
 	users := make([]model.User, 0, limit)
 	for _, u := range f.byID {
@@ -85,8 +94,17 @@ type fakeIssuer struct {
 
 func (f *fakeIssuer) Issue(_ int64, _ string) (string, error) { return f.token, f.err }
 
+type fakeMedia struct{}
+
+func (fakeMedia) IsOwned(_ context.Context, ownerID int64, reference, kind string) (bool, error) {
+	if kind != "image" || reference != fmt.Sprintf("/files/user-%d-image", ownerID) {
+		return false, nil
+	}
+	return true, nil
+}
+
 func newTestService(users *fakeUsers, addresses *fakeAddresses, issuer TokenIssuer) Service {
-	return New(repository.Store{Users: users, Addresses: addresses}, issuer)
+	return NewWithMedia(repository.Store{Users: users, Addresses: addresses}, issuer, fakeMedia{})
 }
 
 func TestRegisterSuccess(t *testing.T) {
@@ -247,7 +265,7 @@ func TestUpdateProfileNicknameAndAvatar(t *testing.T) {
 	u, err := svc.Register(context.Background(), "erin", "secret123")
 	require.NoError(t, err)
 
-	avatar := "http://127.0.0.1:19000/go-shop/20260814/abc.png"
+	avatar := fmt.Sprintf("/files/user-%d-image", u.ID)
 	got, err := svc.UpdateProfile(context.Background(), u.ID, ProfileParams{
 		Nickname:  strPtr("  小艾  "),
 		AvatarURL: strPtr(avatar),
@@ -270,7 +288,7 @@ func TestUpdateProfilePartialAndClear(t *testing.T) {
 	u, err := svc.Register(context.Background(), "frank", "secret123")
 	require.NoError(t, err)
 
-	avatar := "https://cdn.example.com/a.jpg"
+	avatar := fmt.Sprintf("/files/user-%d-image", u.ID)
 	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{
 		Nickname:  strPtr("老王"),
 		AvatarURL: strPtr(avatar),
@@ -307,15 +325,19 @@ func TestUpdateProfileValidation(t *testing.T) {
 	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{Nickname: strPtr(strings.Repeat("昵", 32))})
 	require.NoError(t, err)
 
-	// 头像 URL 非 http(s) 被拒；协议合法但超长（>255 字节）被拒。
+	// 头像必须是当前用户拥有的系统托管图片；外链和他人引用均被拒。
 	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("ftp://example.com/a.png")})
 	require.ErrorIs(t, err, ErrInvalidProfile)
 	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("javascript:alert(1)")})
 	require.ErrorIs(t, err, ErrInvalidProfile)
-	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("http://e.com/" + strings.Repeat("a", 248))})
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("https://cdn.example.com/a.png")})
 	require.ErrorIs(t, err, ErrInvalidProfile)
-	// 恰好 255 字节通过（前缀 "http://e.com/" 为 13 字节）。
-	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("http://e.com/" + strings.Repeat("a", 242))})
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("/files/user-2-image")})
+	require.ErrorIs(t, err, ErrInvalidProfile)
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("/files/" + strings.Repeat("a", 249))})
+	require.ErrorIs(t, err, ErrInvalidProfile)
+
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr(fmt.Sprintf("/files/user-%d-image", u.ID))})
 	require.NoError(t, err)
 }
 
@@ -338,4 +360,22 @@ func TestUpdateProfileRepoErrorPropagates(t *testing.T) {
 	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{Nickname: strPtr("x")})
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrInvalidProfile)
+}
+
+type failingMedia struct{ err error }
+
+func (f failingMedia) IsOwned(context.Context, int64, string, string) (bool, error) {
+	return false, f.err
+}
+
+func TestUpdateProfileMediaErrorPropagates(t *testing.T) {
+	repo := newFakeUsers()
+	base := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
+	u, err := base.Register(context.Background(), "mediaerr", "secret123")
+	require.NoError(t, err)
+
+	wantErr := errors.New("minio unavailable")
+	svc := NewWithMedia(repository.Store{Users: repo, Addresses: newFakeAddresses()}, &fakeIssuer{}, failingMedia{err: wantErr})
+	_, err = svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: strPtr("/files/ref")})
+	require.ErrorIs(t, err, wantErr)
 }

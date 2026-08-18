@@ -37,7 +37,7 @@ sidebar_position: 9
 | user_id | BIGINT UNSIGNED FK | 发布者（CASCADE） |
 | sku_id | BIGINT UNSIGNED FK | 引用已购 SKU（**RESTRICT**：有动态引用的 SKU 不可删除） |
 | content | VARCHAR(500) | 可选文案（空串 = 未填） |
-| image_url | VARCHAR(500) | 可选图片（MinIO URL，http/https 校验；空串 = 未填） |
+| image_url | VARCHAR(500) | 可选托管图片引用（必须由发布者上传且类型为 image；空串 = 未填） |
 
 ## 接口
 
@@ -78,10 +78,12 @@ POST /api/friend-requests/:id/accept（被申请人）
 
 ```text
 POST /api/posts
-  → 参数校验（content ≤500 字符；image_url ≤500 且 http/https）
+  → 参数校验（content ≤500 字符；image_url 非空时校验系统托管、发布者归属与 image 类型）
   → order.HasPurchasedSKU（未购买 → 403）→ 落库
 GET /api/posts/feed
   → 好友列表 → posts 按时间倒序分页（friend_ids IN (...)）→ 批量补作者用户名
+GET /api/files/:reference
+  → 上传者可读；其他用户仅在当前与动态作者为好友且动态仍存在时可读
 ```
 
 权威源：[docs/DESIGN.md 社交](https://github.com/xiangzhang-coding/go-single/blob/main/docs/DESIGN.md)、迁移 `000006_friendships` / `000012_posts`。

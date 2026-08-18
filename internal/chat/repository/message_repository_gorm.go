@@ -125,6 +125,14 @@ func (r *GORMMessageRepository) GetByIDs(ctx context.Context, ids []int64) (map[
 	return out, nil
 }
 
+func (r *GORMMessageRepository) CanAccessMedia(ctx context.Context, userID int64, reference string) (bool, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&model.Message{}).
+		Where("url = ? AND (sender_id = ? OR recipient_id = ?)", reference, userID, userID).
+		Limit(1).Count(&count).Error
+	return count > 0, err
+}
+
 func (r *GORMMessageRepository) ListAfter(ctx context.Context, key string, afterID int64, limit int) ([]model.Message, error) {
 	var list []model.Message
 	err := r.db.WithContext(ctx).

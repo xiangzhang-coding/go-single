@@ -325,6 +325,16 @@ export interface UpdateProfileRequest {
   avatar_url?: string;
 }
 
+export type MediaKind = "image" | "file";
+
+export interface UploadedMedia {
+  url: string;
+  kind: MediaKind;
+  filename: string;
+  content_type: string;
+  size: number;
+}
+
 // ---- 社交：好友 ----
 
 export type FriendRequestStatus = "pending" | "accepted" | "rejected";

@@ -9,6 +9,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"testing"
@@ -191,6 +192,17 @@ func (f *fakeMessages) GetByIDs(_ context.Context, ids []int64) (map[int64]model
 	return out, nil
 }
 
+func (f *fakeMessages) CanAccessMedia(_ context.Context, userID int64, reference string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, message := range f.byID {
+		if message.URL == reference && (message.SenderID == userID || message.RecipientID == userID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *fakeMessages) ListAfter(_ context.Context, key string, afterID int64, limit int) ([]model.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -314,6 +326,15 @@ func (f *fakeNotifier) snapshot() []*model.Message {
 
 var _ MessageNotifier = (*fakeNotifier)(nil)
 
+type fakeChatMedia struct{}
+
+func (fakeChatMedia) IsOwned(_ context.Context, ownerID int64, reference, kind string) (bool, error) {
+	if reference != fmt.Sprintf("/files/user-%d-%s", ownerID, kind) {
+		return false, nil
+	}
+	return true, nil
+}
+
 // ---- 测试环境 ----
 
 type env struct {
@@ -329,12 +350,12 @@ type env struct {
 func newEnv() *env {
 	e := &env{users: newFakeUsers(), social: newFakeSocial(), conv: newFakeConversations(), msgs: newFakeMessages(), notifier: &fakeNotifier{}}
 	e.reads = newFakeReads(e.msgs)
-	e.svc = New(repository.Store{
+	e.svc = NewWithMedia(repository.Store{
 		Conversations: e.conv,
 		Messages:      e.msgs,
 		Reads:         e.reads,
 		Tx:            fakeTx{},
-	}, e.users, e.social, e.notifier)
+	}, e.users, e.social, e.notifier, fakeChatMedia{})
 	return e
 }
 
@@ -365,13 +386,13 @@ func TestSendTextImageFile(t *testing.T) {
 	require.Equal(t, int64(1), text.Message.SenderID)
 	require.Equal(t, int64(2), text.Message.RecipientID)
 
-	image, err := e.svc.Send(context.Background(), 1, SendParams{ToUserID: 2, Type: "image", URL: "http://minio.example/a.png"})
+	image, err := e.svc.Send(context.Background(), 1, SendParams{ToUserID: 2, Type: "image", URL: "/files/user-1-image"})
 	require.NoError(t, err)
 	require.Equal(t, "image", image.Message.Type)
-	require.Equal(t, "http://minio.example/a.png", image.Message.URL)
+	require.Equal(t, "/files/user-1-image", image.Message.URL)
 	require.Equal(t, "", image.Message.Content)
 
-	file, err := e.svc.Send(context.Background(), 2, SendParams{ToUserID: 1, Type: "file", URL: "https://minio.example/b.pdf"})
+	file, err := e.svc.Send(context.Background(), 2, SendParams{ToUserID: 1, Type: "file", URL: "/files/user-2-file"})
 	require.NoError(t, err)
 	require.Equal(t, "file", file.Message.Type)
 
@@ -413,11 +434,13 @@ func TestSendValidation(t *testing.T) {
 		{"非法类型", SendParams{ToUserID: 2, Type: "voice", Content: "x"}, ErrInvalidInput},
 		{"text 缺内容", SendParams{ToUserID: 2, Type: "text"}, ErrInvalidInput},
 		{"text 内容超长", SendParams{ToUserID: 2, Type: "text", Content: str(maxContentRunes + 1)}, ErrInvalidInput},
-		{"text 携带 url", SendParams{ToUserID: 2, Type: "text", Content: "x", URL: "http://minio.example/a.png"}, ErrInvalidInput},
+		{"text 携带 url", SendParams{ToUserID: 2, Type: "text", Content: "x", URL: "/files/user-1-image"}, ErrInvalidInput},
 		{"image 缺 url", SendParams{ToUserID: 2, Type: "image"}, ErrInvalidInput},
-		{"image url 非法", SendParams{ToUserID: 2, Type: "image", URL: "ftp://x"}, ErrInvalidInput},
-		{"image 携带内容", SendParams{ToUserID: 2, Type: "image", URL: "http://minio.example/a.png", Content: "x"}, ErrInvalidInput},
-		{"file url 超长", SendParams{ToUserID: 2, Type: "file", URL: "http://x/" + str(maxURLRunes)}, ErrInvalidInput},
+		{"image 外链非法", SendParams{ToUserID: 2, Type: "image", URL: "https://cdn.example.com/a.png"}, ErrInvalidInput},
+		{"image 他人引用非法", SendParams{ToUserID: 2, Type: "image", URL: "/files/user-2-image"}, ErrInvalidInput},
+		{"image 类型不匹配", SendParams{ToUserID: 2, Type: "image", URL: "/files/user-1-file"}, ErrInvalidInput},
+		{"image 携带内容", SendParams{ToUserID: 2, Type: "image", URL: "/files/user-1-image", Content: "x"}, ErrInvalidInput},
+		{"file url 超长", SendParams{ToUserID: 2, Type: "file", URL: "/files/" + str(maxURLRunes)}, ErrInvalidInput},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -425,6 +448,40 @@ func TestSendValidation(t *testing.T) {
 			require.ErrorIs(t, err, c.want)
 		})
 	}
+}
+
+type failingChatMedia struct{ err error }
+
+func (f failingChatMedia) IsOwned(context.Context, int64, string, string) (bool, error) {
+	return false, f.err
+}
+
+func TestSendMediaErrorPropagates(t *testing.T) {
+	e := newEnv()
+	e.seed()
+	wantErr := errors.New("minio unavailable")
+	e.svc = NewWithMedia(repository.Store{
+		Conversations: e.conv, Messages: e.msgs, Reads: e.reads, Tx: fakeTx{},
+	}, e.users, e.social, e.notifier, failingChatMedia{err: wantErr})
+	_, err := e.svc.Send(context.Background(), 1, SendParams{ToUserID: 2, Type: "image", URL: "/files/ref"})
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestCanReadMediaOnlyAllowsConversationParticipants(t *testing.T) {
+	e := newEnv()
+	e.seed()
+	reference := "/files/user-1-image"
+	_, err := e.svc.Send(context.Background(), 1, SendParams{ToUserID: 2, Type: "image", URL: reference})
+	require.NoError(t, err)
+
+	for _, userID := range []int64{1, 2} {
+		allowed, err := e.svc.CanReadMedia(context.Background(), userID, reference)
+		require.NoError(t, err)
+		require.True(t, allowed)
+	}
+	allowed, err := e.svc.CanReadMedia(context.Background(), 3, reference)
+	require.NoError(t, err)
+	require.False(t, allowed)
 }
 
 func str(n int) string {

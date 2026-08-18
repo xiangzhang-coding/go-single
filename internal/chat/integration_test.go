@@ -9,10 +9,12 @@
 package chat_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -37,6 +39,7 @@ import (
 	chatrepo "github.com/xiangzhang-coding/go-single/internal/chat/repository"
 	chatsvc "github.com/xiangzhang-coding/go-single/internal/chat/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/file"
 	"github.com/xiangzhang-coding/go-single/internal/platform/ws"
 	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
 	socialrepo "github.com/xiangzhang-coding/go-single/internal/social/repository"
@@ -117,7 +120,14 @@ func buildEnv() (*testEnv, error) {
 	}
 
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
-	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier)
+	fileSvc, err := file.NewMinIO(file.MinIOConfig{
+		Endpoint: envOr("GO_SINGLE_MINIO_ENDPOINT", "127.0.0.1:19000"), AccessKey: envOr("GO_SINGLE_MINIO_ACCESS_KEY", "minioadmin"),
+		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"), Bucket: envOr("GO_SINGLE_MINIO_BUCKET", "go-shop-test"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	userSvc := usersvc.NewWithMedia(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier, fileSvc)
 
 	socialStore := socialrepo.Store{
 		Requests:    socialrepo.NewGORMRequest(gdb),
@@ -125,16 +135,16 @@ func buildEnv() (*testEnv, error) {
 		Posts:       socialrepo.NewGORMPost(gdb),
 	}
 	socialSvc := socialsvc.New(socialStore, userSvc)
-	postSvc := socialsvc.NewPosts(socialStore, userSvc, stubOrders{})
+	postSvc := socialsvc.NewPostsWithMedia(socialStore, userSvc, stubOrders{}, fileSvc)
 
 	chatConversationRepo := chatrepo.NewGORMConversation(gdb)
 	wsHub := ws.New(ws.Config{HeartbeatInterval: wsHeartbeat, WriteWait: 2 * time.Second}, zap.NewNop())
-	chatSvc := chatsvc.New(chatrepo.Store{
+	chatSvc := chatsvc.NewWithMedia(chatrepo.Store{
 		Conversations: chatConversationRepo,
 		Messages:      chatrepo.NewGORMMessage(gdb),
 		Reads:         chatrepo.NewGORMReadState(gdb),
 		Tx:            chatConversationRepo,
-	}, userSvc, socialSvc, wsNotifier{hub: wsHub})
+	}, userSvc, socialSvc, wsNotifier{hub: wsHub}, fileSvc)
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -143,8 +153,17 @@ func buildEnv() (*testEnv, error) {
 	userhandler.New(userSvc, verifier).RegisterRoutes(api)
 	socialhandler.New(socialSvc, postSvc, verifier).RegisterRoutes(api)
 	chathandler.New(chatSvc, verifier).RegisterRoutes(api)
+	file.NewHandler(fileSvc, verifier, chatMediaAuthorizer{chat: chatSvc}).RegisterRoutes(api)
 	return &testEnv{router: r, verifier: verifier, hub: wsHub}, nil
 }
+
+type chatMediaAuthorizer struct{ chat chatsvc.Service }
+
+func (a chatMediaAuthorizer) CanRead(ctx context.Context, userID int64, reference string) (bool, error) {
+	return a.chat.CanReadMedia(ctx, userID, reference)
+}
+
+var _ file.AccessAuthorizer = chatMediaAuthorizer{}
 
 // wsNotifier 测试侧的消息实时推送适配器（与 cmd/server 组装一致）。
 type wsNotifier struct{ hub *ws.Hub }
@@ -197,6 +216,40 @@ func doJSON(t *testing.T, env *testEnv, method, path, body string, token string)
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
 	}
 	return w, parsed
+}
+
+func uploadMedia(t *testing.T, env *testEnv, token, filename, kind string, content []byte) string {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	require.NoError(t, mw.WriteField("kind", kind))
+	part, err := mw.CreateFormFile("file", filename)
+	require.NoError(t, err)
+	_, err = part.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, mw.Close())
+	req := httptest.NewRequest(http.MethodPost, "/api/files", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	env.router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	reference, _ := response["url"].(string)
+	require.True(t, strings.HasPrefix(reference, "/files/"))
+	return reference
+}
+
+func readMedia(t *testing.T, env *testEnv, token, reference string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api"+reference, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	env.router.ServeHTTP(w, req)
+	return w
 }
 
 // register 注册并登录，返回 (userID, token)。
@@ -272,6 +325,7 @@ func TestChatSendMessageTypes(t *testing.T) {
 	env := requireEnv(t)
 	aliceID, aliceToken := register(t, env, "ava_ct")
 	bobID, bobToken := register(t, env, "bob_ct")
+	_, carolToken := register(t, env, "carol_ct")
 	befriend(t, env, aliceToken, bobID, bobToken)
 
 	key := conversationKeyOf(aliceID, bobID)
@@ -284,15 +338,37 @@ func TestChatSendMessageTypes(t *testing.T) {
 	require.Equal(t, float64(aliceID), text["sender_id"])
 	require.Equal(t, float64(bobID), text["recipient_id"])
 
-	// image：MinIO URL 落库（经 platform/file 上传后引用）。
-	image := sendMsg(t, env, aliceToken, bobID, "image", "", "http://minio.example/a.png", "")
+	// image：真实上传后保存托管引用；会话双方可读，第三人不可读。
+	imageBytes := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52}
+	imageReference := uploadMedia(t, env, aliceToken, "chat.png", file.KindImage, imageBytes)
+	image := sendMsg(t, env, aliceToken, bobID, "image", "", imageReference, "")
 	require.Equal(t, "image", image["type"])
-	require.Equal(t, "http://minio.example/a.png", image["url"])
+	require.Equal(t, imageReference, image["url"])
+	read := readMedia(t, env, bobToken, imageReference)
+	require.Equal(t, http.StatusOK, read.Code)
+	require.Equal(t, imageBytes, read.Body.Bytes())
+	require.Equal(t, http.StatusForbidden, readMedia(t, env, carolToken, imageReference).Code)
+	require.Equal(t, http.StatusUnauthorized, readMedia(t, env, "", imageReference).Code)
 
-	// file：反向（bob→alice）也可发送，会话键不变（有序用户对）。
-	file := sendMsg(t, env, bobToken, aliceID, "file", "", "https://minio.example/b.pdf", "")
-	require.Equal(t, "file", file["type"])
-	require.Equal(t, key, file["conversation_key"])
+	// file：明确的 PDF 策略，反向（bob→alice）发送并鉴权下载。
+	pdf := []byte("%PDF-1.7\nchat file\n")
+	fileReference := uploadMedia(t, env, bobToken, "manual.pdf", file.KindFile, pdf)
+	fileMessage := sendMsg(t, env, bobToken, aliceID, "file", "", fileReference, "")
+	require.Equal(t, "file", fileMessage["type"])
+	require.Equal(t, key, fileMessage["conversation_key"])
+	read = readMedia(t, env, aliceToken, fileReference)
+	require.Equal(t, http.StatusOK, read.Code)
+	require.Equal(t, pdf, read.Body.Bytes())
+	require.Contains(t, read.Header().Get("Content-Disposition"), "attachment")
+	require.Contains(t, read.Header().Get("Content-Disposition"), "manual.pdf")
+
+	foreignReference := uploadMedia(t, env, carolToken, "foreign.png", file.KindImage, imageBytes)
+	w, _ := doJSON(t, env, http.MethodPost, "/api/messages",
+		fmt.Sprintf(`{"to_user_id":%d,"type":"image","url":%q}`, bobID, foreignReference), aliceToken)
+	require.Equal(t, http.StatusBadRequest, w.Code, "不能发送他人的对象引用")
+	w, _ = doJSON(t, env, http.MethodPost, "/api/messages",
+		fmt.Sprintf(`{"to_user_id":%d,"type":"image","url":"https://cdn.example.com/a.png"}`, bobID), aliceToken)
+	require.Equal(t, http.StatusBadRequest, w.Code, "任意外部 URL 必须被拒")
 }
 
 func conversationKeyOf(uidA, uidB int64) string {

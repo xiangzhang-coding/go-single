@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -12,7 +12,9 @@ import {
 import { getApiErrorMessage } from "../api/client";
 import type { OrderItem, OrderStatus, PostView } from "../api/types";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, Spinner } from "../components/ui";
+import { AuthorizedImage } from "../components/AuthorizedMedia";
 import { formatDate } from "../lib/format";
+import { IMAGE_ACCEPT, validateImage } from "../lib/media";
 
 type FeedTab = "share" | "feed" | "mine";
 
@@ -74,10 +76,14 @@ function ShareForm({
   });
   const [skuId, setSkuId] = useState("");
   const [content, setContent] = useState("");
-  const [imageUrl, setImageUrl] = useState("");
-  const [uploading, setUploading] = useState(false);
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
+
+  useEffect(() => () => {
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+  }, [imagePreview]);
 
   // 已购订单里的 SKU（paid/shipped/completed），按 sku_id 去重。
   const purchased = useMemo(() => {
@@ -95,12 +101,20 @@ function ShareForm({
   }, [orders.data]);
 
   const share = useMutation({
-    mutationFn: () =>
-      sharePost({ sku_id: Number(skuId), content: content.trim() || undefined, image_url: imageUrl || undefined }),
+    mutationFn: async () => {
+      const uploaded = imageFile ? await uploadFile(imageFile, "image") : null;
+      return sharePost({
+        sku_id: Number(skuId),
+        content: content.trim() || undefined,
+        image_url: uploaded?.url,
+      });
+    },
     onSuccess: () => {
       onNotice({ kind: "success", text: "已分享到好友圈。" });
       setContent("");
-      setImageUrl("");
+      setImageFile(null);
+      setImagePreview("");
+      if (fileInput.current) fileInput.current.value = "";
       setSkuId("");
       queryClient.invalidateQueries({ queryKey: ["feed"] });
       queryClient.invalidateQueries({ queryKey: ["posts", "mine"] });
@@ -108,19 +122,18 @@ function ShareForm({
     onError: (error) => onNotice({ kind: "error", text: getApiErrorMessage(error) }),
   });
 
-  async function pickImage(event: React.ChangeEvent<HTMLInputElement>) {
+  function pickImage(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
-    setUploading(true);
-    try {
-      const url = await uploadFile(file);
-      setImageUrl(url);
-    } catch (error) {
-      onNotice({ kind: "error", text: getApiErrorMessage(error) });
-    } finally {
-      setUploading(false);
+    const validationError = validateImage(file, "配图");
+    if (validationError) {
+      onNotice({ kind: "error", text: validationError });
+      return;
     }
+    setImageFile(file);
+    setImagePreview(URL.createObjectURL(file));
+    onNotice(null);
   }
 
   function submit(event: FormEvent<HTMLFormElement>) {
@@ -173,10 +186,10 @@ function ShareForm({
 
           <div className="mt-5">
             <span className="form-label-span">配图（可选）</span>
-            {imageUrl ? (
+            {imagePreview ? (
               <div className="share-image-preview">
-                <img src={imageUrl} alt="分享配图" />
-                <button type="button" className="icon-button" aria-label="移除配图" onClick={() => setImageUrl("")}>
+                <img src={imagePreview} alt="分享配图" />
+                <button type="button" className="icon-button" aria-label="移除配图" onClick={() => { setImageFile(null); setImagePreview(""); }}>
                   <Icon name="close" size={16} />
                 </button>
               </div>
@@ -184,18 +197,18 @@ function ShareForm({
               <button
                 type="button"
                 className="button button-secondary button-small mt-2"
-                disabled={uploading}
+                disabled={share.isPending}
                 onClick={() => fileInput.current?.click()}
               >
-                {uploading ? <Spinner label="上传中" /> : <><Icon name="image" size={15} /> 上传图片</>}
+                <><Icon name="image" size={15} /> 选择图片</>
               </button>
             )}
-            <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden onChange={pickImage} />
+            <input ref={fileInput} type="file" accept={IMAGE_ACCEPT} hidden onChange={pickImage} />
           </div>
 
           <div className="mt-6 flex items-center gap-4">
             <Button type="submit" disabled={share.isPending || !skuId}>
-              {share.isPending ? <Spinner label="分享中" /> : <><Icon name="send" size={16} /> 分享</>}
+              {share.isPending ? <Spinner label="上传并分享中" /> : <><Icon name="send" size={16} /> 分享</>}
             </Button>
             <span className="text-sm text-smoke">好友动态只会出现在好友的时间线上。</span>
           </div>
@@ -325,7 +338,7 @@ function PostCard({ post, action }: { post: PostView; action?: React.ReactNode }
       </div>
       {post.content && <p className="post-card-content">{post.content}</p>}
       {post.image_url && (
-        <img className="post-card-image" src={post.image_url} alt={post.content || "分享配图"} loading="lazy" />
+        <AuthorizedImage className="post-card-image" reference={post.image_url} alt={post.content || "分享配图"} loading="lazy" />
       )}
       <p className="post-card-sku">引用了 <span className="font-mono">SKU #{post.sku_id}</span></p>
     </li>

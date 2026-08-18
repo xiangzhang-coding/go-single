@@ -41,7 +41,6 @@ minio:
   secret_key: minioadmin
   bucket: go-shop
   use_ssl: false
-  public_url: http://127.0.0.1:19000
 
 migrations:
   path: ./migrations

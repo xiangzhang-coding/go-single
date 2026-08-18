@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// 消息类型：text 携带文本内容；image/file 携带 MinIO URL（经 platform/file 上传）。
+// 消息类型：text 携带文本内容；image/file 携带 platform/file 返回的托管引用。
 const (
 	MessageTypeText  = "text"
 	MessageTypeImage = "image"

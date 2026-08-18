@@ -45,6 +45,7 @@ func Middleware(allowOrigins []string) gin.HandlerFunc {
 		header.Add("Vary", "Origin")
 		header.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
 		header.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		header.Set("Access-Control-Expose-Headers", "Content-Disposition, Content-Length")
 		header.Set("Access-Control-Max-Age", "86400")
 
 		if c.Request.Method == http.MethodOptions {

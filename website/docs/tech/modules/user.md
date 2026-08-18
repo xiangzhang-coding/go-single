@@ -17,14 +17,15 @@ sidebar_position: 2
 | id | BIGINT UNSIGNED PK | 用户 ID |
 | username | VARCHAR(32) UNIQUE | 用户名（3–32 字符） |
 | nickname | VARCHAR(64) NULL | 昵称（可空，≤32 字符；空时前端回退展示 username） |
-| avatar_url | VARCHAR(255) NULL | 头像 URL（可空；`POST /api/files` 上传返回的引用地址） || password_hash | VARCHAR(255) | bcrypt 哈希（默认 cost=10），日志不记录密码 |
+| avatar_url | VARCHAR(255) NULL | 头像托管引用（可空；`POST /api/files` 上传返回） |
+| password_hash | VARCHAR(255) | bcrypt 哈希（默认 cost=10），日志不记录密码 |
 | role | VARCHAR(16) | `user` / `admin` |
 | default_address_id | BIGINT UNSIGNED NULL | **默认地址唯一性指针**（FK → user_addresses.id ON DELETE SET NULL） |
 | created_at / updated_at | DATETIME(3) | — |
 
 admin 种子账号 `admin/admin123` 由迁移种入（见[演示账号](../../user-guide/demo-accounts)）。
 
-头像采用与图片消息/动态配图一致的引用模式：前端先 `POST /api/files` 上传（MinIO 私有桶）取回 URL，再经 `PATCH /api/users/me` 写入 `avatar_url`——user 模块不依赖 platform/file，URL 仅作业务数据引用（私有桶演示取舍，见 DESIGN.md 文件上传）。
+头像采用与图片消息/动态配图一致的托管引用模式：前端先 `POST /api/files` 上传到 MinIO 私有桶，取回 `/files/<opaque-ref>`，再经 `PATCH /api/users/me` 写入 `avatar_url`。user 服务通过最小媒体端口校验对象真实存在、类型为 image 且归当前用户；任意外部 URL 和他人引用均被拒。展示时前端经带 Bearer 的 `GET /api/files/:reference` 拉取 Blob，不依赖桶匿名访问。
 
 ### user_addresses（地址簿）
 
@@ -46,7 +47,7 @@ admin 种子账号 `admin/admin123` 由迁移种入（见[演示账号](../../us
 | POST | /api/auth/register | 无 | 注册 `{username, password}`；用户名重复 409 |
 | POST | /api/auth/login | 无 | 登录，返回 `{token, user}`；凭证错误 401 |
 | GET | /api/users/me | Bearer | 当前用户（含 nickname/avatar_url） |
-| PATCH | /api/users/me | Bearer | 修改个人资料 `{nickname?, avatar_url?}`（PATCH 语义：未提交字段不动、空串清空；昵称 ≤32 字符，avatar_url 须为 http(s) 且 ≤255 字节；归属由 token 声明保证——只改本人） |
+| PATCH | /api/users/me | Bearer | 修改个人资料 `{nickname?, avatar_url?}`（PATCH 语义：未提交字段不动、空串清空；昵称 ≤32 字符；avatar_url 非空时必须是本人上传的托管图片；归属由 token 声明保证） |
 | GET | /api/users | Bearer | 按用户名前缀搜索（`username` + `limit`，默认 10 上限 20；**排除自己**——"加好友"发现入口） |
 | GET | /api/users/:id | Bearer | 指定用户（仅本人或 admin，防 IDOR） |
 | GET | /api/addresses | Bearer | 我的地址列表（默认地址排最前） |

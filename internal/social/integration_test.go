@@ -6,10 +6,12 @@
 package social_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,6 +37,7 @@ import (
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/file"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
@@ -116,7 +119,14 @@ func buildEnv() (*testEnv, error) {
 	}
 
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
-	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier)
+	fileSvc, err := file.NewMinIO(file.MinIOConfig{
+		Endpoint: envOr("GO_SINGLE_MINIO_ENDPOINT", "127.0.0.1:19000"), AccessKey: envOr("GO_SINGLE_MINIO_ACCESS_KEY", "minioadmin"),
+		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"), Bucket: envOr("GO_SINGLE_MINIO_BUCKET", "go-shop-test"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	userSvc := usersvc.NewWithMedia(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier, fileSvc)
 
 	// order 服务：好友圈分享的购买校验端口（HasPurchasedSKU）走真实订单仓储；
 	// 其余跨模块依赖（下单/支付路径本包不触达）用替身，避免拉起 Redis 与全部模块。
@@ -132,15 +142,24 @@ func buildEnv() (*testEnv, error) {
 		Posts:       socialrepo.NewGORMPost(gdb),
 	}
 	socialSvc := socialsvc.New(socialStore, userSvc)
-	postSvc := socialsvc.NewPosts(socialStore, userSvc, orderSvc)
+	postSvc := socialsvc.NewPostsWithMedia(socialStore, userSvc, orderSvc, fileSvc)
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	api := r.Group("/api")
 	userhandler.New(userSvc, verifier).RegisterRoutes(api)
 	socialhandler.New(socialSvc, postSvc, verifier).RegisterRoutes(api)
+	file.NewHandler(fileSvc, verifier, postMediaAuthorizer{posts: postSvc}).RegisterRoutes(api)
 	return &testEnv{router: r, verifier: verifier, gdb: gdb}, nil
 }
+
+type postMediaAuthorizer struct{ posts socialsvc.PostService }
+
+func (a postMediaAuthorizer) CanRead(ctx context.Context, userID int64, reference string) (bool, error) {
+	return a.posts.CanReadImage(ctx, userID, reference)
+}
+
+var _ file.AccessAuthorizer = postMediaAuthorizer{}
 
 // ---- order 服务跨模块替身（本包只触达 HasPurchasedSKU） ----
 
@@ -234,6 +253,42 @@ func doJSON(t *testing.T, env *testEnv, method, path, body string, token string)
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
 	}
 	return w, parsed
+}
+
+func uploadMedia(t *testing.T, env *testEnv, token, filename, kind string, content []byte) string {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	if kind != "" {
+		require.NoError(t, mw.WriteField("kind", kind))
+	}
+	part, err := mw.CreateFormFile("file", filename)
+	require.NoError(t, err)
+	_, err = part.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, mw.Close())
+	req := httptest.NewRequest(http.MethodPost, "/api/files", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	env.router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	reference, _ := response["url"].(string)
+	require.True(t, strings.HasPrefix(reference, "/files/"))
+	return reference
+}
+
+func readMedia(t *testing.T, env *testEnv, token, reference string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api"+reference, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	env.router.ServeHTTP(w, req)
+	return w
 }
 
 // register 注册并登录，返回 (userID, token)。
@@ -515,10 +570,13 @@ func TestPostSharePurchaseValidation(t *testing.T) {
 	// 已支付 → 201。
 	seedPurchase(t, env, aliceID, productID, skuID, ordermodel.OrderStatusPaid)
 	w, body := doJSON(t, env, http.MethodPost, "/api/posts",
-		fmt.Sprintf(`{"sku_id":%d,"content":"好好用","image_url":"https://minio.example/x.png"}`, skuID), aliceToken)
+		fmt.Sprintf(`{"sku_id":%d,"content":"好好用"}`, skuID), aliceToken)
 	require.Equal(t, http.StatusCreated, w.Code, "已购分享应成功: %s", w.Body.String())
 	require.Equal(t, float64(skuID), body["sku_id"])
 	require.Equal(t, "好好用", body["content"])
+	w, _ = doJSON(t, env, http.MethodPost, "/api/posts",
+		fmt.Sprintf(`{"sku_id":%d,"image_url":"https://cdn.example.com/x.png"}`, skuID), aliceToken)
+	require.Equal(t, http.StatusBadRequest, w.Code, "任意外部 URL 必须被拒")
 
 	// 参数校验：缺 sku_id → 400。
 	w, _ = doJSON(t, env, http.MethodPost, "/api/posts", `{"content":"x"}`, aliceToken)
@@ -527,6 +585,47 @@ func TestPostSharePurchaseValidation(t *testing.T) {
 	// 未带 token → 401。
 	w, _ = doJSON(t, env, http.MethodPost, "/api/posts", `{"sku_id":1}`, "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestPostImageUploadAuthorizedRead(t *testing.T) {
+	env := requireEnv(t)
+	aliceID, aliceToken := register(t, env, "ava_media")
+	bobID, bobToken := register(t, env, "bob_media")
+	_, carolToken := register(t, env, "carol_media")
+	befriend(t, env, aliceToken, bobID, bobToken)
+
+	productID, skuID := seedProductSKU(t, env, "media")
+	seedPurchase(t, env, aliceID, productID, skuID, ordermodel.OrderStatusPaid)
+	image := []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+		0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+	}
+	reference := uploadMedia(t, env, aliceToken, "post.png", file.KindImage, image)
+
+	// 未绑定到动态前，好友即使知道引用也无权读取。
+	require.Equal(t, http.StatusForbidden, readMedia(t, env, bobToken, reference).Code)
+	w, post := doJSON(t, env, http.MethodPost, "/api/posts",
+		fmt.Sprintf(`{"sku_id":%d,"content":"带图动态","image_url":%q}`, skuID, reference), aliceToken)
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	postID := int64(post["id"].(float64))
+
+	items, _ := feedOf(t, env, bobToken, "")
+	require.Len(t, items, 1)
+	require.Equal(t, reference, items[0].(map[string]any)["image_url"])
+	read := readMedia(t, env, bobToken, reference)
+	require.Equal(t, http.StatusOK, read.Code)
+	require.Equal(t, image, read.Body.Bytes())
+	require.Equal(t, http.StatusForbidden, readMedia(t, env, carolToken, reference).Code)
+	require.Equal(t, http.StatusUnauthorized, readMedia(t, env, "", reference).Code)
+
+	foreignReference := uploadMedia(t, env, bobToken, "foreign.png", file.KindImage, image)
+	w, _ = doJSON(t, env, http.MethodPost, "/api/posts",
+		fmt.Sprintf(`{"sku_id":%d,"image_url":%q}`, skuID, foreignReference), aliceToken)
+	require.Equal(t, http.StatusBadRequest, w.Code, "不能保存他人的对象引用")
+
+	w, _ = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/posts/%d", postID), "", aliceToken)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	require.Equal(t, http.StatusForbidden, readMedia(t, env, bobToken, reference).Code, "删除动态后好友授权应失效")
 }
 
 // ---- 时间线：仅好友可见 ----

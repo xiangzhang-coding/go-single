@@ -13,7 +13,9 @@ import {
 import { getApiErrorMessage } from "../api/client";
 import type { Address, CreateAddressRequest, UpdateProfileRequest } from "../api/types";
 import { formatAddress } from "../lib/format";
+import { IMAGE_ACCEPT, validateImage } from "../lib/media";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, Spinner } from "../components/ui";
+import { AuthorizedImage } from "../components/AuthorizedMedia";
 import { useAuthStore } from "../store/auth";
 
 const emptyDraft: CreateAddressRequest = {
@@ -25,9 +27,6 @@ const emptyDraft: CreateAddressRequest = {
   detail: "",
   is_default: false,
 };
-
-// 头像上传上限（与后端 platform/file 一致：类型白名单 png/jpeg/webp/gif）。
-const maxAvatarBytes = 5 * 1024 * 1024;
 
 export function ProfilePage() {
   return (
@@ -58,17 +57,19 @@ function ProfileSection() {
   const [nickname, setNickname] = useState(user?.nickname || "");
   const [previewUrl, setPreviewUrl] = useState(""); // 本地预览（objectURL），空 = 未换头像
   const [pendingAvatar, setPendingAvatar] = useState<File | null>(null);
+  const [avatarRemoved, setAvatarRemoved] = useState(false);
   const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
-  const [avatarBroken, setAvatarBroken] = useState(false); // 私有桶匿名不可直读，失败回退字母头像
-  const shownAvatarKey = previewUrl || user?.avatar_url || "";
+  const persistedAvatar = avatarRemoved ? "" : user?.avatar_url || "";
 
   useEffect(() => {
     setNickname(user?.nickname || "");
   }, [user?.nickname]);
-  // 头像来源变化后重置失败标记。
   useEffect(() => {
-    setAvatarBroken(false);
-  }, [shownAvatarKey]);
+    setAvatarRemoved(false);
+  }, [user?.avatar_url]);
+  useEffect(() => () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
 
   const profileQuery = useQuery({ queryKey: ["me"], queryFn: authApi.me });
 
@@ -82,8 +83,8 @@ function ProfileSection() {
   const saveMutation = useMutation({
     mutationFn: async (request: UpdateProfileRequest) => {
       if (request.avatar_url === undefined && pendingAvatar) {
-        const url = await uploadFile(pendingAvatar);
-        return authApi.updateProfile({ ...request, avatar_url: url });
+        const uploaded = await uploadFile(pendingAvatar, "image");
+        return authApi.updateProfile({ ...request, avatar_url: uploaded.url });
       }
       return authApi.updateProfile(request);
     },
@@ -92,6 +93,7 @@ function ProfileSection() {
       queryClient.setQueryData(["me"], updated);
       setPendingAvatar(null);
       setPreviewUrl("");
+      setAvatarRemoved(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
       setNotice({ kind: "ok", text: "资料已更新。" });
     },
@@ -101,38 +103,38 @@ function ProfileSection() {
   function pickAvatar(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
-    if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(file.type)) {
-      setNotice({ kind: "error", text: "头像仅支持 png / jpeg / webp / gif 图片。" });
-      event.target.value = "";
-      return;
-    }
-    if (file.size > maxAvatarBytes) {
-      setNotice({ kind: "error", text: "头像图片不能超过 5MB。" });
+    const validationError = validateImage(file, "头像图片");
+    if (validationError) {
+      setNotice({ kind: "error", text: validationError });
       event.target.value = "";
       return;
     }
     setPendingAvatar(file);
-    if (previewUrl) URL.revokeObjectURL(previewUrl); // 释放旧预览，避免 objectURL 泄漏
     setPreviewUrl(URL.createObjectURL(file));
+    setAvatarRemoved(false);
     setNotice(null);
   }
 
   function clearAvatar() {
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    setPendingAvatar(null);
-    setPreviewUrl("");
+    if (pendingAvatar) {
+      setPendingAvatar(null);
+      setPreviewUrl("");
+    } else {
+      setAvatarRemoved(true);
+    }
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
   function submitProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const nicknameChanged = nickname.trim() !== (user?.nickname || "");
-    if (!pendingAvatar && !nicknameChanged) {
+    if (!pendingAvatar && !avatarRemoved && !nicknameChanged) {
       setNotice({ kind: "error", text: "没有要保存的修改。" });
       return;
     }
     const request: UpdateProfileRequest = {};
     if (nicknameChanged) request.nickname = nickname.trim(); // 头像（若有）由 mutation 上传后一并 PATCH
+    if (avatarRemoved) request.avatar_url = "";
     setNotice(null);
     saveMutation.mutate(request);
   }
@@ -145,9 +147,8 @@ function ProfileSection() {
   }
 
   const current = user;
-  const shownAvatar = shownAvatarKey;
   const displayName = current?.nickname || current?.username || "";
-  const showAvatarImage = Boolean(shownAvatar) && !avatarBroken;
+  const avatarFallback = <div className="friend-avatar" aria-hidden="true" style={{ width: 64, height: 64, fontSize: 24 }}>{displayName.slice(0, 1).toUpperCase()}</div>;
 
   return (
     <section className="checkout-section">
@@ -159,26 +160,38 @@ function ProfileSection() {
 
       <form className="mt-6 space-y-6" onSubmit={submitProfile}>
         <div className="flex items-center gap-5">
-          {showAvatarImage ? (
+          {previewUrl ? (
             <img
-              src={shownAvatar}
+              src={previewUrl}
               alt="头像"
               className="friend-avatar"
               style={{ width: 64, height: 64, borderRadius: "var(--radius-md)", objectFit: "cover" }}
-              onError={() => setAvatarBroken(true)}
+            />
+          ) : persistedAvatar ? (
+            <AuthorizedImage
+              reference={persistedAvatar}
+              alt="头像"
+              className="friend-avatar"
+              style={{ width: 64, height: 64, borderRadius: "var(--radius-md)", objectFit: "cover" }}
+              fallback={avatarFallback}
             />
           ) : (
-            <div className="friend-avatar" aria-hidden="true" style={{ width: 64, height: 64, fontSize: 24 }}>{displayName.slice(0, 1).toUpperCase()}</div>
+            avatarFallback
           )}
           <div className="space-y-2">
-            <input ref={fileInputRef} type="file" accept="image/png,image/jpeg,image/webp,image/gif" className="hidden" onChange={pickAvatar} aria-label="选择头像图片" />
+            <input ref={fileInputRef} type="file" accept={IMAGE_ACCEPT} className="hidden" onChange={pickAvatar} aria-label="选择头像图片" />
             <div className="flex flex-wrap gap-2">
               <Button type="button" variant="secondary" size="small" onClick={() => fileInputRef.current?.click()} disabled={saveMutation.isPending}>
                 <Icon name="image" size={15} /> {pendingAvatar ? "换一张" : "上传头像"}
               </Button>
-              {pendingAvatar && (
+              {(pendingAvatar || persistedAvatar) && (
                 <Button type="button" variant="ghost" size="small" onClick={clearAvatar} disabled={saveMutation.isPending}>
-                  移除预览
+                  {pendingAvatar ? "移除预览" : "移除头像"}
+                </Button>
+              )}
+              {avatarRemoved && (
+                <Button type="button" variant="ghost" size="small" onClick={() => setAvatarRemoved(false)} disabled={saveMutation.isPending}>
+                  撤销移除
                 </Button>
               )}
             </div>

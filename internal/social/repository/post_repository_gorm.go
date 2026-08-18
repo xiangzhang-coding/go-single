@@ -34,6 +34,17 @@ func (r *GORMPostRepository) GetByID(ctx context.Context, id int64) (*model.Post
 	return &post, nil
 }
 
+func (r *GORMPostRepository) GetByImageURL(ctx context.Context, reference string) (*model.Post, error) {
+	var post model.Post
+	if err := r.db.WithContext(ctx).First(&post, "image_url = ?", reference).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &post, nil
+}
+
 // ListByUsers 时间线拉取：好友列表 join 动态表（user_id IN 好友集合），
 // 时间倒序分页（created_at DESC, id DESC——id 为单调自增，作同秒并列时的稳定次序）。
 func (r *GORMPostRepository) ListByUsers(ctx context.Context, userIDs []int64, offset, limit int) ([]model.Post, int64, error) {

@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -61,12 +60,17 @@ type MessageNotifier interface {
 	NotifyMessageSent(ctx context.Context, msg *model.Message)
 }
 
+// MediaValidator 是 chat 模块消费的最小媒体端口。
+type MediaValidator interface {
+	IsOwned(ctx context.Context, ownerID int64, reference, kind string) (bool, error)
+}
+
 // SendParams 发送消息参数。
 type SendParams struct {
 	ToUserID        int64
 	Type            string // text / image / file
 	Content         string // text 内容
-	URL             string // image/file 的 MinIO URL
+	URL             string // image/file 的系统托管引用
 	ClientRequestID string // 空串 = 不要求幂等
 }
 
@@ -92,6 +96,8 @@ type Service interface {
 	ListMessages(ctx context.Context, userID int64, key string, afterID, beforeID int64, limit int) ([]model.Message, bool, error)
 	// MarkRead 推进我的已读游标到指定消息（只进不退）；仅会话双方可操作。
 	MarkRead(ctx context.Context, userID int64, key string, messageID int64) error
+	// CanReadMedia 判断用户是否为引用该媒体的消息发送方或接收方。
+	CanReadMedia(ctx context.Context, userID int64, reference string) (bool, error)
 }
 
 type messageService struct {
@@ -99,11 +105,17 @@ type messageService struct {
 	users    UserService
 	social   SocialService
 	notifier MessageNotifier // nil = 不推送（调用方未接实时通道）
+	media    MediaValidator
 }
 
 // New 构造消息服务；notifier 可传 nil（跳过实时推送）。
 func New(store repository.Store, users UserService, social SocialService, notifier MessageNotifier) Service {
 	return &messageService{store: store, users: users, social: social, notifier: notifier}
+}
+
+// NewWithMedia 构造启用托管图片/文件校验的消息服务。
+func NewWithMedia(store repository.Store, users UserService, social SocialService, notifier MessageNotifier, media MediaValidator) Service {
+	return &messageService{store: store, users: users, social: social, notifier: notifier, media: media}
 }
 
 // Send 发送流程：参数校验 → 接收方存在校验（跨模块）→ 好友关系校验（跨模块）→
@@ -118,6 +130,18 @@ func (s *messageService) Send(ctx context.Context, senderID int64, p SendParams)
 	}
 	if err := validateMessage(p); err != nil {
 		return nil, err
+	}
+	if p.Type == model.MessageTypeImage || p.Type == model.MessageTypeFile {
+		if s.media == nil {
+			return nil, fmt.Errorf("%w: url must reference an owned managed %s", ErrInvalidInput, p.Type)
+		}
+		owned, mediaErr := s.media.IsOwned(ctx, senderID, p.URL, p.Type)
+		if mediaErr != nil {
+			return nil, mediaErr
+		}
+		if !owned {
+			return nil, fmt.Errorf("%w: url must reference an owned managed %s", ErrInvalidInput, p.Type)
+		}
 	}
 
 	u, err := s.users.GetByID(ctx, p.ToUserID)
@@ -189,7 +213,7 @@ func (s *messageService) Send(ctx context.Context, senderID int64, p SendParams)
 }
 
 // validateMessage 按类型校验：text 必填 content（≤2000 字符）且 url 为空；
-// image/file 必填 URL（http/https，≤500 字符）且 content 为空。
+// image/file 必填托管引用（≤500 字符）且 content 为空；归属与类型随后经媒体端口校验。
 func validateMessage(p SendParams) error {
 	contentLen := utf8.RuneCountInString(p.Content)
 	urlLen := utf8.RuneCountInString(p.URL)
@@ -205,9 +229,6 @@ func validateMessage(p SendParams) error {
 		if urlLen < 1 || urlLen > maxURLRunes {
 			return fmt.Errorf("%w: url must be 1-%d chars", ErrInvalidInput, maxURLRunes)
 		}
-		if !validURL(p.URL) {
-			return fmt.Errorf("%w: url must be http(s) URL", ErrInvalidInput)
-		}
 		if p.Content != "" {
 			return fmt.Errorf("%w: image/file message must not carry content", ErrInvalidInput)
 		}
@@ -217,10 +238,11 @@ func validateMessage(p SendParams) error {
 	return nil
 }
 
-// validURL 图片/文件消息的 URL 须为 http/https（文件经 platform/file 上传后引用 URL）。
-func validURL(raw string) bool {
-	u, err := url.Parse(raw)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+func (s *messageService) CanReadMedia(ctx context.Context, userID int64, reference string) (bool, error) {
+	if userID <= 0 || reference == "" {
+		return false, nil
+	}
+	return s.store.Messages.CanAccessMedia(ctx, userID, reference)
 }
 
 // ListConversations 我的会话（游标分页）：会话行（最新在前，limit+1 探更多）→

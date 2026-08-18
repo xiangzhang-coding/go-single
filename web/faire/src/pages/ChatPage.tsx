@@ -6,10 +6,12 @@ import { getMessages, markConversationRead, sendMessage, uploadFile } from "../a
 import { getApiErrorMessage } from "../api/client";
 import type { Message } from "../api/types";
 import { Button, EmptyState, Icon, LoadingBlock, Spinner } from "../components/ui";
+import { AuthorizedDownload, AuthorizedImage } from "../components/AuthorizedMedia";
 import { useAuthStore } from "../store/auth";
 import { useChatStore } from "../store/chat";
 import { formatDate } from "../lib/format";
 import { makeClientRequestID } from "../lib/format";
+import { IMAGE_ACCEPT, MESSAGE_FILE_ACCEPT, validateImage, validateMessageFile } from "../lib/media";
 
 export function ChatPage() {
   const { token, user } = useAuthStore();
@@ -330,11 +332,9 @@ function MessageBubble({ message, own }: { message: Message; own: boolean }) {
     <div className={`chat-message ${own ? "chat-message-own" : ""}`}>
       <div className="chat-bubble">
         {message.type === "image" && message.url ? (
-          <img className="chat-bubble-image" src={message.url} alt="图片消息" />
+          <AuthorizedImage className="chat-bubble-image" reference={message.url} alt="图片消息" />
         ) : message.type === "file" && message.url ? (
-          <a className="chat-bubble-file" href={message.url} target="_blank" rel="noreferrer">
-            <Icon name="pin" size={15} /> 下载文件
-          </a>
+          <AuthorizedDownload reference={message.url} />
         ) : (
           <span className="chat-bubble-text">{message.content || ""}</span>
         )}
@@ -356,21 +356,23 @@ function MessageComposer({
   disabled?: boolean;
 }) {
   const [text, setText] = useState("");
-  const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const imageInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const send = useMutation({
-    mutationFn: (payload: { type: "text" | "image"; content?: string; url?: string }) =>
-      sendMessage({
+    mutationFn: async (payload: { type: "text"; content: string } | { type: "image" | "file"; file: File }) => {
+      const uploaded = payload.type === "text" ? null : await uploadFile(payload.file, payload.type);
+      return sendMessage({
         to_user_id: peerUserId,
         type: payload.type,
-        content: payload.content,
-        url: payload.url,
+        content: payload.type === "text" ? payload.content : undefined,
+        url: uploaded?.url,
         client_request_id: makeClientRequestID(),
-      }),
-    onSuccess: (msg) => {
-      setText("");
+      });
+    },
+    onSuccess: (msg, payload) => {
+      if (payload.type === "text") setText("");
       setError(null);
       onSent(msg);
     },
@@ -380,24 +382,29 @@ function MessageComposer({
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = text.trim();
-    if (!content || send.isPending || uploading) return;
+    if (!content || send.isPending) return;
     send.mutate({ type: "text", content });
   }
 
-  async function pickImage(event: React.ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
+  function pickMedia(event: React.ChangeEvent<HTMLInputElement>, type: "image" | "file") {
+    const selected = event.target.files?.[0];
     event.target.value = "";
-    if (!file || send.isPending) return;
-    setUploading(true);
+    if (!selected || send.isPending) return;
     setError(null);
-    try {
-      const url = await uploadFile(file);
-      send.mutate({ type: "image", url });
-    } catch (err) {
-      setError(getApiErrorMessage(err));
-    } finally {
-      setUploading(false);
+    if (type === "image") {
+      const validationError = validateImage(selected);
+      if (validationError) {
+        setError(validationError);
+        return;
+      }
+    } else {
+      const validationError = validateMessageFile(selected);
+      if (validationError) {
+        setError(validationError);
+        return;
+      }
     }
+    send.mutate({ type, file: selected });
   }
 
   return (
@@ -410,22 +417,33 @@ function MessageComposer({
           onChange={(e) => setText(e.target.value)}
           placeholder="输入消息，Enter 发送"
           maxLength={2000}
-          disabled={disabled || send.isPending || uploading}
+          disabled={disabled || send.isPending}
         />
         <button
           type="button"
           className="icon-button chat-composer-image"
           aria-label="发送图片"
-          disabled={disabled || send.isPending || uploading}
+          disabled={disabled || send.isPending}
+          onClick={() => imageInput.current?.click()}
+        >
+          {send.isPending ? <Spinner label="发送中" /> : <Icon name="image" size={19} />}
+        </button>
+        <button
+          type="button"
+          className="icon-button chat-composer-image"
+          aria-label="发送文件"
+          disabled={disabled || send.isPending}
           onClick={() => fileInput.current?.click()}
         >
-          {uploading ? <Spinner label="上传中" /> : <Icon name="image" size={19} />}
+          <Icon name="pin" size={19} />
         </button>
-        <Button type="submit" disabled={disabled || send.isPending || uploading || !text.trim()}>
+        <Button type="submit" disabled={disabled || send.isPending || !text.trim()}>
           <Icon name="send" size={16} /> 发送
         </Button>
-        <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden onChange={pickImage} />
+        <input ref={imageInput} type="file" accept={IMAGE_ACCEPT} hidden onChange={(event) => pickMedia(event, "image")} />
+        <input ref={fileInput} type="file" accept={MESSAGE_FILE_ACCEPT} hidden onChange={(event) => pickMedia(event, "file")} />
       </form>
+      <p className="mt-2 text-xs text-smoke">图片 ≤5MB；文件支持 PDF / ZIP / TXT / CSV / MD，≤20MB。</p>
     </div>
   );
 }

@@ -5,6 +5,7 @@ package user_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -52,19 +53,18 @@ func TestUpdateProfileAndMe(t *testing.T) {
 	require.Equal(t, "", me["nickname"])
 	require.Equal(t, "", me["avatar_url"])
 
-	// 同时修改昵称与头像。
-	avatar := "http://127.0.0.1:19000/go-shop/20260814/ab.png"
+	// 修改昵称；头像完整闭环由真实 MinIO 用例覆盖。
 	w, updated := doJSON(t, env, http.MethodPatch, "/api/users/me",
-		fmt.Sprintf(`{"nickname":%q,"avatar_url":%q}`, "  小艾  ", avatar), token)
+		`{"nickname":"  小艾  "}`, token)
 	require.Equal(t, http.StatusOK, w.Code, "PATCH 失败: %v", updated)
 	require.Equal(t, "小艾", updated["nickname"], "昵称应 trim 后返回")
-	require.Equal(t, avatar, updated["avatar_url"])
+	require.Equal(t, "", updated["avatar_url"])
 
 	// 只改昵称：头像保持（PATCH 部分更新语义）。
 	w, updated = doJSON(t, env, http.MethodPatch, "/api/users/me", `{"nickname":"阿艾"}`, token)
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, "阿艾", updated["nickname"])
-	require.Equal(t, avatar, updated["avatar_url"])
+	require.Equal(t, "", updated["avatar_url"])
 
 	// 空串清空头像。
 	w, updated = doJSON(t, env, http.MethodPatch, "/api/users/me", `{"avatar_url":""}`, token)
@@ -145,7 +145,6 @@ func TestAvatarUploadThenSetProfile(t *testing.T) {
 		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"),
 		Bucket:    envOr("GO_SINGLE_MINIO_BUCKET", "go-shop-test"),
 		UseSSL:    false,
-		PublicURL: envOr("GO_SINGLE_MINIO_PUBLIC_URL", "http://127.0.0.1:19000"),
 	})
 	testsupport.RequireDependency(t, "MinIO", err)
 
@@ -154,9 +153,9 @@ func TestAvatarUploadThenSetProfile(t *testing.T) {
 	r := gin.New()
 	api := r.Group("/api")
 	issuer := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
-	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(env.gdb), Addresses: userrepo.NewGORMAddress(env.gdb)}, issuer)
+	userSvc := usersvc.NewWithMedia(userrepo.Store{Users: userrepo.NewGORM(env.gdb), Addresses: userrepo.NewGORMAddress(env.gdb)}, issuer, fileSvc)
 	userhandler.New(userSvc, env.verifier).RegisterRoutes(api)
-	file.NewHandler(fileSvc, env.verifier).RegisterRoutes(api)
+	file.NewHandler(fileSvc, env.verifier, avatarAuthorizer{users: userSvc}).RegisterRoutes(api)
 
 	username := fmt.Sprintf("avatar_%d", time.Now().UnixNano())
 	w := doReq(t, r, http.MethodPost, "/api/auth/register",
@@ -169,6 +168,17 @@ func TestAvatarUploadThenSetProfile(t *testing.T) {
 	token, _ := loginResp["token"].(string)
 	require.NotEmpty(t, token)
 
+	otherUsername := fmt.Sprintf("avatar_other_%d", time.Now().UnixNano())
+	w = doReq(t, r, http.MethodPost, "/api/auth/register",
+		fmt.Sprintf(`{"username":%q,"password":"secret123"}`, otherUsername), "")
+	require.Equal(t, http.StatusCreated, w.Code)
+	w = doReq(t, r, http.MethodPost, "/api/auth/login",
+		fmt.Sprintf(`{"username":%q,"password":"secret123"}`, otherUsername), "")
+	var otherLogin map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &otherLogin))
+	otherToken, _ := otherLogin["token"].(string)
+	require.NotEmpty(t, otherToken)
+
 	// 上传头像图片 → 201 + URL。
 	up := uploadMultipart(t, r, token, "avatar.png", png1x1)
 	require.Equal(t, http.StatusCreated, up.Code, "上传失败: %s", up.Body.String())
@@ -176,13 +186,22 @@ func TestAvatarUploadThenSetProfile(t *testing.T) {
 	require.NoError(t, json.Unmarshal(up.Body.Bytes(), &uploadResp))
 	url, ok := uploadResp["url"].(string)
 	require.True(t, ok)
-	require.True(t, strings.HasSuffix(url, ".png"), "URL 应带 png 扩展名: %s", url)
+	require.True(t, strings.HasPrefix(url, "/files/"), "应返回后端托管引用: %s", url)
+	require.NotContains(t, url, "19000", "不得暴露 MinIO 地址")
 
 	// 非图片内容被拒（魔数嗅探）。
 	bad := uploadMultipart(t, r, token, "avatar.png", []byte("plain text, not an image"))
 	require.Equal(t, http.StatusBadRequest, bad.Code)
 
-	// URL 写入 avatar_url → me 回读。
+	// 未绑定前只有上传者可预览；他人不能盗用引用作为头像。
+	w = doReq(t, r, http.MethodGet, "/api"+url, "", otherToken)
+	require.Equal(t, http.StatusForbidden, w.Code)
+	w = doReq(t, r, http.MethodPatch, "/api/users/me", fmt.Sprintf(`{"avatar_url":%q}`, url), otherToken)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	w = doReq(t, r, http.MethodPatch, "/api/users/me", `{"avatar_url":"https://cdn.example.com/a.png"}`, token)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	// 托管引用写入 avatar_url → 回读；上传者和已获头像引用的登录用户均可读取原始字节。
 	w = doReq(t, r, http.MethodPatch, "/api/users/me", fmt.Sprintf(`{"avatar_url":%q}`, url), token)
 	require.Equal(t, http.StatusOK, w.Code, "PATCH 失败: %s", w.Body.String())
 	w = doReq(t, r, http.MethodGet, "/api/users/me", "", token)
@@ -190,7 +209,23 @@ func TestAvatarUploadThenSetProfile(t *testing.T) {
 	var me map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &me))
 	require.Equal(t, url, me["avatar_url"])
+	for _, readerToken := range []string{token, otherToken} {
+		w = doReq(t, r, http.MethodGet, "/api"+url, "", readerToken)
+		require.Equal(t, http.StatusOK, w.Code)
+		require.Equal(t, png1x1, w.Body.Bytes())
+		require.Equal(t, "image/png", w.Header().Get("Content-Type"))
+	}
+	w = doReq(t, r, http.MethodGet, "/api"+url, "", "")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
 }
+
+type avatarAuthorizer struct{ users usersvc.Service }
+
+func (a avatarAuthorizer) CanRead(ctx context.Context, _ int64, reference string) (bool, error) {
+	return a.users.CanReadAvatar(ctx, reference)
+}
+
+var _ file.AccessAuthorizer = avatarAuthorizer{}
 
 // doReq 向指定 router 发 JSON 请求（独立路由的轻量辅助）。
 func doReq(t *testing.T, r http.Handler, method, path, body, token string) *httptest.ResponseRecorder {

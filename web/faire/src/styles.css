@@ -1522,6 +1522,28 @@
   color: inherit;
   text-decoration: underline;
   text-underline-offset: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-bubble-file:disabled { cursor: wait; opacity: 0.72; }
+
+.media-placeholder {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  color: var(--color-smoke);
+  font-size: 12px;
+}
+
+.media-download-error {
+  display: block;
+  margin-top: 6px;
+  color: var(--color-chili-red);
+  font-size: 11px;
 }
 
 .chat-message-time {

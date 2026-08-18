@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"unicode/utf8"
 
 	"github.com/xiangzhang-coding/go-single/internal/social/model"
@@ -36,6 +35,11 @@ type OrderService interface {
 	HasPurchasedSKU(ctx context.Context, userID, skuID int64) (bool, error)
 }
 
+// MediaValidator 是 social 模块消费的最小媒体端口。
+type MediaValidator interface {
+	IsOwned(ctx context.Context, ownerID int64, reference, kind string) (bool, error)
+}
+
 // ShareParams 分享参数；Content / ImageURL 为空串表示未填写。
 type ShareParams struct {
 	SKUID    int64
@@ -54,17 +58,25 @@ type PostService interface {
 	MyPosts(ctx context.Context, userID int64, page, pageSize int) ([]model.PostView, int64, error)
 	// Delete 删除自己的动态（owner 校验，防 IDOR）。
 	Delete(ctx context.Context, userID, postID int64) error
+	// CanReadImage 判断用户当前是否可见引用该图片的动态。
+	CanReadImage(ctx context.Context, userID int64, reference string) (bool, error)
 }
 
 type postService struct {
 	store  repository.Store
 	users  UserService
 	orders OrderService
+	media  MediaValidator
 }
 
 // NewPosts 构造动态服务。
 func NewPosts(store repository.Store, users UserService, orders OrderService) PostService {
 	return &postService{store: store, users: users, orders: orders}
+}
+
+// NewPostsWithMedia 构造启用托管动态图片校验的服务。
+func NewPostsWithMedia(store repository.Store, users UserService, orders OrderService, media MediaValidator) PostService {
+	return &postService{store: store, users: users, orders: orders, media: media}
 }
 
 // Share 分享流程：参数校验 → 购买校验（跨模块 order 服务，未购买被拒）→ 落库。
@@ -79,8 +91,17 @@ func (s *postService) Share(ctx context.Context, userID int64, p ShareParams) (*
 	if utf8.RuneCountInString(p.ImageURL) > maxImageURL {
 		return nil, fmt.Errorf("%w: image url too long", ErrInvalidInput)
 	}
-	if p.ImageURL != "" && !validImageURL(p.ImageURL) {
-		return nil, fmt.Errorf("%w: invalid image url", ErrInvalidInput)
+	if p.ImageURL != "" {
+		if s.media == nil {
+			return nil, fmt.Errorf("%w: image_url must be an owned managed image", ErrInvalidInput)
+		}
+		owned, mediaErr := s.media.IsOwned(ctx, userID, p.ImageURL, "image")
+		if mediaErr != nil {
+			return nil, mediaErr
+		}
+		if !owned {
+			return nil, fmt.Errorf("%w: image_url must be an owned managed image", ErrInvalidInput)
+		}
 	}
 	purchased, err := s.orders.HasPurchasedSKU(ctx, userID, p.SKUID)
 	if err != nil {
@@ -96,10 +117,15 @@ func (s *postService) Share(ctx context.Context, userID int64, p ShareParams) (*
 	return post, nil
 }
 
-// validImageURL 可选图片须为 http/https URL（图片经 platform/file 上传后引用 URL）。
-func validImageURL(raw string) bool {
-	u, err := url.Parse(raw)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+func (s *postService) CanReadImage(ctx context.Context, userID int64, reference string) (bool, error) {
+	post, err := s.store.Posts.GetByImageURL(ctx, reference)
+	if err != nil || post == nil {
+		return false, err
+	}
+	if post.UserID == userID {
+		return true, nil
+	}
+	return s.store.Friendships.Exists(ctx, userID, post.UserID)
 }
 
 // Feed 时间线：好友列表 → 动态表按时间倒序分页 → 跨模块批量补作者用户名。

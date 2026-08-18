@@ -37,6 +37,11 @@ type TokenIssuer interface {
 	Issue(userID int64, role string) (string, error)
 }
 
+// MediaValidator 是 user 模块消费的最小媒体端口：头像必须是当前用户上传的图片。
+type MediaValidator interface {
+	IsOwned(ctx context.Context, ownerID int64, reference, kind string) (bool, error)
+}
+
 // AddressParams 地址簿参数（新增/编辑共用）；IsDefault 仅新增时生效。
 type AddressParams struct {
 	Receiver  string
@@ -63,6 +68,8 @@ type Service interface {
 	// UpdateProfile 更新当前用户个人资料（昵称/头像，PATCH 语义见 ProfileParams）；
 	// userID 取自令牌声明，天然只有 owner 本人可改（防 IDOR）。
 	UpdateProfile(ctx context.Context, userID int64, p ProfileParams) (*model.User, error)
+	// CanReadAvatar 判断引用是否仍绑定为某个用户头像；供私有媒体读取授权使用。
+	CanReadAvatar(ctx context.Context, reference string) (bool, error)
 	// Search 按用户名前缀搜索用户（社交"加好友"发现入口）：
 	// 前缀须非空且 ≤32 字符（与注册同名规则），limit 截断到 [1, maxSearchLimit]。
 	Search(ctx context.Context, username string, limit int) ([]*model.User, error)
@@ -87,11 +94,17 @@ type Service interface {
 type userService struct {
 	store  repository.Store
 	tokens TokenIssuer
+	media  MediaValidator
 }
 
 // New 构造 user 服务。
 func New(store repository.Store, tokens TokenIssuer) Service {
 	return &userService{store: store, tokens: tokens}
+}
+
+// NewWithMedia 构造启用托管头像校验的 user 服务。
+func NewWithMedia(store repository.Store, tokens TokenIssuer, media MediaValidator) Service {
+	return &userService{store: store, tokens: tokens, media: media}
 }
 
 func (s *userService) Register(ctx context.Context, username, password string) (*model.User, error) {
@@ -153,6 +166,18 @@ func (s *userService) UpdateProfile(ctx context.Context, userID int64, p Profile
 	if err != nil {
 		return nil, err
 	}
+	if cleaned.AvatarURL != nil && *cleaned.AvatarURL != "" {
+		if s.media == nil {
+			return nil, fmt.Errorf("%w: avatar_url must be an owned managed image", ErrInvalidProfile)
+		}
+		owned, mediaErr := s.media.IsOwned(ctx, userID, *cleaned.AvatarURL, "image")
+		if mediaErr != nil {
+			return nil, mediaErr
+		}
+		if !owned {
+			return nil, fmt.Errorf("%w: avatar_url must be an owned managed image", ErrInvalidProfile)
+		}
+	}
 	u, err := s.store.Users.GetByID(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -173,6 +198,13 @@ func (s *userService) UpdateProfile(ctx context.Context, userID int64, p Profile
 		return nil, err
 	}
 	return u, nil
+}
+
+func (s *userService) CanReadAvatar(ctx context.Context, reference string) (bool, error) {
+	if reference == "" {
+		return false, nil
+	}
+	return s.store.Users.HasAvatarURL(ctx, reference)
 }
 
 // 搜索默认条数与上限（演示页一次展示数量有限）。
@@ -330,8 +362,8 @@ func validateCredentials(username, password string) error {
 }
 
 // validateProfile 校验并返回清理后（trim）的个人资料参数（同 validateAddress 风格）：
-// 昵称非空时 ≤32 字符（rune 计数，支持中文）；头像 URL 为空（清空）或
-// http(s) 且 ≤255 字节（对齐列宽）。
+// 昵称非空时 ≤32 字符（rune 计数，支持中文）；头像引用为空（清空）或
+// ≤255 字节（托管引用的归属与类型由 UpdateProfile 经媒体端口校验）。
 func validateProfile(p ProfileParams) (ProfileParams, error) {
 	if p.Nickname != nil {
 		nickname := strings.TrimSpace(*p.Nickname)
@@ -343,9 +375,6 @@ func validateProfile(p ProfileParams) (ProfileParams, error) {
 	if p.AvatarURL != nil {
 		url := strings.TrimSpace(*p.AvatarURL)
 		p.AvatarURL = &url
-		if url != "" && !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-			return p, fmt.Errorf("%w: invalid avatar_url", ErrInvalidProfile)
-		}
 		if len(url) > 255 {
 			return p, fmt.Errorf("%w: invalid avatar_url", ErrInvalidProfile)
 		}

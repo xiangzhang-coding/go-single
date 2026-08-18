@@ -1,5 +1,5 @@
 # Cloudflare Pages 响应头（T28 部署收尾）：与本地 Nginx 安全头对齐（DESIGN「安全设计 → HTTPS 与安全头」）。
-# Cloudflare Pages 默认强制 HTTPS（免配证书），故 img-src/connect-src 放开 https/wss 且无需本地 MinIO 地址。
+# Cloudflare Pages 默认强制 HTTPS；媒体由 API 鉴权读取为 blob，不直连 MinIO。
 /*
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
