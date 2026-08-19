@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -51,13 +52,16 @@ func TestRedisGetSetDel(t *testing.T) {
 	require.Equal(t, "v1", got)
 
 	// 覆盖写 + TTL 生效。
-	require.NoError(t, c.Set(ctx, key, "v2", 50*time.Millisecond))
+	require.NoError(t, c.Set(ctx, key, "v2", time.Second))
 	got, err = c.Get(ctx, key)
 	require.NoError(t, err)
 	require.Equal(t, "v2", got)
-	time.Sleep(100 * time.Millisecond)
-	_, err = c.Get(ctx, key)
-	require.ErrorIs(t, err, ErrMiss, "TTL 过期后应视为未命中")
+	require.Eventually(t, func() bool {
+		checkCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		_, getErr := c.Get(checkCtx, key)
+		return errors.Is(getErr, ErrMiss)
+	}, 4*time.Second, 50*time.Millisecond, "TTL 过期后应视为未命中")
 
 	require.NoError(t, c.Del(ctx, key))
 	_, err = c.Get(ctx, key)

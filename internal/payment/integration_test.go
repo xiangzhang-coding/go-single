@@ -136,10 +136,13 @@ func buildEnv() (*testEnv, error) {
 	}
 
 	rc := redis.NewClient(&redis.Options{Addr: redisAddr, DB: redisTestDB})
-	if err := rc.Ping(ctx).Err(); err != nil {
+	defer rc.Close()
+	redisCtx, redisCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer redisCancel()
+	if err := rc.Ping(redisCtx).Err(); err != nil {
 		return nil, fmt.Errorf("Redis 连接失败: %w", err)
 	}
-	if err := rc.FlushDB(ctx).Err(); err != nil {
+	if err := rc.FlushDB(redisCtx).Err(); err != nil {
 		return nil, err
 	}
 	cacheClient, err := cache.NewRedis(redisAddr, "", redisTestDB)

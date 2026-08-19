@@ -132,16 +132,18 @@ func buildEnv() (*testEnv, error) {
 
 	// Redis：测试专用 DB，先清空避免跨包污染。
 	rc := redis.NewClient(&redis.Options{Addr: redisAddr, DB: redisTestDB})
-	if err := rc.Ping(ctx).Err(); err != nil {
+	redisCtx, redisCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer redisCancel()
+	if err := rc.Ping(redisCtx).Err(); err != nil {
 		return nil, fmt.Errorf("Redis 连接失败: %w", err)
 	}
-	if err := rc.ConfigSet(ctx, "appendonly", "yes").Err(); err != nil {
+	if err := rc.ConfigSet(redisCtx, "appendonly", "yes").Err(); err != nil {
 		return nil, fmt.Errorf("Redis 开启 AOF: %w", err)
 	}
-	if err := rc.ConfigSet(ctx, "appendfsync", "always").Err(); err != nil {
+	if err := rc.ConfigSet(redisCtx, "appendfsync", "always").Err(); err != nil {
 		return nil, fmt.Errorf("Redis 设置测试 AOF fsync: %w", err)
 	}
-	if err := rc.FlushDB(ctx).Err(); err != nil {
+	if err := rc.FlushDB(redisCtx).Err(); err != nil {
 		return nil, err
 	}
 	cacheClient, err := cache.NewRedis(redisAddr, "", redisTestDB)
