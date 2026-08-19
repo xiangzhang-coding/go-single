@@ -1,16 +1,16 @@
 import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 
 import { getCart } from "../api/endpoints";
 import { Icon } from "./ui";
 import { AuthorizedImage } from "./AuthorizedMedia";
+import { endSession } from "../lib/session";
 import { useAuthStore } from "../store/auth";
 import { totalUnread, useChatStore } from "../store/chat";
 
 export function AppShell() {
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
-  const { token, user, logout } = useAuthStore();
+  const { token, user } = useAuthStore();
   const cartQuery = useQuery({
     queryKey: ["cart"],
     queryFn: getCart,
@@ -21,8 +21,7 @@ export function AppShell() {
   const unreadCount = totalUnread(useChatStore((state) => state.conversations));
 
   function signOut() {
-    logout();
-    queryClient.clear();
+    endSession();
     navigate("/");
   }
 

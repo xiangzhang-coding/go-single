@@ -15,20 +15,23 @@ import { chatSocket } from "./ws";
  */
 export function useChatRealtime() {
   const token = useAuthStore((state) => state.token);
+  const userId = useAuthStore((state) => state.user?.id);
   const setConversations = useChatStore((state) => state.setConversations);
   const setWsOnline = useChatStore((state) => state.setWsOnline);
 
-  useQuery({
-    queryKey: ["conversations"],
-    queryFn: async () => {
-      const { items } = await getConversations({ limit: 50 });
-      setConversations(items);
-      return items;
-    },
-    enabled: Boolean(token),
+  const conversationsQuery = useQuery({
+    queryKey: ["conversations", userId],
+    queryFn: async () => (await getConversations({ limit: 50 })).items,
+    enabled: Boolean(token && userId),
     refetchInterval: 60_000,
     staleTime: 30_000,
   });
+
+  useEffect(() => {
+    if (token && userId && conversationsQuery.data) {
+      setConversations(conversationsQuery.data);
+    }
+  }, [conversationsQuery.data, setConversations, token, userId]);
 
   useEffect(() => {
     if (!token) {

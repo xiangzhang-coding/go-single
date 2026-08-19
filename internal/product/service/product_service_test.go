@@ -614,6 +614,24 @@ func TestListAllProductsIncludesDrafts(t *testing.T) {
 	assert.Equal(t, 1, len(page2))
 }
 
+func TestGetAdminDetailIncludesOffSaleSKUs(t *testing.T) {
+	fx := newFixture()
+	category := fx.category(t, "后台详情")
+	product, err := fx.svc.CreateProduct(context.Background(), category.ID, "草稿商品", "desc")
+	require.NoError(t, err)
+	sku, err := fx.svc.CreateSKU(context.Background(), product.ID, json.RawMessage(`{"color":"红"}`), 9900, 10)
+	require.NoError(t, err)
+
+	detail, err := fx.svc.GetAdminDetail(context.Background(), product.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.ProductStatusOffSale, detail.Status)
+	require.Len(t, detail.Skus, 1)
+	require.Equal(t, sku.ID, detail.Skus[0].ID)
+
+	_, err = fx.svc.GetAdminDetail(context.Background(), 999)
+	require.ErrorIs(t, err, ErrProductNotFound)
+}
+
 func TestGetDetailOffSaleInvisible(t *testing.T) {
 	fx := newFixture()
 	c := fx.category(t, "数码")

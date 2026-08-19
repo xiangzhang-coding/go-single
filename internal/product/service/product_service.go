@@ -73,6 +73,8 @@ type Service interface {
 	// ListAllProducts 后台商品列表（T25）：可选类目/状态筛选 + 分页，
 	// 与 ListProducts 的区别是不过滤上架状态（admin 需管理草稿/下架商品）。
 	ListAllProducts(ctx context.Context, categoryID *int64, status string, page, pageSize int) ([]model.Product, int64, error)
+	// GetAdminDetail 后台商品详情，包含上架及下架商品的全部 SKU，不经过公开详情缓存。
+	GetAdminDetail(ctx context.Context, id int64) (*model.ProductDetail, error)
 
 	// ---- 游客浏览 ----
 	ListCategories(ctx context.Context) ([]model.Category, error)
@@ -302,6 +304,21 @@ func (s *productService) ListAllProducts(ctx context.Context, categoryID *int64,
 		return nil, 0, fmt.Errorf("%w: invalid status", ErrInvalidInput)
 	}
 	return s.store.Product.List(ctx, categoryID, status, (page-1)*pageSize, pageSize)
+}
+
+func (s *productService) GetAdminDetail(ctx context.Context, id int64) (*model.ProductDetail, error) {
+	p, err := s.store.Product.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, ErrProductNotFound
+	}
+	skus, err := s.store.SKU.ListByProduct(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &model.ProductDetail{Product: *p, Skus: skus}, nil
 }
 
 // GetDetail 缓存优先（product:detail:{id}，TTL 5min）；未命中读取缓存代次后

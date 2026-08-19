@@ -381,7 +381,7 @@ export const adminApi = {
     await api.post(`/admin/products/${id}/unpublish`);
   },
   async getProductDetail(productId: number) {
-    const { data } = await api.get<ProductDetail>(`/products/${productId}`);
+    const { data } = await api.get<ProductDetail>(`/admin/products/${productId}`);
     return data;
   },
   async createSKU(productId: number, request: CreateSKURequest) {

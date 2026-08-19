@@ -62,6 +62,20 @@ export function ProductDetailPage() {
     addMutation.mutate();
   }
 
+  function buyNow() {
+    if (!token) {
+      navigate(`/login?returnTo=${encodeURIComponent(`${location.pathname}${location.search}`)}`);
+      return;
+    }
+    if (!selectedSku) return;
+    const params = new URLSearchParams({
+      product_id: String(productId),
+      sku_id: String(selectedSku.id),
+      quantity: String(quantity),
+    });
+    navigate(`/checkout?${params.toString()}`);
+  }
+
   return (
     <section className="site-container page-section pt-8 sm:pt-14">
       <Link to="/" className="back-link"><Icon name="arrow-left" size={16} /> 返回目录</Link>
@@ -107,10 +121,15 @@ export function ProductDetailPage() {
 
           <div className="detail-buy-row mt-8">
             <QuantityStepper value={quantity} max={Math.min(99, selectedSku?.stock || 1)} onChange={setQuantity} disabled={!canAdd} />
-            <Button className="flex-1 justify-center" onClick={addToCart} disabled={!canAdd || addMutation.isPending}>
-              {addMutation.isPending ? "正在加入" : "加入购物车"}
-              {!addMutation.isPending && <Icon name="bag" size={17} />}
-            </Button>
+            <div className="detail-buy-actions">
+              <Button variant="secondary" className="flex-1 justify-center" onClick={addToCart} disabled={!canAdd || addMutation.isPending}>
+                {addMutation.isPending ? "正在加入" : "加入购物车"}
+                {!addMutation.isPending && <Icon name="bag" size={17} />}
+              </Button>
+              <Button className="flex-1 justify-center" onClick={buyNow} disabled={!canAdd}>
+                立即购买 <Icon name="arrow-right" size={17} />
+              </Button>
+            </div>
           </div>
           {feedback && <div className={`notice mt-4 ${feedback === "已加入购物车" ? "notice-success" : "notice-error"}`}>{feedback}</div>}
 

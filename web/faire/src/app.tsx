@@ -28,6 +28,7 @@ import { AdminLayout } from "./pages/admin/AdminLayout";
 import { AdminOrdersPage } from "./pages/admin/AdminOrdersPage";
 import { AdminProductsPage } from "./pages/admin/AdminProductsPage";
 import { useChatRealtime } from "./lib/chat-hooks";
+import { endSession } from "./lib/session";
 import { useAuthStore } from "./store/auth";
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -66,13 +67,11 @@ function GuestRoute({ children }: { children: ReactNode }) {
 }
 
 function SessionEvents() {
-  const logout = useAuthStore((state) => state.logout);
-
   useEffect(() => {
-    const handleSessionExpired = () => logout();
+    const handleSessionExpired = () => endSession();
     window.addEventListener("faire:session-expired", handleSessionExpired);
     return () => window.removeEventListener("faire:session-expired", handleSessionExpired);
-  }, [logout]);
+  }, []);
 
   return null;
 }

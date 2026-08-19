@@ -1,6 +1,7 @@
 import axios, { AxiosError } from "axios";
 
 import { ACCESS_TOKEN_KEY } from "../lib/auth-storage";
+import { endSession } from "../lib/session";
 
 export const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE || "/api",
@@ -28,15 +29,22 @@ api.interceptors.request.use((config) => {
 });
 
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    if (!responseBelongsToCurrentSession(response.config.headers.get("Authorization"))) {
+      return Promise.reject(new ApiRequestError("登录账号已切换"));
+    }
+    return response;
+  },
   async (error: AxiosError<{ error?: string } | Blob>) => {
     const status = error.response?.status;
     const message = await responseErrorMessage(error.response?.data);
     const requestError = new ApiRequestError(message, status);
 
-    if (status === 401 && typeof window !== "undefined") {
-      localStorage.removeItem(ACCESS_TOKEN_KEY);
-      window.dispatchEvent(new Event("faire:session-expired"));
+    const requestToken = bearerToken(error.config?.headers.get("Authorization"));
+    const currentToken = typeof localStorage !== "undefined" ? localStorage.getItem(ACCESS_TOKEN_KEY) : null;
+    const expiresCurrentSession = requestToken === currentToken;
+    if (status === 401 && typeof window !== "undefined" && expiresCurrentSession) {
+      endSession();
       if (!window.location.pathname.startsWith("/login")) {
         const returnTo = `${window.location.pathname}${window.location.search}`;
         window.location.assign(`/login?returnTo=${encodeURIComponent(returnTo)}`);
@@ -46,6 +54,18 @@ api.interceptors.response.use(
     return Promise.reject(requestError);
   },
 );
+
+function bearerToken(value: unknown): string | null {
+  if (typeof value !== "string" || !value.startsWith("Bearer ")) return null;
+  return value.slice("Bearer ".length);
+}
+
+function responseBelongsToCurrentSession(authorization: unknown): boolean {
+  const requestToken = bearerToken(authorization);
+  if (requestToken === null) return true;
+  const currentToken = typeof localStorage !== "undefined" ? localStorage.getItem(ACCESS_TOKEN_KEY) : null;
+  return requestToken === currentToken;
+}
 
 async function responseErrorMessage(data: { error?: string } | Blob | undefined): Promise<string> {
   if (data instanceof Blob) {

@@ -408,6 +408,8 @@ function SKUSection({ productId, onNotice }: { productId: number; onNotice: (n: 
       <p className="eyebrow text-smoke">SKU / 规格 · 价格 · 库存</p>
       {detailQuery.isPending ? (
         <Spinner label="读取 SKU 中" />
+      ) : detailQuery.isError ? (
+        <ErrorState message={getApiErrorMessage(detailQuery.error)} onRetry={() => detailQuery.refetch()} />
       ) : skus.length === 0 ? (
         <p className="mt-2 text-sm text-smoke">还没有 SKU，添加一个规格组合即可上架售卖。</p>
       ) : (

@@ -29,9 +29,12 @@ class ChatSocket {
   private closing = false;
 
   connect(token: string) {
+    if (this.socket && this.token === token) return;
+    if (this.socket || this.retryTimer) {
+      this.disconnect();
+    }
     this.token = token;
     this.closing = false;
-    if (this.socket) return;
     this.open();
   }
 
@@ -68,11 +71,13 @@ class ChatSocket {
     this.socket = socket;
 
     socket.onopen = () => {
+      if (this.socket !== socket) return;
       this.retry = 0;
       this.setStatus("open");
     };
 
     socket.onmessage = (event: MessageEvent<string>) => {
+      if (this.socket !== socket) return;
       let envelope: ChatSocketEvent;
       try {
         envelope = JSON.parse(event.data) as ChatSocketEvent;
@@ -87,6 +92,7 @@ class ChatSocket {
     };
 
     socket.onclose = (event) => {
+      if (this.socket !== socket) return;
       this.socket = null;
       this.setStatus("closed");
       if (event.code === TOKEN_EXPIRED_CLOSE_CODE) {
@@ -103,6 +109,7 @@ class ChatSocket {
     };
 
     socket.onerror = () => {
+      if (this.socket !== socket) return;
       socket.close();
     };
   }

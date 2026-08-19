@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -8,9 +8,11 @@ import {
   getAddresses,
   getCart,
   getMyCoupons,
+  getProductDetail,
 } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import type { Address, CreateAddressRequest, UserCouponView } from "../api/types";
+import { buildOrderRequest, parseCheckoutIntent } from "../lib/checkout";
 import { formatAddress, formatMoney, formatSpecs, isCouponUsable, makeClientRequestID } from "../lib/format";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, Spinner } from "../components/ui";
 
@@ -24,16 +26,37 @@ const emptyDraft: CreateAddressRequest = {
   is_default: false,
 };
 
+interface CheckoutItem {
+  key: string;
+  title: string;
+  specs: unknown;
+  price: number;
+  quantity: number;
+}
+
 export function CheckoutPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const checkoutIntent = parseCheckoutIntent(searchParams);
+  const directProductId = checkoutIntent?.kind === "direct" ? checkoutIntent.productId : 0;
+  const [clientRequestId] = useState(() => makeClientRequestID());
   const [selectedAddressId, setSelectedAddressId] = useState<number | null>(null);
   const [selectedCouponId, setSelectedCouponId] = useState<number | null>(null);
   const [showAddressForm, setShowAddressForm] = useState(false);
   const [draft, setDraft] = useState<CreateAddressRequest>(emptyDraft);
   const [actionError, setActionError] = useState("");
 
-  const cartQuery = useQuery({ queryKey: ["cart"], queryFn: getCart });
+  const cartQuery = useQuery({
+    queryKey: ["cart"],
+    queryFn: getCart,
+    enabled: checkoutIntent?.kind === "cart",
+  });
+  const directProductQuery = useQuery({
+    queryKey: ["product", directProductId],
+    queryFn: () => getProductDetail(directProductId),
+    enabled: checkoutIntent?.kind === "direct",
+  });
   const addressesQuery = useQuery({ queryKey: ["addresses"], queryFn: getAddresses });
   const couponsQuery = useQuery({ queryKey: ["coupons", "unused"], queryFn: () => getMyCoupons("unused") });
 
@@ -45,7 +68,18 @@ export function CheckoutPage() {
     setSelectedAddressId(defaultAddress.id);
   }, [addressesQuery.data, selectedAddressId]);
 
-  const items = cartQuery.data?.items || [];
+  const directSKU = checkoutIntent?.kind === "direct"
+    ? directProductQuery.data?.skus.find((sku) => sku.id === checkoutIntent.skuId)
+    : undefined;
+  const items: CheckoutItem[] = checkoutIntent?.kind === "direct" && directProductQuery.data && directSKU
+    ? [{
+        key: `direct-${directSKU.id}`,
+        title: directProductQuery.data.title,
+        specs: directSKU.specs,
+        price: directSKU.price,
+        quantity: checkoutIntent.quantity,
+      }]
+    : (cartQuery.data?.items || []).map((item) => ({ ...item, key: `cart-${item.id}` }));
   const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
   const coupons = couponsQuery.data?.items || [];
   const eligibleCoupons = coupons.filter((coupon) => isCouponUsable(coupon, subtotal));
@@ -65,14 +99,18 @@ export function CheckoutPage() {
     onError: (error) => setActionError(getApiErrorMessage(error)),
   });
   const orderMutation = useMutation({
-    mutationFn: () => createOrder({
-      client_request_id: makeClientRequestID(),
-      address_id: selectedAddressId!,
-      coupon_id: selectedCouponId || 0,
-      from_cart: true,
-    }),
+    mutationFn: () => createOrder(buildOrderRequest(
+      checkoutIntent!,
+      clientRequestId,
+      selectedAddressId!,
+      selectedCouponId || 0,
+    )),
     onSuccess: (order) => {
-      queryClient.invalidateQueries({ queryKey: ["cart"] });
+      if (checkoutIntent?.kind === "cart") {
+        queryClient.invalidateQueries({ queryKey: ["cart"] });
+      } else if (checkoutIntent?.kind === "direct") {
+        queryClient.invalidateQueries({ queryKey: ["product", checkoutIntent.productId] });
+      }
       queryClient.invalidateQueries({ queryKey: ["orders"] });
       queryClient.invalidateQueries({ queryKey: ["coupons"] });
       navigate(`/orders/${order.order_no}`);
@@ -80,11 +118,25 @@ export function CheckoutPage() {
     onError: (error) => setActionError(getApiErrorMessage(error)),
   });
 
-  if (cartQuery.isPending || addressesQuery.isPending || couponsQuery.isPending) {
+  if (!checkoutIntent) {
+    return <div className="site-container page-section"><ErrorState message="直购参数无效，请返回商品详情重新选择规格和数量。" /></div>;
+  }
+  const sourcePending = checkoutIntent.kind === "cart" ? cartQuery.isPending : directProductQuery.isPending;
+  if (sourcePending || addressesQuery.isPending || couponsQuery.isPending) {
     return <div className="site-container page-section"><LoadingBlock label="正在准备结算页" /></div>;
   }
-  if (cartQuery.isError) {
+  if (checkoutIntent.kind === "cart" && cartQuery.isError) {
     return <div className="site-container page-section"><ErrorState message={getApiErrorMessage(cartQuery.error)} onRetry={() => cartQuery.refetch()} /></div>;
+  }
+  if (checkoutIntent.kind === "direct" && directProductQuery.isError) {
+    return <div className="site-container page-section"><ErrorState message={getApiErrorMessage(directProductQuery.error)} onRetry={() => directProductQuery.refetch()} /></div>;
+  }
+  if (addressesQuery.isError || couponsQuery.isError) {
+    const error = addressesQuery.error || couponsQuery.error;
+    return <div className="site-container page-section"><ErrorState message={getApiErrorMessage(error)} onRetry={() => { addressesQuery.refetch(); couponsQuery.refetch(); }} /></div>;
+  }
+  if (checkoutIntent.kind === "direct" && (!directSKU || directSKU.stock < checkoutIntent.quantity)) {
+    return <div className="site-container page-section"><ErrorState message="所选 SKU 已不可购买或库存不足，请返回商品详情重新选择。" /></div>;
   }
   if (items.length === 0) {
     return (
@@ -115,7 +167,7 @@ export function CheckoutPage() {
 
   return (
     <section className="site-container page-section pt-8 sm:pt-14">
-      <Link to="/cart" className="back-link"><Icon name="arrow-left" size={16} /> 返回购物车</Link>
+      <Link to={checkoutIntent.kind === "direct" ? `/products/${checkoutIntent.productId}` : "/cart"} className="back-link"><Icon name="arrow-left" size={16} /> {checkoutIntent.kind === "direct" ? "返回商品详情" : "返回购物车"}</Link>
       <div className="section-heading-row mt-8 sm:mt-12">
         <div>
           <p className="eyebrow text-smoke">结算 / 最后确认</p>
@@ -176,7 +228,7 @@ export function CheckoutPage() {
           <section className="checkout-section">
             <div className="checkout-section-heading"><div><p className="eyebrow text-smoke">03 / 商品</p><h2 className="mt-2 font-nantes text-3xl">确认这几件。</h2></div></div>
             <div className="checkout-items mt-6">
-              {items.map((item) => <div className="checkout-item" key={item.id}><div><strong>{item.title}</strong><p>{formatSpecs(item.specs)} × {item.quantity}</p></div><strong>{formatMoney(item.price * item.quantity)}</strong></div>)}
+              {items.map((item) => <div className="checkout-item" key={item.key}><div><strong>{item.title}</strong><p>{formatSpecs(item.specs)} × {item.quantity}</p></div><strong>{formatMoney(item.price * item.quantity)}</strong></div>)}
             </div>
           </section>
         </div>

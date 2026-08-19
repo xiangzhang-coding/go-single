@@ -330,7 +330,15 @@ func orderRequestBody(rid string, addrID int64, skuID int64, quantity int, coupo
 	if couponID > 0 {
 		couponPart = fmt.Sprintf(`,"coupon_id":%d`, couponID)
 	}
-	return fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"items":[{"sku_id":%d,"quantity":%d}]%s}`, rid, addrID, skuID, quantity, couponPart)
+	return fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"from_cart":false,"items":[{"sku_id":%d,"quantity":%d}]%s}`, rid, addrID, skuID, quantity, couponPart)
+}
+
+func mapKeys(value map[string]any) []string {
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func skuStock(t *testing.T, env *testEnv, skuID int64) int {
@@ -388,6 +396,10 @@ func TestOrderDirectBuyHappyPath(t *testing.T) {
 
 	w, body := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 2, 0)
 	require.Equal(t, http.StatusCreated, w.Code, "下单失败: %s", w.Body.String())
+	require.ElementsMatch(t, []string{
+		"order_no", "user_id", "order_type", "status", "total_amount", "discount_amount", "pay_amount",
+		"receiver", "phone", "province", "city", "district", "detail", "expire_at", "created_at", "updated_at", "items",
+	}, mapKeys(body))
 	orderNo := body["order_no"].(string)
 	require.Equal(t, "pending_payment", body["status"])
 	require.Equal(t, "normal", body["order_type"])
@@ -403,6 +415,9 @@ func TestOrderDirectBuyHappyPath(t *testing.T) {
 	items := body["items"].([]any)
 	require.Len(t, items, 1)
 	it := items[0].(map[string]any)
+	require.ElementsMatch(t, []string{
+		"id", "order_no", "sku_id", "product_id", "title", "specs", "price", "quantity", "subtotal", "created_at", "updated_at",
+	}, mapKeys(it))
 	require.Equal(t, float64(skuID), it["sku_id"])
 	require.Equal(t, float64(9900), it["price"])
 	require.Equal(t, float64(2), it["quantity"])

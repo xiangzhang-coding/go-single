@@ -301,13 +301,23 @@ export interface FlashSaleAdminListResponse {
   items: FlashSaleActivity[];
 }
 
-export interface CreateOrderRequest {
+interface CreateOrderRequestBase {
   client_request_id: string;
   address_id: number;
   coupon_id?: number;
-  from_cart: boolean;
-  items?: Array<{ sku_id: number; quantity: number }>;
 }
+
+interface CreateOrderItemRequest {
+  sku_id: number;
+  quantity: number;
+}
+
+export type CreateOrderRequest =
+  | (CreateOrderRequestBase & { from_cart: true; items?: never })
+  | (CreateOrderRequestBase & {
+      from_cart: false;
+      items: [CreateOrderItemRequest, ...CreateOrderItemRequest[]];
+    });
 
 export interface CreateAddressRequest {
   receiver: string;

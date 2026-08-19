@@ -243,6 +243,14 @@ func publish(t *testing.T, env *testEnv, token string, productID int64, publish_
 
 func uniqueName(prefix string) string { return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano()) }
 
+func mapKeys(value map[string]any) []string {
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
 func resetProductDetailCache(t *testing.T, env *testEnv, productID int64) string {
 	t.Helper()
 	detailKey := fmt.Sprintf("product:detail:%d", productID)
@@ -463,6 +471,43 @@ func TestAdminProductListIncludesDrafts(t *testing.T) {
 	for _, item := range visitorList["items"].([]any) {
 		require.NotEqual(t, float64(p2), item.(map[string]any)["id"])
 	}
+}
+
+func TestAdminProductDetailContractIncludesOffSaleSKUs(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	categoryID := createCategory(t, env, admin, uniqueName("后台详情"))
+	productID := createProduct(t, env, admin, categoryID, uniqueName("草稿商品"))
+	skuID := createSKU(t, env, admin, productID, 9900, 10)
+	path := fmt.Sprintf("/api/admin/products/%d", productID)
+
+	w, _ := doJSON(t, env, http.MethodGet, path, "", "")
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	userToken := registerAndToken(t, env, uniqueName("detail-user"))
+	w, _ = doJSON(t, env, http.MethodGet, path, "", userToken)
+	require.Equal(t, http.StatusForbidden, w.Code)
+
+	w, detail := doJSON(t, env, http.MethodGet, path, "", admin)
+	require.Equal(t, http.StatusOK, w.Code, "后台应能读取下架商品详情: %s", w.Body.String())
+	require.ElementsMatch(t,
+		[]string{"id", "category_id", "title", "description", "status", "created_at", "updated_at", "skus"},
+		mapKeys(detail),
+	)
+	require.Equal(t, "off_sale", detail["status"])
+	skus := detail["skus"].([]any)
+	require.Len(t, skus, 1)
+	sku := skus[0].(map[string]any)
+	require.ElementsMatch(t,
+		[]string{"id", "product_id", "specs", "price", "stock", "created_at", "updated_at"},
+		mapKeys(sku),
+	)
+	require.Equal(t, float64(skuID), sku["id"])
+
+	publish(t, env, admin, productID, true)
+	w, detail = doJSON(t, env, http.MethodGet, path, "", admin)
+	require.Equal(t, http.StatusOK, w.Code, "后台应能读取上架商品详情: %s", w.Body.String())
+	require.Equal(t, "on_sale", detail["status"])
+	require.Len(t, detail["skus"].([]any), 1)
 }
 
 // 游客列表：按类目筛选 + 分页 + 下架不可见。

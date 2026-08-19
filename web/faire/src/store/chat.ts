@@ -13,6 +13,7 @@ interface ChatState {
   setActiveKey: (key: string | null) => void;
   setMessages: (key: string, messages: Message[]) => void;
   setWsOnline: (online: boolean) => void;
+  reset: () => void;
   /** 收到/发送一条消息：去重追加、刷新会话预览、按当前会话判定未读与已读。 */
   handleMessage: (message: Message, isOwn: boolean) => void;
 }
@@ -36,6 +37,8 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     set((state) => ({ messagesByKey: { ...state.messagesByKey, [key]: messages } })),
 
   setWsOnline: (online) => set({ wsOnline: online }),
+
+  reset: () => set({ conversations: [], messagesByKey: {}, activeKey: null, wsOnline: false }),
 
   handleMessage: (message, isOwn) => {
     const { conversations, messagesByKey, activeKey } = get();

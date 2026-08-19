@@ -758,6 +758,7 @@
 .sku-option strong { font-size: 14px; font-weight: 400; white-space: nowrap; }
 
 .detail-buy-row { display: flex; gap: 12px; }
+.detail-buy-actions { display: flex; flex: 1; gap: 12px; }
 
 .quantity-stepper {
   display: inline-flex;
@@ -930,8 +931,9 @@
   .product-card-copy { padding-top: 10px; }
   .product-card-copy h2 { font-size: 14px; }
   .product-detail-copy h1 { font-size: 42px; }
-  .detail-buy-row { align-items: stretch; }
-  .quantity-stepper { width: 112px; }
+  .detail-buy-row { flex-direction: column; align-items: stretch; }
+  .detail-buy-actions { flex-direction: column; }
+  .quantity-stepper { width: 100%; }
   .form-grid-2 { grid-template-columns: 1fr; }
   .checkout-section-heading { align-items: flex-start; }
   .checkout-section-heading .button { padding-inline: 12px; }
