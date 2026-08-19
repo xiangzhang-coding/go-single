@@ -415,12 +415,32 @@ func TestHubSlowConsumerClosed(t *testing.T) {
 }
 
 func TestHubHeartbeatKeepsAlive(t *testing.T) {
-	hub, handler := newTestHub(t)
-	client := dialClient(t, handler, "valid-token")
+	// race/共享 CI CPU 下 30ms 测试心跳会让 60ms 初始读期限先于首个
+	// Ping 到期。这里仍使用短周期，但显式等待真实 Ping/Pong，而非依赖 Sleep。
+	const heartbeatInterval = 250 * time.Millisecond
+	hub, handler := newTestHubWithConfig(t, Config{HeartbeatInterval: heartbeatInterval})
+	pings := make(chan struct{}, 4)
+	client := dialClient(t, handler, "valid-token", func(conn *websocket.Conn) {
+		conn.SetPingHandler(func(appData string) error {
+			select {
+			case pings <- struct{}{}:
+			default:
+			}
+			return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(writeWait))
+		})
+	})
 	require.NotNil(t, client)
 
-	// 读循环自动回 Pong：跨多个心跳周期（30ms × 20 = 600ms）连接存活。
-	time.Sleep(600 * time.Millisecond)
+	deadline := time.After(5 * time.Second)
+	for received := 0; received < 3; received++ {
+		select {
+		case <-pings:
+		case err := <-client.errs:
+			t.Fatalf("等待心跳期间连接意外关闭: %v", err)
+		case <-deadline:
+			t.Fatal("未观察到三个心跳周期")
+		}
+	}
 	require.Equal(t, 1, hub.ConnectedCount(), "心跳保活下连接应保持在线")
 
 	hub.PushToUser(42, EventNewMessage, "alive")
