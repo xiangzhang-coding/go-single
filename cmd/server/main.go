@@ -51,6 +51,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/logger"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
+	"github.com/xiangzhang-coding/go-single/internal/platform/requestbody"
 	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
 	"github.com/xiangzhang-coding/go-single/internal/platform/ws"
@@ -119,6 +120,8 @@ func run() error {
 		SecretKey: cfg.MinIO.SecretKey,
 		Bucket:    cfg.MinIO.Bucket,
 		UseSSL:    cfg.MinIO.UseSSL,
+	}, file.NewGORMUsage(db), file.QuotaConfig{
+		MaxBytesPerUser: cfg.Upload.MaxBytesPerUser, MaxObjectsPerUser: cfg.Upload.MaxObjectsPerUser,
 	})
 	if err != nil {
 		return err
@@ -251,7 +254,20 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// user 模块：注册/登录/鉴权 + 地址簿（默认地址唯一由 users.default_address_id 指针保证）。
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: cfg.Auth.Secret, TTL: cfg.Auth.TTL})
 	userSvc := usersvc.NewWithMedia(userrepo.Store{Users: userrepo.NewGORM(db), Addresses: userrepo.NewGORMAddress(db)}, verifier, fileSvc)
-	userHandler := userhandler.New(userSvc, verifier)
+	authLimits, err := limiter.NewAuthAttempts(cacheClient, userSvc, limiter.AuthAttemptsConfig{
+		Login: limiter.AuthAttemptConfig{
+			PerIPMax: cfg.Auth.LoginRateLimit.PerIPMax, PerAccountMax: cfg.Auth.LoginRateLimit.PerAccountMax,
+			Window: cfg.Auth.LoginRateLimit.Window,
+		},
+		Register: limiter.AuthAttemptConfig{
+			PerIPMax: cfg.Auth.RegisterRateLimit.PerIPMax, PerAccountMax: cfg.Auth.RegisterRateLimit.PerAccountMax,
+			Window: cfg.Auth.RegisterRateLimit.Window,
+		},
+	})
+	if err != nil {
+		log.Fatal("初始化认证限流失败", zap.Error(err))
+	}
+	userHandler := userhandler.New(userSvc, verifier, authLimits)
 	addressHandler := userhandler.NewAddress(userSvc, verifier)
 
 	// product 模块：admin 维护类目/商品/SKU，游客浏览（详情走缓存）。
@@ -403,7 +419,11 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// /ws 长连接不适用请求超时（连接生命周期自行管理），/metrics、/healthz
 	// 为本地快速检查不挂超时（healthz 自带 2s 内部超时）。
 	api := r.Group("/api")
-	api.Use(requestTimeout(cfg.Server.RequestTimeout))
+	jsonLimit, err := requestbody.LimitJSON(cfg.Server.MaxJSONBodyBytes)
+	if err != nil {
+		log.Fatal("初始化 JSON 请求体上限失败", zap.Error(err))
+	}
+	api.Use(requestTimeout(cfg.Server.RequestTimeout), jsonLimit)
 	userHandler.RegisterRoutes(api)
 	addressHandler.RegisterRoutes(api)
 	productHandler.RegisterRoutes(api)
@@ -414,7 +434,11 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	chatHandler.RegisterRoutes(api)
 	orderHandler.RegisterRoutes(api)
 	paymentHandler.RegisterRoutes(api)
-	fileHandler.RegisterRoutes(api)
+
+	// Multipart 上传使用独立的 21 MiB 解析前预算，不能经过 64 KiB JSON 路由组。
+	fileAPI := r.Group("/api")
+	fileAPI.Use(requestTimeout(cfg.Server.RequestTimeout))
+	fileHandler.RegisterRoutes(fileAPI)
 
 	return r, cronRegistry
 }

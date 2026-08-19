@@ -104,8 +104,8 @@ jobs:
       - name: 全量单元 + 集成测试（真实 MySQL/Redis/RabbitMQ/MinIO）
         run: go test ./... -count=1
 
-      - name: race 检测（并发敏感包：秒杀 / 优惠券 / WS / MQ / 聊天）
-        run: go test -race -count=1 ./internal/flashsale/... ./internal/coupon/... ./internal/platform/ws/... ./internal/platform/mq/... ./internal/chat/...
+      - name: race 检测（并发敏感包：认证 / 上传 / 秒杀 / 优惠券 / WS / MQ / 聊天）
+        run: go test -race -count=1 ./internal/user/... ./internal/platform/limiter/... ./internal/platform/requestbody/... ./internal/platform/file/... ./internal/flashsale/... ./internal/coupon/... ./internal/platform/ws/... ./internal/platform/mq/... ./internal/chat/...
 
       - name: 供应链漏洞扫描（govulncheck）
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...

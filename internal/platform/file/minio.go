@@ -55,12 +55,17 @@ type StoredObject struct {
 
 // MinIO 文件存储实现：私有桶 + 内容校验 + 托管引用 + 鉴权代理读取。
 type MinIO struct {
-	client *minio.Client
-	bucket string
+	client   *minio.Client
+	bucket   string
+	usage    UsageStore
+	quotaCfg QuotaConfig
 }
 
 // NewMinIO 构造 MinIO 实现：建连、确保桶存在且私有。
-func NewMinIO(cfg MinIOConfig) (*MinIO, error) {
+func NewMinIO(cfg MinIOConfig, usage UsageStore, quotaCfg QuotaConfig) (*MinIO, error) {
+	if usage == nil || quotaCfg.MaxBytesPerUser < 1 || quotaCfg.MaxObjectsPerUser < 1 {
+		return nil, fmt.Errorf("%w: bytes=%d objects=%d", ErrQuotaConfig, quotaCfg.MaxBytesPerUser, quotaCfg.MaxObjectsPerUser)
+	}
 	client, err := minio.New(cfg.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
 		Secure: cfg.UseSSL,
@@ -83,7 +88,7 @@ func NewMinIO(cfg MinIOConfig) (*MinIO, error) {
 	if err := ensurePrivate(ctx, client, cfg.Endpoint, cfg.Bucket); err != nil {
 		return nil, err
 	}
-	return &MinIO{client: client, bucket: cfg.Bucket}, nil
+	return &MinIO{client: client, bucket: cfg.Bucket, usage: usage, quotaCfg: quotaCfg}, nil
 }
 
 // Upload 按媒体类型校验内容后写入私有桶。对象 key 固化上传者和类型，
@@ -98,6 +103,9 @@ func (s *MinIO) Upload(ctx context.Context, ownerID int64, kind string, r io.Rea
 	if err != nil {
 		return nil, err
 	}
+	if err := s.usage.Reserve(ctx, ownerID, size, s.quotaCfg.MaxBytesPerUser, s.quotaCfg.MaxObjectsPerUser); err != nil {
+		return nil, err
+	}
 
 	key := fmt.Sprintf("users/%d/%s/%s/%s.%s", ownerID, kind, time.Now().Format("20060102"), randHex(32), ext)
 	cleanName := sanitizeFilename(filename)
@@ -108,7 +116,13 @@ func (s *MinIO) Upload(ctx context.Context, ownerID int64, kind string, r io.Rea
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("上传对象 %s: %w", key, err)
+		uploadErr := fmt.Errorf("上传对象 %s: %w", key, err)
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		if releaseErr := s.usage.Release(releaseCtx, ownerID, size); releaseErr != nil {
+			return nil, errors.Join(uploadErr, releaseErr)
+		}
+		return nil, uploadErr
 	}
 	return &ObjectInfo{
 		Reference: referenceForKey(key), OwnerID: ownerID, Kind: kind,

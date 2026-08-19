@@ -146,7 +146,7 @@
 - 预扣事实固化 SKU、成交价、数量和购买槽位，消费者不读取活动当前价格/SKU改写订单；进行中仅标题和库存减少可编辑，编辑经 Redis pause 栅栏 + MySQL 行锁重算差额，不能减到已接受预扣以下，同步失败活动自动下架
 - key 约定 `flashsale:stock:{id}` / `flashsale:count:{id}:{user}` / `flashsale:idem:{id}:{user}:{purchase_slot}`
 - 对账分场景：活动进行中只比对告警不自动回写（Redis 预扣领先属正常，仅识别"有扣减无订单"作补单信号）；活动结束收尾对账以 MySQL 为准对齐 Redis
-- 限流：全局单机令牌桶（x/time/rate，QPS 可配）+ 秒杀接口按用户 Redis 计数（INCR+TTL）
+- 限流：登录/注册按可信来源 IP 与 MySQL 排序权重账号键使用 Redis 固定窗口预算；秒杀使用全局单机令牌桶（x/time/rate，QPS 可配）+ 按用户 Redis 计数（INCR+TTL）
 
 ### 支付 / 优惠券
 
@@ -158,7 +158,7 @@
 - JWT 自签 HS256（2h，无 refresh）+ bcrypt；TokenVerifier 接口（自签实现，OIDC 换实现进 backlog）
 - `user.role`（user/admin）+ admin 中间件；admin 种子账号 admin/admin123（migration 种入）
 - 对象级授权：订单/购物车/地址簿/聊天/好友操作强制校验 `owner_id`，防 IDOR
-- HTTPS 与安全头（Nginx 终止 SSL + X-Content-Type-Options/X-Frame-Options/CSP）；图片按魔数限定 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB；上传返回绑定上传者与类型的托管引用，业务拒绝外链/他人引用/类型错配；MinIO 桶私有，读取经 Bearer 后端代理并按头像、好友关系或会话参与者授权；日志不记录密码与 token
+- HTTPS 与安全头（Nginx 终止 SSL + X-Content-Type-Options/X-Frame-Options/CSP）；JSON 解析前硬上限 64 KiB；multipart 请求硬上限 21 MiB，图片按魔数限定 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB；上传受可配置的每用户累计字节/对象数配额约束并返回绑定上传者与类型的托管引用，业务拒绝外链/他人引用/类型错配；MinIO 桶私有，读取经 Bearer 后端代理并按头像、好友关系或会话参与者授权；日志不记录密码与 token
 
 ### 社交 / 即时通信
 

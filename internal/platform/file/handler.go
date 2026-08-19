@@ -38,6 +38,24 @@ func (h *Handler) Upload(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 		return
 	}
+	if c.Request.ContentLength > MaxMultipartBodySize {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "multipart body too large"})
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxMultipartBodySize)
+	err := c.Request.ParseMultipartForm(MultipartMemorySize)
+	if c.Request.MultipartForm != nil {
+		defer c.Request.MultipartForm.RemoveAll()
+	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "multipart body too large"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid multipart body"})
+		return
+	}
 	fh, err := c.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": `file is required (multipart field "file")`})
@@ -57,7 +75,11 @@ func (h *Handler) Upload(c *gin.Context) {
 	info, err := h.svc.Upload(c.Request.Context(), claims.UserID, kind, f, fh.Size, fh.Filename)
 	if err != nil {
 		switch {
-		case errors.Is(err, ErrInvalidType), errors.Is(err, ErrInvalidKind), errors.Is(err, ErrTooLarge):
+		case errors.Is(err, ErrTooLarge):
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+		case errors.Is(err, ErrQuotaExceeded):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		case errors.Is(err, ErrInvalidType), errors.Is(err, ErrInvalidKind):
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})

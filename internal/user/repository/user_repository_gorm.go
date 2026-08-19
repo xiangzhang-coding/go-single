@@ -35,6 +35,14 @@ func (r *GORMUserRepository) GetByUsername(ctx context.Context, username string)
 	return r.findOne(ctx, "username = ?", username)
 }
 
+func (r *GORMUserRepository) UsernameRateLimitKey(ctx context.Context, username string) (string, error) {
+	var key string
+	err := r.db.WithContext(ctx).Raw(
+		"SELECT HEX(WEIGHT_STRING(RTRIM(CAST(? AS CHAR CHARACTER SET utf8mb4)) COLLATE utf8mb4_unicode_ci))", username,
+	).Scan(&key).Error
+	return key, err
+}
+
 func (r *GORMUserRepository) GetByID(ctx context.Context, id int64) (*model.User, error) {
 	return r.findOne(ctx, "id = ?", id)
 }

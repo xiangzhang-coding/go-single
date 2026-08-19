@@ -123,7 +123,7 @@ func buildEnv() (*testEnv, error) {
 	fileSvc, err := file.NewMinIO(file.MinIOConfig{
 		Endpoint: envOr("GO_SINGLE_MINIO_ENDPOINT", "127.0.0.1:19000"), AccessKey: envOr("GO_SINGLE_MINIO_ACCESS_KEY", "minioadmin"),
 		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"), Bucket: envOr("GO_SINGLE_MINIO_BUCKET", "go-shop-test"),
-	})
+	}, file.NewGORMUsage(gdb), file.QuotaConfig{MaxBytesPerUser: 1 << 30, MaxObjectsPerUser: 10000})
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +156,7 @@ func buildEnv() (*testEnv, error) {
 	r := gin.New()
 	r.GET("/ws", wsHub.Handler(verifier))
 	api := r.Group("/api")
-	userhandler.New(userSvc, verifier).RegisterRoutes(api)
+	userhandler.New(userSvc, verifier, testsupport.AllowAllAuthAttempts{}).RegisterRoutes(api)
 	socialhandler.New(socialSvc, postSvc, verifier).RegisterRoutes(api)
 	chathandler.New(chatSvc, verifier).RegisterRoutes(api)
 	file.NewHandler(fileSvc, verifier, chatMediaAuthorizer{chat: chatSvc}).RegisterRoutes(api)

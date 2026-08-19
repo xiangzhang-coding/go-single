@@ -140,7 +140,7 @@ func buildMQEnv() (*mqEnv, error) {
 	// userSvc 需要签发令牌（TokenIssuer）；env.verifier 仅校验，重新构造同密钥 JWT。
 	jwt := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
 	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, jwt)
-	userHandler := userhandler.New(userSvc, verifier)
+	userHandler := userhandler.New(userSvc, verifier, testsupport.AllowAllAuthAttempts{})
 	addressHandler := userhandler.NewAddress(userSvc, verifier)
 	productHandler := env.productHandler
 

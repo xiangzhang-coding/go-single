@@ -2,6 +2,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -16,13 +17,23 @@ import (
 
 // Handler user 模块的 HTTP 处理器。
 type Handler struct {
-	svc      service.Service
-	verifier auth.TokenVerifier
+	svc        service.Service
+	verifier   auth.TokenVerifier
+	authLimits AuthAttemptLimiter
+}
+
+// AuthAttemptLimiter bounds public authentication work before bcrypt runs.
+type AuthAttemptLimiter interface {
+	AllowLogin(ctx context.Context, ip, account string) (bool, error)
+	AllowRegister(ctx context.Context, ip, account string) (bool, error)
 }
 
 // New 构造处理器。
-func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
-	return &Handler{svc: svc, verifier: verifier}
+func New(svc service.Service, verifier auth.TokenVerifier, authLimits AuthAttemptLimiter) *Handler {
+	if authLimits == nil {
+		panic("user handler requires authentication rate limits")
+	}
+	return &Handler{svc: svc, verifier: verifier, authLimits: authLimits}
 }
 
 // RegisterRoutes 注册用户与认证路由。
@@ -55,6 +66,9 @@ func (h *Handler) Register(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "username and password are required"})
 		return
 	}
+	if !h.allowAuthAttempt(c, req.Username, false) {
+		return
+	}
 
 	u, err := h.svc.Register(c.Request.Context(), req.Username, req.Password)
 	if err != nil {
@@ -77,6 +91,9 @@ func (h *Handler) Login(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "username and password are required"})
 		return
 	}
+	if !h.allowAuthAttempt(c, req.Username, true) {
+		return
+	}
 
 	u, token, err := h.svc.Login(c.Request.Context(), req.Username, req.Password)
 	if err != nil {
@@ -88,6 +105,27 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"token": token, "user": u})
+}
+
+func (h *Handler) allowAuthAttempt(c *gin.Context, account string, login bool) bool {
+	var (
+		allowed bool
+		err     error
+	)
+	if login {
+		allowed, err = h.authLimits.AllowLogin(c.Request.Context(), c.ClientIP(), account)
+	} else {
+		allowed, err = h.authLimits.AllowRegister(c.Request.Context(), c.ClientIP(), account)
+	}
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "authentication temporarily unavailable"})
+		return false
+	}
+	if !allowed {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
+		return false
+	}
+	return true
 }
 
 // Me 返回当前登录用户（对象级授权：仅本人）。

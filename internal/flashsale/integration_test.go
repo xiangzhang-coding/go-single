@@ -150,7 +150,7 @@ func buildEnv() (*testEnv, error) {
 
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
 	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier)
-	userHandler := userhandler.New(userSvc, verifier)
+	userHandler := userhandler.New(userSvc, verifier, testsupport.AllowAllAuthAttempts{})
 
 	productRepo := productrepo.NewGORMProduct(gdb)
 	productSvc := productsvc.New(productrepo.Store{Category: productrepo.NewGORMCategory(gdb), Product: productRepo, SKU: productrepo.NewGORMSKU(gdb)}, cacheClient)

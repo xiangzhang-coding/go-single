@@ -18,6 +18,9 @@ var ErrUserNotFound = errors.New("user not found")
 type UserRepository interface {
 	Create(ctx context.Context, u *model.User) error
 	GetByUsername(ctx context.Context, username string) (*model.User, error)
+	// UsernameRateLimitKey returns MySQL's equality weight for the username,
+	// exactly matching the unique index's utf8mb4_unicode_ci collation.
+	UsernameRateLimitKey(ctx context.Context, username string) (string, error)
 	GetByID(ctx context.Context, id int64) (*model.User, error)
 	// UpdateProfile 按主键更新个人资料字段（nickname/avatar_url，零值生效允许清空）。
 	UpdateProfile(ctx context.Context, u *model.User) error

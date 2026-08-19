@@ -22,6 +22,7 @@ func TestLoad(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 8080, cfg.Server.Port)
+	require.Equal(t, int64(64<<10), cfg.Server.MaxJSONBodyBytes)
 	require.Equal(t, "info", cfg.Log.Level)
 	require.Equal(t, "./logs/app.log", cfg.Log.File)
 	require.Equal(t, "127.0.0.1", cfg.MySQL.Host)
@@ -41,6 +42,12 @@ func TestLoad(t *testing.T) {
 	require.Equal(t, 5, cfg.WS.MaxConnectionsPerUser)
 	require.Equal(t, 50, cfg.WS.MaxConnectionsPerIP)
 	require.Empty(t, cfg.CORS.AllowOrigins)
+	require.Equal(t, 20, cfg.Auth.LoginRateLimit.PerIPMax)
+	require.Equal(t, 10, cfg.Auth.LoginRateLimit.PerAccountMax)
+	require.Equal(t, 5, cfg.Auth.RegisterRateLimit.PerIPMax)
+	require.Equal(t, 3, cfg.Auth.RegisterRateLimit.PerAccountMax)
+	require.Equal(t, int64(512<<20), cfg.Upload.MaxBytesPerUser)
+	require.Equal(t, int64(1000), cfg.Upload.MaxObjectsPerUser)
 }
 
 func TestMySQLDSN(t *testing.T) {
@@ -53,6 +60,9 @@ func TestLoadEnvOverride(t *testing.T) {
 	t.Setenv("GO_SINGLE_REDIS_ADDR", "10.0.0.1:6379")
 	t.Setenv("GO_SINGLE_SNOWFLAKE_WORKER_ID", "7")
 	t.Setenv("GO_SINGLE_WS_MAX_CONNECTIONS", "321")
+	t.Setenv("GO_SINGLE_SERVER_MAX_JSON_BODY_BYTES", "32768")
+	t.Setenv("GO_SINGLE_AUTH_LOGIN_RATE_LIMIT_PER_IP_MAX", "42")
+	t.Setenv("GO_SINGLE_UPLOAD_MAX_OBJECTS_PER_USER", "77")
 
 	root := repoRoot(t)
 	cfg, err := LoadFrom(filepath.Join(root, "configs"), root)
@@ -61,4 +71,7 @@ func TestLoadEnvOverride(t *testing.T) {
 	require.Equal(t, "10.0.0.1:6379", cfg.Redis.Addr)
 	require.Equal(t, int64(7), cfg.Snowflake.WorkerID)
 	require.Equal(t, 321, cfg.WS.MaxConnections)
+	require.Equal(t, int64(32768), cfg.Server.MaxJSONBodyBytes)
+	require.Equal(t, 42, cfg.Auth.LoginRateLimit.PerIPMax)
+	require.Equal(t, int64(77), cfg.Upload.MaxObjectsPerUser)
 }

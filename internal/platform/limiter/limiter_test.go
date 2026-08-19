@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,12 +19,30 @@ import (
 // ---- fake cache（镜像固定窗口原子计数语义）----
 
 type fakeCache struct {
+	lock sync.Mutex
 	mu   map[string]int
 	err  error
 	keys []string
 }
 
+type fakeAccountKeys struct {
+	keys map[string]string
+	err  error
+}
+
+func (f fakeAccountKeys) AuthenticationAccountKey(_ context.Context, username string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	if key := f.keys[username]; key != "" {
+		return key, nil
+	}
+	return username, nil
+}
+
 func (f *fakeCache) IncrementFixedWindow(_ context.Context, key string, _ time.Duration) (int64, error) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
 	if f.err != nil {
 		return 0, f.err
 	}
@@ -148,4 +167,102 @@ func TestCountScriptFirstCountIsOne(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, 1, fc.mu["rl:user:9"])
 	require.True(t, strings.HasPrefix(fc.keys[0], "rl:"))
+}
+
+func TestAuthAttemptsLimitAccountAcrossIPs(t *testing.T) {
+	fc := &fakeCache{mu: map[string]int{}}
+	limits, err := NewAuthAttempts(fc, fakeAccountKeys{}, AuthAttemptsConfig{
+		Login:    AuthAttemptConfig{PerIPMax: 100, PerAccountMax: 3, Window: time.Minute},
+		Register: AuthAttemptConfig{PerIPMax: 10, PerAccountMax: 2, Window: time.Minute},
+	})
+	require.NoError(t, err)
+
+	const attempts = 12
+	type result struct {
+		allowed bool
+		err     error
+	}
+	results := make(chan result, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ok, allowErr := limits.AllowLogin(context.Background(), "192.0.2."+strconv.Itoa(i+1), "Alice")
+			results <- result{allowed: ok, err: allowErr}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	allowed := 0
+	for result := range results {
+		require.NoError(t, result.err)
+		if result.allowed {
+			allowed++
+		}
+	}
+	require.Equal(t, 3, allowed)
+}
+
+func TestAuthAttemptsLimitIPAcrossAccounts(t *testing.T) {
+	fc := &fakeCache{mu: map[string]int{}}
+	limits, err := NewAuthAttempts(fc, fakeAccountKeys{}, AuthAttemptsConfig{
+		Login:    AuthAttemptConfig{PerIPMax: 2, PerAccountMax: 10, Window: time.Minute},
+		Register: AuthAttemptConfig{PerIPMax: 2, PerAccountMax: 10, Window: time.Minute},
+	})
+	require.NoError(t, err)
+
+	for i, want := range []bool{true, true, false} {
+		ok, allowErr := limits.AllowLogin(context.Background(), "192.0.2.1", "user"+strconv.Itoa(i))
+		require.NoError(t, allowErr)
+		require.Equal(t, want, ok)
+	}
+}
+
+func TestAuthAttemptsUseResolvedAndHiddenAccountKeys(t *testing.T) {
+	fc := &fakeCache{mu: map[string]int{}}
+	limits, err := NewAuthAttempts(fc, fakeAccountKeys{keys: map[string]string{
+		" Álîcé ": "mysql-weight", "alice": "mysql-weight",
+	}}, AuthAttemptsConfig{
+		Login:    AuthAttemptConfig{PerIPMax: 10, PerAccountMax: 1, Window: time.Minute},
+		Register: AuthAttemptConfig{PerIPMax: 10, PerAccountMax: 1, Window: time.Minute},
+	})
+	require.NoError(t, err)
+
+	ok, err := limits.AllowLogin(context.Background(), "192.0.2.1", " Álîcé ")
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = limits.AllowLogin(context.Background(), "192.0.2.2", "alice")
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	fc.lock.Lock()
+	defer fc.lock.Unlock()
+	for _, key := range fc.keys {
+		require.NotContains(t, key, "Alice")
+		require.NotContains(t, key, "alice")
+		require.NotContains(t, key, "Álîcé")
+	}
+}
+
+func TestAuthAttemptsKeepLoginAndRegisterBudgetsSeparate(t *testing.T) {
+	fc := &fakeCache{mu: map[string]int{}}
+	limits, err := NewAuthAttempts(fc, fakeAccountKeys{}, AuthAttemptsConfig{
+		Login:    AuthAttemptConfig{PerIPMax: 1, PerAccountMax: 1, Window: time.Minute},
+		Register: AuthAttemptConfig{PerIPMax: 1, PerAccountMax: 1, Window: time.Minute},
+	})
+	require.NoError(t, err)
+
+	ok, err := limits.AllowLogin(context.Background(), "192.0.2.1", "alice")
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = limits.AllowRegister(context.Background(), "192.0.2.1", "alice")
+	require.NoError(t, err)
+	require.True(t, ok)
+}
+
+func TestAuthAttemptsRejectInvalidConfig(t *testing.T) {
+	_, err := NewAuthAttempts(&fakeCache{mu: map[string]int{}}, fakeAccountKeys{}, AuthAttemptsConfig{})
+	require.ErrorIs(t, err, ErrConfig)
 }

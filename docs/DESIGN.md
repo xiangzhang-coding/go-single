@@ -94,7 +94,7 @@ go_single/
 - **主题资产**：四件套放 `web/<theme>/design/`——DESIGN.md（设计规范，供人/AI 参考）/ CSS_Variables.css / Design_Tokens.json（W3C DTCG）/ Tailwind_V4.css（`@theme`）；组件代码一律用语义化 Tailwind 类，不写死颜色
 - **工具链**：bun（`bun install` / `bun run dev` / `bun run build`）；Vite dev proxy 把 `/api`、`/ws` 转发到后端 :8080
 - **API 对接**：HTTP base 由 `VITE_API_BASE` 控制（dev 用 `/api` 代理，云端构建传后端绝对地址）；WebSocket 地址由 `VITE_WS_BASE` 控制（dev 用 `/ws` 代理）；后端 `platform/cors` 中间件允许前端域名（跨源场景）
-- **私有媒体**：统一后端代理——`POST /api/files` 将图片（png/jpeg/webp/gif，魔数校验，≤5 MiB）或普通文件（PDF/ZIP/TXT/CSV/MD，≤20 MiB）写入 MinIO 私有桶，返回 `/files/<opaque-ref>` 托管引用；引用固化上传者与 `image/file` 类型，头像/动态/消息保存前校验归属与类型。`GET /api/files/:reference` 经 Bearer 代理读取：头像对登录用户可见，动态图片跟随好友关系，聊天媒体仅会话双方可读；前端以 Axios 拉取 Blob 展示/下载，不直连 MinIO（presigned 直传明确不做）
+- **私有媒体**：统一后端代理——`POST /api/files` 将图片（png/jpeg/webp/gif，魔数校验，≤5 MiB）或普通文件（PDF/ZIP/TXT/CSV/MD，≤20 MiB）写入 MinIO 私有桶，返回 `/files/<opaque-ref>` 托管引用；Nginx 与后端均以 21 MiB 作为 multipart 请求硬上限（为 20 MiB 文件预留 1 MiB 开销），后端解析仅保留 1 MiB 内存，超限返回 413；每用户累计字节与对象数先在 MySQL 原子预留，默认 512 MiB/1000 个，防止合法重复上传无限占用存储。引用固化上传者与 `image/file` 类型，头像/动态/消息保存前校验归属与类型。`GET /api/files/:reference` 经 Bearer 代理读取：头像对登录用户可见，动态图片跟随好友关系，聊天媒体仅会话双方可读；前端以 Axios 拉取 Blob 展示/下载，不直连 MinIO（presigned 直传明确不做）
 - **页面清单**（演示前端功能范围，各主题通用）：
   - 登录/注册 → user；首页（商品列表）→ product；商品详情 → product + cart；购物车 → cart + product
   - 结算（下单）→ order + user(地址簿) + coupon；订单列表/详情 → order；秒杀页 → flashsale
@@ -194,7 +194,7 @@ go_single/
 
 ## 认证与权限
 
-- JWT 自签（HS256）+ bcrypt 密码哈希；`platform/auth` 定义 TokenVerifier 接口（轻量 seam，不属于 ADR-0003 三类；自签实现，OIDC/第三方认证服务器换实现即可，进 backlog）
+- JWT 自签（HS256）+ bcrypt 密码哈希；`platform/auth` 定义 TokenVerifier 接口（轻量 seam，不属于 ADR-0003 三类；自签实现，OIDC/第三方认证服务器换实现即可，进 backlog）。登录与注册在 bcrypt 前按可信来源 IP/与 MySQL 唯一索引排序规则一致的账号权重执行 Redis 固定窗口限流；未知账号使用固定 cost 的 dummy hash 完成同一次 bcrypt 比较，避免已知/未知账号失败形成明显时序探针
 - JWT 有效期 2h，无 refresh（refresh token 进 backlog）
 - `user.role`（`user`/`admin`）+ admin 路由中间件校验，不另起认证体系；admin 账号由 migration 种入默认管理员
 - WebSocket 握手携带 JWT 校验身份；已建立连接在 JWT 到期时以关闭码 4001 主动断开，重连必须重新鉴权
@@ -203,7 +203,7 @@ go_single/
 
 - **对象级授权（越权防护）**：所有资源查询/变更强制校验归属——订单、购物车、地址簿、聊天消息、好友操作均校验 `owner_id`，禁止跨用户访问（IDOR）
 - **HTTPS 与安全头**：Nginx 终止 SSL（本地演示可自签证书）；响应加 `X-Content-Type-Options` / `X-Frame-Options` / `Content-Security-Policy` 等安全头
-- **上传安全**：`POST /api/files` 不信任客户端 MIME，图片按魔数校验 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB；返回托管引用而非 MinIO URL。头像、动态和消息拒绝外部 URL、他人引用与媒体类型错配；MinIO 桶保持匿名不可读，授权读取统一走 `GET /api/files/:reference`
+- **请求与上传预算**：JSON 路由在解析前最多读取 64 KiB（包括伪造 Content-Type 的请求）；`POST /api/files` 不信任客户端 MIME，multipart 总体硬上限 21 MiB，图片按魔数校验 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB。上传先原子预留每用户累计字节/对象数配额，再写 MinIO，写入失败释放额度；返回托管引用而非 MinIO URL。头像、动态和消息拒绝外部 URL、他人引用与媒体类型错配；MinIO 桶保持匿名不可读，授权读取统一走 `GET /api/files/:reference`
 - **输入与注入**：validator 参数校验（设计已含）；GORM 参数化查询防 SQL 注入（设计已含）；React 默认转义防 XSS（设计已含）
 - **敏感数据**：密码 bcrypt（设计已含）；日志不记录密码与 token；应用恢复日志不转储请求，Nginx 不记录 query/协议头，Promtail 在写入 Loki 前防御性替换 JWT
 - 登出黑名单 / 密码复杂度策略 / 双因素认证进 backlog
@@ -223,7 +223,7 @@ go_single/
 
 ## 限流与幂等
 
-- 限流：全局令牌桶中间件（golang.org/x/time/rate，QPS 可配，单实例）+ 秒杀接口按用户限流（Redis 计数 INCR+TTL，跨请求状态）；backlog 的"Redis 分布式限流"指替代全局单机令牌桶的多实例方案
+- 限流：登录/注册按可信来源 IP 与账号分别使用 Redis 固定窗口预算（跨实例、fail-closed）；秒杀使用全局令牌桶中间件（golang.org/x/time/rate，QPS 可配，单实例）+ 按用户 Redis 计数（INCR+TTL，跨请求状态）。backlog 的"Redis 分布式限流"指替代秒杀全局单机令牌桶的多实例方案
 - 幂等键 TTL：秒杀幂等键 30min；普通下单 Redis 在途键 15min（持久幂等事实无 TTL，保存在 MySQL）
 
 ## 可观测性

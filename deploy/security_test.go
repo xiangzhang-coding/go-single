@@ -101,3 +101,14 @@ func TestNginxUsesDedicatedTrustedProxyAddress(t *testing.T) {
 	require.Contains(t, string(appConfig), "- 172.30.0.10")
 	require.NotContains(t, string(appConfig), "172.16.0.0/12")
 }
+
+func TestNginxBodyBudgetsMatchBackendContracts(t *testing.T) {
+	content, err := os.ReadFile("nginx/nginx.conf")
+	require.NoError(t, err)
+	config := string(content)
+
+	require.Contains(t, config, "client_max_body_size 64k;")
+	require.Contains(t, config, "location = /api/files")
+	require.Equal(t, 1, strings.Count(config, "client_max_body_size 21m;"))
+	require.Regexp(t, regexp.MustCompile(`(?s)location = /api/files\s*\{.*?client_max_body_size 21m;`), config)
+}

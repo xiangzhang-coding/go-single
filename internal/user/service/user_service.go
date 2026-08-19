@@ -32,6 +32,10 @@ var (
 // phoneRe 中国大陆手机号（学习点：字段级正则校验）。
 var phoneRe = regexp.MustCompile(`^1[3-9]\d{9}$`)
 
+// dummyPasswordHash keeps unknown-account failures on the same bcrypt cost as
+// known-account failures, without generating a hash per request.
+const dummyPasswordHash = "$2a$10$YDcE3V.LXJpDdAcovEV/D.ZLd2pWN66gelFHvaxI0IHxnCs2yEYRq"
+
 // TokenIssuer 签发登录令牌（自签 JWT 实现，见 platform/auth）。
 type TokenIssuer interface {
 	Issue(userID int64, role string) (string, error)
@@ -64,6 +68,7 @@ type ProfileParams struct {
 type Service interface {
 	Register(ctx context.Context, username, password string) (*model.User, error)
 	Login(ctx context.Context, username, password string) (*model.User, string, error)
+	AuthenticationAccountKey(ctx context.Context, username string) (string, error)
 	GetByID(ctx context.Context, id int64) (*model.User, error)
 	// UpdateProfile 更新当前用户个人资料（昵称/头像，PATCH 语义见 ProfileParams）；
 	// userID 取自令牌声明，天然只有 owner 本人可改（防 IDOR）。
@@ -132,10 +137,12 @@ func (s *userService) Login(ctx context.Context, username, password string) (*mo
 	if err != nil {
 		return nil, "", err
 	}
-	if u == nil {
-		return nil, "", ErrInvalidCredentials
+	hash := dummyPasswordHash
+	if u != nil {
+		hash = u.PasswordHash
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
+	compareErr := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	if u == nil || compareErr != nil {
 		return nil, "", ErrInvalidCredentials
 	}
 
@@ -144,6 +151,10 @@ func (s *userService) Login(ctx context.Context, username, password string) (*mo
 		return nil, "", err
 	}
 	return u, token, nil
+}
+
+func (s *userService) AuthenticationAccountKey(ctx context.Context, username string) (string, error) {
+	return s.store.Users.UsernameRateLimitKey(ctx, username)
 }
 
 func (s *userService) GetByID(ctx context.Context, id int64) (*model.User, error) {

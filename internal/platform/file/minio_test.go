@@ -8,6 +8,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -49,6 +51,50 @@ type testEnv struct {
 	client   *minio.Client
 }
 
+type memoryUsage struct {
+	mu      sync.Mutex
+	bytes   map[int64]int64
+	objects map[int64]int64
+}
+
+type contextCheckingUsage struct {
+	released      bool
+	releaseCtxErr error
+}
+
+func (*contextCheckingUsage) Reserve(context.Context, int64, int64, int64, int64) error {
+	return nil
+}
+
+func (u *contextCheckingUsage) Release(ctx context.Context, _ int64, _ int64) error {
+	u.released = true
+	u.releaseCtxErr = ctx.Err()
+	return nil
+}
+
+func newMemoryUsage() *memoryUsage {
+	return &memoryUsage{bytes: map[int64]int64{}, objects: map[int64]int64{}}
+}
+
+func (u *memoryUsage) Reserve(_ context.Context, ownerID, size, maxBytes, maxObjects int64) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.bytes[ownerID]+size > maxBytes || u.objects[ownerID]+1 > maxObjects {
+		return file.ErrQuotaExceeded
+	}
+	u.bytes[ownerID] += size
+	u.objects[ownerID]++
+	return nil
+}
+
+func (u *memoryUsage) Release(_ context.Context, ownerID, size int64) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.bytes[ownerID] -= size
+	u.objects[ownerID]--
+	return nil
+}
+
 var (
 	envOnce sync.Once
 	env     *testEnv
@@ -70,7 +116,9 @@ func buildEnv() (*testEnv, error) {
 		Bucket:    envOr("GO_SINGLE_MINIO_BUCKET", "go-shop-test"),
 		UseSSL:    false,
 	}
-	svc, err := file.NewMinIO(cfg)
+	svc, err := file.NewMinIO(cfg, newMemoryUsage(), file.QuotaConfig{
+		MaxBytesPerUser: 256 << 20, MaxObjectsPerUser: 100,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -176,6 +224,20 @@ func TestUploadValidImageReturnsURL(t *testing.T) {
 	require.Equal(t, "image/png", obj.ContentType)
 }
 
+func TestUploadAcceptsImagesFromOneToFiveMiB(t *testing.T) {
+	e := requireEnv(t)
+	for _, size := range []int{1 << 20, file.MaxImageSize} {
+		t.Run(fmt.Sprintf("%d_MiB", size>>20), func(t *testing.T) {
+			content := largePNG(size)
+			w := uploadFile(t, e, tokenFor(t, int64(100+size), 2*time.Hour), "photo.png", content)
+			require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+			var body map[string]any
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+			require.Equal(t, float64(size), body["size"])
+		})
+	}
+}
+
 func TestAuthorizedReadStreamsPrivateObject(t *testing.T) {
 	e := requireEnv(t)
 	ownerToken := tokenFor(t, 41, 2*time.Hour)
@@ -236,10 +298,99 @@ func TestUploadInvalidTypeRejected(t *testing.T) {
 
 func TestUploadTooLargeRejected(t *testing.T) {
 	e := requireEnv(t)
-	// 5MB 合法 PNG 前缀 + 填充至超过上限 → 400。
+	// 5 MiB 合法 PNG 前缀 + 填充至超过上限 → 413。
 	oversize := append(append([]byte{}, png1x1...), make([]byte, file.MaxImageSize)...)
 	w := uploadFile(t, e, token(t), "big.png", oversize)
-	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+}
+
+func TestMultipartHardLimitRejectsBeforeParsing(t *testing.T) {
+	e := requireEnv(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/files", strings.NewReader("not parsed"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=unused")
+	req.Header.Set("Authorization", "Bearer "+token(t))
+	req.ContentLength = file.MaxMultipartBodySize + 1
+	w := httptest.NewRecorder()
+	e.router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+}
+
+func TestMultipartHardLimitStopsChunkedStream(t *testing.T) {
+	e := requireEnv(t)
+	reader, writer := io.Pipe()
+	multipartWriter := multipart.NewWriter(writer)
+	contentType := multipartWriter.FormDataContentType()
+	type writeResult struct {
+		bytes int64
+		err   error
+	}
+	done := make(chan writeResult, 1)
+	go func() {
+		part, err := multipartWriter.CreateFormFile("file", "oversize.bin")
+		if err != nil {
+			_ = writer.CloseWithError(err)
+			done <- writeResult{err: err}
+			return
+		}
+		n, copyErr := io.CopyN(part, zeroReader{}, file.MaxMultipartBodySize+1)
+		if closeErr := multipartWriter.Close(); copyErr == nil {
+			copyErr = closeErr
+		}
+		_ = writer.CloseWithError(copyErr)
+		done <- writeResult{bytes: n, err: copyErr}
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/files", reader)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token(t))
+	req.ContentLength = -1
+	w := httptest.NewRecorder()
+	e.router.ServeHTTP(w, req)
+	_ = req.Body.Close()
+	result := <-done
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+	require.Less(t, result.bytes, int64(file.MaxMultipartBodySize+1), "parser must stop before buffering the whole stream")
+}
+
+func TestUploadQuotaStopsRepeatedLegalUploads(t *testing.T) {
+	e := requireEnv(t)
+	cfg := file.MinIOConfig{
+		Endpoint: e.endpoint, AccessKey: envOr("GO_SINGLE_MINIO_ACCESS_KEY", "minioadmin"),
+		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"), Bucket: e.bucket,
+	}
+	svc, err := file.NewMinIO(cfg, newMemoryUsage(), file.QuotaConfig{
+		MaxBytesPerUser: int64(len(png1x1) * 2), MaxObjectsPerUser: 1,
+	})
+	require.NoError(t, err)
+	verifier := auth.NewJWT(auth.JWTConfig{Secret: "integration-test-secret", TTL: 2 * time.Hour})
+	r := gin.New()
+	api := r.Group("/api")
+	file.NewHandler(svc, verifier, nil).RegisterRoutes(api)
+	limited := &testEnv{router: r}
+
+	ownerToken := tokenFor(t, 9001, 2*time.Hour)
+	require.Equal(t, http.StatusCreated, uploadFile(t, limited, ownerToken, "first.png", png1x1).Code)
+	w := uploadFile(t, limited, ownerToken, "second.png", png1x1)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Contains(t, w.Body.String(), "quota")
+}
+
+func TestUploadFailureReleasesQuotaAfterRequestCancellation(t *testing.T) {
+	e := requireEnv(t)
+	usage := &contextCheckingUsage{}
+	svc, err := file.NewMinIO(file.MinIOConfig{
+		Endpoint: e.endpoint, AccessKey: envOr("GO_SINGLE_MINIO_ACCESS_KEY", "minioadmin"),
+		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"), Bucket: e.bucket,
+	}, usage, file.QuotaConfig{MaxBytesPerUser: 1 << 20, MaxObjectsPerUser: 10})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = svc.Upload(ctx, 1, file.KindImage, bytes.NewReader(png1x1), int64(len(png1x1)), "avatar.png")
+	require.Error(t, err)
+	require.True(t, usage.released)
+	require.NoError(t, usage.releaseCtxErr)
 }
 
 // ---- 未授权 401 ----
@@ -303,7 +454,7 @@ func TestExistingPublicBucketRejected(t *testing.T) {
 		AccessKey: envOr("GO_SINGLE_MINIO_ACCESS_KEY", "minioadmin"),
 		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"),
 		Bucket:    bucket,
-	})
+	}, newMemoryUsage(), file.QuotaConfig{MaxBytesPerUser: 1 << 20, MaxObjectsPerUser: 1})
 	require.Error(t, err, "公开桶应被拒绝")
 	require.Contains(t, err.Error(), "访问策略")
 }
@@ -326,4 +477,17 @@ func mustURL(t *testing.T, w *httptest.ResponseRecorder) string {
 	url, ok := body["url"].(string)
 	require.True(t, ok)
 	return url
+}
+
+func largePNG(size int) []byte {
+	content := make([]byte, size)
+	copy(content, png1x1)
+	return content
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }

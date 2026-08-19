@@ -130,7 +130,7 @@ func buildEnv() (*testEnv, error) {
 		SKU:      productrepo.NewGORMSKU(gdb),
 	}
 	productHandler := producthandler.New(productsvc.New(store, cacheClient), verifier)
-	userHandler := userhandler.New(usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier), verifier)
+	userHandler := userhandler.New(usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier), verifier, testsupport.AllowAllAuthAttempts{})
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

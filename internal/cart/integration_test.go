@@ -136,7 +136,7 @@ func buildEnv() (*testEnv, error) {
 	}
 	productSvc := productsvc.New(productStore, cacheClient)
 
-	userHandler := userhandler.New(usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier), verifier)
+	userHandler := userhandler.New(usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier), verifier, testsupport.AllowAllAuthAttempts{})
 	cartHandler := carthandler.New(cartsvc.New(cartrepo.Store{Items: cartrepo.NewGORMCartItem(gdb)}, productSvc), verifier)
 	productHandler := producthandler.New(productSvc, verifier)
 

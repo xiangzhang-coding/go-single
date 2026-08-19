@@ -22,6 +22,10 @@ const (
 	MaxImageSize = 5 << 20
 	// MaxMessageFileSize 文件消息上传大小上限：20 MiB。
 	MaxMessageFileSize = 20 << 20
+	// MaxMultipartBodySize 为 20 MiB 文件预留 1 MiB multipart 元数据开销。
+	MaxMultipartBodySize = MaxMessageFileSize + (1 << 20)
+	// MultipartMemorySize 限制 multipart 解析驻留内存，其余合法内容落临时文件。
+	MultipartMemorySize = 1 << 20
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。

@@ -26,6 +26,9 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
+	"github.com/xiangzhang-coding/go-single/internal/platform/requestbody"
 	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
@@ -42,6 +45,7 @@ const (
 type testEnv struct {
 	router   http.Handler
 	verifier auth.TokenVerifier
+	userSvc  usersvc.Service
 	gdb      *gorm.DB
 }
 
@@ -103,15 +107,20 @@ func buildEnv() (*testEnv, error) {
 
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
 	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier)
-	handler := userhandler.New(userSvc, verifier)
+	handler := userhandler.New(userSvc, verifier, testsupport.AllowAllAuthAttempts{})
 	addressHandler := userhandler.NewAddress(userSvc, verifier)
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	api := r.Group("/api")
+	jsonLimit, err := requestbody.LimitJSON(64 << 10)
+	if err != nil {
+		return nil, err
+	}
+	api.Use(jsonLimit)
 	handler.RegisterRoutes(api)
 	addressHandler.RegisterRoutes(api)
-	return &testEnv{router: r, verifier: verifier, gdb: gdb}, nil
+	return &testEnv{router: r, verifier: verifier, userSvc: userSvc, gdb: gdb}, nil
 }
 
 func testDSN(dbName string) string {
@@ -290,6 +299,120 @@ func TestRegisterValidation(t *testing.T) {
 
 	w, _ = doJSON(t, env, http.MethodPost, "/api/auth/register", `{"username":""}`, "")
 	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestConcurrentLoginHasAccountBudget(t *testing.T) {
+	env := requireEnv(t)
+	username := fmt.Sprintf("ll_%d", time.Now().UnixNano())
+	registerUser(t, env, username, "secret123")
+	router := authLimitedRouter(t, env, limiter.AuthAttemptsConfig{
+		Login:    limiter.AuthAttemptConfig{PerIPMax: 100, PerAccountMax: 3, Window: time.Minute},
+		Register: limiter.AuthAttemptConfig{PerIPMax: 100, PerAccountMax: 3, Window: time.Minute},
+	})
+
+	statuses := concurrentAuthRequests(router, "/api/auth/login", username, "wrong-pass", 10)
+	require.Equal(t, 3, statuses[http.StatusUnauthorized])
+	require.Equal(t, 7, statuses[http.StatusTooManyRequests])
+}
+
+func TestLoginAccountBudgetMatchesMySQLUsernameCollation(t *testing.T) {
+	env := requireEnv(t)
+	for _, tc := range []struct {
+		name       string
+		username   func(string) string
+		equivalent func(string) string
+	}{
+		{name: "ligature", username: func(s string) string { return "oe_" + s }, equivalent: func(s string) string { return "œ_" + s }},
+		{name: "trailing_space", username: func(s string) string { return "space_" + s }, equivalent: func(s string) string { return "space_" + s + " " }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			suffix := fmt.Sprint(time.Now().UnixNano())
+			username := tc.username(suffix)
+			registerUser(t, env, username, "secret123")
+			router := authLimitedRouter(t, env, limiter.AuthAttemptsConfig{
+				Login:    limiter.AuthAttemptConfig{PerIPMax: 100, PerAccountMax: 1, Window: time.Minute},
+				Register: limiter.AuthAttemptConfig{PerIPMax: 100, PerAccountMax: 3, Window: time.Minute},
+			})
+
+			require.Equal(t, http.StatusUnauthorized,
+				authRequestStatus(router, "/api/auth/login", username, "wrong-pass", "192.0.2.1:1234"))
+			require.Equal(t, http.StatusTooManyRequests,
+				authRequestStatus(router, "/api/auth/login", tc.equivalent(suffix), "wrong-pass", "192.0.2.2:1234"))
+		})
+	}
+}
+
+func TestConcurrentDuplicateRegistrationIsBounded(t *testing.T) {
+	env := requireEnv(t)
+	username := fmt.Sprintf("lr_%d", time.Now().UnixNano())
+	router := authLimitedRouter(t, env, limiter.AuthAttemptsConfig{
+		Login:    limiter.AuthAttemptConfig{PerIPMax: 100, PerAccountMax: 3, Window: time.Minute},
+		Register: limiter.AuthAttemptConfig{PerIPMax: 100, PerAccountMax: 3, Window: time.Minute},
+	})
+
+	statuses := concurrentAuthRequests(router, "/api/auth/register", username, "secret123", 10)
+	require.Equal(t, 1, statuses[http.StatusCreated])
+	require.Equal(t, 2, statuses[http.StatusConflict])
+	require.Equal(t, 7, statuses[http.StatusTooManyRequests])
+}
+
+func TestOversizedJSONRejectedBeforeRegistration(t *testing.T) {
+	env := requireEnv(t)
+	username := fmt.Sprintf("oversize_%d", time.Now().UnixNano())
+	body := fmt.Sprintf(`{"username":%q,"password":"secret123","padding":%q}`, username, strings.Repeat("x", 64<<10))
+	w, _ := doJSON(t, env, http.MethodPost, "/api/auth/register", body, "")
+	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+
+	code, _ := login(t, env, username, "secret123")
+	require.Equal(t, http.StatusUnauthorized, code)
+}
+
+func authLimitedRouter(t *testing.T, env *testEnv, cfg limiter.AuthAttemptsConfig) http.Handler {
+	t.Helper()
+	cacheClient, err := cache.NewRedis(envOr("GO_SINGLE_REDIS_ADDR", "127.0.0.1:6379"),
+		envOr("GO_SINGLE_REDIS_PASSWORD", ""), 13)
+	testsupport.RequireDependency(t, "Redis", err)
+	t.Cleanup(func() { _ = cacheClient.Close() })
+	authLimits, err := limiter.NewAuthAttempts(cacheClient, env.userSvc, cfg)
+	require.NoError(t, err)
+	jsonLimit, err := requestbody.LimitJSON(64 << 10)
+	require.NoError(t, err)
+
+	r := gin.New()
+	api := r.Group("/api")
+	api.Use(jsonLimit)
+	userhandler.New(env.userSvc, env.verifier, authLimits).RegisterRoutes(api)
+	return r
+}
+
+func concurrentAuthRequests(router http.Handler, path, username, password string, count int) map[int]int {
+	statuses := make(chan int, count)
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			statuses <- authRequestStatus(router, path, username, password, fmt.Sprintf("192.0.2.%d:1234", i+1))
+		}(i)
+	}
+	wg.Wait()
+	close(statuses)
+
+	counts := map[int]int{}
+	for status := range statuses {
+		counts[status]++
+	}
+	return counts
+}
+
+func authRequestStatus(router http.Handler, path, username, password, remoteAddr string) int {
+	body := fmt.Sprintf(`{"username":%q,"password":%q}`, username, password)
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = remoteAddr
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w.Code
 }
 
 // 用户名前缀搜索：命中、排除自己、鉴权与校验。

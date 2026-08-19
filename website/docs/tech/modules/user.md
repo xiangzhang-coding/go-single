@@ -25,6 +25,8 @@ sidebar_position: 2
 
 admin 种子账号 `admin/admin123` 由迁移种入（见[演示账号](../../user-guide/demo-accounts)）。
 
+公开注册与登录在 bcrypt 前同时按可信来源 IP 和 MySQL `utf8mb4_unicode_ci` 排序权重账号键执行 Redis 固定窗口限流；Redis 故障时 fail closed。未知账号不会快速返回，而是使用固定 cost=10 的 dummy hash 完成一次 bcrypt 比较，使其与已知账号密码错误路径保持相近成本。
+
 头像采用与图片消息/动态配图一致的托管引用模式：前端先 `POST /api/files` 上传到 MinIO 私有桶，取回 `/files/<opaque-ref>`，再经 `PATCH /api/users/me` 写入 `avatar_url`。user 服务通过最小媒体端口校验对象真实存在、类型为 image 且归当前用户；任意外部 URL 和他人引用均被拒。展示时前端经带 Bearer 的 `GET /api/files/:reference` 拉取 Blob，不依赖桶匿名访问。
 
 ### user_addresses（地址簿）
@@ -70,12 +72,13 @@ admin 种子账号 `admin/admin123` 由迁移种入（见[演示账号](../../us
 
 ```text
 POST /api/auth/login
-  → 按 username 查用户（不存在 → 401）
-  → bcrypt.CompareHashAndPassword（不匹配 → 401）
+  → 按来源 IP + MySQL 排序权重账号键检查固定窗口预算（超限 → 429）
+  → 按 username 查用户（不存在时选择 dummy hash）
+  → bcrypt.CompareHashAndPassword（不存在/不匹配统一 → 401）
   → JWT 签发（HS256，TTL 2h，sub=user_id，role 声明）
   → 返回 {token, user}
 ```
 
 鉴权中间件：`Authorization: Bearer <token>` → `TokenVerifier.Verify`（失败 401）→ Claims 写入上下文；admin 路由另加 `RequireAdmin`（非 admin 403）。
 
-权威源：[docs/DESIGN.md 认证与权限](https://github.com/xiangzhang-coding/go-single/blob/main/docs/DESIGN.md)、迁移 `000001_init` / `000002_users` / `000005_addresses` / `000015_user_profile`。
+权威源：[docs/DESIGN.md 认证与权限](https://github.com/xiangzhang-coding/go-single/blob/main/docs/DESIGN.md)、迁移 `000001_init` / `000002_users` / `000005_addresses` / `000015_user_profile` / `000020_user_upload_usage`。

@@ -26,6 +26,7 @@ type Config struct {
 	Retry      Retry
 	WS         WS
 	CORS       CORS
+	Upload     Upload
 }
 
 // Retry 幂等操作有限重试配置（T20）：仅幂等操作启用（普通下单/模拟支付回调/
@@ -79,9 +80,24 @@ type FlashSale struct {
 
 type Auth struct {
 	// Secret JWT HS256 签名密钥（生产环境用环境变量 GO_SINGLE_AUTH_SECRET 注入）。
-	Secret string
+	Secret string `mapstructure:"secret"`
 	// TTL 令牌有效期，如 "2h"。
-	TTL time.Duration
+	TTL time.Duration `mapstructure:"ttl"`
+	// LoginRateLimit and RegisterRateLimit protect bcrypt work by IP and account.
+	LoginRateLimit    AuthRateLimit `mapstructure:"login_rate_limit"`
+	RegisterRateLimit AuthRateLimit `mapstructure:"register_rate_limit"`
+}
+
+type AuthRateLimit struct {
+	PerIPMax      int           `mapstructure:"per_ip_max"`
+	PerAccountMax int           `mapstructure:"per_account_max"`
+	Window        time.Duration `mapstructure:"window"`
+}
+
+// Upload is the durable per-user object-storage budget.
+type Upload struct {
+	MaxBytesPerUser   int64 `mapstructure:"max_bytes_per_user"`
+	MaxObjectsPerUser int64 `mapstructure:"max_objects_per_user"`
 }
 
 // Snowflake 雪花订单号生成器配置；多实例部署时每个实例必须使用不同 worker_id。
@@ -95,6 +111,8 @@ type Server struct {
 	// RequestTimeout 单请求全链路超时（T20）：HTTP handler → service → 存储/MQ
 	// 逐层传递同一 ctx，依赖超时时快速失败（504），不挂起连接。
 	RequestTimeout time.Duration `mapstructure:"request_timeout"`
+	// MaxJSONBodyBytes bounds JSON before Gin decodes it.
+	MaxJSONBodyBytes int64 `mapstructure:"max_json_body_bytes"`
 	// TrustedProxies 可信反代 IP 白名单（gin SetTrustedProxies）：
 	// 命中才采信 X-Forwarded-For/X-Real-IP 得到真实客户端 IP（日志/指标）。
 	// 默认信任本机与 compose 中固定的 Nginx 地址（容器经 host-gateway 转发）；
@@ -198,6 +216,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.mode", "debug")
 	v.SetDefault("server.request_timeout", "5s")
+	v.SetDefault("server.max_json_body_bytes", 64<<10)
 	v.SetDefault("log.level", "info")
 	v.SetDefault("mysql.host", "127.0.0.1")
 	v.SetDefault("mysql.port", 3306)
@@ -219,6 +238,14 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("migrations.path", "./migrations")
 	v.SetDefault("auth.secret", "dev-secret-change-me")
 	v.SetDefault("auth.ttl", "2h")
+	v.SetDefault("auth.login_rate_limit.per_ip_max", 20)
+	v.SetDefault("auth.login_rate_limit.per_account_max", 10)
+	v.SetDefault("auth.login_rate_limit.window", "1m")
+	v.SetDefault("auth.register_rate_limit.per_ip_max", 5)
+	v.SetDefault("auth.register_rate_limit.per_account_max", 3)
+	v.SetDefault("auth.register_rate_limit.window", "1m")
+	v.SetDefault("upload.max_bytes_per_user", 512<<20)
+	v.SetDefault("upload.max_objects_per_user", 1000)
 	v.SetDefault("snowflake.worker_id", 1)
 	v.SetDefault("flashsale.qps", 50)
 	v.SetDefault("flashsale.burst", 100)

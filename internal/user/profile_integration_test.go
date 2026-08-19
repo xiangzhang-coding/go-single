@@ -145,7 +145,7 @@ func TestAvatarUploadThenSetProfile(t *testing.T) {
 		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"),
 		Bucket:    envOr("GO_SINGLE_MINIO_BUCKET", "go-shop-test"),
 		UseSSL:    false,
-	})
+	}, file.NewGORMUsage(env.gdb), file.QuotaConfig{MaxBytesPerUser: 1 << 30, MaxObjectsPerUser: 10000})
 	testsupport.RequireDependency(t, "MinIO", err)
 
 	// 独立路由：user + file 同挂，走同库同 JWT。
@@ -154,7 +154,7 @@ func TestAvatarUploadThenSetProfile(t *testing.T) {
 	api := r.Group("/api")
 	issuer := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
 	userSvc := usersvc.NewWithMedia(userrepo.Store{Users: userrepo.NewGORM(env.gdb), Addresses: userrepo.NewGORMAddress(env.gdb)}, issuer, fileSvc)
-	userhandler.New(userSvc, env.verifier).RegisterRoutes(api)
+	userhandler.New(userSvc, env.verifier, testsupport.AllowAllAuthAttempts{}).RegisterRoutes(api)
 	file.NewHandler(fileSvc, env.verifier, avatarAuthorizer{users: userSvc}).RegisterRoutes(api)
 
 	username := fmt.Sprintf("avatar_%d", time.Now().UnixNano())

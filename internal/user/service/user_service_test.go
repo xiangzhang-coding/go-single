@@ -47,6 +47,10 @@ func (f *fakeUsers) GetByUsername(_ context.Context, username string) (*model.Us
 	return f.byUsername[username], nil
 }
 
+func (f *fakeUsers) UsernameRateLimitKey(_ context.Context, username string) (string, error) {
+	return strings.ToLower(strings.TrimSpace(username)), nil
+}
+
 func (f *fakeUsers) GetByID(_ context.Context, id int64) (*model.User, error) {
 	return f.byID[id], nil
 }
@@ -173,6 +177,12 @@ func TestLoginUnknownUser(t *testing.T) {
 
 	_, _, err := svc.Login(context.Background(), "ghost", "secret123")
 	require.ErrorIs(t, err, ErrInvalidCredentials)
+}
+
+func TestUnknownLoginDummyHashUsesDefaultBcryptCost(t *testing.T) {
+	cost, err := bcrypt.Cost([]byte(dummyPasswordHash))
+	require.NoError(t, err)
+	require.Equal(t, bcrypt.DefaultCost, cost)
 }
 
 func TestGetByID(t *testing.T) {

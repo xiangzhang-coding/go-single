@@ -125,7 +125,7 @@ func buildEnv() (*testEnv, error) {
 
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
 	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier)
-	userHandler := userhandler.New(userSvc, verifier)
+	userHandler := userhandler.New(userSvc, verifier, testsupport.AllowAllAuthAttempts{})
 	couponHandler := couponhandler.New(
 		couponsvc.New(couponrepo.Store{Template: couponrepo.NewGORMCouponTemplate(gdb), UserCoupon: couponrepo.NewGORMUserCoupon(gdb)}, cacheClient, metrics.New().Business()),
 		verifier,
