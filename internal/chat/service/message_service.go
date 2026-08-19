@@ -24,20 +24,20 @@ import (
 
 // 业务错误：handler 据此映射 HTTP 状态码。
 var (
-	ErrInvalidInput          = errors.New("invalid input")
-	ErrSelfMessage           = errors.New("cannot message yourself")
-	ErrRecipientNotFound     = errors.New("recipient user not found")
-	ErrNotFriends            = errors.New("recipient is not your friend")
-	ErrConversationNotFound  = errors.New("conversation not found")
-	ErrConversationForbidden = errors.New("conversation does not belong to user")
-	ErrMessageNotFound       = errors.New("message not found")
+	ErrInvalidInput         = errors.New("invalid input")
+	ErrSelfMessage          = errors.New("cannot message yourself")
+	ErrRecipientNotFound    = errors.New("recipient user not found")
+	ErrNotFriends           = errors.New("recipient is not your friend")
+	ErrConversationNotFound = errors.New("conversation not found")
+	ErrMessageNotFound      = errors.New("message not found")
 )
 
 // 字段上限与分页限制（与迁移列宽一致）。
 const (
-	maxContentRunes = 2000 // content VARCHAR(2000)
-	maxURLRunes     = 500  // url VARCHAR(500)
-	maxKeyRunes     = 64   // conversation_key VARCHAR(64)
+	maxContentRunes   = 2000 // content VARCHAR(2000)
+	maxURLRunes       = 500  // url VARCHAR(500)
+	maxKeyRunes       = 64   // conversation_key VARCHAR(64)
+	maxRequestIDRunes = 64   // client_request_id VARCHAR(64)
 	// 消息列表分页：默认页大小与上限。
 	defaultListLimit = 20
 	maxListLimit     = 50
@@ -215,6 +215,9 @@ func (s *messageService) Send(ctx context.Context, senderID int64, p SendParams)
 // validateMessage 按类型校验：text 必填 content（≤2000 字符）且 url 为空；
 // image/file 必填托管引用（≤500 字符）且 content 为空；归属与类型随后经媒体端口校验。
 func validateMessage(p SendParams) error {
+	if utf8.RuneCountInString(p.ClientRequestID) > maxRequestIDRunes {
+		return fmt.Errorf("%w: client_request_id must be at most %d chars", ErrInvalidInput, maxRequestIDRunes)
+	}
 	contentLen := utf8.RuneCountInString(p.Content)
 	urlLen := utf8.RuneCountInString(p.URL)
 	switch p.Type {
@@ -380,10 +383,15 @@ func (s *messageService) MarkRead(ctx context.Context, userID int64, key string,
 	return s.store.Reads.MarkRead(ctx, userID, key, messageID)
 }
 
-// ensureAccessible 会话可达性：键格式合法（400）→ 会话存在（404）→ 属于当前用户（403）。
+// ensureAccessible 会话可达性：非键中成员在查库前统一返回 404，避免第三方
+// 通过已有会话的 403 与不存在会话的 404 差异枚举任意用户对。
 func (s *messageService) ensureAccessible(ctx context.Context, userID int64, key string) error {
-	if err := validateKey(key); err != nil {
+	a, b, err := parseConversationKey(key)
+	if err != nil {
 		return err
+	}
+	if userID != a && userID != b {
+		return ErrConversationNotFound
 	}
 	conv, err := s.store.Conversations.GetByKey(ctx, key)
 	if err != nil {
@@ -392,27 +400,27 @@ func (s *messageService) ensureAccessible(ctx context.Context, userID int64, key
 	if conv == nil {
 		return ErrConversationNotFound
 	}
-	if conv.UserA != userID && conv.UserB != userID {
-		return ErrConversationForbidden
+	if conv.UserA != a || conv.UserB != b {
+		return ErrConversationNotFound
 	}
 	return nil
 }
 
-// validateKey 会话键格式：min:max 两个正整数且 min < max（与生成规则一致）。
-func validateKey(key string) error {
+// parseConversationKey 校验并解析 min:max 两个正整数（min < max）。
+func parseConversationKey(key string) (int64, int64, error) {
 	if key == "" || utf8.RuneCountInString(key) > maxKeyRunes {
-		return fmt.Errorf("%w: invalid conversation key", ErrInvalidInput)
+		return 0, 0, fmt.Errorf("%w: invalid conversation key", ErrInvalidInput)
 	}
 	parts := strings.Split(key, ":")
 	if len(parts) != 2 {
-		return fmt.Errorf("%w: invalid conversation key", ErrInvalidInput)
+		return 0, 0, fmt.Errorf("%w: invalid conversation key", ErrInvalidInput)
 	}
 	a, errA := strconv.ParseInt(parts[0], 10, 64)
 	b, errB := strconv.ParseInt(parts[1], 10, 64)
 	if errA != nil || errB != nil || a <= 0 || b <= 0 || a >= b {
-		return fmt.Errorf("%w: invalid conversation key", ErrInvalidInput)
+		return 0, 0, fmt.Errorf("%w: invalid conversation key", ErrInvalidInput)
 	}
-	return nil
+	return a, b, nil
 }
 
 // usernames 批量取用户名：去重后逐个跨模块查询（用户不存在兜底空串）。

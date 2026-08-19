@@ -86,7 +86,7 @@ func run() error {
 	defer log.Sync()
 
 	// MySQL：连接 + 迁移。
-	db, err := openMySQL(cfg)
+	db, err := openMySQL(cfg, log)
 	if err != nil {
 		return err
 	}
@@ -175,10 +175,10 @@ func run() error {
 	return srv.Shutdown(ctx)
 }
 
-func openMySQL(cfg *config.Config) (*gorm.DB, error) {
+func openMySQL(cfg *config.Config, log *zap.Logger) (*gorm.DB, error) {
 	gdb, err := gorm.Open(mysql.Open(cfg.MySQL.DSN()), &gorm.Config{
-		// record not found 属正常分支（仓储已处理），仅记录 warn 及以上。
-		Logger: gormlogger.Default.LogMode(gormlogger.Warn),
+		// SQL 始终保留占位符，错误与慢查询不输出绑定参数或原始数据库错误。
+		Logger: logger.NewGORM(log, gormlogger.Warn, 200*time.Millisecond),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("打开 MySQL: %w", err)
@@ -339,7 +339,10 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 
 	// social 模块：好友申请/通过/拒绝与好友列表；用户名经 userSvc 跨模块进程内调用补齐。
 	// 好友圈动态：分享购买校验经 orderSvc（已支付/已发货/已完成订单含该 SKU）。
-	socialStore := socialrepo.Store{Requests: socialrepo.NewGORMRequest(db), Friendships: socialrepo.NewGORMFriendship(db), Posts: socialrepo.NewGORMPost(db)}
+	socialStore := socialrepo.Store{
+		Requests: socialrepo.NewGORMRequest(db), Friendships: socialrepo.NewGORMFriendship(db),
+		Posts: socialrepo.NewGORMPost(db), Tx: socialrepo.NewGORMTx(db),
+	}
 	socialSvc := socialsvc.New(socialStore, userSvc)
 	postSvc := socialsvc.NewPostsWithMedia(socialStore, userSvc, orderSvc, fileSvc)
 	socialHandler := socialhandler.New(socialSvc, postSvc, verifier)

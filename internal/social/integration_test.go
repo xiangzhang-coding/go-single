@@ -41,10 +41,12 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
+	socialmodel "github.com/xiangzhang-coding/go-single/internal/social/model"
 	socialrepo "github.com/xiangzhang-coding/go-single/internal/social/repository"
 	socialsvc "github.com/xiangzhang-coding/go-single/internal/social/service"
 	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
+	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
 )
@@ -140,6 +142,7 @@ func buildEnv() (*testEnv, error) {
 		Requests:    socialrepo.NewGORMRequest(gdb),
 		Friendships: socialrepo.NewGORMFriendship(gdb),
 		Posts:       socialrepo.NewGORMPost(gdb),
+		Tx:          socialrepo.NewGORMTx(gdb),
 	}
 	socialSvc := socialsvc.New(socialStore, userSvc)
 	postSvc := socialsvc.NewPostsWithMedia(socialStore, userSvc, orderSvc, fileSvc)
@@ -394,6 +397,245 @@ func TestFriendRequestRejectNoFriendship(t *testing.T) {
 	require.Equal(t, http.StatusCreated, w.Code)
 	require.Equal(t, float64(reqID), body["id"], "被拒后重新申请应复用原行")
 	require.Equal(t, "pending", body["status"])
+}
+
+func TestFriendRequestDecisionConcurrent(t *testing.T) {
+	env := requireEnv(t)
+	_, aliceToken := register(t, env, "ava_fc")
+	bobID, bobToken := register(t, env, "bob_fc")
+	req := sendRequest(t, env, aliceToken, bobID)
+	reqID := int64(req["id"].(float64))
+
+	const attempts = 24
+	start := make(chan struct{})
+	statuses := make(chan int, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(accept bool) {
+			defer wg.Done()
+			<-start
+			action := "reject"
+			if accept {
+				action = "accept"
+			}
+			statuses <- requestStatus(env.router, http.MethodPost,
+				fmt.Sprintf("/api/friend-requests/%d/%s", reqID, action), bobToken)
+		}(i%2 == 0)
+	}
+	close(start)
+	wg.Wait()
+	close(statuses)
+
+	counts := map[int]int{}
+	for status := range statuses {
+		counts[status]++
+	}
+	require.Equal(t, 1, counts[http.StatusNoContent], "只有一个 pending 状态迁移可以成功")
+	require.Equal(t, attempts-1, counts[http.StatusConflict])
+
+	w, list := doJSON(t, env, http.MethodGet, "/api/friend-requests?scope=outgoing", "", aliceToken)
+	require.Equal(t, http.StatusOK, w.Code)
+	item := list["items"].([]any)[0].(map[string]any)
+	switch item["status"] {
+	case socialmodel.RequestStatusAccepted:
+		require.Len(t, friendsOf(t, env, aliceToken), 1)
+		require.Len(t, friendsOf(t, env, bobToken), 1)
+	case socialmodel.RequestStatusRejected:
+		require.Empty(t, friendsOf(t, env, aliceToken))
+		require.Empty(t, friendsOf(t, env, bobToken))
+	default:
+		t.Fatalf("意外的申请状态: %v", item["status"])
+	}
+}
+
+func TestFriendRequestOppositeDecisionConcurrent(t *testing.T) {
+	env := requireEnv(t)
+	for i := 0; i < 8; i++ {
+		aliceID, aliceToken := register(t, env, "ava_fx")
+		bobID, bobToken := register(t, env, "bob_fx")
+		ab := int64(sendRequest(t, env, aliceToken, bobID)["id"].(float64))
+		ba := int64(sendRequest(t, env, bobToken, aliceID)["id"].(float64))
+
+		start := make(chan struct{})
+		statuses := make(chan int, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			statuses <- requestStatus(env.router, http.MethodPost,
+				fmt.Sprintf("/api/friend-requests/%d/accept", ab), bobToken)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			statuses <- requestStatus(env.router, http.MethodPost,
+				fmt.Sprintf("/api/friend-requests/%d/reject", ba), aliceToken)
+		}()
+		close(start)
+		wg.Wait()
+		close(statuses)
+		for status := range statuses {
+			require.Contains(t, []int{http.StatusNoContent, http.StatusConflict}, status)
+		}
+
+		var requests []socialmodel.FriendRequest
+		require.NoError(t, env.gdb.Where("id IN ?", []int64{ab, ba}).Order("id ASC").Find(&requests).Error)
+		require.Len(t, requests, 2)
+		var friendships int64
+		require.NoError(t, env.gdb.Model(&socialmodel.Friendship{}).
+			Where("user_id IN ? AND friend_id IN ?", []int64{aliceID, bobID}, []int64{aliceID, bobID}).
+			Count(&friendships).Error)
+		if friendships > 0 {
+			require.Equal(t, int64(2), friendships)
+			for _, request := range requests {
+				require.Equal(t, socialmodel.RequestStatusAccepted, request.Status,
+					"已成好友时同一用户对不能残留 rejected 申请")
+			}
+		}
+	}
+}
+
+func TestFriendRequestSendRacesAcceptWithoutPendingResidual(t *testing.T) {
+	env := requireEnv(t)
+	aliceID, aliceToken := register(t, env, "ava_fs")
+	bobID, bobToken := register(t, env, "bob_fs")
+	ab := int64(sendRequest(t, env, aliceToken, bobID)["id"].(float64))
+
+	start := make(chan struct{})
+	acceptStatus := make(chan int, 1)
+	sendStatus := make(chan int, 1)
+	go func() {
+		<-start
+		acceptStatus <- requestStatus(env.router, http.MethodPost,
+			fmt.Sprintf("/api/friend-requests/%d/accept", ab), bobToken)
+	}()
+	go func() {
+		<-start
+		sendStatus <- requestJSONStatus(env.router, "/api/friend-requests",
+			fmt.Sprintf(`{"to_user_id":%d}`, aliceID), bobToken)
+	}()
+	close(start)
+	require.Equal(t, http.StatusNoContent, <-acceptStatus)
+	require.Contains(t, []int{http.StatusCreated, http.StatusConflict}, <-sendStatus)
+
+	var requests []socialmodel.FriendRequest
+	require.NoError(t, env.gdb.Where(
+		"(from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?)",
+		aliceID, bobID, bobID, aliceID).Find(&requests).Error)
+	require.NotEmpty(t, requests)
+	for _, request := range requests {
+		require.Equal(t, socialmodel.RequestStatusAccepted, request.Status,
+			"已成好友时不能并发插入 pending 反向申请")
+	}
+}
+
+func TestFriendRequestConcurrentFreshPairsStayAvailable(t *testing.T) {
+	env := requireEnv(t)
+	const pairs = 24
+	type request struct {
+		fromToken string
+		toUserID  int64
+	}
+	requests := make([]request, 0, pairs)
+	for i := 0; i < pairs; i++ {
+		_, fromToken := seedUserToken(t, env, fmt.Sprintf("ff%02d", i))
+		toUserID, _ := seedUserToken(t, env, fmt.Sprintf("ft%02d", i))
+		requests = append(requests, request{fromToken: fromToken, toUserID: toUserID})
+	}
+
+	start := make(chan struct{})
+	statuses := make(chan int, pairs)
+	var wg sync.WaitGroup
+	for _, item := range requests {
+		wg.Add(1)
+		go func(item request) {
+			defer wg.Done()
+			<-start
+			statuses <- requestJSONStatus(env.router, "/api/friend-requests",
+				fmt.Sprintf(`{"to_user_id":%d}`, item.toUserID), item.fromToken)
+		}(item)
+	}
+	close(start)
+	wg.Wait()
+	close(statuses)
+	for status := range statuses {
+		require.Equal(t, http.StatusCreated, status, "不同用户对的首次申请不应因锁冲突返回 500")
+	}
+}
+
+func seedUserToken(t *testing.T, env *testEnv, prefix string) (int64, string) {
+	t.Helper()
+	u := &usermodel.User{
+		Username:     fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano()),
+		PasswordHash: "unused",
+		Role:         usermodel.RoleUser,
+	}
+	require.NoError(t, env.gdb.Create(u).Error)
+	issuer, ok := env.verifier.(interface {
+		Issue(userID int64, role string) (string, error)
+	})
+	require.True(t, ok)
+	token, err := issuer.Issue(u.ID, u.Role)
+	require.NoError(t, err)
+	return u.ID, token
+}
+
+func requestStatus(router http.Handler, method, path, token string) int {
+	req := httptest.NewRequest(method, path, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w.Code
+}
+
+func requestJSONStatus(router http.Handler, path, body, token string) int {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w.Code
+}
+
+func TestFriendRequestListPagination(t *testing.T) {
+	env := requireEnv(t)
+	recipientID, recipientToken := register(t, env, "bulk_to")
+	suffix := fmt.Sprint(time.Now().UnixNano())
+
+	for i := 0; i < 55; i++ {
+		u := &usermodel.User{
+			Username:     fmt.Sprintf("bulk%s%02d", suffix, i),
+			PasswordHash: "unused",
+			Role:         usermodel.RoleUser,
+		}
+		require.NoError(t, env.gdb.Create(u).Error)
+		require.NoError(t, env.gdb.Create(&socialmodel.FriendRequest{
+			FromUserID: u.ID,
+			ToUserID:   recipientID,
+			Status:     socialmodel.RequestStatusPending,
+		}).Error)
+	}
+
+	w, page2 := doJSON(t, env, http.MethodGet,
+		"/api/friend-requests?scope=incoming&page=2&page_size=20", "", recipientToken)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, float64(55), page2["total"])
+	items := page2["items"].([]any)
+	require.Len(t, items, 20)
+	require.Equal(t, fmt.Sprintf("bulk%s%02d", suffix, 34), items[0].(map[string]any)["peer_username"])
+
+	w, page3 := doJSON(t, env, http.MethodGet,
+		"/api/friend-requests?scope=incoming&page=3&page_size=20", "", recipientToken)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, float64(55), page3["total"])
+	require.Len(t, page3["items"].([]any), 15)
+
+	w, clamped := doJSON(t, env, http.MethodGet,
+		"/api/friend-requests?scope=incoming&page_size=1000", "", recipientToken)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, clamped["items"].([]any), 50)
 }
 
 // ---- 重复申请与自加被拒 ----

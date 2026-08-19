@@ -1,13 +1,18 @@
 package logger
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 // newTestLogger 创建写往临时文件镜像的 logger，返回日志文件路径。
@@ -93,4 +98,37 @@ func TestNewWithoutFileOnlyStdout(t *testing.T) {
 	require.NoError(t, err)
 	log.Info("hello")
 	syncLog(log)
+}
+
+func TestGORMLoggerRedactsParametersFromErrorsAndSlowQueries(t *testing.T) {
+	log, file := newTestLogger(t, "debug")
+	dbLog := NewGORM(log, gormlogger.Warn, time.Millisecond)
+	filter, ok := dbLog.(gorm.ParamsFilter)
+	require.True(t, ok)
+
+	const (
+		message    = "private-message-sentinel"
+		address    = "private-address-sentinel"
+		credential = "private-credential-sentinel"
+	)
+	sqlTemplate, params := filter.ParamsFilter(context.Background(),
+		"INSERT INTO sensitive_table (message, address, credential) VALUES (?, ?, ?)",
+		message, address, credential)
+	require.Empty(t, params)
+
+	dbLog.Trace(context.Background(), time.Now(), func() (string, int64) {
+		return sqlTemplate, 0
+	}, errors.New("database rejected "+credential))
+	dbLog.Trace(context.Background(), time.Now().Add(-time.Second), func() (string, int64) {
+		return sqlTemplate, 1
+	}, nil)
+	syncLog(log)
+
+	got := readFile(t, file)
+	for _, secret := range []string{message, address, credential} {
+		require.NotContains(t, got, secret)
+	}
+	require.Contains(t, got, "数据库查询失败")
+	require.Contains(t, got, "数据库慢查询")
+	require.Contains(t, got, "VALUES (?, ?, ?)")
 }

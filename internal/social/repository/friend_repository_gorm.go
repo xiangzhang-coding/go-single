@@ -20,6 +20,20 @@ func NewGORMRequest(db *gorm.DB) *GORMRequestRepository {
 	return &GORMRequestRepository{db: db}
 }
 
+// GORMTxRunner 在 repository 内部把同一事务连接包装回仓储接口。
+type GORMTxRunner struct{ db *gorm.DB }
+
+func NewGORMTx(db *gorm.DB) *GORMTxRunner { return &GORMTxRunner{db: db} }
+
+func (r *GORMTxRunner) WithinTx(ctx context.Context, fn func(store TxStore) error) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return fn(TxStore{
+			Requests:    &GORMRequestRepository{db: tx},
+			Friendships: &GORMFriendshipRepository{db: tx},
+		})
+	})
+}
+
 func (r *GORMRequestRepository) Create(ctx context.Context, req *model.FriendRequest) error {
 	if err := r.db.WithContext(ctx).Create(req).Error; err != nil {
 		if isDuplicateKey(err) {
@@ -38,12 +52,22 @@ func (r *GORMRequestRepository) GetByPair(ctx context.Context, fromUserID, toUse
 	return r.findOne(ctx, "from_user_id = ? AND to_user_id = ?", fromUserID, toUserID)
 }
 
-func (r *GORMRequestRepository) UpdateStatus(ctx context.Context, id int64, status string) error {
-	return r.db.WithContext(ctx).Model(&model.FriendRequest{}).
-		Where("id = ?", id).Update("status", status).Error
+func (r *GORMRequestRepository) LockPair(ctx context.Context, userID, peerID int64) error {
+	if userID > peerID {
+		userID, peerID = peerID, userID
+	}
+	return r.db.WithContext(ctx).Exec(`
+		INSERT INTO friend_pair_locks (user_a, user_b) VALUES (?, ?)
+		ON DUPLICATE KEY UPDATE user_a = friend_pair_locks.user_a`, userID, peerID).Error
 }
 
-func (r *GORMRequestRepository) ListByUser(ctx context.Context, userID int64, scope, status string) ([]model.FriendRequest, error) {
+func (r *GORMRequestRepository) TransitionStatus(ctx context.Context, id int64, from, to string) (bool, error) {
+	result := r.db.WithContext(ctx).Model(&model.FriendRequest{}).
+		Where("id = ? AND status = ?", id, from).Update("status", to)
+	return result.RowsAffected == 1, result.Error
+}
+
+func (r *GORMRequestRepository) ListByUser(ctx context.Context, userID int64, scope, status string, offset, limit int) ([]model.FriendRequest, int64, error) {
 	q := r.db.WithContext(ctx)
 	switch scope {
 	case "incoming":
@@ -54,16 +78,24 @@ func (r *GORMRequestRepository) ListByUser(ctx context.Context, userID int64, sc
 	if status != "" {
 		q = q.Where("status = ?", status)
 	}
-	var list []model.FriendRequest
-	if err := q.Order("id DESC").Find(&list).Error; err != nil {
-		return nil, err
+	var total int64
+	if err := q.Model(&model.FriendRequest{}).Count(&total).Error; err != nil {
+		return nil, 0, err
 	}
-	return list, nil
+	var list []model.FriendRequest
+	if err := q.Order("id DESC").Offset(offset).Limit(limit).Find(&list).Error; err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
 }
 
 func (r *GORMRequestRepository) findOne(ctx context.Context, query string, args ...any) (*model.FriendRequest, error) {
+	return findRequest(ctx, r.db, query, args...)
+}
+
+func findRequest(ctx context.Context, db *gorm.DB, query string, args ...any) (*model.FriendRequest, error) {
 	var req model.FriendRequest
-	if err := r.db.WithContext(ctx).Where(query, args...).First(&req).Error; err != nil {
+	if err := db.WithContext(ctx).Where(query, args...).First(&req).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
@@ -73,6 +105,7 @@ func (r *GORMRequestRepository) findOne(ctx context.Context, query string, args 
 }
 
 var _ FriendRequestRepository = (*GORMRequestRepository)(nil)
+var _ TxRunner = (*GORMTxRunner)(nil)
 
 // GORMFriendshipRepository GORM 实现的好友关系仓储。
 type GORMFriendshipRepository struct {
@@ -86,6 +119,9 @@ func NewGORMFriendship(db *gorm.DB) *GORMFriendshipRepository {
 
 // CreatePair 一次写入双向两行；任一行撞唯一键（并发重复通过）即回滚返回 ErrFriendshipExists。
 func (r *GORMFriendshipRepository) CreatePair(ctx context.Context, userID, friendID int64) error {
+	if userID > friendID {
+		userID, friendID = friendID, userID
+	}
 	pair := []model.Friendship{
 		{UserID: userID, FriendID: friendID},
 		{UserID: friendID, FriendID: userID},

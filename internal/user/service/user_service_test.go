@@ -77,16 +77,26 @@ func (f *fakeUsers) HasAvatarURL(_ context.Context, reference string) (bool, err
 	return false, nil
 }
 
-func (f *fakeUsers) SearchByUsername(_ context.Context, prefix string, limit int) ([]model.User, error) {
-	users := make([]model.User, 0, limit)
+func (f *fakeUsers) SearchByUsername(_ context.Context, prefix string, limit int) ([]model.PublicUser, error) {
+	users := make([]model.PublicUser, 0, limit)
 	for _, u := range f.byID {
 		if strings.HasPrefix(u.Username, prefix) {
-			users = append(users, *u)
+			users = append(users, model.PublicUser{ID: u.ID, Username: u.Username})
 		}
 	}
 	sort.Slice(users, func(i, j int) bool { return users[i].ID < users[j].ID })
 	if len(users) > limit {
 		users = users[:limit]
+	}
+	return users, nil
+}
+
+func (f *fakeUsers) GetPublicByIDs(_ context.Context, ids []int64) ([]model.PublicUser, error) {
+	users := make([]model.PublicUser, 0, len(ids))
+	for _, id := range ids {
+		if u := f.byID[id]; u != nil {
+			users = append(users, model.PublicUser{ID: u.ID, Username: u.Username})
+		}
 	}
 	return users, nil
 }

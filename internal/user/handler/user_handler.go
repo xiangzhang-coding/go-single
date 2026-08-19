@@ -202,12 +202,12 @@ func (h *Handler) SearchUsers(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
-	items := make([]model.User, 0, len(users))
+	items := make([]model.PublicUser, 0, len(users))
 	for _, u := range users {
 		if u.ID == claims.UserID {
 			continue
 		}
-		items = append(items, *u)
+		items = append(items, u)
 	}
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }

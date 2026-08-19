@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -456,4 +457,48 @@ func TestUserSearchByPrefix(t *testing.T) {
 	// 空前缀 → 400。
 	w, _ = doJSON(t, env, http.MethodGet, "/api/users?username=", "", tokenA)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestUserSearchTreatsWildcardsLiterallyAndReturnsPublicFields(t *testing.T) {
+	env := requireEnv(t)
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	seeker := "find" + suffix
+	registerUser(t, env, seeker, "secret123")
+	_, loginBody := login(t, env, seeker, "secret123")
+	token := tokenOf(t, loginBody)
+
+	base := "lit" + suffix
+	underscoreMatch := base + "_one"
+	underscoreDecoy := base + "xone"
+	percentMatch := base + "%two"
+	percentDecoy := base + "ytwo"
+	for _, username := range []string{underscoreMatch, underscoreDecoy, percentMatch, percentDecoy} {
+		registerUser(t, env, username, "secret123")
+	}
+
+	for _, tc := range []struct {
+		prefix string
+		want   string
+		not    string
+	}{
+		{prefix: base + "_", want: underscoreMatch, not: underscoreDecoy},
+		{prefix: base + "%", want: percentMatch, not: percentDecoy},
+	} {
+		w, body := doJSON(t, env, http.MethodGet, "/api/users?username="+url.QueryEscape(tc.prefix), "", token)
+		require.Equal(t, http.StatusOK, w.Code)
+		items := body["items"].([]any)
+		require.Len(t, items, 1)
+		item := items[0].(map[string]any)
+		require.Equal(t, tc.want, item["username"])
+		require.NotEqual(t, tc.not, item["username"])
+		require.ElementsMatch(t, []string{"id", "username"}, mapKeys(item))
+	}
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	return keys
 }

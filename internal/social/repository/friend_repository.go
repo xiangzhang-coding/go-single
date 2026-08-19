@@ -17,6 +17,17 @@ var ErrRequestPairExists = errors.New("friend request pair already exists")
 // ErrFriendshipExists 该方向好友关系已存在（唯一键冲突，含并发重复通过）。
 var ErrFriendshipExists = errors.New("friendship already exists")
 
+// TxStore 是好友申请决策事务内使用的仓储集合。
+type TxStore struct {
+	Requests    FriendRequestRepository
+	Friendships FriendshipRepository
+}
+
+// TxRunner 开启好友申请决策事务，GORM 事务对象不泄漏到 service。
+type TxRunner interface {
+	WithinTx(ctx context.Context, fn func(store TxStore) error) error
+}
+
 // FriendRequestRepository 好友申请数据访问接口。
 type FriendRequestRepository interface {
 	// Create 落库一条申请；同 (from, to) 已有行时返回 ErrRequestPairExists。
@@ -24,11 +35,13 @@ type FriendRequestRepository interface {
 	GetByID(ctx context.Context, id int64) (*model.FriendRequest, error)
 	// GetByPair 按 (from, to) 取申请（每对唯一一行，判重/收敛用）。
 	GetByPair(ctx context.Context, fromUserID, toUserID int64) (*model.FriendRequest, error)
-	// UpdateStatus 状态迁移：pending→accepted/rejected；rejected→pending（重新申请）。
-	UpdateStatus(ctx context.Context, id int64, status string) error
+	// LockPair 锁定稳定排序后的用户对；必须在事务仓储上调用。
+	LockPair(ctx context.Context, userID, peerID int64) error
+	// TransitionStatus 仅当当前状态等于 from 时迁移，返回是否命中。
+	TransitionStatus(ctx context.Context, id int64, from, to string) (bool, error)
 	// ListByUser 我的申请：scope=incoming（我收到的）/outgoing（我发出的）；
 	// status 为空返回全部，否则按状态筛选；id 倒序（最新在前）。
-	ListByUser(ctx context.Context, userID int64, scope, status string) ([]model.FriendRequest, error)
+	ListByUser(ctx context.Context, userID int64, scope, status string, offset, limit int) ([]model.FriendRequest, int64, error)
 }
 
 // FriendshipRepository 好友关系数据访问接口。
@@ -46,4 +59,5 @@ type Store struct {
 	Requests    FriendRequestRepository
 	Friendships FriendshipRepository
 	Posts       PostRepository
+	Tx          TxRunner
 }

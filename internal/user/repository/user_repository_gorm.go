@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
@@ -68,16 +69,30 @@ func (r *GORMUserRepository) HasAvatarURL(ctx context.Context, reference string)
 	return count > 0, err
 }
 
-// SearchByUsername 前缀搜索：username LIKE 'prefix%'，id 升序限量返回。
-func (r *GORMUserRepository) SearchByUsername(ctx context.Context, prefix string, limit int) ([]model.User, error) {
+// SearchByUsername 按字面前缀搜索；显式转义 LIKE 通配符，避免 %/_ 改变查询模式。
+func (r *GORMUserRepository) SearchByUsername(ctx context.Context, prefix string, limit int) ([]model.PublicUser, error) {
 	if prefix == "" || limit <= 0 {
-		return []model.User{}, nil
+		return []model.PublicUser{}, nil
 	}
-	var users []model.User
-	if err := r.db.WithContext(ctx).Where("username LIKE ?", prefix+"%").Order("id ASC").Limit(limit).Find(&users).Error; err != nil {
+	escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(prefix)
+	var users []model.PublicUser
+	if err := r.db.WithContext(ctx).Model(&model.User{}).
+		Select("id", "username").
+		Where("username LIKE ? ESCAPE '!'", escaped+"%").
+		Order("id ASC").Limit(limit).Scan(&users).Error; err != nil {
 		return nil, err
 	}
 	return users, nil
+}
+
+func (r *GORMUserRepository) GetPublicByIDs(ctx context.Context, ids []int64) ([]model.PublicUser, error) {
+	if len(ids) == 0 {
+		return []model.PublicUser{}, nil
+	}
+	var users []model.PublicUser
+	err := r.db.WithContext(ctx).Model(&model.User{}).
+		Select("id", "username").Where("id IN ?", ids).Scan(&users).Error
+	return users, err
 }
 
 func (r *GORMUserRepository) findOne(ctx context.Context, query string, args ...any) (*model.User, error) {

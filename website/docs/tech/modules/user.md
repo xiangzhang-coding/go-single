@@ -50,7 +50,7 @@ admin 种子账号 `admin/admin123` 由迁移种入（见[演示账号](../../us
 | POST | /api/auth/login | 无 | 登录，返回 `{token, user}`；凭证错误 401 |
 | GET | /api/users/me | Bearer | 当前用户（含 nickname/avatar_url） |
 | PATCH | /api/users/me | Bearer | 修改个人资料 `{nickname?, avatar_url?}`（PATCH 语义：未提交字段不动、空串清空；昵称 ≤32 字符；avatar_url 非空时必须是本人上传的托管图片；归属由 token 声明保证） |
-| GET | /api/users | Bearer | 按用户名前缀搜索（`username` + `limit`，默认 10 上限 20；**排除自己**——"加好友"发现入口） |
+| GET | /api/users | Bearer | 按用户名前缀**字面**搜索（`%` / `_` 不作为通配符；`username` + `limit`，默认 10 上限 20；**排除自己**）；响应仅含 `{id, username}` |
 | GET | /api/users/:id | Bearer | 指定用户（仅本人或 admin，防 IDOR） |
 | GET | /api/addresses | Bearer | 我的地址列表（默认地址排最前） |
 | POST | /api/addresses | Bearer | 新增地址（**首条自动设为默认**；`is_default=true` 显式设默认） |
@@ -62,7 +62,8 @@ admin 种子账号 `admin/admin123` 由迁移种入（见[演示账号](../../us
 
 | 端口 | 实现方消费 | 说明 |
 | --- | --- | --- |
-| `GetByID` | social（补用户名）、chat（接收方校验） | 用户查询 |
+| `GetByID` | social（目标存在校验）、chat（接收方校验） | 单用户查询 |
+| `GetPublicByIDs` | social（补列表用户名） | 单次批量读取 `{id, username}`，避免逐条查询 |
 | `GetAddress` | order | 下单固化地址快照（owner 校验） |
 | `GetDefaultAddress` | flashsale 落单消费者 | 秒杀订单地址快照（无默认地址 → 永久失败进死信） |
 

@@ -21,7 +21,7 @@ import type {
   FlashSalePurchase,
   FlashSalePurchaseResponse,
   FriendRequest,
-  FriendRequestView,
+  FriendRequestListResponse,
   FriendView,
   LoginResponse,
   Message,
@@ -221,11 +221,16 @@ export async function sendFriendRequest(toUserId: number) {
   return data;
 }
 
-export async function getFriendRequests(params: { scope: "incoming" | "outgoing"; status?: string }) {
-  const { data } = await api.get<{ items: FriendRequestView[] }>("/friend-requests", {
-    params: { scope: params.scope, status: params.status || undefined },
+export async function getFriendRequests(params: { scope: "incoming" | "outgoing"; status?: string; page: number; pageSize?: number }) {
+  const { data } = await api.get<FriendRequestListResponse>("/friend-requests", {
+    params: {
+      scope: params.scope,
+      status: params.status || undefined,
+      page: params.page,
+      page_size: params.pageSize || 20,
+    },
   });
-  return data.items;
+  return data;
 }
 
 export async function acceptFriendRequest(requestId: number) {

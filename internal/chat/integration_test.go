@@ -133,6 +133,7 @@ func buildEnv() (*testEnv, error) {
 		Requests:    socialrepo.NewGORMRequest(gdb),
 		Friendships: socialrepo.NewGORMFriendship(gdb),
 		Posts:       socialrepo.NewGORMPost(gdb),
+		Tx:          socialrepo.NewGORMTx(gdb),
 	}
 	socialSvc := socialsvc.New(socialStore, userSvc)
 	postSvc := socialsvc.NewPostsWithMedia(socialStore, userSvc, stubOrders{}, fileSvc)
@@ -540,11 +541,16 @@ func TestChatOwnerCheck(t *testing.T) {
 
 	sendMsg(t, env, aliceToken, bobID, "text", "私聊内容", "", "")
 
-	// 第三人（非会话双方）拉取消息 / 推进已读 → 403。
+	// 第三人探测已有与不存在的会话都得到 404，不能据此枚举会话存在性。
 	w, _ := doJSON(t, env, http.MethodGet, "/api/conversations/"+key+"/messages", "", carolToken)
-	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Equal(t, http.StatusNotFound, w.Code)
 	w, _ = doJSON(t, env, http.MethodPost, "/api/conversations/"+key+"/read", `{"last_message_id":1}`, carolToken)
-	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Equal(t, http.StatusNotFound, w.Code)
+	missingKey := conversationKeyOf(aliceID, bobID+1000000)
+	w, _ = doJSON(t, env, http.MethodGet, "/api/conversations/"+missingKey+"/messages", "", carolToken)
+	require.Equal(t, http.StatusNotFound, w.Code)
+	w, _ = doJSON(t, env, http.MethodPost, "/api/conversations/"+missingKey+"/read", `{"last_message_id":1}`, carolToken)
+	require.Equal(t, http.StatusNotFound, w.Code)
 
 	// 第三人会话列表不含该会话。
 	carolConvs, _ := conversationsOf(t, env, carolToken, "")
@@ -583,6 +589,21 @@ func TestChatIdempotentReplay(t *testing.T) {
 
 	items, _ := messagesOf(t, env, bobToken, conversationKeyOf(aliceID, bobID), "")
 	require.Len(t, items, 1, "幂等重放不产生新消息")
+}
+
+func TestChatIdempotencyKeyLength(t *testing.T) {
+	env := requireEnv(t)
+	_, aliceToken := register(t, env, "ava_kl")
+	bobID, bobToken := register(t, env, "bob_kl")
+	befriend(t, env, aliceToken, bobID, bobToken)
+
+	w, _ := doJSON(t, env, http.MethodPost, "/api/messages",
+		fmt.Sprintf(`{"to_user_id":%d,"type":"text","content":"边界","client_request_id":%q}`, bobID, strings.Repeat("a", 64)), aliceToken)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	w, _ = doJSON(t, env, http.MethodPost, "/api/messages",
+		fmt.Sprintf(`{"to_user_id":%d,"type":"text","content":"超长","client_request_id":%q}`, bobID, strings.Repeat("b", 65)), aliceToken)
+	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestChatSendRejections(t *testing.T) {

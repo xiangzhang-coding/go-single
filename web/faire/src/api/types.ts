@@ -352,6 +352,11 @@ export interface FriendRequestView extends FriendRequest {
   peer_username: string;
 }
 
+export interface FriendRequestListResponse {
+  items: FriendRequestView[];
+  total: number;
+}
+
 export interface FriendView {
   user_id: number;
   username: string;
@@ -361,9 +366,6 @@ export interface FriendView {
 export interface UserSearchResult {
   id: number;
   username: string;
-  role: "user" | "admin";
-  created_at: string;
-  updated_at: string;
 }
 
 // ---- 社交：好友圈动态 ----

@@ -70,6 +70,8 @@ type Service interface {
 	Login(ctx context.Context, username, password string) (*model.User, string, error)
 	AuthenticationAccountKey(ctx context.Context, username string) (string, error)
 	GetByID(ctx context.Context, id int64) (*model.User, error)
+	// GetPublicByIDs 批量读取最小公开资料，供 social 等模块补齐列表展示。
+	GetPublicByIDs(ctx context.Context, ids []int64) (map[int64]model.PublicUser, error)
 	// UpdateProfile 更新当前用户个人资料（昵称/头像，PATCH 语义见 ProfileParams）；
 	// userID 取自令牌声明，天然只有 owner 本人可改（防 IDOR）。
 	UpdateProfile(ctx context.Context, userID int64, p ProfileParams) (*model.User, error)
@@ -77,7 +79,7 @@ type Service interface {
 	CanReadAvatar(ctx context.Context, reference string) (bool, error)
 	// Search 按用户名前缀搜索用户（社交"加好友"发现入口）：
 	// 前缀须非空且 ≤32 字符（与注册同名规则），limit 截断到 [1, maxSearchLimit]。
-	Search(ctx context.Context, username string, limit int) ([]*model.User, error)
+	Search(ctx context.Context, username string, limit int) ([]model.PublicUser, error)
 
 	// ---- 地址簿 ----
 	// CreateAddress 新增地址：首条自动设为默认；IsDefault=true 时显式设为默认。
@@ -168,6 +170,18 @@ func (s *userService) GetByID(ctx context.Context, id int64) (*model.User, error
 	return u, nil
 }
 
+func (s *userService) GetPublicByIDs(ctx context.Context, ids []int64) (map[int64]model.PublicUser, error) {
+	users, err := s.store.Users.GetPublicByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int64]model.PublicUser, len(users))
+	for i := range users {
+		byID[users[i].ID] = users[i]
+	}
+	return byID, nil
+}
+
 // UpdateProfile 更新当前用户个人资料：校验 → 读出本人 → 落库；nil 字段不动，空串清空。
 func (s *userService) UpdateProfile(ctx context.Context, userID int64, p ProfileParams) (*model.User, error) {
 	if p.Nickname == nil && p.AvatarURL == nil {
@@ -225,7 +239,7 @@ const (
 )
 
 // Search 前缀搜索：校验 → 限量查询（≤maxSearchLimit，非法 limit 用默认值）。
-func (s *userService) Search(ctx context.Context, username string, limit int) ([]*model.User, error) {
+func (s *userService) Search(ctx context.Context, username string, limit int) ([]model.PublicUser, error) {
 	if username == "" || len(username) > 32 {
 		return nil, ErrInvalidUsername
 	}
@@ -239,11 +253,7 @@ func (s *userService) Search(ctx context.Context, username string, limit int) ([
 	if err != nil {
 		return nil, err
 	}
-	items := make([]*model.User, 0, len(users))
-	for i := range users {
-		items = append(items, &users[i])
-	}
-	return items, nil
+	return users, nil
 }
 
 // ---- 地址簿 ----

@@ -201,14 +201,15 @@ function IncomingTab({
 }: {
   onNotice: (n: { kind: "success" | "error"; text: string } | null) => void;
 }) {
+  const [page, setPage] = useState(1);
   const query = useQuery({
-    queryKey: ["friend-requests", "incoming"],
-    queryFn: () => getFriendRequests({ scope: "incoming" }),
+    queryKey: ["friend-requests", "incoming", page],
+    queryFn: () => getFriendRequests({ scope: "incoming", page }),
   });
   const queryClient = useQueryClient();
 
-  const pending = (query.data ?? []).filter((r) => r.status === "pending");
-  const history = (query.data ?? []).filter((r) => r.status !== "pending");
+  const pending = (query.data?.items ?? []).filter((r) => r.status === "pending");
+  const history = (query.data?.items ?? []).filter((r) => r.status !== "pending");
 
   const decide = useMutation({
     mutationFn: async ({ id, accept }: { id: number; accept: boolean }) => {
@@ -270,21 +271,23 @@ function IncomingTab({
           </ul>
         </>
       )}
+      <RequestPager page={page} total={query.data.total} onPage={setPage} />
     </div>
   );
 }
 
 function OutgoingTab() {
+  const [page, setPage] = useState(1);
   const query = useQuery({
-    queryKey: ["friend-requests", "outgoing"],
-    queryFn: () => getFriendRequests({ scope: "outgoing" }),
+    queryKey: ["friend-requests", "outgoing", page],
+    queryFn: () => getFriendRequests({ scope: "outgoing", page }),
   });
 
   if (query.isPending) return <LoadingBlock label="正在读取申请" />;
   if (query.isError) {
     return <ErrorState message={getApiErrorMessage(query.error)} onRetry={() => query.refetch()} />;
   }
-  if (query.data.length === 0) {
+  if (query.data.items.length === 0) {
     return (
       <div className="mt-8">
         <EmptyState eyebrow="没有发出的申请" title="去添加好友吧" description="在「我的好友」页搜索用户名发起申请。" />
@@ -292,11 +295,30 @@ function OutgoingTab() {
     );
   }
   return (
-    <ul className="friend-list mt-8">
-      {query.data.map((req) => (
-        <RequestRow key={req.id} req={req} />
-      ))}
-    </ul>
+    <div className="mt-8">
+      <ul className="friend-list">
+        {query.data.items.map((req) => (
+          <RequestRow key={req.id} req={req} />
+        ))}
+      </ul>
+      <RequestPager page={page} total={query.data.total} onPage={setPage} />
+    </div>
+  );
+}
+
+function RequestPager({ page, total, onPage }: { page: number; total: number; onPage: (page: number) => void }) {
+  const pageCount = Math.max(1, Math.ceil(total / 20));
+  if (pageCount === 1) return null;
+  return (
+    <div className="mt-6 flex items-center justify-between gap-3">
+      <Button variant="secondary" disabled={page === 1} onClick={() => onPage(page - 1)}>
+        上一页
+      </Button>
+      <span className="text-sm text-smoke">第 {page} / {pageCount} 页，共 {total} 条</span>
+      <Button variant="secondary" disabled={page >= pageCount} onClick={() => onPage(page + 1)}>
+        下一页
+      </Button>
+    </div>
   );
 }
 

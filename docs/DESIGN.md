@@ -204,13 +204,13 @@ go_single/
 - **对象级授权（越权防护）**：所有资源查询/变更强制校验归属——订单、购物车、地址簿、聊天消息、好友操作均校验 `owner_id`，禁止跨用户访问（IDOR）
 - **HTTPS 与安全头**：Nginx 终止 SSL（本地演示可自签证书）；响应加 `X-Content-Type-Options` / `X-Frame-Options` / `Content-Security-Policy` 等安全头
 - **请求与上传预算**：JSON 路由在解析前最多读取 64 KiB（包括伪造 Content-Type 的请求）；`POST /api/files` 不信任客户端 MIME，multipart 总体硬上限 21 MiB，图片按魔数校验 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB。上传先原子预留每用户累计字节/对象数配额，再写 MinIO，写入失败释放额度；返回托管引用而非 MinIO URL。头像、动态和消息拒绝外部 URL、他人引用与媒体类型错配；MinIO 桶保持匿名不可读，授权读取统一走 `GET /api/files/:reference`
-- **输入与注入**：validator 参数校验（设计已含）；GORM 参数化查询防 SQL 注入（设计已含）；React 默认转义防 XSS（设计已含）
-- **敏感数据**：密码 bcrypt（设计已含）；日志不记录密码与 token；应用恢复日志不转储请求，Nginx 不记录 query/协议头，Promtail 在写入 Loki 前防御性替换 JWT
+- **输入与注入**：validator 参数校验（设计已含）；GORM 参数化查询防 SQL 注入；用户发现的 `LIKE` 前缀显式转义 `%` / `_` / 转义符，按字面匹配；React 默认转义防 XSS（设计已含）
+- **敏感数据**：密码 bcrypt（设计已含）；日志不记录密码与 token；GORM 错误与慢查询日志只记录 SQL 占位符模板、耗时和行数，不记录原始数据库错误或绑定参数（消息、地址、凭据等）；应用恢复日志不转储请求，Nginx 不记录 query/协议头，Promtail 在写入 Loki 前防御性替换 JWT
 - 登出黑名单 / 密码复杂度策略 / 双因素认证进 backlog
 
 ## 社交
 
-- **好友**：申请/通过流程（好友申请 待处理→通过/拒绝）；关系仓储接口化，"免申请互加"实现可切换（backlog）
+- **好友**：申请/通过流程（好友申请 待处理→通过/拒绝）；申请、通过、拒绝先以单条 `INSERT ... ON DUPLICATE KEY UPDATE` 对 `friend_pair_locks` 中稳定排序的精确用户对主键直接获取排他锁，既避免锁不存在申请键造成 gap-lock 死锁，也避免共享锁升级；随后在单事务内执行条件状态迁移，通过时双向好友关系同事务写入、两个方向申请均收敛为通过，避免交叉决策留下“已拒绝但已成好友”；申请列表默认 20、上限 50 分页，并以单次批量用户查询补齐对方资料；关系仓储接口化，"免申请互加"实现可切换（backlog）
 - **动态**：仅好友可见；购买成功后"分享到好友圈"按钮生成动态（引用已购 SKU + 可选文案 + 可选托管图片）；图片读取权限动态跟随好友关系，动态删除后授权立即失效
 - **时间线**：拉取式——好友列表 join 动态表按时间倒序分页
 
@@ -218,7 +218,7 @@ go_single/
 
 - 消息类型：`text` / `image` / `file`（image/file 经私有 MinIO 上传，消息仅保存发送者拥有且类型匹配的托管引用；读取/下载仅限发送方与接收方）
 - 会话标识：`conversation_key = min(uidA, uidB):max(uidA, uidB)` 有序用户对，消息表含会话键
-- **三通道**：发送走 REST（`POST /api/messages`，可幂等重试）；实时接收走 WebSocket 推送；离线消息落库，上线 REST 按会话游标分页拉取
+- **三通道**：发送走 REST（`POST /api/messages`，可幂等重试，`client_request_id` 非空时最多 64 字符）；实时接收走 WebSocket 推送；离线消息落库，上线 REST 按会话游标分页拉取。非会话成员探测任意合法会话键统一返回 404，且在查库前拒绝，避免 403/404 差异泄露会话存在性
 - 连接：WebSocket 长连接 + 心跳保活（`ws.heartbeat_interval` 默认 30s，pong_wait = 2× 间隔；写超时 `ws.write_wait` 默认 10s）；单进程总连接、单用户和单来源 IP 上限分别由 `ws.max_connections`、`ws.max_connections_per_user`、`ws.max_connections_per_ip` 配置，升级中的握手同样占用配额
 
 ## 限流与幂等

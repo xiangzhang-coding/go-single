@@ -29,12 +29,16 @@ var (
 // userSvc 天然满足，未来拆模块时换实现即可）。
 type UserService interface {
 	GetByID(ctx context.Context, id int64) (*usermodel.User, error)
+	GetPublicByIDs(ctx context.Context, ids []int64) (map[int64]usermodel.PublicUser, error)
 }
 
 // 申请列表范围（scope）。
 const (
 	ScopeIncoming = "incoming"
 	ScopeOutgoing = "outgoing"
+
+	defaultRequestPageSize = 20
+	maxRequestPageSize     = 50
 )
 
 // Service social 模块好友业务接口。
@@ -46,7 +50,7 @@ type Service interface {
 	// Reject 拒绝申请：仅被申请人可操作（owner 校验）。
 	Reject(ctx context.Context, userID, requestID int64) error
 	// ListRequests 我的申请：scope=incoming/outgoing；status 空 = 全部。
-	ListRequests(ctx context.Context, userID int64, scope, status string) ([]model.FriendRequestView, error)
+	ListRequests(ctx context.Context, userID int64, scope, status string, page, pageSize int) ([]model.FriendRequestView, int64, error)
 	// ListFriends 我的好友列表（双向：双方互为好友）。
 	ListFriends(ctx context.Context, userID int64) ([]model.FriendView, error)
 	// AreFriends 两人是否已是好友（chat 等跨模块校验用）。
@@ -81,109 +85,190 @@ func (s *friendService) SendRequest(ctx context.Context, fromUserID, toUserID in
 		return nil, ErrTargetUserNotFound
 	}
 
-	if req, err := s.store.Requests.GetByPair(ctx, fromUserID, toUserID); err != nil {
-		return nil, err
-	} else if req != nil {
-		return s.resolveExisting(ctx, req)
-	}
-
-	req := &model.FriendRequest{FromUserID: fromUserID, ToUserID: toUserID, Status: model.RequestStatusPending}
-	if err := s.store.Requests.Create(ctx, req); err != nil {
-		// 并发同对提交：唯一键冲突，按已有行状态再分流一次（与 resolveExisting 同一判定）。
-		if errors.Is(err, repository.ErrRequestPairExists) {
-			existing, getErr := s.store.Requests.GetByPair(ctx, fromUserID, toUserID)
-			if getErr != nil {
-				return nil, getErr
-			}
-			return s.resolveExisting(ctx, existing)
+	var result *model.FriendRequest
+	err = s.store.Tx.WithinTx(ctx, func(tx repository.TxStore) error {
+		forward, reverse, lockErr := lockUserPair(ctx, tx.Requests, fromUserID, toUserID)
+		if lockErr != nil {
+			return lockErr
 		}
+		friends, existsErr := tx.Friendships.Exists(ctx, fromUserID, toUserID)
+		if existsErr != nil {
+			return existsErr
+		}
+		if friends {
+			return ErrAlreadyFriends
+		}
+		existing := forward
+		if forward == nil || forward.FromUserID != fromUserID {
+			existing = reverse
+		}
+		if existing != nil && existing.FromUserID == fromUserID {
+			var resolveErr error
+			result, resolveErr = resolveExisting(ctx, tx.Requests, existing)
+			return resolveErr
+		}
+
+		result = &model.FriendRequest{
+			FromUserID: fromUserID,
+			ToUserID:   toUserID,
+			Status:     model.RequestStatusPending,
+		}
+		if createErr := tx.Requests.Create(ctx, result); errors.Is(createErr, repository.ErrRequestPairExists) {
+			return ErrDuplicateRequest
+		} else {
+			return createErr
+		}
+	})
+	if err != nil {
 		return nil, err
 	}
-	return req, nil
+	return result, nil
 }
 
 // resolveExisting 已有申请行按状态分流：
 // pending 重复申请被拒 / accepted 已是好友被拒 / rejected 复用原行重新申请（已是好友则不许重提）。
-func (s *friendService) resolveExisting(ctx context.Context, req *model.FriendRequest) (*model.FriendRequest, error) {
+func resolveExisting(ctx context.Context, requests repository.FriendRequestRepository, req *model.FriendRequest) (*model.FriendRequest, error) {
 	switch req.Status {
 	case model.RequestStatusPending:
 		return nil, ErrDuplicateRequest
 	case model.RequestStatusAccepted:
 		return nil, ErrAlreadyFriends
-	default: // rejected
-		friends, err := s.store.Friendships.Exists(ctx, req.FromUserID, req.ToUserID)
+	case model.RequestStatusRejected:
+		changed, err := requests.TransitionStatus(ctx, req.ID,
+			model.RequestStatusRejected, model.RequestStatusPending)
 		if err != nil {
 			return nil, err
 		}
-		if friends {
-			return nil, ErrAlreadyFriends
-		}
-		if err := s.store.Requests.UpdateStatus(ctx, req.ID, model.RequestStatusPending); err != nil {
-			return nil, err
+		if !changed {
+			current, getErr := requests.GetByID(ctx, req.ID)
+			if getErr != nil {
+				return nil, getErr
+			}
+			if current == nil {
+				return nil, ErrRequestNotFound
+			}
+			switch current.Status {
+			case model.RequestStatusPending:
+				return nil, ErrDuplicateRequest
+			case model.RequestStatusAccepted:
+				return nil, ErrAlreadyFriends
+			default:
+				return nil, ErrRequestNotPending
+			}
 		}
 		req.Status = model.RequestStatusPending
 		return req, nil
+	default:
+		return nil, ErrRequestNotPending
 	}
 }
 
-// Accept 通过申请：owner 校验 → 双向建关系 → 申请置为通过 →
-// 收敛反向待处理申请（A→B 与 B→A 并存时一并通过，维持"好友间无待处理申请"不变式）。
-// 已是好友（含建关系前检查与并发撞唯一键两处）时收敛本申请为通过，自愈历史残留。
+// Accept 通过申请：按稳定顺序锁定同一用户对的申请 → owner 校验 →
+// 双向建关系 → 两个方向的申请一并收敛为通过。
+// 已是好友（建关系撞唯一键）时仍收敛申请，自愈历史残留。
 func (s *friendService) Accept(ctx context.Context, userID, requestID int64) error {
-	req, err := s.ensurePendingOwned(ctx, userID, requestID)
+	seed, err := s.store.Requests.GetByID(ctx, requestID)
 	if err != nil {
 		return err
 	}
-	exists, err := s.store.Friendships.Exists(ctx, userID, req.FromUserID)
-	if err != nil {
-		return err
+	if seed == nil {
+		return ErrRequestNotFound
 	}
-	if exists {
-		return s.markAccepted(ctx, req.ID)
-	}
-	if err := s.store.Friendships.CreatePair(ctx, userID, req.FromUserID); err != nil {
-		if errors.Is(err, repository.ErrFriendshipExists) {
-			return s.markAccepted(ctx, req.ID)
+	return s.store.Tx.WithinTx(ctx, func(tx repository.TxStore) error {
+		req, reverse, err := lockRequestPair(ctx, tx.Requests, requestID, seed.FromUserID, seed.ToUserID)
+		if err != nil {
+			return err
 		}
-		return err
-	}
-	if err := s.markAccepted(ctx, req.ID); err != nil {
-		return err
-	}
+		if req.ToUserID != userID {
+			return ErrRequestForbidden
+		}
+		if req.Status != model.RequestStatusPending {
+			return ErrRequestNotPending
+		}
+		changed, err := tx.Requests.TransitionStatus(ctx, req.ID,
+			model.RequestStatusPending, model.RequestStatusAccepted)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return ErrRequestNotPending
+		}
+		if err := tx.Friendships.CreatePair(ctx, userID, req.FromUserID); err != nil &&
+			!errors.Is(err, repository.ErrFriendshipExists) {
+			return err
+		}
 
-	// 反向待处理申请（B→A）随建关系一并收敛。
-	reverse, err := s.store.Requests.GetByPair(ctx, req.ToUserID, req.FromUserID)
-	if err != nil {
-		return err
-	}
-	if reverse != nil && reverse.ID != req.ID && reverse.Status == model.RequestStatusPending {
-		return s.store.Requests.UpdateStatus(ctx, reverse.ID, model.RequestStatusAccepted)
-	}
-	return nil
-}
-
-// markAccepted 将申请置为通过（幂等：已通过也不报错）。
-func (s *friendService) markAccepted(ctx context.Context, requestID int64) error {
-	return s.store.Requests.UpdateStatus(ctx, requestID, model.RequestStatusAccepted)
+		// 建立好友后，同一用户对不能残留 pending/rejected 申请。
+		if reverse != nil && reverse.ID != req.ID && reverse.Status != model.RequestStatusAccepted {
+			changed, err = tx.Requests.TransitionStatus(ctx, reverse.ID,
+				reverse.Status, model.RequestStatusAccepted)
+			if err != nil {
+				return err
+			}
+			if !changed {
+				return ErrRequestNotPending
+			}
+		}
+		return nil
+	})
 }
 
 // Reject 拒绝申请：仅被申请人可操作，且申请须处于待处理。
 func (s *friendService) Reject(ctx context.Context, userID, requestID int64) error {
-	req, err := s.ensurePendingOwned(ctx, userID, requestID)
+	seed, err := s.store.Requests.GetByID(ctx, requestID)
 	if err != nil {
 		return err
 	}
-	return s.store.Requests.UpdateStatus(ctx, req.ID, model.RequestStatusRejected)
+	if seed == nil {
+		return ErrRequestNotFound
+	}
+	return s.store.Tx.WithinTx(ctx, func(tx repository.TxStore) error {
+		req, _, err := lockRequestPair(ctx, tx.Requests, requestID, seed.FromUserID, seed.ToUserID)
+		if err != nil {
+			return err
+		}
+		if req.ToUserID != userID {
+			return ErrRequestForbidden
+		}
+		if req.Status != model.RequestStatusPending {
+			return ErrRequestNotPending
+		}
+		friends, err := tx.Friendships.Exists(ctx, userID, req.FromUserID)
+		if err != nil {
+			return err
+		}
+		if friends {
+			return ErrRequestNotPending
+		}
+		changed, err := tx.Requests.TransitionStatus(ctx, req.ID,
+			model.RequestStatusPending, model.RequestStatusRejected)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return ErrRequestNotPending
+		}
+		return nil
+	})
 }
 
 // ListRequests 我的申请：先取申请行，再跨模块批量补对方用户名（去重后一次一查）。
-func (s *friendService) ListRequests(ctx context.Context, userID int64, scope, status string) ([]model.FriendRequestView, error) {
+func (s *friendService) ListRequests(ctx context.Context, userID int64, scope, status string, page, pageSize int) ([]model.FriendRequestView, int64, error) {
 	if scope != ScopeIncoming && scope != ScopeOutgoing {
-		return nil, fmt.Errorf("%w: invalid scope", ErrInvalidInput)
+		return nil, 0, fmt.Errorf("%w: invalid scope", ErrInvalidInput)
 	}
-	requests, err := s.store.Requests.ListByUser(ctx, userID, scope, status)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = defaultRequestPageSize
+	}
+	if pageSize > maxRequestPageSize {
+		pageSize = maxRequestPageSize
+	}
+	requests, total, err := s.store.Requests.ListByUser(ctx, userID, scope, status, (page-1)*pageSize, pageSize)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	peers := make([]int64, 0, len(requests))
 	for i := range requests {
@@ -195,7 +280,7 @@ func (s *friendService) ListRequests(ctx context.Context, userID int64, scope, s
 	}
 	usernames, err := usernames(ctx, s.users, peers)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	views := make([]model.FriendRequestView, 0, len(requests))
 	for i := range requests {
@@ -208,7 +293,7 @@ func (s *friendService) ListRequests(ctx context.Context, userID int64, scope, s
 			PeerUsername:  usernames[peerID],
 		})
 	}
-	return views, nil
+	return views, total, nil
 }
 
 // ListFriends 我的好友：关系行 → 跨模块批量补用户名（去重后一次一查）。
@@ -242,45 +327,54 @@ func (s *friendService) AreFriends(ctx context.Context, userID, friendID int64) 
 	return s.store.Friendships.Exists(ctx, userID, friendID)
 }
 
-// usernames 批量取用户名：去重后逐个跨模块查询（用户不存在兜底空串）。
+// usernames 批量取用户名；用户不存在兜底空串。
 // 好友服务与动态服务共用（动态时间线补作者用户名）。
 func usernames(ctx context.Context, users UserService, ids []int64) (map[int64]string, error) {
 	out := make(map[int64]string, len(ids))
 	for _, id := range ids {
-		if _, done := out[id]; done {
-			continue
-		}
-		u, err := users.GetByID(ctx, id)
-		if err != nil {
-			if errors.Is(err, usersvc.ErrUserNotFound) {
-				out[id] = ""
-				continue
-			}
-			return nil, err
-		}
-		if u == nil {
-			out[id] = ""
-			continue
-		}
-		out[id] = u.Username
+		out[id] = ""
+	}
+	profiles, err := users.GetPublicByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for id, profile := range profiles {
+		out[id] = profile.Username
 	}
 	return out, nil
 }
 
-// ensurePendingOwned 申请存在（404）、归属本人（403）、处于待处理（409）。
-func (s *friendService) ensurePendingOwned(ctx context.Context, userID, requestID int64) (*model.FriendRequest, error) {
-	req, err := s.store.Requests.GetByID(ctx, requestID)
+// lockRequestPair 按较小用户 ID 的方向先锁定同一用户对的两条申请。
+// 通过和拒绝都遵循相同锁顺序，避免反向申请并发决策形成死锁或分裂终态。
+func lockRequestPair(ctx context.Context, requests repository.FriendRequestRepository, requestID, userID, peerID int64) (*model.FriendRequest, *model.FriendRequest, error) {
+	forward, reverse, err := lockUserPair(ctx, requests, userID, peerID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if req == nil {
-		return nil, ErrRequestNotFound
+	if forward != nil && forward.ID == requestID {
+		return forward, reverse, nil
 	}
-	if req.ToUserID != userID {
-		return nil, ErrRequestForbidden
+	if reverse != nil && reverse.ID == requestID {
+		return reverse, forward, nil
 	}
-	if req.Status != model.RequestStatusPending {
-		return nil, ErrRequestNotPending
+	return nil, nil, ErrRequestNotFound
+}
+
+func lockUserPair(ctx context.Context, requests repository.FriendRequestRepository, userID, peerID int64) (*model.FriendRequest, *model.FriendRequest, error) {
+	if err := requests.LockPair(ctx, userID, peerID); err != nil {
+		return nil, nil, err
 	}
-	return req, nil
+	low, high := userID, peerID
+	if low > high {
+		low, high = high, low
+	}
+	forward, err := requests.GetByPair(ctx, low, high)
+	if err != nil {
+		return nil, nil, err
+	}
+	reverse, err := requests.GetByPair(ctx, high, low)
+	if err != nil {
+		return nil, nil, err
+	}
+	return forward, reverse, nil
 }

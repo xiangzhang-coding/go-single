@@ -28,7 +28,7 @@ sidebar_position: 10
 | type | VARCHAR(16) | `text`（用 content）/ `image` / `file`（用 url 托管引用） |
 | content | VARCHAR(2000) | text 内容（1–2000 字符） |
 | url | VARCHAR(500) | image/file 托管引用（发送者上传、类型匹配，1–500 字符） |
-| client_request_id | VARCHAR(64) NULL | 幂等键（可空；NULL 不参与唯一约束，非幂等发送多次落库多行） |
+| client_request_id | VARCHAR(64) NULL | 幂等键（可空；服务层严格限制最多 64 字符；NULL 不参与唯一约束，非幂等发送多次落库多行） |
 
 **UNIQUE (sender_id, client_request_id)**：同一发送方同一幂等键仅一条消息（重放返回原消息）。
 
@@ -45,7 +45,7 @@ sidebar_position: 10
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | /api/messages | 发送消息 `{to_user_id, type, content?, url?, client_request_id?}`；首次 201 / 幂等重放 200（同 id） |
+| POST | /api/messages | 发送消息 `{to_user_id, type, content?, url?, client_request_id?}`；幂等键最多 64 字符；首次 201 / 幂等重放 200（同 id） |
 | GET | /api/conversations | 我的会话列表（`before_id` 游标 + `limit`，默认 20 上限 50；最近消息 + 未读数 + 对方用户名） |
 | GET | /api/conversations/:key/messages | 会话消息（`after_id` 拉新 / `before_id` 拉旧，互斥；均缺省取最近 limit 条；返回正序 + has_more） |
 | POST | /api/conversations/:key/read | 推进已读游标 `{last_message_id}`（只进不退） |
@@ -81,7 +81,8 @@ ListConversations：会话行（last_message_id 倒序，limit+1 探更多）
   → 批量补对方用户名 / 最近消息预览 / 未读数（各一次查询）
 ListMessages：after_id（id > cursor，正序）| before_id（id < cursor）
   | 缺省取最近 limit 条；旧消息方向倒序 → 反转成正序返回
-MarkRead：会话可达（404/403）→ 消息存在且属于该会话 → 游标只进不退
+ListMessages / MarkRead：合法键先校验当前用户是否为键中成员；非成员与不存在会话统一 404，避免会话存在性探针
+MarkRead：会话可达 → 消息存在且属于该会话 → 游标只进不退
 ```
 
 跨模块端口：依赖 `user.GetByID`、`social.AreFriends`；`MessageNotifier` 为业务对平台基础设施端口（实现：platform/ws Hub）。

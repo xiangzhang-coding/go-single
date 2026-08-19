@@ -21,9 +21,9 @@ import (
 // ---- fake 用户服务 ----
 
 type fakeUsers struct {
-	byID    map[int64]*usermodel.User
-	order   int64
-	missing []int64 // 模拟不存在的用户 id（返回 ErrUserNotFound）
+	byID       map[int64]*usermodel.User
+	batchCalls int
+	missing    []int64 // 模拟不存在的用户 id（返回 ErrUserNotFound）
 }
 
 func newFakeUsers() *fakeUsers {
@@ -44,6 +44,17 @@ func (f *fakeUsers) GetByID(_ context.Context, id int64) (*usermodel.User, error
 		return u, nil
 	}
 	return nil, usersvc.ErrUserNotFound
+}
+
+func (f *fakeUsers) GetPublicByIDs(_ context.Context, ids []int64) (map[int64]usermodel.PublicUser, error) {
+	f.batchCalls++
+	out := make(map[int64]usermodel.PublicUser, len(ids))
+	for _, id := range ids {
+		if u := f.byID[id]; u != nil {
+			out[id] = usermodel.PublicUser{ID: id, Username: u.Username}
+		}
+	}
+	return out, nil
 }
 
 // ---- fake 好友申请仓储 ----
@@ -83,16 +94,19 @@ func (f *fakeRequests) GetByPair(_ context.Context, fromUserID, toUserID int64) 
 	return r, nil
 }
 
-func (f *fakeRequests) UpdateStatus(_ context.Context, id int64, status string) error {
+func (f *fakeRequests) LockPair(context.Context, int64, int64) error { return nil }
+
+func (f *fakeRequests) TransitionStatus(_ context.Context, id int64, from, to string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if r, ok := f.byID[id]; ok {
-		r.Status = status
+	if r, ok := f.byID[id]; ok && r.Status == from {
+		r.Status = to
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
-func (f *fakeRequests) ListByUser(_ context.Context, userID int64, scope, status string) ([]model.FriendRequest, error) {
+func (f *fakeRequests) ListByUser(_ context.Context, userID int64, scope, status string, offset, limit int) ([]model.FriendRequest, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []model.FriendRequest
@@ -113,7 +127,15 @@ func (f *fakeRequests) ListByUser(_ context.Context, userID int64, scope, status
 		out = append(out, *r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
-	return out, nil
+	total := int64(len(out))
+	if offset >= len(out) {
+		return []model.FriendRequest{}, total, nil
+	}
+	out = out[offset:]
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, total, nil
 }
 
 func (f *fakeRequests) findPair(from, to int64) (*model.FriendRequest, bool) {
@@ -146,6 +168,15 @@ func (f *fakeFriendships) CreatePair(_ context.Context, userID, friendID int64) 
 		model.Friendship{ID: int64(len(f.rows) + 2), UserID: friendID, FriendID: userID},
 	)
 	return nil
+}
+
+type fakeFriendTx struct {
+	requests    *fakeRequests
+	friendships *fakeFriendships
+}
+
+func (f fakeFriendTx) WithinTx(_ context.Context, fn func(repository.TxStore) error) error {
+	return fn(repository.TxStore{Requests: f.requests, Friendships: f.friendships})
 }
 
 func (f *fakeFriendships) Exists(_ context.Context, userID, friendID int64) (bool, error) {
@@ -183,7 +214,10 @@ func newFixture() *fixture {
 	users.add(3, "carol")
 	reqs := newFakeRequests()
 	fs := newFakeFriendships()
-	svc := New(repository.Store{Requests: reqs, Friendships: fs}, users)
+	svc := New(repository.Store{
+		Requests: reqs, Friendships: fs,
+		Tx: fakeFriendTx{requests: reqs, friendships: fs},
+	}, users)
 	return &fixture{svc: svc, users: users, reqs: reqs, fs: fs}
 }
 
@@ -314,6 +348,32 @@ func TestFriendRequestReverseConvergence(t *testing.T) {
 	require.Len(t, aFriends, 1)
 }
 
+func TestFriendRequestRejectedReverseConvergesWhenPairBecomesFriends(t *testing.T) {
+	fx := newFixture()
+	ab := fx.send(t, 1, 2)
+	ba := fx.send(t, 2, 1)
+	require.NoError(t, fx.svc.Reject(context.Background(), 1, ba))
+
+	require.NoError(t, fx.svc.Accept(context.Background(), 2, ab))
+	for _, id := range []int64{ab, ba} {
+		req, err := fx.reqs.GetByID(context.Background(), id)
+		require.NoError(t, err)
+		require.Equal(t, model.RequestStatusAccepted, req.Status)
+	}
+}
+
+func TestFriendRequestCannotCreateMissingReverseAfterAcceptance(t *testing.T) {
+	fx := newFixture()
+	ab := fx.send(t, 1, 2)
+	require.NoError(t, fx.svc.Accept(context.Background(), 2, ab))
+
+	_, err := fx.svc.SendRequest(context.Background(), 2, 1)
+	require.ErrorIs(t, err, ErrAlreadyFriends)
+	reverse, getErr := fx.reqs.GetByPair(context.Background(), 2, 1)
+	require.NoError(t, getErr)
+	require.Nil(t, reverse)
+}
+
 // 历史残留自愈：两人已是好友但申请仍为 pending（如历史建关系后未收敛），
 // 通过该申请应直接收敛为 accepted 而非报错，维持"好友间无待处理申请"不变式。
 func TestFriendRequestAcceptSelfHeal(t *testing.T) {
@@ -340,27 +400,30 @@ func TestListRequestsScopes(t *testing.T) {
 	ab := fx.send(t, 1, 2)
 	_ = fx.send(t, 1, 3)
 
-	incoming, err := fx.svc.ListRequests(context.Background(), 2, ScopeIncoming, "")
+	incoming, total, err := fx.svc.ListRequests(context.Background(), 2, ScopeIncoming, "", 1, 20)
 	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
 	require.Len(t, incoming, 1)
 	require.Equal(t, ab, incoming[0].ID)
 	require.Equal(t, "alice", incoming[0].PeerUsername)
 
-	outgoing, err := fx.svc.ListRequests(context.Background(), 1, ScopeOutgoing, "")
+	outgoing, total, err := fx.svc.ListRequests(context.Background(), 1, ScopeOutgoing, "", 1, 20)
 	require.NoError(t, err)
+	require.Equal(t, int64(2), total)
 	require.Len(t, outgoing, 2)
 	require.Equal(t, "carol", outgoing[0].PeerUsername, "最新申请在前")
 	require.Equal(t, "bob", outgoing[1].PeerUsername)
 
 	// status 筛选：pending 两条，通过后筛选 accepted 一条。
 	require.NoError(t, fx.svc.Accept(context.Background(), 2, ab))
-	accepted, err := fx.svc.ListRequests(context.Background(), 1, ScopeOutgoing, "accepted")
+	accepted, _, err := fx.svc.ListRequests(context.Background(), 1, ScopeOutgoing, "accepted", 1, 20)
 	require.NoError(t, err)
 	require.Len(t, accepted, 1)
 
 	// 非法 scope → 400 类错误。
-	_, err = fx.svc.ListRequests(context.Background(), 1, "sideways", "")
+	_, _, err = fx.svc.ListRequests(context.Background(), 1, "sideways", "", 1, 20)
 	require.ErrorIs(t, err, ErrInvalidInput)
+	require.Equal(t, 3, fx.users.batchCalls, "每次列表补齐只应调用一次批量用户查询")
 }
 
 // ---- 并发申请只成功一条 ----

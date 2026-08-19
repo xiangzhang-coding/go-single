@@ -142,7 +142,7 @@ func writeError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, service.ErrRecipientNotFound), errors.Is(err, service.ErrConversationNotFound), errors.Is(err, service.ErrMessageNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrNotFriends), errors.Is(err, service.ErrConversationForbidden):
+	case errors.Is(err, service.ErrNotFriends):
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})

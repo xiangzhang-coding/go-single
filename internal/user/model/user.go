@@ -22,5 +22,11 @@ type User struct {
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
+// PublicUser 是用户发现接口可公开的最小资料。
+type PublicUser struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
 // IsAdmin 是否为管理员。
 func (u *User) IsAdmin() bool { return u.Role == RoleAdmin }

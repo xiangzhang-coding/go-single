@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 	"github.com/xiangzhang-coding/go-single/internal/social/service"
 )
 
@@ -91,12 +92,13 @@ func (h *Handler) ListRequests(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status"})
 		return
 	}
-	items, err := h.svc.ListRequests(c.Request.Context(), claims.UserID, scope, status)
+	page := pagination.FromQuery(c)
+	items, total, err := h.svc.ListRequests(c.Request.Context(), claims.UserID, scope, status, page.Page, page.PageSize)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": total})
 }
 
 func (h *Handler) Accept(c *gin.Context) {

@@ -441,6 +441,7 @@ func TestSendValidation(t *testing.T) {
 		{"image 类型不匹配", SendParams{ToUserID: 2, Type: "image", URL: "/files/user-1-file"}, ErrInvalidInput},
 		{"image 携带内容", SendParams{ToUserID: 2, Type: "image", URL: "/files/user-1-image", Content: "x"}, ErrInvalidInput},
 		{"file url 超长", SendParams{ToUserID: 2, Type: "file", URL: "/files/" + str(maxURLRunes)}, ErrInvalidInput},
+		{"幂等键超长", SendParams{ToUserID: 2, Type: "text", Content: "x", ClientRequestID: str(65)}, ErrInvalidInput},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -521,17 +522,18 @@ func TestSendIdempotentReplay(t *testing.T) {
 	e.seed()
 	ctx := context.Background()
 
-	first, err := e.svc.Send(ctx, 1, SendParams{ToUserID: 2, Type: "text", Content: "你好", ClientRequestID: "req-1"})
+	requestID := str(64)
+	first, err := e.svc.Send(ctx, 1, SendParams{ToUserID: 2, Type: "text", Content: "你好", ClientRequestID: requestID})
 	require.NoError(t, err)
 	require.False(t, first.Idempotent)
 
-	replay, err := e.svc.Send(ctx, 1, SendParams{ToUserID: 2, Type: "text", Content: "你好", ClientRequestID: "req-1"})
+	replay, err := e.svc.Send(ctx, 1, SendParams{ToUserID: 2, Type: "text", Content: "你好", ClientRequestID: requestID})
 	require.NoError(t, err)
 	require.True(t, replay.Idempotent)
 	require.Equal(t, first.Message.ID, replay.Message.ID, "幂等重放返回原消息")
 
 	// 同一 client_request_id 但不同发送方 → 各算各的。
-	_, err = e.svc.Send(ctx, 2, SendParams{ToUserID: 1, Type: "text", Content: "hi", ClientRequestID: "req-1"})
+	_, err = e.svc.Send(ctx, 2, SendParams{ToUserID: 1, Type: "text", Content: "hi", ClientRequestID: requestID})
 	require.NoError(t, err)
 
 	// 无 client_request_id → 不幂等，可重复发。
@@ -774,10 +776,12 @@ func TestListMessagesOwnerCheck(t *testing.T) {
 	_, _, err = e.svc.ListMessages(ctx, 2, "1:2", 0, 0, 10)
 	require.NoError(t, err)
 
-	// 非会话双方 → 403 语义。
+	// 非会话双方与不存在的会话统一为 404，不能探测会话是否存在。
 	e.users.add(3, "carol")
 	_, _, err = e.svc.ListMessages(ctx, 3, "1:2", 0, 0, 10)
-	require.ErrorIs(t, err, ErrConversationForbidden)
+	require.ErrorIs(t, err, ErrConversationNotFound)
+	_, _, missingErr := e.svc.ListMessages(ctx, 3, "1:4", 0, 0, 10)
+	require.ErrorIs(t, missingErr, ErrConversationNotFound)
 
 	// 会话列表不含他人会话。
 	views, _, err := e.svc.ListConversations(ctx, 3, 0, 20)
@@ -828,9 +832,9 @@ func TestMarkReadValidationAndOwner(t *testing.T) {
 	require.ErrorIs(t, e.svc.MarkRead(ctx, 2, "1:2", 0), ErrInvalidInput)
 	require.ErrorIs(t, e.svc.MarkRead(ctx, 2, "1:2", 999), ErrMessageNotFound)
 
-	// 非会话双方 → 403 语义。
+	// 非会话双方与不存在的会话统一为 404。
 	e.users.add(3, "carol")
-	require.ErrorIs(t, e.svc.MarkRead(ctx, 3, "1:2", 1), ErrConversationForbidden)
+	require.ErrorIs(t, e.svc.MarkRead(ctx, 3, "1:2", 1), ErrConversationNotFound)
 
 	// 不存在的会话 → 404 语义。
 	require.ErrorIs(t, e.svc.MarkRead(ctx, 2, "8:9", 1), ErrConversationNotFound)
