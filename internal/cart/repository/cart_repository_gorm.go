@@ -4,18 +4,11 @@ import (
 	"context"
 	"errors"
 
-	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/cart/model"
 )
-
-// isDuplicate MySQL 1062：唯一键冲突。
-func isDuplicate(err error) bool {
-	var mysqlErr *mysql.MySQLError
-	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
-}
 
 // GORMCartItemRepository 购物车条目仓储（GORM 实现）。
 type GORMCartItemRepository struct {
@@ -27,30 +20,27 @@ func NewGORMCartItem(db *gorm.DB) *GORMCartItemRepository {
 	return &GORMCartItemRepository{db: db}
 }
 
-func (r *GORMCartItemRepository) Create(ctx context.Context, item *model.CartItem) error {
-	if err := r.db.WithContext(ctx).Create(item).Error; err != nil {
-		if isDuplicate(err) {
-			return ErrCartItemExists
-		}
-		return err
-	}
-	return nil
-}
-
-func (r *GORMCartItemRepository) GetByID(ctx context.Context, id int64) (*model.CartItem, error) {
+func (r *GORMCartItemRepository) AddQuantity(ctx context.Context, userID, skuID int64, quantity, maxQuantity int) (*model.CartItem, error) {
 	var item model.CartItem
-	if err := r.db.WithContext(ctx).First(&item, id).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`
+			INSERT INTO cart_items (user_id, sku_id, quantity)
+			VALUES (?, ?, ?)
+			ON DUPLICATE KEY UPDATE quantity = LEAST(cart_items.quantity + VALUES(quantity), ?)`,
+			userID, skuID, quantity, maxQuantity).Error; err != nil {
+			return err
 		}
+		return tx.Where("user_id = ? AND sku_id = ?", userID, skuID).First(&item).Error
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &item, nil
 }
 
-func (r *GORMCartItemRepository) GetByUserAndSKU(ctx context.Context, userID, skuID int64) (*model.CartItem, error) {
+func (r *GORMCartItemRepository) GetByID(ctx context.Context, id int64) (*model.CartItem, error) {
 	var item model.CartItem
-	if err := r.db.WithContext(ctx).Where("user_id = ? AND sku_id = ?", userID, skuID).First(&item).Error; err != nil {
+	if err := r.db.WithContext(ctx).First(&item, id).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}

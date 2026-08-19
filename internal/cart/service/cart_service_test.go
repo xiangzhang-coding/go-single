@@ -20,34 +20,30 @@ import (
 // ---- fake 购物车仓储 ----
 
 type fakeItems struct {
-	byID      map[int64]*model.CartItem
-	order     int64
-	createErr error
+	byID  map[int64]*model.CartItem
+	order int64
 }
 
 func newFakeItems() *fakeItems { return &fakeItems{byID: map[int64]*model.CartItem{}} }
 
-func (f *fakeItems) Create(_ context.Context, item *model.CartItem) error {
-	if f.createErr != nil {
-		return f.createErr
+func (f *fakeItems) AddQuantity(_ context.Context, userID, skuID int64, quantity, maxQuantity int) (*model.CartItem, error) {
+	for _, v := range f.byID {
+		if v.UserID == userID && v.SKUID == skuID {
+			v.Quantity += quantity
+			if v.Quantity > maxQuantity {
+				v.Quantity = maxQuantity
+			}
+			return v, nil
+		}
 	}
 	f.order++
-	item.ID = f.order
+	item := &model.CartItem{ID: f.order, UserID: userID, SKUID: skuID, Quantity: quantity}
 	f.byID[item.ID] = item
-	return nil
+	return item, nil
 }
 
 func (f *fakeItems) GetByID(_ context.Context, id int64) (*model.CartItem, error) {
 	return f.byID[id], nil
-}
-
-func (f *fakeItems) GetByUserAndSKU(_ context.Context, userID, skuID int64) (*model.CartItem, error) {
-	for _, v := range f.byID {
-		if v.UserID == userID && v.SKUID == skuID {
-			return v, nil
-		}
-	}
-	return nil, nil
 }
 
 func (f *fakeItems) UpdateQuantity(_ context.Context, id int64, quantity int) error {
@@ -121,11 +117,12 @@ func (f *fakeProducts) GetSKU(_ context.Context, id int64) (*productmodel.SKU, e
 	return nil, productsvc.ErrSKUNotFound
 }
 
-func (f *fakeProducts) GetDetail(_ context.Context, productID int64) (*productmodel.ProductDetail, error) {
+func (f *fakeProducts) GetProduct(_ context.Context, productID int64) (*productmodel.Product, error) {
+	status := productmodel.ProductStatusOnSale
 	if f.offSale[productID] {
-		return nil, productsvc.ErrProductNotFound
+		status = productmodel.ProductStatusOffSale
 	}
-	return &productmodel.ProductDetail{Product: productmodel.Product{ID: productID}}, nil
+	return &productmodel.Product{ID: productID, Status: status}, nil
 }
 
 // ---- 测试夹具 ----
@@ -201,21 +198,6 @@ func TestAddItemMergesExisting(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, maxQuantity, got.Quantity)
 	assert.Equal(t, 1, len(fx.items.byID), "合并不应新增条目")
-}
-
-// 并发同对加购：Create 撞唯一键冲突，服务应重查后合并（与正常合并同一逻辑）。
-func TestAddItemConcurrentDuplicateMerges(t *testing.T) {
-	fx := newFixture()
-	fx.products.seed(1, 10)
-
-	_, err := fx.svc.AddItem(context.Background(), 100, 1, 2)
-	require.NoError(t, err)
-
-	fx.items.createErr = repository.ErrCartItemExists
-	merged, err := fx.svc.AddItem(context.Background(), 100, 1, 3)
-	require.NoError(t, err)
-	assert.Equal(t, 5, merged.Quantity)
-	assert.Equal(t, 1, len(fx.items.byID), "冲突合并不应新增条目")
 }
 
 // ---- 改量 / 删除 ----

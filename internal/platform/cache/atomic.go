@@ -24,6 +24,21 @@ type DurableIdempotencyStore interface {
 	ReleaseIdempotencyDurably(ctx context.Context, key, value string, timeout time.Duration) error
 }
 
+// ProductDetailStore prevents a cache-miss request from publishing a detail
+// snapshot after a product or SKU mutation has invalidated its generation.
+type ProductDetailKeys struct {
+	Detail   string
+	Version  string
+	Mutation string
+}
+
+type ProductDetailStore interface {
+	ProductDetailVersion(ctx context.Context, keys ProductDetailKeys) (int64, error)
+	SetProductDetailIfVersion(ctx context.Context, keys ProductDetailKeys, version int64, value string, ttl time.Duration) (bool, error)
+	BeginProductDetailMutation(ctx context.Context, keys ProductDetailKeys, token string, ttl, aofTimeout time.Duration) error
+	FinishProductDetailMutation(ctx context.Context, keys ProductDetailKeys, token string, aofTimeout time.Duration) error
+}
+
 // CouponClaimResult is the complete outcome set of an atomic coupon claim.
 type CouponClaimResult uint8
 
@@ -212,6 +227,7 @@ type Client interface {
 	Cache
 	IdempotencyStore
 	DurableIdempotencyStore
+	ProductDetailStore
 	CouponStore
 	FlashSaleStore
 	FixedWindowStore
@@ -230,6 +246,55 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
     return 1
 end
 return 0
+`
+
+const productDetailVersionScript = `
+return tonumber(redis.call('GET', KEYS[1]) or '0')
+`
+
+const setProductDetailIfVersionScript = `
+local now = redis.call('TIME')
+local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now_ms)
+if redis.call('ZCARD', KEYS[3]) > 0 then
+    return 0
+end
+redis.call('DEL', KEYS[3])
+local current = tonumber(redis.call('GET', KEYS[2]) or '0')
+if current ~= tonumber(ARGV[1]) then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
+return 1
+`
+
+const beginProductDetailMutationScript = `
+local now = redis.call('TIME')
+local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now_ms)
+local expires_at = now_ms + tonumber(ARGV[2])
+redis.call('ZADD', KEYS[3], expires_at, ARGV[1])
+local latest = redis.call('ZRANGE', KEYS[3], -1, -1, 'WITHSCORES')
+redis.call('PEXPIREAT', KEYS[3], latest[2])
+redis.call('INCR', KEYS[2])
+redis.call('DEL', KEYS[1])
+return 1
+`
+
+const finishProductDetailMutationScript = `
+redis.call('INCR', KEYS[2])
+redis.call('DEL', KEYS[1])
+local now = redis.call('TIME')
+local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+redis.call('ZREM', KEYS[3], ARGV[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now_ms)
+if redis.call('ZCARD', KEYS[3]) == 0 then
+    redis.call('DEL', KEYS[3])
+else
+    local latest = redis.call('ZRANGE', KEYS[3], -1, -1, 'WITHSCORES')
+    redis.call('PEXPIREAT', KEYS[3], latest[2])
+end
+return 1
 `
 
 const claimCouponScript = `
@@ -637,6 +702,61 @@ func (r *redisCache) ReleaseIdempotencyDurably(ctx context.Context, key, value s
 	}
 	if code != 1 {
 		return fmt.Errorf("idempotency key no longer belongs to reservation")
+	}
+	return nil
+}
+
+func (r *redisCache) ProductDetailVersion(ctx context.Context, keys ProductDetailKeys) (int64, error) {
+	if keys.Detail == "" || keys.Version == "" || keys.Mutation == "" {
+		return 0, fmt.Errorf("product detail version requires key")
+	}
+	return r.evalInt(ctx, productDetailVersionScript, []string{keys.Version})
+}
+
+func (r *redisCache) SetProductDetailIfVersion(ctx context.Context, keys ProductDetailKeys, version int64, value string, ttl time.Duration) (bool, error) {
+	if keys.Detail == "" || keys.Version == "" || keys.Mutation == "" || version < 0 || ttl <= 0 {
+		return false, fmt.Errorf("product detail fill requires keys, non-negative version, and positive ttl")
+	}
+	code, err := r.evalInt(ctx, setProductDetailIfVersionScript, []string{keys.Detail, keys.Version, keys.Mutation}, version, value, ttl.Milliseconds())
+	if err != nil {
+		return false, err
+	}
+	switch code {
+	case 1:
+		return true, nil
+	case 0:
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected product detail fill result: %d", code)
+	}
+}
+
+func (r *redisCache) BeginProductDetailMutation(ctx context.Context, keys ProductDetailKeys, token string, ttl, aofTimeout time.Duration) error {
+	if keys.Detail == "" || keys.Version == "" || keys.Mutation == "" || token == "" || ttl <= 0 || aofTimeout <= 0 {
+		return fmt.Errorf("product detail mutation begin requires keys, token, positive ttl, and AOF timeout")
+	}
+	code, err := r.evalIntAndWaitAOF(ctx, aofTimeout, beginProductDetailMutationScript,
+		[]string{keys.Detail, keys.Version, keys.Mutation}, token, ttl.Milliseconds())
+	if err != nil {
+		return err
+	}
+	if code != 1 {
+		return fmt.Errorf("unexpected product detail mutation begin result: %d", code)
+	}
+	return nil
+}
+
+func (r *redisCache) FinishProductDetailMutation(ctx context.Context, keys ProductDetailKeys, token string, aofTimeout time.Duration) error {
+	if keys.Detail == "" || keys.Version == "" || keys.Mutation == "" || token == "" || aofTimeout <= 0 {
+		return fmt.Errorf("product detail mutation finish requires keys, token, and positive AOF timeout")
+	}
+	code, err := r.evalIntAndWaitAOF(ctx, aofTimeout, finishProductDetailMutationScript,
+		[]string{keys.Detail, keys.Version, keys.Mutation}, token)
+	if err != nil {
+		return err
+	}
+	if code != 1 {
+		return fmt.Errorf("unexpected product detail mutation finish result: %d", code)
 	}
 	return nil
 }

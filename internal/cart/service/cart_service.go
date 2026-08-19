@@ -34,8 +34,8 @@ const maxQuantity = 99
 type ProductService interface {
 	// GetSKU 校验 SKU 存在。
 	GetSKU(ctx context.Context, id int64) (*productmodel.SKU, error)
-	// GetDetail 详情仅上架商品可见：返回 ErrProductNotFound 即商品下架。
-	GetDetail(ctx context.Context, id int64) (*productmodel.ProductDetail, error)
+	// GetProduct 直读商品事实；加购可售性不能依赖详情缓存。
+	GetProduct(ctx context.Context, id int64) (*productmodel.Product, error)
 }
 
 // Service cart 模块的业务接口。
@@ -64,8 +64,8 @@ func New(store repository.Store, products ProductService) Service {
 	return &cartService{store: store, products: products}
 }
 
-// AddItem 加购流程：数量校验 → SKU 存在校验 → 商品上架校验（GetDetail
-// 仅上架可见，SKU 已存在则商品必存在，404 即下架）→ 已有条目合并数量 / 新建。
+// AddItem 加购流程：数量校验 → SKU 存在校验 → 直读商品状态校验上架
+// → 数据库原子创建或累加数量并封顶。
 func (s *cartService) AddItem(ctx context.Context, userID, skuID int64, quantity int) (*model.CartItem, error) {
 	if quantity < 1 || quantity > maxQuantity {
 		return nil, fmt.Errorf("%w: invalid quantity", ErrInvalidInput)
@@ -84,50 +84,18 @@ func (s *cartService) AddItem(ctx context.Context, userID, skuID int64, quantity
 	if sku == nil {
 		return nil, ErrSKUNotFound
 	}
-	if _, err := s.products.GetDetail(ctx, sku.ProductID); err != nil {
+	product, err := s.products.GetProduct(ctx, sku.ProductID)
+	if err != nil {
 		if errors.Is(err, productsvc.ErrProductNotFound) {
 			return nil, ErrSKUUnavailable
 		}
 		return nil, err
 	}
-
-	existing, err := s.store.Items.GetByUserAndSKU(ctx, userID, skuID)
-	if err != nil {
-		return nil, err
-	}
-	if existing != nil {
-		return s.mergeItem(ctx, existing, quantity)
+	if product == nil || !product.IsOnSale() {
+		return nil, ErrSKUUnavailable
 	}
 
-	item := &model.CartItem{UserID: userID, SKUID: skuID, Quantity: quantity}
-	if err := s.store.Items.Create(ctx, item); err != nil {
-		// 并发同 (user, sku) 加购：唯一键冲突，重查后按合并路径处理（与正常合并同一逻辑）。
-		if errors.Is(err, repository.ErrCartItemExists) {
-			existing, getErr := s.store.Items.GetByUserAndSKU(ctx, userID, skuID)
-			if getErr != nil {
-				return nil, getErr
-			}
-			return s.mergeItem(ctx, existing, quantity)
-		}
-		return nil, err
-	}
-	return item, nil
-}
-
-// mergeItem 已有条目合并数量（上限 maxQuantity）。
-func (s *cartService) mergeItem(ctx context.Context, existing *model.CartItem, quantity int) (*model.CartItem, error) {
-	q := existing.Quantity + quantity
-	if q > maxQuantity {
-		q = maxQuantity
-	}
-	if err := s.store.Items.UpdateQuantity(ctx, existing.ID, q); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrCartItemNotFound
-		}
-		return nil, err
-	}
-	existing.Quantity = q
-	return existing, nil
+	return s.store.Items.AddQuantity(ctx, userID, skuID, quantity, maxQuantity)
 }
 
 // UpdateQuantity 改量：数量校验 + 条目归属校验后更新。

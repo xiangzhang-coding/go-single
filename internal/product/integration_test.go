@@ -22,6 +22,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -29,6 +30,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
+	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 	"github.com/xiangzhang-coding/go-single/internal/testsupport"
@@ -49,10 +51,11 @@ const (
 
 // testEnv 每个测试包只构建一次；MySQL 或 Redis 不可达时本地跳过、CI 失败。
 type testEnv struct {
-	router   http.Handler
-	verifier auth.TokenVerifier
-	redis    *redis.Client
-	gdb      *gorm.DB
+	router      http.Handler
+	verifier    auth.TokenVerifier
+	redis       *redis.Client
+	cacheClient cache.Client
+	gdb         *gorm.DB
 }
 
 var (
@@ -129,7 +132,7 @@ func buildEnv() (*testEnv, error) {
 		Product:  productrepo.NewGORMProduct(gdb),
 		SKU:      productrepo.NewGORMSKU(gdb),
 	}
-	productHandler := producthandler.New(productsvc.New(store, cacheClient), verifier)
+	productHandler := producthandler.New(productsvc.New(store, cacheClient, zap.NewNop()), verifier)
 	userHandler := userhandler.New(usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier), verifier, testsupport.AllowAllAuthAttempts{})
 
 	gin.SetMode(gin.TestMode)
@@ -137,7 +140,7 @@ func buildEnv() (*testEnv, error) {
 	api := r.Group("/api")
 	userHandler.RegisterRoutes(api)
 	productHandler.RegisterRoutes(api)
-	return &testEnv{router: r, verifier: verifier, redis: rc, gdb: gdb}, nil
+	return &testEnv{router: r, verifier: verifier, redis: rc, cacheClient: cacheClient, gdb: gdb}, nil
 }
 
 func testDSN(dbName string) string {
@@ -237,6 +240,73 @@ func publish(t *testing.T, env *testEnv, token string, productID int64, publish_
 }
 
 func uniqueName(prefix string) string { return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano()) }
+
+func resetProductDetailCache(t *testing.T, env *testEnv, productID int64) string {
+	t.Helper()
+	detailKey := fmt.Sprintf("product:detail:%d", productID)
+	versionKey := fmt.Sprintf("product:detail-version:%d", productID)
+	mutationKey := fmt.Sprintf("product:detail-mutation:%d", productID)
+	require.NoError(t, env.redis.Del(context.Background(), detailKey, versionKey, mutationKey).Err())
+	return detailKey
+}
+
+type blockingSKUList struct {
+	productrepo.SKURepository
+	loaded  chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type cacheRaceFixture struct {
+	reader productsvc.Service
+	writer productsvc.Service
+	block  *blockingSKUList
+}
+
+func newCacheRaceFixture(env *testEnv) cacheRaceFixture {
+	baseSKU := productrepo.NewGORMSKU(env.gdb)
+	block := &blockingSKUList{
+		SKURepository: baseSKU,
+		loaded:        make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	newService := func(skus productrepo.SKURepository) productsvc.Service {
+		return productsvc.New(productrepo.Store{
+			Category: productrepo.NewGORMCategory(env.gdb),
+			Product:  productrepo.NewGORMProduct(env.gdb),
+			SKU:      skus,
+		}, env.cacheClient, zap.NewNop())
+	}
+	return cacheRaceFixture{reader: newService(block), writer: newService(baseSKU), block: block}
+}
+
+type detailResult struct {
+	detail *productmodel.ProductDetail
+	err    error
+}
+
+func startDetailRead(ctx context.Context, service productsvc.Service, productID int64) <-chan detailResult {
+	result := make(chan detailResult, 1)
+	go func() {
+		detail, err := service.GetDetail(ctx, productID)
+		result <- detailResult{detail: detail, err: err}
+	}()
+	return result
+}
+
+func (r *blockingSKUList) ListByProduct(ctx context.Context, productID int64) ([]productmodel.SKU, error) {
+	skus, err := r.SKURepository.ListByProduct(ctx, productID)
+	if err != nil {
+		return nil, err
+	}
+	r.once.Do(func() { close(r.loaded) })
+	select {
+	case <-r.release:
+		return skus, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 // ---- 测试 ----
 
@@ -496,6 +566,100 @@ func TestVisitorDetailCacheLifecycle(t *testing.T) {
 	// 不存在的商品 → 404。
 	w, _ = doJSON(t, env, http.MethodGet, "/api/products/999999", "", "")
 	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestOlderCacheMissCannotRefillAfterSKUUpdate(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	catID := createCategory(t, env, admin, uniqueName("交错缓存"))
+	productID := createProduct(t, env, admin, catID, uniqueName("并发商品"))
+	skuID := createSKU(t, env, admin, productID, 100, 10)
+	publish(t, env, admin, productID, true)
+
+	ctx := context.Background()
+	detailKey := resetProductDetailCache(t, env, productID)
+
+	race := newCacheRaceFixture(env)
+	result := startDetailRead(ctx, race.reader, productID)
+	<-race.block.loaded
+
+	require.NoError(t, race.writer.UpdateSKU(ctx, skuID, json.RawMessage(`{"color":"蓝"}`), 200, 5))
+	close(race.block.release)
+	stale := <-result
+	require.NoError(t, stale.err)
+	require.Equal(t, int64(100), stale.detail.Skus[0].Price, "在途读取可返回其已读取的快照")
+
+	_, err := env.redis.Get(ctx, detailKey).Result()
+	require.ErrorIs(t, err, redis.Nil, "较早开始的请求不得在更新后回填旧详情")
+	fresh, err := race.writer.GetDetail(ctx, productID)
+	require.NoError(t, err)
+	require.Equal(t, int64(200), fresh.Skus[0].Price)
+}
+
+func TestOlderCacheMissCannotRefillAfterUnpublish(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	catID := createCategory(t, env, admin, uniqueName("下架交错"))
+	productID := createProduct(t, env, admin, catID, uniqueName("待下架商品"))
+	createSKU(t, env, admin, productID, 100, 10)
+	publish(t, env, admin, productID, true)
+
+	ctx := context.Background()
+	detailKey := resetProductDetailCache(t, env, productID)
+
+	race := newCacheRaceFixture(env)
+	result := startDetailRead(ctx, race.reader, productID)
+	<-race.block.loaded
+
+	require.NoError(t, race.writer.UnpublishProduct(ctx, productID))
+	close(race.block.release)
+	stale := <-result
+	require.NoError(t, stale.err)
+	require.NotNil(t, stale.detail, "在途读取可返回其已读取的快照")
+
+	_, err := env.redis.Get(ctx, detailKey).Result()
+	require.ErrorIs(t, err, redis.Nil, "较早开始的请求不得在下架后回填旧详情")
+	_, err = race.writer.GetDetail(ctx, productID)
+	require.ErrorIs(t, err, productsvc.ErrProductNotFound)
+}
+
+func TestOlderCacheMissCannotRefillAfterTransactionalStockCommit(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	catID := createCategory(t, env, admin, uniqueName("库存交错"))
+	productID := createProduct(t, env, admin, catID, uniqueName("事务库存商品"))
+	skuID := createSKU(t, env, admin, productID, 100, 10)
+	publish(t, env, admin, productID, true)
+
+	ctx := context.Background()
+	detailKey := resetProductDetailCache(t, env, productID)
+
+	race := newCacheRaceFixture(env)
+
+	tx := env.gdb.WithContext(ctx).Begin()
+	require.NoError(t, tx.Error)
+	t.Cleanup(func() { _ = tx.Rollback().Error })
+	mutationToken, err := race.writer.BeginDetailMutation(ctx, productID)
+	require.NoError(t, err)
+	ok, err := race.writer.DeductStock(ctx, tx, skuID, 1)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	result := startDetailRead(ctx, race.reader, productID)
+	<-race.block.loaded
+
+	require.NoError(t, tx.Commit().Error)
+	race.writer.FinishDetailMutation(ctx, productID, mutationToken)
+	close(race.block.release)
+	stale := <-result
+	require.NoError(t, stale.err)
+	require.Equal(t, 10, stale.detail.Skus[0].Stock, "事务提交前开始的读取可返回旧快照")
+
+	_, err = env.redis.Get(ctx, detailKey).Result()
+	require.ErrorIs(t, err, redis.Nil, "事务提交后的失效必须阻止旧库存回填")
+	fresh, err := race.writer.GetDetail(ctx, productID)
+	require.NoError(t, err)
+	require.Equal(t, 9, fresh.Skus[0].Stock)
 }
 
 // 下架商品对游客不可见（列表与详情双通道）。

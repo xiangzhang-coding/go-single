@@ -35,22 +35,23 @@ import (
 
 // 业务错误：handler 据此映射 HTTP 状态码。
 var (
-	ErrInvalidInput          = errors.New("invalid input")
-	ErrOrderNotFound         = errors.New("order not found")
-	ErrOrderForbidden        = errors.New("order does not belong to user")
-	ErrOrderChanged          = errors.New("order status changed, retry")
-	ErrIllegalTransition     = errors.New("illegal order status transition")
-	ErrCartEmpty             = errors.New("cart is empty")
-	ErrInsufficientStock     = errors.New("insufficient stock")
-	ErrSKUNotFound           = errors.New("sku not found")
-	ErrSKUUnavailable        = errors.New("sku product is not on sale")
-	ErrSeckillOrderConflict  = errors.New("seckill order conflicts with an existing purchase")
-	ErrCouponNotFound        = errors.New("coupon not found")
-	ErrCouponUsed            = errors.New("coupon already used")
-	ErrCouponExpired         = errors.New("coupon not in valid period")
-	ErrCouponThresholdNotMet = errors.New("coupon threshold not met")
-	ErrAddressNotFound       = errors.New("address not found")
-	ErrAddressForbidden      = errors.New("address does not belong to user")
+	ErrInvalidInput            = errors.New("invalid input")
+	ErrOrderNotFound           = errors.New("order not found")
+	ErrOrderForbidden          = errors.New("order does not belong to user")
+	ErrOrderChanged            = errors.New("order status changed, retry")
+	ErrIllegalTransition       = errors.New("illegal order status transition")
+	ErrCartEmpty               = errors.New("cart is empty")
+	ErrInsufficientStock       = errors.New("insufficient stock")
+	ErrSKUNotFound             = errors.New("sku not found")
+	ErrSKUUnavailable          = errors.New("sku product is not on sale")
+	ErrSeckillOrderConflict    = errors.New("seckill order conflicts with an existing purchase")
+	ErrCouponNotFound          = errors.New("coupon not found")
+	ErrCouponUsed              = errors.New("coupon already used")
+	ErrCouponExpired           = errors.New("coupon not in valid period")
+	ErrCouponThresholdNotMet   = errors.New("coupon threshold not met")
+	ErrAddressNotFound         = errors.New("address not found")
+	ErrAddressForbidden        = errors.New("address does not belong to user")
+	errCartChangedWhileFencing = errors.New("cart changed while fencing product details")
 )
 
 // 超时取消：普通订单默认 15min（expire_at 写入订单，T09 定时任务扫描）；
@@ -82,6 +83,8 @@ type ProductService interface {
 	GetDetail(ctx context.Context, id int64) (*productmodel.ProductDetail, error)
 	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
 	RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error
+	BeginDetailMutation(ctx context.Context, productID int64) (string, error)
+	FinishDetailMutation(ctx context.Context, productID int64, token string)
 }
 
 // CouponService 优惠券模块最小接口：结算前校验可用券，事务内核销/回退。
@@ -94,6 +97,7 @@ type CouponService interface {
 // CartService 购物车模块最小接口：在订单事务内锁定并读取当前条目，
 // 再按条目 ID 删除已购行。
 type CartService interface {
+	ListItems(ctx context.Context, userID int64) ([]cartmodel.CartItemView, error)
 	LockItems(ctx context.Context, tx *gorm.DB, userID int64) ([]cartmodel.CartItem, error)
 	DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error
 }
@@ -334,6 +338,14 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 			return nil, translateCouponError(err)
 		}
 	}
+	plannedProductIDs, err := s.productIDsForCreate(ctx, userID, &p)
+	if err != nil {
+		return nil, err
+	}
+	mutatingProducts, err := s.beginProductDetailMutations(ctx, plannedProductIDs)
+	if err != nil {
+		return nil, err
+	}
 
 	var (
 		snapshots   []lineSnapshot
@@ -368,6 +380,9 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 				return err
 			}
 		}
+		if !mutationsCoverProducts(mutatingProducts, productIDsFromSnapshots(snapshots)) {
+			return errCartChangedWhileFencing
+		}
 
 		discount, pay, err := calculateAmounts(total, coupon)
 		if err != nil {
@@ -376,6 +391,7 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 		order, items = buildOrder(userID, orderNo, p.ClientRequestID, address, snapshots, total, discount, pay, coupon)
 		return s.persistOrder(ctx, tx, userID, p.CouponID, coupon, snapshots, order, items, cartItemIDs)
 	})
+	s.finishProductDetailMutations(context.WithoutCancel(ctx), mutatingProducts)
 	if err != nil {
 		if errors.Is(err, repository.ErrOrderDuplicate) {
 			if existing, replayErr := s.replayNormalRequest(ctx, userID, p.ClientRequestID); replayErr != nil || existing != nil {
@@ -384,7 +400,6 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 		}
 		return nil, err
 	}
-
 	// 订单创建/状态流转打点（T19c）：事务提交后计数，幂等命中不重复计数。
 	s.metrics.OrderCreated(model.OrderTypeNormal)
 	s.metrics.OrderStatusChanged(model.OrderStatusPendingPayment)
@@ -885,9 +900,14 @@ func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string)
 		return fmt.Errorf("%w: %s → %s", ErrIllegalTransition, view.Status, model.OrderStatusCancelled)
 	}
 
+	mutatingProducts, err := s.beginProductDetailMutations(ctx, productIDsFromItems(view.Items))
+	if err != nil {
+		return err
+	}
 	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
 		return s.cancelInTx(ctx, tx, view)
 	})
+	s.finishProductDetailMutations(context.WithoutCancel(ctx), mutatingProducts)
 	if err != nil {
 		return err
 	}
@@ -924,9 +944,15 @@ func (s *orderService) CancelExpired(ctx context.Context) (cancelled, failed int
 
 	for _, o := range orders {
 		view := &model.OrderView{Order: o, Items: itemsByOrder[o.OrderNo]}
+		mutatingProducts, beginErr := s.beginProductDetailMutations(ctx, productIDsFromItems(view.Items))
+		if beginErr != nil {
+			failed++
+			continue
+		}
 		err := s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
 			return s.cancelInTx(ctx, tx, view)
 		})
+		s.finishProductDetailMutations(context.WithoutCancel(ctx), mutatingProducts)
 		if err != nil {
 			failed++
 			continue
@@ -1034,6 +1060,95 @@ func (s *orderService) cancelInTx(ctx context.Context, tx *gorm.DB, view *model.
 		}
 	}
 	return nil
+}
+
+func productIDsFromSnapshots(snapshots []lineSnapshot) []int64 {
+	ids := make([]int64, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		ids = append(ids, snapshot.productID)
+	}
+	return ids
+}
+
+func productIDsFromItems(items []model.OrderItem) []int64 {
+	ids := make([]int64, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ProductID)
+	}
+	return ids
+}
+
+func (s *orderService) productIDsForCreate(ctx context.Context, userID int64, p *CreateParams) ([]int64, error) {
+	if p.FromCart {
+		items, err := s.cart.ListItems(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		if len(items) == 0 {
+			return nil, ErrCartEmpty
+		}
+		ids := make([]int64, 0, len(items))
+		for _, item := range items {
+			ids = append(ids, item.ProductID)
+		}
+		return ids, nil
+	}
+
+	lines := directLines(p)
+	ids := make([]int64, 0, len(lines))
+	for _, line := range lines {
+		sku, err := s.products.GetSKU(ctx, line.skuID)
+		if err != nil {
+			return nil, translateProductError(err)
+		}
+		if sku == nil {
+			return nil, ErrSKUNotFound
+		}
+		ids = append(ids, sku.ProductID)
+	}
+	return ids, nil
+}
+
+func mutationsCoverProducts(mutations []productDetailMutation, productIDs []int64) bool {
+	fenced := make(map[int64]struct{}, len(mutations))
+	for _, mutation := range mutations {
+		fenced[mutation.productID] = struct{}{}
+	}
+	for _, productID := range productIDs {
+		if _, ok := fenced[productID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+type productDetailMutation struct {
+	productID int64
+	token     string
+}
+
+func (s *orderService) beginProductDetailMutations(ctx context.Context, productIDs []int64) ([]productDetailMutation, error) {
+	seen := make(map[int64]struct{}, len(productIDs))
+	begun := make([]productDetailMutation, 0, len(productIDs))
+	for _, productID := range productIDs {
+		if _, exists := seen[productID]; exists {
+			continue
+		}
+		seen[productID] = struct{}{}
+		token, err := s.products.BeginDetailMutation(ctx, productID)
+		if err != nil {
+			s.finishProductDetailMutations(context.WithoutCancel(ctx), begun)
+			return nil, err
+		}
+		begun = append(begun, productDetailMutation{productID: productID, token: token})
+	}
+	return begun, nil
+}
+
+func (s *orderService) finishProductDetailMutations(ctx context.Context, mutations []productDetailMutation) {
+	for _, mutation := range mutations {
+		s.products.FinishDetailMutation(ctx, mutation.productID, mutation.token)
+	}
 }
 
 // MarkPaid 支付成功状态迁移：待支付 → 已支付（事务由支付模块开启）。

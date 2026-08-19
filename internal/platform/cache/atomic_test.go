@@ -68,6 +68,107 @@ func TestAcquireIdempotencyPropagatesRedisError(t *testing.T) {
 	require.ErrorIs(t, err, ErrMiss, "失败的抢占不得留下幂等键")
 }
 
+func TestProductDetailFillRejectsStaleGeneration(t *testing.T) {
+	c := newAtomicRedis(t)
+	ctx := context.Background()
+	detailKey := atomicTestKey(t, "product-detail")
+	versionKey := atomicTestKey(t, "product-detail-version")
+	mutationKey := atomicTestKey(t, "product-detail-mutation")
+	keys := ProductDetailKeys{Detail: detailKey, Version: versionKey, Mutation: mutationKey}
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), detailKey))
+		require.NoError(t, c.Del(context.Background(), versionKey))
+		require.NoError(t, c.Del(context.Background(), mutationKey))
+	})
+
+	staleVersion, err := c.ProductDetailVersion(ctx, keys)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), staleVersion)
+	require.NoError(t, c.Set(ctx, detailKey, "existing", time.Minute))
+	require.NoError(t, c.BeginProductDetailMutation(ctx, keys, "mutation-a", time.Minute, 2*time.Second))
+	_, err = c.Get(ctx, detailKey)
+	require.ErrorIs(t, err, ErrMiss)
+
+	written, err := c.SetProductDetailIfVersion(ctx, keys, staleVersion, "old", time.Minute)
+	require.NoError(t, err)
+	require.False(t, written)
+	require.NoError(t, c.FinishProductDetailMutation(ctx, keys, "mutation-a", 2*time.Second))
+	written, err = c.SetProductDetailIfVersion(ctx, keys, staleVersion, "old", time.Minute)
+	require.NoError(t, err)
+	require.False(t, written)
+	_, err = c.Get(ctx, detailKey)
+	require.ErrorIs(t, err, ErrMiss)
+
+	currentVersion, err := c.ProductDetailVersion(ctx, keys)
+	require.NoError(t, err)
+	written, err = c.SetProductDetailIfVersion(ctx, keys, currentVersion, "new", time.Minute)
+	require.NoError(t, err)
+	require.True(t, written)
+	value, err := c.Get(ctx, detailKey)
+	require.NoError(t, err)
+	require.Equal(t, "new", value)
+}
+
+func TestProductDetailFinishCannotReleaseNewerMutation(t *testing.T) {
+	c := newAtomicRedis(t)
+	ctx := context.Background()
+	keys := ProductDetailKeys{
+		Detail:   atomicTestKey(t, "owned-detail"),
+		Version:  atomicTestKey(t, "owned-version"),
+		Mutation: atomicTestKey(t, "owned-mutation"),
+	}
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), keys.Detail))
+		require.NoError(t, c.Del(context.Background(), keys.Version))
+		require.NoError(t, c.Del(context.Background(), keys.Mutation))
+	})
+
+	require.NoError(t, c.BeginProductDetailMutation(ctx, keys, "mutation-a", time.Minute, 2*time.Second))
+	require.NoError(t, c.Del(ctx, keys.Mutation), "模拟 mutation-a 的 marker 过期")
+	require.NoError(t, c.BeginProductDetailMutation(ctx, keys, "mutation-b", time.Minute, 2*time.Second))
+	require.NoError(t, c.FinishProductDetailMutation(ctx, keys, "mutation-a", 2*time.Second))
+
+	version, err := c.ProductDetailVersion(ctx, keys)
+	require.NoError(t, err)
+	written, err := c.SetProductDetailIfVersion(ctx, keys, version, "stale", time.Minute)
+	require.NoError(t, err)
+	require.False(t, written, "迟到的 mutation-a 不得解除 mutation-b 的围栏")
+
+	require.NoError(t, c.FinishProductDetailMutation(ctx, keys, "mutation-b", 2*time.Second))
+	version, err = c.ProductDetailVersion(ctx, keys)
+	require.NoError(t, err)
+	written, err = c.SetProductDetailIfVersion(ctx, keys, version, "fresh", time.Minute)
+	require.NoError(t, err)
+	require.True(t, written)
+}
+
+func TestProductDetailExpiredOwnerDoesNotOutliveOverlappingMutation(t *testing.T) {
+	c := newAtomicRedis(t)
+	ctx := context.Background()
+	keys := ProductDetailKeys{
+		Detail:   atomicTestKey(t, "expiry-detail"),
+		Version:  atomicTestKey(t, "expiry-version"),
+		Mutation: atomicTestKey(t, "expiry-mutation"),
+	}
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), keys.Detail))
+		require.NoError(t, c.Del(context.Background(), keys.Version))
+		require.NoError(t, c.Del(context.Background(), keys.Mutation))
+	})
+
+	require.NoError(t, c.BeginProductDetailMutation(ctx, keys, "mutation-a", 200*time.Millisecond, 2*time.Second))
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, c.BeginProductDetailMutation(ctx, keys, "mutation-b", 2*time.Second, 2*time.Second))
+	time.Sleep(250 * time.Millisecond)
+	require.NoError(t, c.FinishProductDetailMutation(ctx, keys, "mutation-b", 2*time.Second))
+
+	version, err := c.ProductDetailVersion(ctx, keys)
+	require.NoError(t, err)
+	written, err := c.SetProductDetailIfVersion(ctx, keys, version, "fresh", time.Minute)
+	require.NoError(t, err)
+	require.True(t, written, "mutation-a 过期后不应因 mutation-b 刷新 key TTL 而继续阻塞回填")
+}
+
 func TestReleaseIdempotencyDurablyDeletesOnlyOwnedKey(t *testing.T) {
 	c := newAtomicRedis(t)
 	key := atomicTestKey(t, "idem-release")

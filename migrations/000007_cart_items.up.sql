@@ -1,6 +1,6 @@
 -- 购物车：登录用户的待购条目集合，条目引用 SKU。
--- (user_id, sku_id) 唯一：重复加购同一 SKU 合并数量（服务层先查后并，
--- 并发兜底由唯一键仲裁后重查合并），SKU 删除经 FK CASCADE 自动清条目。
+-- (user_id, sku_id) 唯一：重复加购以 INSERT ... ON DUPLICATE KEY UPDATE
+-- 原子累加并封顶，SKU 删除经 FK CASCADE 自动清条目。
 
 CREATE TABLE IF NOT EXISTS cart_items (
     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

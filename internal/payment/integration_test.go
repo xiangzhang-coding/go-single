@@ -23,6 +23,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -152,7 +153,7 @@ func buildEnv() (*testEnv, error) {
 		Category: productrepo.NewGORMCategory(gdb),
 		Product:  productrepo.NewGORMProduct(gdb),
 		SKU:      productrepo.NewGORMSKU(gdb),
-	}, cacheClient)
+	}, cacheClient, zap.NewNop())
 	userSvc := usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier)
 	userHandler := userhandler.New(userSvc, verifier, testsupport.AllowAllAuthAttempts{})
 	addressHandler := userhandler.NewAddress(userSvc, verifier)

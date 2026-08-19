@@ -245,7 +245,7 @@ go_single/
 - **超时**：全链路 `context.WithTimeout` 逐层传递（HTTP handler → service → 存储/MQ），超时快速失败
 - **有限重试**：仅幂等操作可重试（MQ 消费失败重投已有；下单/支付等幂等接口有限次重试 + 退避），非幂等操作不重试
 - **熔断**：gobreaker 包住 MQ 消费者（连续失败熔断快速失败、半开探活）；进程内调用与本地 Redis/MySQL 不包
-- **降级**：缓存兜底——商品详情（key `product:detail:{id}`，TTL 5min）/秒杀状态优先读 Redis 缓存，缓存不可用时降级直查 DB
+- **降级**：缓存兜底——商品详情（key `product:detail:{id}`，TTL 5min）/秒杀状态优先读 Redis 缓存，缓存不可用时降级直查 DB。商品详情另有永久代次 key `product:detail-version:{id}` 与写入围栏 `product:detail-mutation:{id}`（按过期时间保存活动 mutation token 的 Redis Sorted Set，每个 token TTL 30min）：数据库变更前由 Lua 原子加入独立 token、递增代次并删除详情，紧跟 `WAITAOF` 确认本地 AOF fsync 后才允许 MySQL 写入；回填脚本先清理过期 token，再在仍有 token 或代次变化时拒绝写入；数据库事务结束后再次递增代次、删除详情并只移除自己的 token，同样经 `WAITAOF` 确认。迟到的旧事务不能解除新围栏，重叠事务也不会延长已失效 token，Redis 重启也不会回退已确认围栏。建立围栏失败时不执行数据库变更；结束步骤失败时围栏保留，详情降级直查而不会重新发布旧快照。订单库存扣减/回补由 order 包围整个 MySQL 事务维护围栏。购物车加购不以详情缓存判断可售性，直接读取商品状态；同一用户与 SKU 的数量通过 MySQL `INSERT ... ON DUPLICATE KEY UPDATE` 原子累加并封顶 99
 - 舱壁（semaphore 并发池）与 Sentinel-golang 进 backlog
 
 ## 模块依赖 DAG

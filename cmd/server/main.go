@@ -272,7 +272,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 
 	// product 模块：admin 维护类目/商品/SKU，游客浏览（详情走缓存）。
 	productRepo := productrepo.NewGORMProduct(db)
-	productSvc := productsvc.New(productrepo.Store{Category: productrepo.NewGORMCategory(db), Product: productRepo, SKU: productrepo.NewGORMSKU(db)}, cacheClient)
+	productSvc := productsvc.New(productrepo.Store{Category: productrepo.NewGORMCategory(db), Product: productRepo, SKU: productrepo.NewGORMSKU(db)}, cacheClient, log)
 	productHandler := producthandler.New(productSvc, verifier)
 
 	// cart 模块：加购校验 SKU 存在/上架（跨模块经 product 服务接口），列表拼装展示快照。

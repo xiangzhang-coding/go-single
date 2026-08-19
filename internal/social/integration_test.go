@@ -191,6 +191,10 @@ func (stubProducts) DeductStock(context.Context, *gorm.DB, int64, int) (bool, er
 	return true, nil
 }
 func (stubProducts) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
+func (stubProducts) BeginDetailMutation(context.Context, int64) (string, error) {
+	return "stub-mutation", nil
+}
+func (stubProducts) FinishDetailMutation(context.Context, int64, string) {}
 
 type stubCoupons struct{}
 
@@ -202,6 +206,7 @@ func (stubCoupons) RollbackCoupon(context.Context, *gorm.DB, int64, int64) error
 
 type stubCart struct{}
 
+func (stubCart) ListItems(context.Context, int64) ([]cartmodel.CartItemView, error) { return nil, nil }
 func (stubCart) LockItems(context.Context, *gorm.DB, int64) ([]cartmodel.CartItem, error) {
 	return nil, nil
 }

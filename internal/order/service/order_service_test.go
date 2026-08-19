@@ -221,12 +221,18 @@ func (f *fakeOrders) ConfirmReceipt(_ context.Context, _ *gorm.DB, orderNo strin
 	return true, nil
 }
 
-// fakeTx 单测事务运行器：直接执行回调（跨模块 fake 均忽略 tx 参数）。
-type fakeTx struct{}
+// fakeTx 单测事务运行器：执行回调并暴露事务活动窗口供围栏时序断言。
+type fakeTx struct{ active *bool }
 
 var serviceTestTx = &gorm.DB{}
 
-func (fakeTx) WithinTx(_ context.Context, fn func(tx *gorm.DB) error) error { return fn(nil) }
+func (f fakeTx) WithinTx(_ context.Context, fn func(tx *gorm.DB) error) error {
+	if f.active != nil {
+		*f.active = true
+		defer func() { *f.active = false }()
+	}
+	return fn(nil)
+}
 
 type fakeItems struct {
 	byOrder map[string][]model.OrderItem
@@ -320,12 +326,31 @@ func (f *fakeIdemCache) AcquireIdempotency(_ context.Context, key, value string,
 
 // fakeProducts 以 SKU 表模拟 product 模块：offSale 标记商品下架。
 type fakeProducts struct {
-	skus        map[int64]*productmodel.SKU
-	offSale     map[int64]bool
-	details     map[int64]*productmodel.ProductDetail
-	deductErr   error // 模拟事务内基础设施故障（如 DB 超时）
-	deductFails int   // 前 N 次扣减以瞬时错误失败、之后成功（供有限重试测试）
-	deductCalls int
+	skus              map[int64]*productmodel.SKU
+	offSale           map[int64]bool
+	details           map[int64]*productmodel.ProductDetail
+	deductErr         error // 模拟事务内基础设施故障（如 DB 超时）
+	deductFails       int   // 前 N 次扣减以瞬时错误失败、之后成功（供有限重试测试）
+	deductCalls       int
+	mutationBegun     []int64
+	mutationFinished  []int64
+	transactionActive *bool
+	fenceInsideTx     bool
+}
+
+func (f *fakeProducts) BeginDetailMutation(_ context.Context, productID int64) (string, error) {
+	if f.transactionActive != nil && *f.transactionActive {
+		f.fenceInsideTx = true
+	}
+	f.mutationBegun = append(f.mutationBegun, productID)
+	return fmt.Sprintf("mutation-%d-%d", productID, len(f.mutationBegun)), nil
+}
+
+func (f *fakeProducts) FinishDetailMutation(_ context.Context, productID int64, _ string) {
+	if f.transactionActive != nil && *f.transactionActive {
+		f.fenceInsideTx = true
+	}
+	f.mutationFinished = append(f.mutationFinished, productID)
 }
 
 func newFakeProducts() *fakeProducts {
@@ -471,10 +496,14 @@ func newFakeCart() *fakeCart {
 }
 
 func (f *fakeCart) seed(userID, skuID int64, quantity int) {
-	view := cartmodel.CartItemView{CartItem: cartmodel.CartItem{UserID: userID, SKUID: skuID, Quantity: quantity}}
+	view := cartmodel.CartItemView{CartItem: cartmodel.CartItem{UserID: userID, SKUID: skuID, Quantity: quantity}, ProductID: 1}
 	view.ID = int64(len(f.itemIDs) + 1)
 	f.itemIDs[view.ID] = view.ID
 	f.items[userID] = append(f.items[userID], view)
+}
+
+func (f *fakeCart) ListItems(_ context.Context, userID int64) ([]cartmodel.CartItemView, error) {
+	return append([]cartmodel.CartItemView(nil), f.items[userID]...), nil
 }
 
 func (f *fakeCart) LockItems(_ context.Context, _ *gorm.DB, userID int64) ([]cartmodel.CartItem, error) {
@@ -549,8 +578,10 @@ type fixture struct {
 func newFixture() *fixture {
 	orders, items, cache := newFakeOrders(), newFakeItems(), newFakeIdemCache()
 	prods, coupons, cart, users := newFakeProducts(), newFakeCoupons(), newFakeCart(), newFakeUsers()
+	var transactionActive bool
+	prods.transactionActive = &transactionActive
 	svc := New(
-		repository.Store{Orders: orders, Items: items, Tx: fakeTx{}},
+		repository.Store{Orders: orders, Items: items, Tx: fakeTx{active: &transactionActive}},
 		cache, &fakeNos{}, prods, coupons, cart, users,
 		metrics.New().Business(),
 	)
@@ -563,8 +594,10 @@ func newFixtureWithRetry(t *testing.T, attempts int) *fixture {
 	t.Helper()
 	orders, items, cache := newFakeOrders(), newFakeItems(), newFakeIdemCache()
 	prods, coupons, cart, users := newFakeProducts(), newFakeCoupons(), newFakeCart(), newFakeUsers()
+	var transactionActive bool
+	prods.transactionActive = &transactionActive
 	svc := New(
-		repository.Store{Orders: orders, Items: items, Tx: fakeTx{}},
+		repository.Store{Orders: orders, Items: items, Tx: fakeTx{active: &transactionActive}},
 		cache, &fakeNos{}, prods, coupons, cart, users,
 		metrics.New().Business(), retry.Config{
 			Attempts:       attempts,
@@ -630,6 +663,9 @@ func TestCreateDirectHappyPath(t *testing.T) {
 	require.Equal(t, int64(200), it.Subtotal)
 
 	require.Equal(t, 8, fx.prods.skus[1].Stock, "库存应扣减 2")
+	require.Equal(t, []int64{1}, fx.prods.mutationBegun)
+	require.Equal(t, []int64{1}, fx.prods.mutationFinished, "事务结束后应解除详情写入围栏")
+	require.False(t, fx.prods.fenceInsideTx, "Redis 围栏操作不应占用 MySQL 事务和行锁")
 }
 
 func TestCreateMaximumPriceBoundary(t *testing.T) {
@@ -975,6 +1011,8 @@ func TestCancelRestoresStockAndCoupon(t *testing.T) {
 	require.Equal(t, model.OrderStatusCancelled, fx.orders.byID[res.Order.OrderNo].Status)
 	require.Equal(t, 10, fx.prods.skus[1].Stock, "取消后库存应回补")
 	require.Equal(t, couponmodel.CouponStatusUnused, fx.coupons.coupons[4].Status, "取消后券应回退")
+	require.Equal(t, []int64{1, 1}, fx.prods.mutationBegun)
+	require.Equal(t, []int64{1, 1}, fx.prods.mutationFinished, "扣减与回补都应维护详情写入围栏")
 
 	// 重复取消：已取消 → 已取消 非法跃迁（状态机拒绝）。
 	err = fx.svc.Cancel(context.Background(), 42, res.Order.OrderNo)

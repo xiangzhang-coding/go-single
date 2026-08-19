@@ -19,7 +19,7 @@ sidebar_position: 4
 | sku_id | BIGINT UNSIGNED FK | 引用 SKU（CASCADE：SKU 删除自动清条目） |
 | quantity | INT UNSIGNED | 数量（1–99） |
 
-**UNIQUE (user_id, sku_id)**：重复加购同一 SKU 合并数量（服务层先查后并；并发由唯一键仲裁后重查再合并）。
+**UNIQUE (user_id, sku_id)**：重复加购通过 MySQL `INSERT ... ON DUPLICATE KEY UPDATE` 原子累加并封顶 99；首次并发创建也由同一语句合并，不发生读后覆盖。
 
 :::note
 `skus` 被 `order_items`、`posts`、`flashsale_activities` 以 FK RESTRICT 引用——有订单/动态/活动历史的 SKU 实际不可删除，CASCADE 清条目仅对从未被引用的 SKU 可达（见 [product](./product)）。
@@ -55,9 +55,8 @@ sidebar_position: 4
 POST /api/cart {sku_id, quantity}
   → 数量校验（1–99）
   → product.GetSKU（不存在 → 404）
-  → product.GetDetail（仅上架可见，404 即商品下架 → 409）
-  → 已存在 (user, sku) 条目？合并数量（上限 99）: 新建
-  （并发撞唯一键 → 重查后走合并路径）
+  → product.GetProduct 直读商品状态（不依赖详情缓存；下架 → 409）
+  → MySQL 原子创建或累加 (user, sku) 数量，并封顶 99
 ```
 
 错误映射：SKU 不存在 404 / 商品下架 409 / 条目不存在 404 / 条目归属他人 403。

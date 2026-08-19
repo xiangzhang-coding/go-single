@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -134,7 +136,7 @@ func buildEnv() (*testEnv, error) {
 		Product:  productrepo.NewGORMProduct(gdb),
 		SKU:      productrepo.NewGORMSKU(gdb),
 	}
-	productSvc := productsvc.New(productStore, cacheClient)
+	productSvc := productsvc.New(productStore, cacheClient, zap.NewNop())
 
 	userHandler := userhandler.New(usersvc.New(userrepo.Store{Users: userrepo.NewGORM(gdb), Addresses: userrepo.NewGORMAddress(gdb)}, verifier), verifier, testsupport.AllowAllAuthAttempts{})
 	cartHandler := carthandler.New(cartsvc.New(cartrepo.Store{Items: cartrepo.NewGORMCartItem(gdb)}, productSvc), verifier)
@@ -210,6 +212,50 @@ func registerAndToken(t *testing.T, env *testEnv, username string) string {
 }
 
 func uniqueName(prefix string) string { return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano()) }
+
+type concurrentAddResult struct {
+	status   int
+	quantity int
+	err      error
+}
+
+func concurrentAdd(env *testEnv, token string, skuID int64, quantity int) concurrentAddResult {
+	body := strings.NewReader(fmt.Sprintf(`{"sku_id":%d,"quantity":%d}`, skuID, quantity))
+	req := httptest.NewRequest(http.MethodPost, "/api/cart", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	env.router.ServeHTTP(w, req)
+
+	var item struct {
+		Quantity int `json:"quantity"`
+	}
+	err := json.Unmarshal(w.Body.Bytes(), &item)
+	return concurrentAddResult{status: w.Code, quantity: item.Quantity, err: err}
+}
+
+func runConcurrentAdds(env *testEnv, token string, skuID int64, quantity, workers int) []concurrentAddResult {
+	start := make(chan struct{})
+	results := make(chan concurrentAddResult, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- concurrentAdd(env, token, skuID, quantity)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	all := make([]concurrentAddResult, 0, workers)
+	for result := range results {
+		all = append(all, result)
+	}
+	return all
+}
 
 // onSaleSKU 组装一条可售 SKU 并返回 (productID, skuID)。
 func onSaleSKU(t *testing.T, env *testEnv) (int64, int64) {
@@ -314,6 +360,92 @@ func TestCartHappyPath(t *testing.T) {
 	require.Empty(t, list["items"].([]any))
 }
 
+func TestConcurrentAddMergesExistingAtomically(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("cx"))
+	_, skuID := onSaleSKU(t, env)
+
+	w, _ := doJSON(t, env, http.MethodPost, "/api/cart",
+		fmt.Sprintf(`{"sku_id":%d,"quantity":9}`, skuID), token)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	const workers = 20
+	returned := make([]int, 0, workers)
+	for _, result := range runConcurrentAdds(env, token, skuID, 2, workers) {
+		require.NoError(t, result.err)
+		require.Equal(t, http.StatusCreated, result.status)
+		require.LessOrEqual(t, result.quantity, 49)
+		returned = append(returned, result.quantity)
+	}
+	sort.Ints(returned)
+	wantReturned := make([]int, workers)
+	for i := range workers {
+		wantReturned[i] = 11 + i*2
+	}
+	require.Equal(t, wantReturned, returned, "每个响应都应对应一个原子增量后的数据库状态")
+
+	var quantity int
+	require.NoError(t, env.gdb.Raw("SELECT quantity FROM cart_items WHERE sku_id = ?", skuID).Scan(&quantity).Error)
+	require.Equal(t, 49, quantity, "每次并发加购都应恰好合并一次")
+}
+
+func TestConcurrentFirstAddCreatesOneMergedItem(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("cf"))
+	_, skuID := onSaleSKU(t, env)
+
+	const workers = 20
+	returned := make([]int, 0, workers)
+	for _, result := range runConcurrentAdds(env, token, skuID, 1, workers) {
+		require.NoError(t, result.err)
+		require.Equal(t, http.StatusCreated, result.status)
+		require.GreaterOrEqual(t, result.quantity, 1)
+		require.LessOrEqual(t, result.quantity, workers)
+		returned = append(returned, result.quantity)
+	}
+	sort.Ints(returned)
+	wantReturned := make([]int, workers)
+	for i := range workers {
+		wantReturned[i] = i + 1
+	}
+	require.Equal(t, wantReturned, returned, "首次并发创建的每个响应都应对应一个数据库状态")
+
+	var count int64
+	var quantity int
+	require.NoError(t, env.gdb.Model(&struct{ Quantity int }{}).
+		Table("cart_items").Where("sku_id = ?", skuID).Count(&count).Error)
+	require.NoError(t, env.gdb.Raw("SELECT quantity FROM cart_items WHERE sku_id = ?", skuID).Scan(&quantity).Error)
+	require.Equal(t, int64(1), count)
+	require.Equal(t, workers, quantity)
+	require.Equal(t, quantity, returned[len(returned)-1], "最后一个线性化的请求应返回最终数据库值")
+}
+
+func TestConcurrentAddHonorsQuantityLimit(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("cl"))
+	_, skuID := onSaleSKU(t, env)
+
+	w, _ := doJSON(t, env, http.MethodPost, "/api/cart",
+		fmt.Sprintf(`{"sku_id":%d,"quantity":95}`, skuID), token)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	const workers = 10
+	returned := make([]int, 0, workers)
+	for _, result := range runConcurrentAdds(env, token, skuID, 1, workers) {
+		require.NoError(t, result.err)
+		require.Equal(t, http.StatusCreated, result.status)
+		require.LessOrEqual(t, result.quantity, 99)
+		returned = append(returned, result.quantity)
+	}
+	sort.Ints(returned)
+	require.Equal(t, []int{96, 97, 98, 99, 99, 99, 99, 99, 99, 99}, returned)
+
+	var quantity int
+	require.NoError(t, env.gdb.Raw("SELECT quantity FROM cart_items WHERE sku_id = ?", skuID).Scan(&quantity).Error)
+	require.Equal(t, 99, quantity)
+	require.Equal(t, quantity, returned[len(returned)-1])
+}
+
 // 校验：SKU 不存在 404、商品下架 409、非法数量/请求 400。
 func TestCartAddRejects(t *testing.T) {
 	env := requireEnv(t)
@@ -346,6 +478,27 @@ func TestCartAddRejects(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code)
 	w, _ = doJSON(t, env, http.MethodDelete, "/api/cart/items/999999", "", token)
 	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestCartAddRejectsStaleCachedOffSaleProduct(t *testing.T) {
+	env := requireEnv(t)
+	user := registerAndToken(t, env, uniqueName("stale"))
+	productID, skuID := onSaleSKU(t, env)
+
+	w, _ := doJSON(t, env, http.MethodGet, fmt.Sprintf("/api/products/%d", productID), "", "")
+	require.Equal(t, http.StatusOK, w.Code)
+	ctx := context.Background()
+	key := fmt.Sprintf("product:detail:%d", productID)
+	staleDetail, err := env.redis.Get(ctx, key).Result()
+	require.NoError(t, err)
+
+	admin := adminToken(t, env)
+	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/products/%d/unpublish", productID), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	require.NoError(t, env.redis.Set(ctx, key, staleDetail, 5*time.Minute).Err(), "模拟外部遗留的陈旧详情缓存")
+
+	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, skuID), user)
+	require.Equal(t, http.StatusConflict, w.Code, "加购可售性必须读取商品事实而非详情缓存")
 }
 
 // 对象级授权（防 IDOR）：他人条目的改量/删除被拒 403，购物车互不可见。

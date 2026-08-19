@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
@@ -206,16 +207,20 @@ func (f *fakeSKUs) RestoreStock(_ context.Context, _ *gorm.DB, skuID int64, quan
 // ---- fake 缓存 ----
 
 type fakeCache struct {
-	data     map[string]string
-	ttl      map[string]time.Duration
-	err      error
-	getCalls int
-	setCalls int
-	delCalls int
+	data      map[string]string
+	ttl       map[string]time.Duration
+	versions  map[string]int64
+	mutations map[string]map[string]struct{}
+	err       error
+	beginErr  error
+	finishErr error
+	getCalls  int
+	setCalls  int
+	delCalls  int
 }
 
 func newFakeCache() *fakeCache {
-	return &fakeCache{data: map[string]string{}, ttl: map[string]time.Duration{}}
+	return &fakeCache{data: map[string]string{}, ttl: map[string]time.Duration{}, versions: map[string]int64{}, mutations: map[string]map[string]struct{}{}}
 }
 
 func (f *fakeCache) Ping(context.Context) error { return nil }
@@ -252,6 +257,63 @@ func (f *fakeCache) Del(_ context.Context, key string) error {
 	return nil
 }
 
+func (f *fakeCache) ProductDetailVersion(_ context.Context, keys cache.ProductDetailKeys) (int64, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	return f.versions[keys.Version], nil
+}
+
+func (f *fakeCache) SetProductDetailIfVersion(_ context.Context, keys cache.ProductDetailKeys, version int64, value string, ttl time.Duration) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	if f.versions[keys.Version] != version {
+		return false, nil
+	}
+	if len(f.mutations[keys.Mutation]) > 0 {
+		return false, nil
+	}
+	f.data[keys.Detail] = value
+	f.ttl[keys.Detail] = ttl
+	f.setCalls++
+	return true, nil
+}
+
+func (f *fakeCache) BeginProductDetailMutation(_ context.Context, keys cache.ProductDetailKeys, token string, _, _ time.Duration) error {
+	if f.beginErr != nil {
+		return f.beginErr
+	}
+	if f.err != nil {
+		return f.err
+	}
+	f.versions[keys.Version]++
+	if f.mutations[keys.Mutation] == nil {
+		f.mutations[keys.Mutation] = map[string]struct{}{}
+	}
+	f.mutations[keys.Mutation][token] = struct{}{}
+	delete(f.data, keys.Detail)
+	f.delCalls++
+	return nil
+}
+
+func (f *fakeCache) FinishProductDetailMutation(_ context.Context, keys cache.ProductDetailKeys, token string, _ time.Duration) error {
+	if f.finishErr != nil {
+		return f.finishErr
+	}
+	if f.err != nil {
+		return f.err
+	}
+	f.versions[keys.Version]++
+	delete(f.mutations[keys.Mutation], token)
+	if len(f.mutations[keys.Mutation]) == 0 {
+		delete(f.mutations, keys.Mutation)
+	}
+	delete(f.data, keys.Detail)
+	f.delCalls++
+	return nil
+}
+
 // ---- 测试夹具 ----
 
 type fixture struct {
@@ -265,7 +327,7 @@ type fixture struct {
 func newFixture() *fixture {
 	cats, prods, skus := newFakeCategories(), newFakeProducts(), newFakeSKUs()
 	fc := newFakeCache()
-	svc := New(repository.Store{Category: cats, Product: prods, SKU: skus}, fc)
+	svc := New(repository.Store{Category: cats, Product: prods, SKU: skus}, fc, zap.NewNop())
 	return &fixture{svc: svc, cats: cats, prods: prods, skus: skus, cache: fc}
 }
 
@@ -445,6 +507,41 @@ func TestUpdateSKUInvalidatesCache(t *testing.T) {
 	require.ErrorIs(t, fx.svc.DeleteSKU(context.Background(), sku.ID), ErrSKUNotFound)
 }
 
+func TestUpdateSKUKeepsCacheFencedWhenFinishFails(t *testing.T) {
+	fx := newFixture()
+	c := fx.category(t, "数码")
+	p := fx.publishedProduct(t, c.ID, "手机")
+	sku, err := fx.svc.CreateSKU(context.Background(), p.ID, json.RawMessage(`{"color":"红"}`), 100, 5)
+	require.NoError(t, err)
+	keys := detailCacheKeys(p.ID)
+	staleVersion := fx.cache.versions[keys.Version]
+
+	fx.cache.finishErr = errors.New("redis unavailable")
+	require.NoError(t, fx.svc.UpdateSKU(context.Background(), sku.ID, json.RawMessage(`{"color":"蓝"}`), 200, 3))
+	fx.cache.finishErr = nil
+
+	written, err := fx.cache.SetProductDetailIfVersion(context.Background(), keys, staleVersion, `{"old":true}`, detailCacheTTL)
+	require.NoError(t, err)
+	require.False(t, written, "结束步骤失败时 marker 应继续拒绝旧请求回填")
+	detail, err := fx.svc.GetDetail(context.Background(), p.ID)
+	require.NoError(t, err)
+	require.Equal(t, int64(200), detail.Skus[0].Price)
+	require.NotContains(t, fx.cache.data, keys.Detail, "marker 存在时详情应降级直查且不回填")
+}
+
+func TestUpdateSKURequiresCacheMutationFence(t *testing.T) {
+	fx := newFixture()
+	c := fx.category(t, "数码")
+	p := fx.publishedProduct(t, c.ID, "手机")
+	sku, err := fx.svc.CreateSKU(context.Background(), p.ID, json.RawMessage(`{}`), 100, 5)
+	require.NoError(t, err)
+
+	fx.cache.beginErr = errors.New("redis unavailable")
+	err = fx.svc.UpdateSKU(context.Background(), sku.ID, json.RawMessage(`{}`), 200, 3)
+	require.Error(t, err)
+	require.Equal(t, int64(100), fx.skus.byID[sku.ID].Price, "围栏未建立时不得提交商品变更")
+}
+
 // ---- 游客浏览 ----
 
 func TestListProductsOnlyOnSaleAndFiltered(t *testing.T) {
@@ -544,7 +641,7 @@ func TestGetDetailCacheHitMissAndFill(t *testing.T) {
 	assert.Equal(t, "手机", d.Title)
 	require.Len(t, d.Skus, 1)
 	assert.Equal(t, int64(9900), d.Skus[0].Price)
-	assert.Equal(t, detailCacheTTL, fx.cache.ttl[detailCacheKey(p.ID)])
+	assert.Equal(t, detailCacheTTL, fx.cache.ttl[detailCacheKeys(p.ID).Detail])
 	require.Equal(t, before+1, fx.cache.getCalls)
 
 	// 绕过缓存改 DB：第二次访问仍返回旧值（命中缓存）。

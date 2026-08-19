@@ -25,6 +25,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -153,7 +154,7 @@ func buildEnv() (*testEnv, error) {
 	userHandler := userhandler.New(userSvc, verifier, testsupport.AllowAllAuthAttempts{})
 
 	productRepo := productrepo.NewGORMProduct(gdb)
-	productSvc := productsvc.New(productrepo.Store{Category: productrepo.NewGORMCategory(gdb), Product: productRepo, SKU: productrepo.NewGORMSKU(gdb)}, cacheClient)
+	productSvc := productsvc.New(productrepo.Store{Category: productrepo.NewGORMCategory(gdb), Product: productRepo, SKU: productrepo.NewGORMSKU(gdb)}, cacheClient, zap.NewNop())
 	productHandler := producthandler.New(productSvc, verifier)
 
 	// 默认 env 的秒杀服务关闭按用户限流；限流专项测试经 newFlashsaleRouter 另起路由。

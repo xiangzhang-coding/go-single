@@ -4,13 +4,15 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
@@ -29,13 +31,29 @@ var (
 
 // 商品详情缓存约定：key product:detail:{id}，TTL 5min（见规格容错节）。
 const (
-	detailCacheTTL = 5 * time.Minute
+	detailCacheTTL    = 5 * time.Minute
+	detailMutationTTL = 30 * time.Minute
+	detailAOFTimeout  = 2 * time.Second
 	// 分页上限与默认页大小。
 	defaultPageSize = 20
 	maxPageSize     = 50
 )
 
-func detailCacheKey(id int64) string { return fmt.Sprintf("product:detail:%d", id) }
+func detailCacheKeys(id int64) cache.ProductDetailKeys {
+	return cache.ProductDetailKeys{
+		Detail:   fmt.Sprintf("product:detail:%d", id),
+		Version:  fmt.Sprintf("product:detail-version:%d", id),
+		Mutation: fmt.Sprintf("product:detail-mutation:%d", id),
+	}
+}
+
+type detailCache interface {
+	Get(ctx context.Context, key string) (string, error)
+	ProductDetailVersion(ctx context.Context, keys cache.ProductDetailKeys) (int64, error)
+	SetProductDetailIfVersion(ctx context.Context, keys cache.ProductDetailKeys, version int64, value string, ttl time.Duration) (bool, error)
+	BeginProductDetailMutation(ctx context.Context, keys cache.ProductDetailKeys, token string, ttl, aofTimeout time.Duration) error
+	FinishProductDetailMutation(ctx context.Context, keys cache.ProductDetailKeys, token string, aofTimeout time.Duration) error
+}
 
 // Service product 模块的业务接口。
 type Service interface {
@@ -61,27 +79,32 @@ type Service interface {
 	ListProducts(ctx context.Context, categoryID *int64, page, pageSize int) ([]model.Product, int64, error)
 	// GetDetail 详情（仅上架商品），优先缓存、缺失回填。
 	GetDetail(ctx context.Context, id int64) (*model.ProductDetail, error)
-	// GetSKU 供后续模块（购物车）校验 SKU 存在/上架。
+	// GetSKU 供后续模块校验 SKU 存在。
 	GetSKU(ctx context.Context, id int64) (*model.SKU, error)
-	// GetProduct 供后续模块（秒杀页）读取 SPU 标题等摘要信息。
+	// GetProduct 供购物车直读状态、秒杀页读取 SPU 标题等摘要信息。
 	GetProduct(ctx context.Context, id int64) (*model.Product, error)
 	// GetSKUForUpdate 在订单事务内锁定 SKU 并校验商品仍上架，供订单固化成交价。
 	GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.SKU, error)
-	// DeductStock 事务内条件扣减库存（stock>=N 防超卖），供 order 模块下单调用；
-	// 扣减成功后失效详情缓存。返回是否扣减成功。
+	// DeductStock 事务内条件扣减库存（stock>=N 防超卖），供 order 模块下单调用。
+	// 返回是否扣减成功；调用方在事务前后维护详情写入围栏。
 	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
-	// RestoreStock 事务内回补库存，供 order 模块取消订单调用；随后失效详情缓存。
+	// RestoreStock 事务内回补库存；调用方在事务前后维护详情写入围栏。
 	RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error
+	// BeginDetailMutation 在调用方事务写入前建立缓存回填围栏。
+	BeginDetailMutation(ctx context.Context, productID int64) (string, error)
+	// FinishDetailMutation 在调用方事务结束后推进代次、删除详情并解除围栏。
+	FinishDetailMutation(ctx context.Context, productID int64, token string)
 }
 
 type productService struct {
 	store repository.Store
-	cache cache.Cache
+	cache detailCache
+	log   *zap.Logger
 }
 
 // New 构造商品服务。
-func New(store repository.Store, c cache.Cache) Service {
-	return &productService{store: store, cache: c}
+func New(store repository.Store, c detailCache, log *zap.Logger) Service {
+	return &productService{store: store, cache: c, log: log}
 }
 
 func (s *productService) CreateCategory(ctx context.Context, name string) (*model.Category, error) {
@@ -169,11 +192,9 @@ func (s *productService) UpdateProduct(ctx context.Context, id int64, categoryID
 	if p == nil {
 		return ErrProductNotFound
 	}
-	if err := s.store.Product.Update(ctx, &model.Product{ID: id, CategoryID: categoryID, Title: title, Description: description}); err != nil {
-		return err
-	}
-	s.invalidateDetail(ctx, id)
-	return nil
+	return s.withDetailMutation(ctx, id, func() error {
+		return s.store.Product.Update(ctx, &model.Product{ID: id, CategoryID: categoryID, Title: title, Description: description})
+	})
 }
 
 func (s *productService) PublishProduct(ctx context.Context, id int64) error {
@@ -195,11 +216,9 @@ func (s *productService) setStatus(ctx context.Context, id int64, status string)
 	if p.Status == status {
 		return nil
 	}
-	if err := s.store.Product.SetStatus(ctx, id, status); err != nil {
-		return err
-	}
-	s.invalidateDetail(ctx, id)
-	return nil
+	return s.withDetailMutation(ctx, id, func() error {
+		return s.store.Product.SetStatus(ctx, id, status)
+	})
 }
 
 func (s *productService) CreateSKU(ctx context.Context, productID int64, specs json.RawMessage, price int64, stock int) (*model.SKU, error) {
@@ -214,10 +233,11 @@ func (s *productService) CreateSKU(ctx context.Context, productID int64, specs j
 		return nil, ErrProductNotFound
 	}
 	sku := &model.SKU{ProductID: productID, Specs: specs, Price: price, Stock: stock}
-	if err := s.store.SKU.Create(ctx, sku); err != nil {
+	if err := s.withDetailMutation(ctx, productID, func() error {
+		return s.store.SKU.Create(ctx, sku)
+	}); err != nil {
 		return nil, err
 	}
-	s.invalidateDetail(ctx, productID)
 	return sku, nil
 }
 
@@ -232,11 +252,9 @@ func (s *productService) UpdateSKU(ctx context.Context, id int64, specs json.Raw
 	if sku == nil {
 		return ErrSKUNotFound
 	}
-	if err := s.store.SKU.Update(ctx, &model.SKU{ID: id, Specs: specs, Price: price, Stock: stock}); err != nil {
-		return err
-	}
-	s.invalidateDetail(ctx, sku.ProductID)
-	return nil
+	return s.withDetailMutation(ctx, sku.ProductID, func() error {
+		return s.store.SKU.Update(ctx, &model.SKU{ID: id, Specs: specs, Price: price, Stock: stock})
+	})
 }
 
 func (s *productService) DeleteSKU(ctx context.Context, id int64) error {
@@ -247,11 +265,9 @@ func (s *productService) DeleteSKU(ctx context.Context, id int64) error {
 	if sku == nil {
 		return ErrSKUNotFound
 	}
-	if err := s.store.SKU.Delete(ctx, id); err != nil {
-		return err
-	}
-	s.invalidateDetail(ctx, sku.ProductID)
-	return nil
+	return s.withDetailMutation(ctx, sku.ProductID, func() error {
+		return s.store.SKU.Delete(ctx, id)
+	})
 }
 
 func (s *productService) ListCategories(ctx context.Context) ([]model.Category, error) {
@@ -288,30 +304,31 @@ func (s *productService) ListAllProducts(ctx context.Context, categoryID *int64,
 	return s.store.Product.List(ctx, categoryID, status, (page-1)*pageSize, pageSize)
 }
 
-// GetDetail 缓存优先（product:detail:{id}，TTL 5min）；未命中直查 DB 并回填；
-// 缓存故障视为未命中（降级直查），不影响可用性。
+// GetDetail 缓存优先（product:detail:{id}，TTL 5min）；未命中读取缓存代次后
+// 直查 DB，仅在代次未变化时回填；缓存故障降级直查且跳过回填。
 func (s *productService) GetDetail(ctx context.Context, id int64) (*model.ProductDetail, error) {
-	key := detailCacheKey(id)
+	keys := detailCacheKeys(id)
 
-	raw, err := s.cache.Get(ctx, key)
+	raw, err := s.cache.Get(ctx, keys.Detail)
 	if err == nil {
 		var d model.ProductDetail
 		jsonErr := json.Unmarshal([]byte(raw), &d)
 		if jsonErr == nil {
 			return &d, nil
 		}
-		slog.Warn("商品详情缓存反序列化失败，降级直查", "key", key, "error", jsonErr)
+		s.log.Warn("商品详情缓存反序列化失败，降级直查", zap.String("key", keys.Detail), zap.Error(jsonErr))
 	} else if !errors.Is(err, cache.ErrMiss) {
-		slog.Warn("商品详情缓存读取失败，降级直查", "key", key, "error", err)
+		s.log.Warn("商品详情缓存读取失败，降级直查", zap.String("key", keys.Detail), zap.Error(err))
 	}
+	version, versionErr := s.cache.ProductDetailVersion(ctx, keys)
 
 	d, err := s.loadDetail(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if data, jsonErr := json.Marshal(d); jsonErr == nil {
-		if setErr := s.cache.Set(ctx, key, string(data), detailCacheTTL); setErr != nil {
-			slog.Warn("商品详情回填缓存失败", "key", key, "error", setErr)
+	if data, jsonErr := json.Marshal(d); jsonErr == nil && versionErr == nil {
+		if _, setErr := s.cache.SetProductDetailIfVersion(ctx, keys, version, string(data), detailCacheTTL); setErr != nil {
+			s.log.Warn("商品详情回填缓存失败", zap.String("key", keys.Detail), zap.Error(setErr))
 		}
 	}
 	return d, nil
@@ -385,15 +402,11 @@ func (s *productService) GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id in
 	return lockedSKU, nil
 }
 
-// DeductStock 先确认 SKU 存在（同时取得 product_id 供缓存失效），
-// 再在同一事务内条件扣减；事务由 order 模块开启并提交。
+// DeductStock 在调用方事务内条件扣减；事务由 order 模块开启并提交，
+// 调用方必须在事务前后调用 BeginDetailMutation / FinishDetailMutation。
 func (s *productService) DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error) {
 	if quantity < 1 {
 		return false, fmt.Errorf("%w: invalid quantity", ErrInvalidInput)
-	}
-	sku, err := s.GetSKU(ctx, skuID)
-	if err != nil {
-		return false, err
 	}
 	ok, err := s.store.SKU.DeductStock(ctx, tx, skuID, quantity)
 	if err != nil {
@@ -416,33 +429,55 @@ func (s *productService) DeductStock(ctx context.Context, tx *gorm.DB, skuID int
 			return false, ErrProductNotFound
 		}
 	}
-	if ok {
-		s.invalidateDetail(ctx, sku.ProductID)
-	}
 	return ok, nil
 }
 
-// RestoreStock 同事务回补库存（取消订单），随后失效详情缓存。
+// RestoreStock 在调用方事务内回补库存；调用方必须在事务前后维护详情围栏。
 func (s *productService) RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error {
 	if quantity < 1 {
 		return fmt.Errorf("%w: invalid quantity", ErrInvalidInput)
 	}
-	sku, err := s.GetSKU(ctx, skuID)
-	if err != nil {
+	if _, err := s.GetSKU(ctx, skuID); err != nil {
 		return err
 	}
 	if err := s.store.SKU.RestoreStock(ctx, tx, skuID, quantity); err != nil {
 		return err
 	}
-	s.invalidateDetail(ctx, sku.ProductID)
 	return nil
 }
 
-// invalidateDetail 商品或其 SKU 变更后清缓存（缓存故障不阻断写路径）。
-func (s *productService) invalidateDetail(ctx context.Context, productID int64) {
-	if err := s.cache.Del(ctx, detailCacheKey(productID)); err != nil {
-		slog.Warn("商品详情缓存失效失败", "product_id", productID, "error", err)
+func (s *productService) BeginDetailMutation(ctx context.Context, productID int64) (string, error) {
+	token, err := newDetailMutationToken()
+	if err != nil {
+		return "", err
 	}
+	if err := s.cache.BeginProductDetailMutation(ctx, detailCacheKeys(productID), token, detailMutationTTL, detailAOFTimeout); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (s *productService) FinishDetailMutation(ctx context.Context, productID int64, token string) {
+	if err := s.cache.FinishProductDetailMutation(ctx, detailCacheKeys(productID), token, detailAOFTimeout); err != nil {
+		s.log.Warn("商品详情缓存写入围栏解除失败，保持降级直查", zap.Int64("product_id", productID), zap.Error(err))
+	}
+}
+
+func (s *productService) withDetailMutation(ctx context.Context, productID int64, mutate func() error) error {
+	token, err := s.BeginDetailMutation(ctx, productID)
+	if err != nil {
+		return err
+	}
+	defer s.FinishDetailMutation(context.WithoutCancel(ctx), productID, token)
+	return mutate()
+}
+
+func newDetailMutationToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate product detail mutation token: %w", err)
+	}
+	return hex.EncodeToString(token[:]), nil
 }
 
 func validateName(what, name string) (string, error) {
