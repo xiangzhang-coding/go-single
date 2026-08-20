@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/chat/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // GORMConversationRepository 会话仓储的 GORM 实现。
@@ -21,12 +22,16 @@ func NewGORMConversation(db *gorm.DB) *GORMConversationRepository {
 }
 
 // WithinTx 开启跨表事务；fn 返回错误则整体回滚。
-func (r *GORMConversationRepository) WithinTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
-	return r.db.WithContext(ctx).Transaction(fn)
+func (r *GORMConversationRepository) WithinTx(ctx context.Context, fn func(tx *transaction.Handle) error) error {
+	return transaction.WithinGORM(ctx, r.db, fn)
 }
 
 // Ensure 会话不存在则创建；并发同键插入撞主键冲突属正常（已由他人创建）。
-func (r *GORMConversationRepository) Ensure(ctx context.Context, tx *gorm.DB, c *model.Conversation) error {
+func (r *GORMConversationRepository) Ensure(ctx context.Context, handle *transaction.Handle, c *model.Conversation) error {
+	tx, unwrapErr := transaction.GORM(handle)
+	if unwrapErr != nil {
+		return unwrapErr
+	}
 	err := tx.WithContext(ctx).Create(c).Error
 	if err == nil || isDuplicateKey(err) {
 		return nil
@@ -55,10 +60,14 @@ func (r *GORMConversationRepository) ListByUser(ctx context.Context, userID int6
 	return list, err
 }
 
-func (r *GORMConversationRepository) TouchLastMessage(ctx context.Context, tx *gorm.DB, key string, messageID int64) error {
+func (r *GORMConversationRepository) TouchLastMessage(ctx context.Context, handle *transaction.Handle, key string, messageID int64) error {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return err
+	}
 	return tx.WithContext(ctx).Model(&model.Conversation{}).
 		Where("conversation_key = ?", key).
-		Update("last_message_id", messageID).Error
+		Update("last_message_id", gorm.Expr("GREATEST(last_message_id, ?)", messageID)).Error
 }
 
 var _ ConversationRepository = (*GORMConversationRepository)(nil)
@@ -75,7 +84,11 @@ func NewGORMMessage(db *gorm.DB) *GORMMessageRepository {
 
 // Create 落库消息；(sender_id, client_request_id) 撞唯一键（含并发重放）
 // 返回 ErrMessageDuplicate，其余错误原样返回。
-func (r *GORMMessageRepository) Create(ctx context.Context, tx *gorm.DB, m *model.Message) error {
+func (r *GORMMessageRepository) Create(ctx context.Context, handle *transaction.Handle, m *model.Message) error {
+	tx, unwrapErr := transaction.GORM(handle)
+	if unwrapErr != nil {
+		return unwrapErr
+	}
 	err := tx.WithContext(ctx).Create(m).Error
 	if err == nil {
 		return nil

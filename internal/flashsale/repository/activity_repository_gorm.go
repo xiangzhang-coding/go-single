@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // GORMActivityRepository 秒杀活动仓储（GORM 实现）。
@@ -20,8 +21,8 @@ func NewGORMActivity(db *gorm.DB) *GORMActivityRepository {
 	return &GORMActivityRepository{db: db}
 }
 
-func (r *GORMActivityRepository) WithinTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
-	return r.db.WithContext(ctx).Transaction(fn)
+func (r *GORMActivityRepository) WithinTx(ctx context.Context, fn func(tx *transaction.Handle) error) error {
+	return transaction.WithinGORM(ctx, r.db, fn)
 }
 
 func (r *GORMActivityRepository) Create(ctx context.Context, a *model.Activity) error {
@@ -32,7 +33,11 @@ func (r *GORMActivityRepository) Update(ctx context.Context, a *model.Activity) 
 	return r.update(r.db.WithContext(ctx), a)
 }
 
-func (r *GORMActivityRepository) UpdateInTx(ctx context.Context, tx *gorm.DB, a *model.Activity) error {
+func (r *GORMActivityRepository) UpdateInTx(ctx context.Context, handle *transaction.Handle, a *model.Activity) error {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return err
+	}
 	return tx.WithContext(ctx).Model(a).
 		Select("sku_id", "title", "price", "stock", "per_user_limit", "status", "start_at", "end_at").
 		Updates(a).Error
@@ -46,7 +51,11 @@ func (r *GORMActivityRepository) GetByID(ctx context.Context, id int64) (*model.
 	return r.getByID(r.db.WithContext(ctx), id)
 }
 
-func (r *GORMActivityRepository) GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.Activity, error) {
+func (r *GORMActivityRepository) GetByIDForUpdate(ctx context.Context, handle *transaction.Handle, id int64) (*model.Activity, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return nil, err
+	}
 	return r.getByID(tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}), id)
 }
 
@@ -75,12 +84,12 @@ func (r *GORMActivityRepository) UpdateStatus(ctx context.Context, id int64, sta
 
 // DeductStock 条件扣减：UPDATE ... SET stock = stock - ? WHERE id = ? AND stock >= ?。
 // RowsAffected=0（活动不存在或库存不足）返回 (false, nil)，由调用方区分语义。
-func (r *GORMActivityRepository) DeductStock(ctx context.Context, tx *gorm.DB, id int64, quantity int) (bool, error) {
-	exec := tx
-	if exec == nil {
-		exec = r.db.WithContext(ctx)
+func (r *GORMActivityRepository) DeductStock(ctx context.Context, handle *transaction.Handle, id int64, quantity int) (bool, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return false, err
 	}
-	res := exec.Model(&model.Activity{}).
+	res := tx.WithContext(ctx).Model(&model.Activity{}).
 		Where("id = ? AND stock >= ?", id, quantity).
 		Update("stock", gorm.Expr("stock - ?", quantity))
 	if res.Error != nil {
@@ -91,12 +100,12 @@ func (r *GORMActivityRepository) DeductStock(ctx context.Context, tx *gorm.DB, i
 
 // RestoreStock 回补库存：UPDATE ... SET stock = stock + ? WHERE id = ?
 // （秒杀订单取消/超时取消回补；活动存在由订单外键 RESTRICT 保证）。
-func (r *GORMActivityRepository) RestoreStock(ctx context.Context, tx *gorm.DB, id int64, quantity int) error {
-	exec := tx
-	if exec == nil {
-		exec = r.db.WithContext(ctx)
+func (r *GORMActivityRepository) RestoreStock(ctx context.Context, handle *transaction.Handle, id int64, quantity int) error {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return err
 	}
-	return exec.Model(&model.Activity{}).
+	return tx.WithContext(ctx).Model(&model.Activity{}).
 		Where("id = ?", id).
 		Update("stock", gorm.Expr("stock + ?", quantity)).Error
 }

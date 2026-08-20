@@ -11,13 +11,13 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
-	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
 )
 
@@ -29,7 +29,7 @@ type fakeOrderService struct {
 	err      error
 }
 
-func (f *fakeOrderService) CreateSeckillInTx(_ context.Context, _ *gorm.DB, p ordersvc.SeckillCreateParams) (bool, error) {
+func (f *fakeOrderService) CreateSeckillInTx(_ context.Context, _ *transaction.Handle, p ordersvc.SeckillCreateParams) (bool, error) {
 	f.created = append(f.created, p)
 	return f.inserted, f.err
 }
@@ -427,22 +427,24 @@ type failingActivities struct{}
 
 func (failingActivities) Create(context.Context, *model.Activity) error { return nil }
 func (failingActivities) Update(context.Context, *model.Activity) error { return nil }
-func (failingActivities) UpdateInTx(context.Context, *gorm.DB, *model.Activity) error {
+func (failingActivities) UpdateInTx(context.Context, *transaction.Handle, *model.Activity) error {
 	return nil
 }
 func (failingActivities) GetByID(context.Context, int64) (*model.Activity, error) {
 	return nil, errors.New("mysql down")
 }
-func (failingActivities) GetByIDForUpdate(context.Context, *gorm.DB, int64) (*model.Activity, error) {
+func (failingActivities) GetByIDForUpdate(context.Context, *transaction.Handle, int64) (*model.Activity, error) {
 	return nil, errors.New("mysql down")
 }
 func (failingActivities) List(context.Context) ([]model.Activity, error) { return nil, nil }
 func (failingActivities) UpdateStatus(context.Context, int64, string) error {
 	return nil
 }
-func (failingActivities) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
+func (failingActivities) DeductStock(context.Context, *transaction.Handle, int64, int) (bool, error) {
 	return true, nil
 }
-func (failingActivities) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
+func (failingActivities) RestoreStock(context.Context, *transaction.Handle, int64, int) error {
+	return nil
+}
 
 var _ repository.ActivityRepository = (*failingActivities)(nil)

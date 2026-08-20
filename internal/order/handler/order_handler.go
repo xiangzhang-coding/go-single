@@ -65,6 +65,11 @@ type itemReq struct {
 	Quantity int   `json:"quantity"`
 }
 
+type processingResponse struct {
+	State   string `json:"state"`
+	OrderNo string `json:"order_no"`
+}
+
 func (h *Handler) Create(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
@@ -93,8 +98,8 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 	status := http.StatusCreated
 	if result.Processing {
-		// 幂等键已占用但订单尚未提交：不是创建成功，客户端应轮询详情。
-		status = http.StatusAccepted
+		c.JSON(http.StatusAccepted, processingResponse{State: "processing", OrderNo: result.Order.OrderNo})
+		return
 	} else if result.Idempotent {
 		status = http.StatusOK
 	}

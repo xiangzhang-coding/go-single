@@ -29,6 +29,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
@@ -684,19 +685,19 @@ func TestOlderCacheMissCannotRefillAfterTransactionalStockCommit(t *testing.T) {
 
 	race := newCacheRaceFixture(env)
 
-	tx := env.gdb.WithContext(ctx).Begin()
-	require.NoError(t, tx.Error)
-	t.Cleanup(func() { _ = tx.Rollback().Error })
 	mutationToken, err := race.writer.BeginDetailMutation(ctx, productID)
 	require.NoError(t, err)
-	ok, err := race.writer.DeductStock(ctx, tx, skuID, 1)
-	require.NoError(t, err)
-	require.True(t, ok)
-
-	result := startDetailRead(ctx, race.reader, productID)
-	<-race.block.loaded
-
-	require.NoError(t, tx.Commit().Error)
+	var result <-chan detailResult
+	require.NoError(t, productrepo.NewGORMProduct(env.gdb).WithinTx(ctx, func(tx *transaction.Handle) error {
+		ok, deductErr := race.writer.DeductStock(ctx, tx, skuID, 1)
+		if deductErr != nil {
+			return deductErr
+		}
+		require.True(t, ok)
+		result = startDetailRead(ctx, race.reader, productID)
+		<-race.block.loaded
+		return nil
+	}))
 	race.writer.FinishDetailMutation(ctx, productID, mutationToken)
 	close(race.block.release)
 	stale := <-result

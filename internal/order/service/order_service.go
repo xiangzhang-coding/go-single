@@ -16,8 +16,6 @@ import (
 	"strconv"
 	"time"
 
-	"gorm.io/gorm"
-
 	cartmodel "github.com/xiangzhang-coding/go-single/internal/cart/model"
 	couponmodel "github.com/xiangzhang-coding/go-single/internal/coupon/model"
 	couponsvc "github.com/xiangzhang-coding/go-single/internal/coupon/service"
@@ -31,6 +29,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -79,10 +78,10 @@ func idemKey(userID int64, clientRequestID string) string {
 // 事务内条件扣减与回补库存（tx 由 order 模块开启）。
 type ProductService interface {
 	GetSKU(ctx context.Context, id int64) (*productmodel.SKU, error)
-	GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*productmodel.SKU, error)
+	GetSKUForUpdate(ctx context.Context, tx *transaction.Handle, id int64) (*productmodel.SKU, error)
 	GetDetail(ctx context.Context, id int64) (*productmodel.ProductDetail, error)
-	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
-	RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error
+	DeductStock(ctx context.Context, tx *transaction.Handle, skuID int64, quantity int) (bool, error)
+	RestoreStock(ctx context.Context, tx *transaction.Handle, skuID int64, quantity int) error
 	BeginDetailMutation(ctx context.Context, productID int64) (string, error)
 	FinishDetailMutation(ctx context.Context, productID int64, token string)
 }
@@ -90,16 +89,16 @@ type ProductService interface {
 // CouponService 优惠券模块最小接口：结算前校验可用券，事务内核销/回退。
 type CouponService interface {
 	GetUsable(ctx context.Context, userID, couponID int64) (*couponmodel.UserCouponView, error)
-	UseCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) error
-	RollbackCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) error
+	UseCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error
+	RollbackCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error
 }
 
 // CartService 购物车模块最小接口：在订单事务内锁定并读取当前条目，
 // 再按条目 ID 删除已购行。
 type CartService interface {
 	ListItems(ctx context.Context, userID int64) ([]cartmodel.CartItemView, error)
-	LockItems(ctx context.Context, tx *gorm.DB, userID int64) ([]cartmodel.CartItem, error)
-	DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error
+	LockItems(ctx context.Context, tx *transaction.Handle, userID int64) ([]cartmodel.CartItem, error)
+	DeletePurchased(ctx context.Context, tx *transaction.Handle, userID int64, itemIDs []int64) error
 }
 
 // UserService 用户模块最小接口：读取地址簿固化为地址快照（owner 校验）。
@@ -169,7 +168,7 @@ type Service interface {
 	// CreateSeckillInTx 在调用方事务内创建秒杀订单与订单项。返回 created=false
 	// 表示唯一约束命中（MQ 重投/并发消费），flashsale 编排不得再次扣减
 	// 活动库存；user_activity_key 在取消时置 NULL，允许再次抢购。
-	CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p SeckillCreateParams) (created bool, err error)
+	CreateSeckillInTx(ctx context.Context, tx *transaction.Handle, p SeckillCreateParams) (created bool, err error)
 	// List 我的订单（状态筛选 + 分页）。
 	List(ctx context.Context, userID int64, status string, page, pageSize int) ([]model.OrderView, int64, error)
 	// ListAll 后台全量订单（admin，T25）：跨用户，状态筛选 + 分页，订单项随列表一次取出。
@@ -186,7 +185,7 @@ type Service interface {
 	// 模块在应用编排层完成订单取消与活动库存回补。
 	ListExpiredSeckill(ctx context.Context) ([]ExpiredSeckillOrder, error)
 	// CancelSeckill 在调用方事务内条件取消一笔待支付秒杀订单。
-	CancelSeckill(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error)
+	CancelSeckill(ctx context.Context, tx *transaction.Handle, orderNo string) (bool, error)
 	// CountValidSeckill 活动的秒杀有效订单数（非取消），对账端口
 	// （flashsale 模块 ReconcileActive 进程内调用）。
 	CountValidSeckill(ctx context.Context, activityID int64) (int, error)
@@ -195,7 +194,7 @@ type Service interface {
 	SeckillOrderStatus(ctx context.Context, orderNo string) (status string, found bool, err error)
 	// MarkPaid 支付成功状态迁移：待支付 → 已支付（支付模块事务内条件更新；
 	// WHERE 同时校验 status、pay_amount 与 expire_at）。
-	MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error)
+	MarkPaid(ctx context.Context, tx *transaction.Handle, orderNo string, payAmount int64) (bool, error)
 	// Ship 后台发货：已支付 → 已发货（admin）。
 	Ship(ctx context.Context, orderNo string) error
 	// ConfirmReceipt 确认收货：已发货 → 已完成（owner 校验）。
@@ -354,7 +353,7 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 		items       []model.OrderItem
 		cartItemIDs []int64
 	)
-	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+	err = s.store.Tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 		if p.FromCart {
 			cartItems, err := s.cart.LockItems(ctx, tx, userID)
 			if err != nil {
@@ -411,7 +410,7 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 //  2. 在调用方事务内创建秒杀订单（10min 超时）+ 订单项
 //  3. 重复键（order_no 主键 / user_activity_key 唯一约束）返回 created=false，
 //     由 flashsale 编排跳过活动库存扣减
-func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p SeckillCreateParams) (bool, error) {
+func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *transaction.Handle, p SeckillCreateParams) (bool, error) {
 	if tx == nil {
 		return false, fmt.Errorf("%w: transaction required", ErrInvalidInput)
 	}
@@ -501,7 +500,7 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p Sec
 }
 
 // persistOrder 在同一事务内完成库存、券、订单、订单项与购物车清理。
-func (s *orderService) persistOrder(ctx context.Context, tx *gorm.DB, userID, couponID int64,
+func (s *orderService) persistOrder(ctx context.Context, tx *transaction.Handle, userID, couponID int64,
 	coupon *couponmodel.UserCouponView, snapshots []lineSnapshot, order *model.Order,
 	items []model.OrderItem, cartItemIDs []int64) error {
 	if err := validateAmountConsistency(order, items); err != nil {
@@ -691,7 +690,7 @@ func translateProductError(err error) error {
 
 // loadSnapshots 读取 SKU 价格并校验存在/上架（GetDetail 仅上架可见，404 即下架），
 // 累计商品总额，产出订单项快照。
-func (s *orderService) loadSnapshots(ctx context.Context, tx *gorm.DB, lines []orderLine) ([]lineSnapshot, int64, error) {
+func (s *orderService) loadSnapshots(ctx context.Context, tx *transaction.Handle, lines []orderLine) ([]lineSnapshot, int64, error) {
 	type candidate struct {
 		line      orderLine
 		productID int64
@@ -904,7 +903,7 @@ func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string)
 	if err != nil {
 		return err
 	}
-	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+	err = s.store.Tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 		return s.cancelInTx(ctx, tx, view)
 	})
 	s.finishProductDetailMutations(context.WithoutCancel(ctx), mutatingProducts)
@@ -949,7 +948,7 @@ func (s *orderService) CancelExpired(ctx context.Context) (cancelled, failed int
 			failed++
 			continue
 		}
-		err := s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		err := s.store.Tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 			return s.cancelInTx(ctx, tx, view)
 		})
 		s.finishProductDetailMutations(context.WithoutCancel(ctx), mutatingProducts)
@@ -1005,7 +1004,7 @@ func (s *orderService) ListExpiredSeckill(ctx context.Context) ([]ExpiredSeckill
 
 // CancelSeckill 在调用方开启的事务中执行条件状态迁移；库存回补由 flashsale
 // 模块在同一事务中紧随其后完成。
-func (s *orderService) CancelSeckill(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error) {
+func (s *orderService) CancelSeckill(ctx context.Context, tx *transaction.Handle, orderNo string) (bool, error) {
 	if tx == nil {
 		return false, fmt.Errorf("%w: transaction required", ErrInvalidInput)
 	}
@@ -1041,7 +1040,7 @@ func sumItemQuantity(items []model.OrderItem) int {
 
 // cancelInTx 事务内取消：条件更新 待支付→已取消 + 回补库存 + 回退券；
 // 用户取消与超时取消共用（库存/券补偿逻辑单点维护）。
-func (s *orderService) cancelInTx(ctx context.Context, tx *gorm.DB, view *model.OrderView) error {
+func (s *orderService) cancelInTx(ctx context.Context, tx *transaction.Handle, view *model.OrderView) error {
 	ok, err := s.store.Orders.Cancel(ctx, tx, view.OrderNo)
 	if err != nil {
 		return err
@@ -1154,7 +1153,7 @@ func (s *orderService) finishProductDetailMutations(ctx context.Context, mutatio
 // MarkPaid 支付成功状态迁移：待支付 → 已支付（事务由支付模块开启）。
 // 状态机、金额核对与支付期限由条件更新 WHERE 原子兜底；false 表示状态、
 // 金额或期限不再允许支付，由支付模块统一按订单已变化处理。
-func (s *orderService) MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error) {
+func (s *orderService) MarkPaid(ctx context.Context, tx *transaction.Handle, orderNo string, payAmount int64) (bool, error) {
 	ok, err := s.store.Orders.MarkPaid(ctx, tx, orderNo, payAmount)
 	if ok {
 		s.metrics.OrderStatusChanged(model.OrderStatusPaid)
@@ -1174,7 +1173,7 @@ func (s *orderService) Ship(ctx context.Context, orderNo string) error {
 	if !model.CanTransition(order.Status, model.OrderStatusShipped) {
 		return fmt.Errorf("%w: %s → %s", ErrIllegalTransition, order.Status, model.OrderStatusShipped)
 	}
-	ok, err := s.store.Orders.Ship(ctx, nil, orderNo)
+	ok, err := s.store.Orders.Ship(ctx, orderNo)
 	if err != nil {
 		return err
 	}
@@ -1194,7 +1193,7 @@ func (s *orderService) ConfirmReceipt(ctx context.Context, userID int64, orderNo
 	if !model.CanTransition(view.Status, model.OrderStatusCompleted) {
 		return fmt.Errorf("%w: %s → %s", ErrIllegalTransition, view.Status, model.OrderStatusCompleted)
 	}
-	ok, err := s.store.Orders.ConfirmReceipt(ctx, nil, orderNo)
+	ok, err := s.store.Orders.ConfirmReceipt(ctx, orderNo)
 	if err != nil {
 		return err
 	}

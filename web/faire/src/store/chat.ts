@@ -2,6 +2,43 @@ import { create } from "zustand";
 
 import type { ConversationView, Message } from "../api/types";
 
+function mergeMessages(current: readonly Message[], incoming: readonly Message[]): Message[] {
+  const byID = new Map(current.map((message) => [message.id, message]));
+  for (const message of incoming) byID.set(message.id, message);
+  return [...byID.values()].sort((a, b) => a.id - b.id);
+}
+
+function mergeConversations(
+  current: readonly ConversationView[],
+  incoming: readonly ConversationView[],
+): ConversationView[] {
+  const byKey = new Map(current.map((conversation) => [conversation.conversation_key, conversation]));
+  for (const conversation of incoming) {
+    const existing = byKey.get(conversation.conversation_key);
+    const existingLastID = existing?.last_message?.id ?? 0;
+    const incomingLastID = conversation.last_message?.id ?? 0;
+    if (existingLastID > incomingLastID) {
+      byKey.set(conversation.conversation_key, {
+        ...existing,
+        ...conversation,
+        last_message: existing?.last_message,
+        unread_count: existing?.unread_count ?? 0,
+      });
+    } else if (existing && existingLastID === incomingLastID) {
+      byKey.set(conversation.conversation_key, {
+        ...existing,
+        ...conversation,
+        unread_count: Math.min(existing.unread_count, conversation.unread_count),
+      });
+    } else {
+      byKey.set(conversation.conversation_key, conversation);
+    }
+  }
+  return [...byKey.values()].sort(
+    (a, b) => (b.last_message?.id ?? 0) - (a.last_message?.id ?? 0),
+  );
+}
+
 interface ChatState {
   conversations: ConversationView[];
   messagesByKey: Record<string, Message[]>;
@@ -12,6 +49,7 @@ interface ChatState {
   upsertConversation: (conv: ConversationView) => void;
   setActiveKey: (key: string | null) => void;
   setMessages: (key: string, messages: Message[]) => void;
+  markConversationReadLocally: (key: string, readThroughID: number) => void;
   setWsOnline: (online: boolean) => void;
   reset: () => void;
   /** 收到/发送一条消息：去重追加、刷新会话预览、按当前会话判定未读与已读。 */
@@ -24,17 +62,32 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   activeKey: null,
   wsOnline: false,
 
-  setConversations: (items) => set({ conversations: items }),
+  setConversations: (items) => set((state) => ({
+    conversations: mergeConversations(state.conversations, items),
+  })),
 
   upsertConversation: (conv) => {
-    const rest = get().conversations.filter((c) => c.conversation_key !== conv.conversation_key);
-    set({ conversations: [conv, ...rest] });
+    set((state) => ({ conversations: mergeConversations(state.conversations, [conv]) }));
   },
 
   setActiveKey: (key) => set({ activeKey: key }),
 
   setMessages: (key, messages) =>
-    set((state) => ({ messagesByKey: { ...state.messagesByKey, [key]: messages } })),
+    set((state) => ({
+      messagesByKey: {
+        ...state.messagesByKey,
+        [key]: mergeMessages(state.messagesByKey[key] ?? [], messages),
+      },
+    })),
+
+  markConversationReadLocally: (key, readThroughID) => set((state) => ({
+    conversations: state.conversations.map((conversation) => (
+      conversation.conversation_key === key
+        && (conversation.last_message?.id ?? 0) <= readThroughID
+        ? { ...conversation, unread_count: 0 }
+        : conversation
+    )),
+  })),
 
   setWsOnline: (online) => set({ wsOnline: online }),
 
@@ -46,26 +99,25 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     const existing = messagesByKey[key] ?? [];
     if (existing.some((m) => m.id === message.id)) return;
 
-    const next = [...existing, message];
+    const next = mergeMessages(existing, [message]);
     const isActive = activeKey === key && !isOwn;
 
     const conv = conversations.find((c) => c.conversation_key === key);
     // 未知会话（WS 先于会话列表到达）：建条目，对方用户名未知占位，轮询到达后替换。
     const peerUserId = conv?.peer_user_id ?? message.sender_id;
     const unread = isActive || isOwn ? 0 : (conv?.unread_count ?? 0) + 1;
+    const lastMessage = (conv?.last_message?.id ?? 0) > message.id ? conv?.last_message : message;
     const nextConversations = [...conversations]
       .filter((c) => c.conversation_key !== key)
       .concat({
         conversation_key: key,
         peer_user_id: peerUserId,
         peer_username: conv?.peer_username ?? `用户 #${peerUserId}`,
-        last_message: message,
+        last_message: lastMessage,
         unread_count: unread,
       })
       .sort((a, b) => {
-        const at = new Date(a.last_message?.created_at ?? 0).getTime();
-        const bt = new Date(b.last_message?.created_at ?? 0).getTime();
-        return bt - at;
+        return (b.last_message?.id ?? 0) - (a.last_message?.id ?? 0);
       });
 
     set({

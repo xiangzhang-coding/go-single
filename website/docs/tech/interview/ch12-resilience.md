@@ -200,7 +200,7 @@ func main() {
 **答案要点**
 
 - 高耗时/高并发操作不阻塞请求：**202 受理 + 状态轮询**（秒杀抢购）。
-- 受理即返回排队号（order_no），前端轮询最终结果。
+- 受理即返回 `pre_deduction_id`，前端轮询预扣生命周期直到 `ordered` / `rolled_back`。
 - 用户侧取舍：立即失败分支（限流/抢光）仍同步 4xx；只有"受理成功"走异步。
 - 兜底：异步链路失败由对账补偿，保证最终一致。
 
@@ -215,27 +215,27 @@ import (
 )
 
 type task struct {
-	status string // queued → processing → done
+	status string // pending_publish → pending_order → ordered / rolled_back
 }
 
 func main() {
-	// 秒杀抢购：预扣成功立即返回 202，落单异步进行；前端轮询订单号。
-	t := &task{status: "queued"}
+	// 秒杀抢购：预扣成功立即返回 202，落单异步进行；前端轮询预扣生命周期。
+	t := &task{status: "pending_publish"}
 
-	fmt.Println("POST /api/flashsales/:id/purchase → 202 {\"status\":\"queued\",\"order_no\":\"O1\"}")
+	fmt.Println("POST /api/flashsales/:id/purchase → 202 {\"status\":\"queued\",\"pre_deduction_id\":\"42\",\"pre_deduction_status\":\"pending_publish\"}")
 
 	go func() { // 消费者异步落单
 		time.Sleep(150 * time.Millisecond)
-		t.status = "processing"
+		t.status = "pending_order"
 		time.Sleep(150 * time.Millisecond)
-		t.status = "done"
+		t.status = "ordered"
 	}()
 
 	for i := 0; i < 8; i++ { // 前端 1.5s×30 轮询
 		time.Sleep(100 * time.Millisecond)
-		fmt.Printf("轮询 GET /api/orders/O1 → %s\n", t.status)
-		if t.status == "done" {
-			fmt.Println("→ 订单已生成，跳转订单详情（失败则提示稍后重试）")
+		fmt.Printf("轮询 GET /api/flashsales/purchases/42 → %s\n", t.status)
+		if t.status == "ordered" || t.status == "rolled_back" {
+			fmt.Println("→ 生命周期已终结：已落单则跳转详情，已回退则提示失败")
 			break
 		}
 	}
@@ -243,7 +243,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/handler/flashsale_handler.go` 返回 202 + order_no；前端轮询见 `web/faire` 秒杀页；异步落单 `flashsale_consumer.go`。
+**项目位置**：`internal/flashsale/handler/flashsale_handler.go` 返回 202 + pre_deduction_id；前端轮询见 `web/faire` 秒杀页；异步落单 `flashsale_consumer.go`。
 
 ## Q6. 最终一致兜底：故障矩阵与对账
 

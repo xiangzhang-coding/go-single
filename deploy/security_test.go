@@ -112,3 +112,26 @@ func TestNginxBodyBudgetsMatchBackendContracts(t *testing.T) {
 	require.Equal(t, 1, strings.Count(config, "client_max_body_size 21m;"))
 	require.Regexp(t, regexp.MustCompile(`(?s)location = /api/files\s*\{.*?client_max_body_size 21m;`), config)
 }
+
+func TestPagesDeploymentRunsAfterSuccessfulCI(t *testing.T) {
+	pages, err := os.ReadFile("../.github/workflows/pages-deploy.yml")
+	require.NoError(t, err)
+	pagesWorkflow := string(pages)
+	require.Contains(t, pagesWorkflow, "workflow_call:")
+	require.NotContains(t, pagesWorkflow, "  push:")
+
+	ci, err := os.ReadFile("../.github/workflows/ci.yml")
+	require.NoError(t, err)
+	ciWorkflow := string(ci)
+	require.Regexp(t, regexp.MustCompile(`(?s)deploy-pages:.*?needs: lint-and-test.*?uses: \./\.github/workflows/pages-deploy\.yml`), ciWorkflow)
+}
+
+func TestCloudflareAPIBaseIncludesBackendAPIPrefix(t *testing.T) {
+	docs, err := os.ReadFile("../docs/DEPLOYMENT.md")
+	require.NoError(t, err)
+	require.Contains(t, string(docs), "https://api.example.com/api")
+
+	workflow, err := os.ReadFile("../.github/workflows/pages-deploy.yml")
+	require.NoError(t, err)
+	require.Contains(t, string(workflow), "bun run scripts/validate-pages-env.ts")
+}

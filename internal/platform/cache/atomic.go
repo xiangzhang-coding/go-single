@@ -203,6 +203,7 @@ type FlashSaleStore interface {
 	WarmFlashSaleStock(ctx context.Context, p FlashSaleWarmParams) (FlashSaleWarmResult, error)
 	DecreaseFlashSaleStockDurably(ctx context.Context, p FlashSaleDecreaseParams, timeout time.Duration) error
 	PauseFlashSaleStockDurably(ctx context.Context, p FlashSalePauseParams, timeout time.Duration) (int, error)
+	HoldFlashSalePauseDurably(ctx context.Context, pauseKey string, timeout time.Duration) error
 	ReleaseFlashSalePauseDurably(ctx context.Context, pauseKey, token string, timeout time.Duration) error
 	PreDeductFlashSale(ctx context.Context, p FlashSalePreDeductParams) (FlashSalePreDeductResult, error)
 	PreDeductFlashSaleDurably(ctx context.Context, p FlashSalePreDeductParams, timeout time.Duration) (FlashSalePreDeductResult, error)
@@ -389,6 +390,11 @@ const releaseFlashSalePauseScript = `
 if ARGV[1] == '' or redis.call('GET', KEYS[1]) == ARGV[1] then
     redis.call('DEL', KEYS[1])
 end
+return 1
+`
+
+const holdFlashSalePauseScript = `
+redis.call('SET', KEYS[1], 'fail-closed')
 return 1
 `
 
@@ -842,6 +848,14 @@ func (r *redisCache) ReleaseFlashSalePauseDurably(ctx context.Context, pauseKey,
 		return fmt.Errorf("durable flash-sale pause release requires key and timeout")
 	}
 	_, err := r.evalIntAndWaitAOF(ctx, timeout, releaseFlashSalePauseScript, []string{pauseKey}, token)
+	return err
+}
+
+func (r *redisCache) HoldFlashSalePauseDurably(ctx context.Context, pauseKey string, timeout time.Duration) error {
+	if pauseKey == "" || timeout <= 0 {
+		return fmt.Errorf("durable fail-closed flash-sale pause requires key and timeout")
+	}
+	_, err := r.evalIntAndWaitAOF(ctx, timeout, holdFlashSalePauseScript, []string{pauseKey})
 	return err
 }
 

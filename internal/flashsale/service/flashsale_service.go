@@ -12,8 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"gorm.io/gorm"
+	"unicode/utf8"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
@@ -21,6 +20,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 )
@@ -92,7 +92,8 @@ const (
 	maxPublishAttempts     = 10
 	preparingRecoveryDelay = 30 * time.Second
 	redisAOFTimeout        = 2 * time.Second
-	stockEditPauseTTL      = 30 * time.Second
+	stockEditPauseTTL      = 24 * time.Hour
+	failClosedStepTimeout  = redisAOFTimeout + time.Second
 )
 
 type PurchaseResult struct {
@@ -268,7 +269,7 @@ func (s *flashsaleService) UpdateActivity(ctx context.Context, id int64, p Activ
 	}
 	var current *model.Activity
 	var inProgress bool
-	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+	err = s.store.Tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 		current, err = s.store.Activities.GetByIDForUpdate(ctx, tx, id)
 		if err != nil {
 			return err
@@ -327,7 +328,7 @@ func (s *flashsaleService) updateInProgressActivity(ctx context.Context, id int6
 	}
 
 	var delta int
-	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+	err = s.store.Tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 		current, err := s.store.Activities.GetByIDForUpdate(ctx, tx, id)
 		if err != nil {
 			return err
@@ -384,11 +385,26 @@ func (s *flashsaleService) updateInProgressActivity(ctx context.Context, id int6
 }
 
 func (s *flashsaleService) failClosedActivity(ctx context.Context, id int64, cause error) error {
-	statusErr := s.store.Activities.UpdateStatus(ctx, id, model.ActivityStatusOffSale)
-	deleteStockErr := s.cache.Del(ctx, stockKey(id))
-	releasePauseErr := s.cache.ReleaseFlashSalePauseDurably(ctx, pauseKey(id), "", redisAOFTimeout)
+	deleteCtx, cancelDelete := context.WithTimeout(context.WithoutCancel(ctx), failClosedStepTimeout)
+	deleteStockErr := s.cache.Del(deleteCtx, stockKey(id))
+	cancelDelete()
+
+	statusCtx, cancelStatus := context.WithTimeout(context.WithoutCancel(ctx), failClosedStepTimeout)
+	statusErr := s.store.Activities.UpdateStatus(statusCtx, id, model.ActivityStatusOffSale)
+	cancelStatus()
+
+	var releasePauseErr, holdPauseErr error
+	if statusErr == nil {
+		releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), failClosedStepTimeout)
+		releasePauseErr = s.cache.ReleaseFlashSalePauseDurably(releaseCtx, pauseKey(id), "", redisAOFTimeout)
+		cancelRelease()
+	} else {
+		holdCtx, cancelHold := context.WithTimeout(context.WithoutCancel(ctx), failClosedStepTimeout)
+		holdPauseErr = s.cache.HoldFlashSalePauseDurably(holdCtx, pauseKey(id), redisAOFTimeout)
+		cancelHold()
+	}
 	s.metrics.DeleteSeckillStock(id)
-	return errors.Join(cause, statusErr, deleteStockErr, releasePauseErr)
+	return errors.Join(cause, statusErr, deleteStockErr, releasePauseErr, holdPauseErr)
 }
 
 func (s *flashsaleService) settleActivityReservations(ctx context.Context, activityID int64) error {
@@ -513,7 +529,7 @@ func (s *flashsaleService) PublishActivity(ctx context.Context, id int64) error 
 	if s.store.Tx == nil {
 		return errors.New("flashsale transaction runner is not configured")
 	}
-	return s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+	return s.store.Tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 		current, err := s.store.Activities.GetByIDForUpdate(ctx, tx, id)
 		if err != nil {
 			return err
@@ -564,13 +580,7 @@ func (s *flashsaleService) UnpublishActivity(ctx context.Context, id int64) erro
 			StockKey: stockKey(id), PauseKey: pauseKey(id), Token: token, TTL: stockEditPauseTTL,
 		}, redisAOFTimeout)
 	}
-	statusErr := s.store.Activities.UpdateStatus(ctx, id, model.ActivityStatusOffSale)
-	// 清除预热库存：key 生命周期 = 上架时预热、下架时清理（再上架重新预热）。
-	deleteStockErr := s.cache.Del(ctx, stockKey(id))
-	releasePauseErr := s.cache.ReleaseFlashSalePauseDurably(ctx, pauseKey(id), "", redisAOFTimeout)
-	// 库存余量 gauge 同步移除（与 Redis key 生命周期一致，T19c）。
-	s.metrics.DeleteSeckillStock(id)
-	return errors.Join(pauseErr, statusErr, deleteStockErr, releasePauseErr)
+	return s.failClosedActivity(ctx, id, pauseErr)
 }
 
 // ---- 抢购（T11）----
@@ -580,8 +590,7 @@ func (s *flashsaleService) UnpublishActivity(ctx context.Context, id int64) erro
 // 持久订单号并发布。成功预扣后即使当前请求的订单号生成或发布失败，也返回
 // 可查询的事实 ID，由启动恢复和 cron 继续发布或完整回退。
 func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64, clientRequestID string) (*PurchaseResult, error) {
-	clientRequestID = strings.TrimSpace(clientRequestID)
-	if clientRequestID == "" || len(clientRequestID) > 64 {
+	if strings.TrimSpace(clientRequestID) == "" || utf8.RuneCountInString(clientRequestID) > 64 {
 		return nil, fmt.Errorf("%w: invalid client_request_id", ErrInvalidInput)
 	}
 	if s.store.PreDeductions == nil {
@@ -855,7 +864,7 @@ func (s *flashsaleService) recoverPreDeduction(ctx context.Context, pd *model.Pr
 			pd.Status = model.PreDeductionStatusPendingPublish
 			return s.dispatchPreDeduction(ctx, pd)
 		case errors.Is(err, cache.ErrMiss):
-			if err := s.store.PreDeductions.MarkPendingRollback(ctx, nil, pd.ID, "pre-deduction not present in Redis"); err != nil {
+			if err := s.store.PreDeductions.MarkPendingRollback(ctx, pd.ID, "pre-deduction not present in Redis"); err != nil {
 				return err
 			}
 			pd.Status = model.PreDeductionStatusPendingRollback
@@ -863,7 +872,7 @@ func (s *flashsaleService) recoverPreDeduction(ctx context.Context, pd *model.Pr
 		case err != nil:
 			return err
 		default:
-			if err := s.store.PreDeductions.MarkPendingRollback(ctx, nil, pd.ID, "reservation token mismatch"); err != nil {
+			if err := s.store.PreDeductions.MarkPendingRollback(ctx, pd.ID, "reservation token mismatch"); err != nil {
 				return err
 			}
 			pd.Status = model.PreDeductionStatusPendingRollback

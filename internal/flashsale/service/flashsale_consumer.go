@@ -12,9 +12,6 @@ import (
 	"fmt"
 	"time"
 
-	"go.uber.org/zap"
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
@@ -22,7 +19,9 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
+	"go.uber.org/zap"
 )
 
 // ErrSeckillStockInsufficient 表示 Redis 已预扣但 MySQL 活动库存不足。
@@ -32,7 +31,7 @@ var ErrSeckillStockInsufficient = errors.New("seckill activity stock insufficien
 // OrderService flashsale 消费侧最小接口（跨模块进程内调用，order 服务实现）：
 // 异步落单（幂等建单 + 同事务扣活动库存）。
 type OrderService interface {
-	CreateSeckillInTx(ctx context.Context, tx *gorm.DB, p ordersvc.SeckillCreateParams) (created bool, err error)
+	CreateSeckillInTx(ctx context.Context, tx *transaction.Handle, p ordersvc.SeckillCreateParams) (created bool, err error)
 }
 
 // UserService 用户模块最小接口：读取默认地址固化为秒杀订单地址快照。
@@ -130,7 +129,7 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 	}
 
 	created := false
-	err = c.tx.WithinTx(ctx, func(tx *gorm.DB) error {
+	err = c.tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 		lockedActivity, err := c.activities.GetByIDForUpdate(ctx, tx, msg.ActivityID)
 		if err != nil {
 			return err
@@ -209,7 +208,7 @@ func (c *SeckillOrderConsumer) permanent(ctx context.Context, reason string, msg
 	}
 	c.log.Error("秒杀落单永久失败（持久化回退意图后进死信）", fields...)
 	if msg != nil && msg.PreDeductionID > 0 && c.preDeductions != nil {
-		if err := c.preDeductions.MarkPendingRollback(ctx, nil, msg.PreDeductionID, reason); err != nil {
+		if err := c.preDeductions.MarkPendingRollback(ctx, msg.PreDeductionID, reason); err != nil {
 			return fmt.Errorf("persist permanent seckill failure: %w", err)
 		}
 	}
@@ -241,7 +240,7 @@ func (c *SeckillOrderConsumer) HandleDeadLetter(ctx context.Context, body []byte
 			return err
 		}
 	}
-	return c.preDeductions.MarkPendingRollback(ctx, nil, msg.PreDeductionID, "message reached dead-letter queue")
+	return c.preDeductions.MarkPendingRollback(ctx, msg.PreDeductionID, "message reached dead-letter queue")
 }
 
 func (c *SeckillOrderConsumer) adoptLegacyMessage(ctx context.Context, msg *SeckillSuccessMessage, activity *model.Activity) error {

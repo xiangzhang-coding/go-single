@@ -4,9 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 var (
@@ -19,10 +18,10 @@ type PreDeductionRepository interface {
 	Create(ctx context.Context, p *model.PreDeduction) error
 	GetByID(ctx context.Context, id int64) (*model.PreDeduction, error)
 	GetByRequestID(ctx context.Context, userID, activityID int64, requestID string) (*model.PreDeduction, error)
-	GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.PreDeduction, error)
+	GetByIDForUpdate(ctx context.Context, tx *transaction.Handle, id int64) (*model.PreDeduction, error)
 	EnsureLegacyPendingOrder(ctx context.Context, seed *model.PreDeduction) (*model.PreDeduction, error)
 	ReservationTargets(ctx context.Context, activityID, userID int64) (pendingQuantity, userQuantity int, err error)
-	PendingReservationQuantityForUpdate(ctx context.Context, tx *gorm.DB, activityID int64) (int, error)
+	PendingReservationQuantityForUpdate(ctx context.Context, tx *transaction.Handle, activityID int64) (int, error)
 	ListRecoverable(ctx context.Context, limit int) ([]model.PreDeduction, error)
 	ListRecoverableByActivity(ctx context.Context, activityID int64) ([]model.PreDeduction, error)
 	ListOrdered(ctx context.Context, limit int) ([]model.PreDeduction, error)
@@ -30,9 +29,9 @@ type PreDeductionRepository interface {
 	SetOrderNo(ctx context.Context, id int64, orderNo string) error
 	MarkPendingOrder(ctx context.Context, id int64) error
 	RecordPublishFailure(ctx context.Context, id int64, maxAttempts int, detail string) error
-	MarkOrdered(ctx context.Context, tx *gorm.DB, id int64) error
-	MarkPendingRollback(ctx context.Context, tx *gorm.DB, id int64, detail string) error
-	EnsurePendingRollback(ctx context.Context, tx *gorm.DB, seed *model.PreDeduction) (*model.PreDeduction, error)
+	MarkOrdered(ctx context.Context, tx *transaction.Handle, id int64) error
+	MarkPendingRollback(ctx context.Context, id int64, detail string) error
+	EnsurePendingRollback(ctx context.Context, tx *transaction.Handle, seed *model.PreDeduction) (*model.PreDeduction, error)
 	MarkRolledBack(ctx context.Context, id int64) error
 	MarkReservationReleased(ctx context.Context, id int64) error
 	RecordRollbackFailure(ctx context.Context, id int64, detail string) error

@@ -93,7 +93,7 @@ go_single/
 - **定义**：工程级插拔——每套主题 = `web/` 下独立 Vite 工程，共享同一后端（契约：REST 接口，json tag ↔ 手写 TS 类型 + HTTP 集成测试，见 ADR-0006），互不依赖；换主题 = 部署时选一套构建
 - **主题资产**：四件套放 `web/<theme>/design/`——DESIGN.md（设计规范，供人/AI 参考）/ CSS_Variables.css / Design_Tokens.json（W3C DTCG）/ Tailwind_V4.css（`@theme`）；组件代码一律用语义化 Tailwind 类，不写死颜色
 - **工具链**：bun（`bun install` / `bun run dev` / `bun run build`）；Vite dev proxy 把 `/api`、`/ws` 转发到后端 :8080
-- **API 对接**：HTTP base 由 `VITE_API_BASE` 控制（dev 用 `/api` 代理，云端构建传后端绝对地址）；WebSocket 地址由 `VITE_WS_BASE` 控制（dev 用 `/ws` 代理）；后端 `platform/cors` 中间件允许前端域名（跨源场景）
+- **API 对接**：HTTP base 由 `VITE_API_BASE` 控制（dev 用 `/api` 代理，云端构建传包含路由前缀且以 `/api` 结尾的后端绝对地址）；WebSocket 地址由 `VITE_WS_BASE` 控制（dev 用 `/ws` 代理）；后端 `platform/cors` 中间件允许前端域名（跨源场景）
 - **私有媒体**：统一后端代理——`POST /api/files` 将图片（png/jpeg/webp/gif，魔数校验，≤5 MiB）或普通文件（PDF/ZIP/TXT/CSV/MD，≤20 MiB）写入 MinIO 私有桶，返回 `/files/<opaque-ref>` 托管引用；Nginx 与后端均以 21 MiB 作为 multipart 请求硬上限（为 20 MiB 文件预留 1 MiB 开销），后端解析仅保留 1 MiB 内存，超限返回 413；每用户累计字节与对象数先在 MySQL 原子预留，默认 512 MiB/1000 个，防止合法重复上传无限占用存储。引用固化上传者与 `image/file` 类型，头像/动态/消息保存前校验归属与类型。`GET /api/files/:reference` 经 Bearer 代理读取：头像对登录用户可见，动态图片跟随好友关系，聊天媒体仅会话双方可读；前端以 Axios 拉取 Blob 展示/下载，不直连 MinIO（presigned 直传明确不做）
 - **页面清单**（演示前端功能范围，各主题通用）：
   - 登录/注册 → user；首页（商品列表）→ product；商品详情 → product + cart；购物车 → cart + product
@@ -135,7 +135,7 @@ go_single/
 ```
 
 - **库存扣减时机**：下单即扣（与秒杀同原则：下单即扣、超时回补）；扣减用条件更新（`UPDATE sku SET stock=stock-N WHERE stock>=N`）防超卖
-- **幂等**：下单接口携带 `client_request_id`；MySQL 唯一约束 `(user_id, client_request_id)` 保存持久请求事实，Redis SETNX + TTL 15min 仅协调在途请求。Redis 丢失或 TTL 到期后重试仍返回原订单
+- **幂等**：下单接口携带 `client_request_id`；MySQL 唯一约束 `(user_id, client_request_id)` 保存持久请求事实，Redis SETNX + TTL 15min 仅协调在途请求。Redis 丢失或 TTL 到期后重试仍返回原订单；命中尚未落库的在途请求时返回 `202 {state:"processing",order_no}`，前端详情页对暂时性 404 以 1.5s 间隔最多重试 30 次
 - **金额安全**：SKU 与秒杀成交价上限为 100,000,000 分（100 万元）；订单项乘法与订单总额累加使用检查运算，金额关系和逐项小计在扣库存前验证，并由数据库 `CHECK` 约束兜底
 - **订单号**：雪花 ID（手写实现，学习点）
 - **地址快照**：下单时从地址簿选择地址固化为订单副本，用户后续改地址不影响历史订单
@@ -262,6 +262,8 @@ graph LR
     payment --> order
     social --> order
     social --> product
+    chat --> user
+    chat --> social
     auth[user/auth 中间件] -.-> cart
     auth -.-> order
     auth -.-> flashsale
@@ -278,7 +280,7 @@ graph LR
 
 ## 可插拔 seam（ADR-0003）
 
-- **仓储接口**：每模块 `repository/` 定义接口，MySQL 实现（GORM 之上再包一层）；好友关系、订单、优惠券等业务数据的访问均为仓储 seam 的具体实例
+- **仓储接口**：每模块 `repository/` 定义接口，MySQL 实现（GORM 之上再包一层）；好友关系、订单、优惠券等业务数据的访问均为仓储 seam 的具体实例。跨模块写事务只传递 `platform/transaction.Handle` 不透明句柄，GORM 的创建与解包仅存在于 adapter
 - **缓存接口**：隔离 go-redis 客户端；业务模块只依赖类型化原子能力，Lua 文本与返回码协议封装在适配器内
 - **MQ 接口**：RabbitMQ 实现，Kafka 可换
 

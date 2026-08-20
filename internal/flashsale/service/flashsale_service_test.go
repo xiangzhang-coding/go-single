@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
@@ -22,6 +21,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 )
@@ -29,8 +29,10 @@ import (
 // ---- fake 活动仓储 ----
 
 type fakeActivities struct {
-	byID  map[int64]*model.Activity
-	order int64
+	byID                 map[int64]*model.Activity
+	order                int64
+	respectContextCancel bool
+	updateStatusErr      error
 }
 
 func newFakeActivities() *fakeActivities {
@@ -53,7 +55,7 @@ func (f *fakeActivities) Update(_ context.Context, a *model.Activity) error {
 	return nil
 }
 
-func (f *fakeActivities) UpdateInTx(ctx context.Context, _ *gorm.DB, a *model.Activity) error {
+func (f *fakeActivities) UpdateInTx(ctx context.Context, _ *transaction.Handle, a *model.Activity) error {
 	if err := f.Update(ctx, a); err != nil {
 		return err
 	}
@@ -67,11 +69,11 @@ func (f *fakeActivities) GetByID(_ context.Context, id int64) (*model.Activity, 
 	return f.byID[id], nil
 }
 
-func (f *fakeActivities) GetByIDForUpdate(ctx context.Context, _ *gorm.DB, id int64) (*model.Activity, error) {
+func (f *fakeActivities) GetByIDForUpdate(ctx context.Context, _ *transaction.Handle, id int64) (*model.Activity, error) {
 	return f.GetByID(ctx, id)
 }
 
-func (f *fakeActivities) WithinTx(_ context.Context, fn func(tx *gorm.DB) error) error {
+func (f *fakeActivities) WithinTx(_ context.Context, fn func(tx *transaction.Handle) error) error {
 	return fn(nil)
 }
 
@@ -84,7 +86,13 @@ func (f *fakeActivities) List(context.Context) ([]model.Activity, error) {
 	return out, nil
 }
 
-func (f *fakeActivities) UpdateStatus(_ context.Context, id int64, status string) error {
+func (f *fakeActivities) UpdateStatus(ctx context.Context, id int64, status string) error {
+	if f.respectContextCancel && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if f.updateStatusErr != nil {
+		return f.updateStatusErr
+	}
 	if v, ok := f.byID[id]; ok {
 		v.Status = status
 	}
@@ -92,7 +100,7 @@ func (f *fakeActivities) UpdateStatus(_ context.Context, id int64, status string
 }
 
 // DeductStock 模拟 GORM 条件扣减：库存不足返回 (false, nil)。
-func (f *fakeActivities) DeductStock(_ context.Context, _ *gorm.DB, id int64, quantity int) (bool, error) {
+func (f *fakeActivities) DeductStock(_ context.Context, _ *transaction.Handle, id int64, quantity int) (bool, error) {
 	v, ok := f.byID[id]
 	if !ok || v.Stock < quantity {
 		return false, nil
@@ -102,7 +110,7 @@ func (f *fakeActivities) DeductStock(_ context.Context, _ *gorm.DB, id int64, qu
 }
 
 // RestoreStock 模拟事务内回补活动库存。
-func (f *fakeActivities) RestoreStock(_ context.Context, _ *gorm.DB, id int64, quantity int) error {
+func (f *fakeActivities) RestoreStock(_ context.Context, _ *transaction.Handle, id int64, quantity int) error {
 	v, ok := f.byID[id]
 	if !ok {
 		return nil
@@ -144,17 +152,23 @@ func (f *fakeProducts) GetProduct(_ context.Context, id int64) (*productmodel.Pr
 // ---- fake 缓存（互斥锁模拟类型化原子缓存能力）----
 
 type fakeCache struct {
-	mu           sync.Mutex
-	stock        map[string]int  // flashsale:stock:{id} → 余量
-	count        map[string]int  // flashsale:count:{id}:{user} → 已购数
-	idem         map[string]bool // flashsale:idem:{id}:{user}:{slot} → 槽位所有权键
-	idemToken    map[string]string
-	reservations map[string]string
-	rl           map[string]int // flashsale:rl:{user} → 限流计数
-	err          error
-	aofErr       error
-	decreaseErr  error
-	paused       map[string]string
+	mu                   sync.Mutex
+	stock                map[string]int  // flashsale:stock:{id} → 余量
+	count                map[string]int  // flashsale:count:{id}:{user} → 已购数
+	idem                 map[string]bool // flashsale:idem:{id}:{user}:{slot} → 槽位所有权键
+	idemToken            map[string]string
+	reservations         map[string]string
+	rl                   map[string]int // flashsale:rl:{user} → 限流计数
+	err                  error
+	aofErr               error
+	decreaseErr          error
+	paused               map[string]string
+	respectContextCancel bool
+	delErrOnce           error
+	delErr               error
+	onDelError           func()
+	onPause              func()
+	releasePauseCalls    int
 	// deductErr 仅作用于预扣能力（模拟预扣时基础设施故障）。
 	deductErr error
 }
@@ -203,9 +217,24 @@ func (f *fakeCache) Set(_ context.Context, key, value string, _ time.Duration) e
 	return nil
 }
 
-func (f *fakeCache) Del(_ context.Context, key string) error {
+func (f *fakeCache) Del(ctx context.Context, key string) error {
+	if f.respectContextCancel && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.delErrOnce != nil {
+		err := f.delErrOnce
+		f.delErrOnce = nil
+		if f.onDelError != nil {
+			f.onDelError()
+			f.onDelError = nil
+		}
+		return err
+	}
+	if f.delErr != nil {
+		return f.delErr
+	}
 	if f.err != nil {
 		return f.err
 	}
@@ -284,6 +313,10 @@ func (f *fakeCache) DecreaseFlashSaleStockDurably(_ context.Context, p cache.Fla
 func (f *fakeCache) PauseFlashSaleStockDurably(_ context.Context, p cache.FlashSalePauseParams, _ time.Duration) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onPause != nil {
+		f.onPause()
+		f.onPause = nil
+	}
 	if f.err != nil {
 		return 0, f.err
 	}
@@ -301,9 +334,17 @@ func (f *fakeCache) PauseFlashSaleStockDurably(_ context.Context, p cache.FlashS
 func (f *fakeCache) ReleaseFlashSalePauseDurably(_ context.Context, pauseKey, token string, _ time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.releasePauseCalls++
 	if token == "" || f.paused[pauseKey] == token {
 		delete(f.paused, pauseKey)
 	}
+	return nil
+}
+
+func (f *fakeCache) HoldFlashSalePauseDurably(_ context.Context, pauseKey string, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paused[pauseKey] = "fail-closed"
 	return nil
 }
 
@@ -880,6 +921,33 @@ func TestUpdateSyncFailureFailsClosed(t *testing.T) {
 	require.False(t, exists, "fail-closed edit must remove stale sellable stock")
 }
 
+func TestUpdateSyncFailureFailsClosedAfterRequestCancellation(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, func(p *ActivityParams) {
+		p.StartAt = time.Now().Add(time.Hour)
+		p.EndAt = time.Now().Add(2 * time.Hour)
+	})
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fx.acts.respectContextCancel = true
+	fx.cache.respectContextCancel = true
+	fx.cache.delErrOnce = errors.New("redis sync failed")
+	fx.cache.onDelError = cancel
+
+	p := ActivityParams{
+		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: 90,
+		PerUserLimit: a.PerUserLimit, StartAt: a.StartAt, EndAt: a.EndAt,
+	}
+	require.Error(t, fx.svc.UpdateActivity(ctx, a.ID, p))
+
+	updated, err := fx.acts.GetByID(context.Background(), a.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.ActivityStatusOffSale, updated.Status)
+	_, exists := fx.cache.stock[stockKey(a.ID)]
+	require.False(t, exists, "fail-closed cleanup must outlive the cancelled request")
+}
+
 func TestUpdateCannotReduceStockBelowAcceptedReservations(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, nil)
@@ -967,6 +1035,51 @@ func TestUnpublishRejectsPreDeduct(t *testing.T) {
 	require.False(t, ok, "下架应清除预热库存")
 
 	require.ErrorIs(t, fx.svc.PreDeduct(context.Background(), 1, a.ID), ErrOffline)
+}
+
+func TestUnpublishFinishesAfterRequestCancellation(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fx.acts.respectContextCancel = true
+	fx.cache.respectContextCancel = true
+	fx.cache.onPause = cancel
+	require.NoError(t, fx.svc.UnpublishActivity(ctx, a.ID))
+
+	updated, err := fx.acts.GetByID(context.Background(), a.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.ActivityStatusOffSale, updated.Status)
+	_, exists := fx.cache.stock[stockKey(a.ID)]
+	require.False(t, exists)
+}
+
+func TestUnpublishKeepsPauseWhenNeitherSafeStateCanBePersisted(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.cache.releasePauseCalls = 0
+	fx.cache.delErr = errors.New("redis delete failed")
+	fx.acts.updateStatusErr = errors.New("mysql update failed")
+
+	require.Error(t, fx.svc.UnpublishActivity(context.Background(), a.ID))
+	require.Equal(t, "fail-closed", fx.cache.paused[pauseKey(a.ID)])
+	require.Zero(t, fx.cache.releasePauseCalls)
+}
+
+func TestUnpublishKeepsPauseWhenDatabaseStillReportsOnSale(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.cache.releasePauseCalls = 0
+	fx.acts.updateStatusErr = errors.New("mysql update failed")
+
+	require.Error(t, fx.svc.UnpublishActivity(context.Background(), a.ID))
+	require.Equal(t, "fail-closed", fx.cache.paused[pauseKey(a.ID)])
+	require.Zero(t, fx.cache.releasePauseCalls)
+	_, stockExists := fx.cache.stock[stockKey(a.ID)]
+	require.False(t, stockExists, "stock deletion alone is not enough to release the pause")
 }
 
 // ---- 预扣 ----

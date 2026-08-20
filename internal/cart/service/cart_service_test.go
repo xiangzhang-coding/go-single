@@ -9,10 +9,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/cart/model"
 	"github.com/xiangzhang-coding/go-single/internal/cart/repository"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 )
@@ -69,7 +68,7 @@ func (f *fakeItems) ListByUser(_ context.Context, userID int64) ([]model.CartIte
 }
 
 // LockByUser 返回用户当前条目；tx 参数忽略（单测无真实事务）。
-func (f *fakeItems) LockByUser(_ context.Context, _ *gorm.DB, userID int64) ([]model.CartItem, error) {
+func (f *fakeItems) LockByUser(_ context.Context, _ *transaction.Handle, userID int64) ([]model.CartItem, error) {
 	var out []model.CartItem
 	for _, v := range f.byID {
 		if v.UserID == userID {
@@ -80,7 +79,7 @@ func (f *fakeItems) LockByUser(_ context.Context, _ *gorm.DB, userID int64) ([]m
 }
 
 // DeleteByIDs 按条目 ID 删除；tx 参数忽略（单测无真实事务）。
-func (f *fakeItems) DeleteByIDs(_ context.Context, _ *gorm.DB, userID int64, itemIDs []int64) error {
+func (f *fakeItems) DeleteByIDs(_ context.Context, _ *transaction.Handle, userID int64, itemIDs []int64) error {
 	ids := make(map[int64]bool, len(itemIDs))
 	for _, id := range itemIDs {
 		ids[id] = true

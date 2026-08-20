@@ -15,7 +15,11 @@ const config: Config = {
     locales: ["zh-CN"],
   },
   onBrokenLinks: "throw",
-  onBrokenMarkdownLinks: "warn",
+  markdown: {
+    hooks: {
+      onBrokenMarkdownLinks: "warn",
+    },
+  },
   presets: [
     [
       "classic",

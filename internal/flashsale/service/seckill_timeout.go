@@ -3,13 +3,12 @@ package service
 import (
 	"context"
 
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // SeckillTimeout 负责秒杀订单超时取消的跨模块应用编排。
@@ -18,12 +17,12 @@ type SeckillTimeout interface {
 }
 
 type seckillTxRunner interface {
-	WithinTx(ctx context.Context, fn func(tx *gorm.DB) error) error
+	WithinTx(ctx context.Context, fn func(tx *transaction.Handle) error) error
 }
 
 type seckillCancellationOrders interface {
 	ListExpiredSeckill(ctx context.Context) ([]ordersvc.ExpiredSeckillOrder, error)
-	CancelSeckill(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error)
+	CancelSeckill(ctx context.Context, tx *transaction.Handle, orderNo string) (bool, error)
 }
 
 type preDeductionRecoverer interface {
@@ -62,7 +61,7 @@ func (s *seckillTimeoutService) CancelExpired(ctx context.Context) (cancelled, f
 			continue
 		}
 		var pdID int64
-		dbErr := s.tx.WithinTx(ctx, func(tx *gorm.DB) error {
+		dbErr := s.tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 			ok, err := s.orders.CancelSeckill(ctx, tx, order.OrderNo)
 			if err != nil {
 				return err

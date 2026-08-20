@@ -125,7 +125,7 @@ export interface FlashSaleSKU {
   price: number;
 }
 
-export interface FlashSaleActivity {
+export interface FlashSaleActivityRecord {
   id: number;
   sku_id: number;
   title: string;
@@ -137,6 +137,9 @@ export interface FlashSaleActivity {
   end_at: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface FlashSaleActivity extends FlashSaleActivityRecord {
   state: FlashSaleState;
   product_title: string;
   sku: FlashSaleSKU;
@@ -205,7 +208,7 @@ export interface Order {
   order_no: string;
   user_id: number;
   order_type: "normal" | "seckill" | string;
-  status: OrderStatus | "";
+  status: OrderStatus;
   activity_id?: number;
   purchase_slot?: number;
   total_amount: number;
@@ -230,6 +233,13 @@ export interface Order {
 export interface OrderView extends Order {
   items: OrderItem[];
 }
+
+export interface OrderProcessingResponse {
+  state: "processing";
+  order_no: string;
+}
+
+export type CreateOrderResponse = OrderView | OrderProcessingResponse;
 
 export interface Payment {
   id: number;

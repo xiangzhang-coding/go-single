@@ -7,9 +7,8 @@ import (
 	"context"
 	"errors"
 
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/payment/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // ErrPaymentDuplicate 同一 payment_id 已存在（重复回调，唯一键冲突）。
@@ -17,14 +16,12 @@ var ErrPaymentDuplicate = errors.New("payment already processed")
 
 // TxRunner 事务运行器：开启支付事务（流水落库 + 订单 待支付→已支付），
 // fn 内任一错误整体回滚（流水与订单状态保持一致）。
-type TxRunner interface {
-	WithinTx(ctx context.Context, fn func(tx *gorm.DB) error) error
-}
+type TxRunner = transaction.Runner
 
 // PaymentRepository 支付流水数据访问接口。
 type PaymentRepository interface {
 	// Create 事务内创建支付流水；payment_id 唯一键冲突返回 ErrPaymentDuplicate。
-	Create(ctx context.Context, tx *gorm.DB, p *model.Payment) error
+	Create(ctx context.Context, tx *transaction.Handle, p *model.Payment) error
 	// GetByPaymentID 按支付流水号读取（幂等键）；不存在返回 (nil, nil)。
 	GetByPaymentID(ctx context.Context, paymentID string) (*model.Payment, error)
 }

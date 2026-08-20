@@ -39,6 +39,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/file"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
 	socialmodel "github.com/xiangzhang-coding/go-single/internal/social/model"
@@ -184,16 +185,18 @@ func (stubOrderNoGen) Next() (int64, error) { return 0, nil }
 type stubProducts struct{}
 
 func (stubProducts) GetSKU(context.Context, int64) (*productmodel.SKU, error) { return nil, nil }
-func (stubProducts) GetSKUForUpdate(context.Context, *gorm.DB, int64) (*productmodel.SKU, error) {
+func (stubProducts) GetSKUForUpdate(context.Context, *transaction.Handle, int64) (*productmodel.SKU, error) {
 	return nil, nil
 }
 func (stubProducts) GetDetail(context.Context, int64) (*productmodel.ProductDetail, error) {
 	return nil, nil
 }
-func (stubProducts) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
+func (stubProducts) DeductStock(context.Context, *transaction.Handle, int64, int) (bool, error) {
 	return true, nil
 }
-func (stubProducts) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
+func (stubProducts) RestoreStock(context.Context, *transaction.Handle, int64, int) error {
+	return nil
+}
 func (stubProducts) BeginDetailMutation(context.Context, int64) (string, error) {
 	return "stub-mutation", nil
 }
@@ -204,25 +207,33 @@ type stubCoupons struct{}
 func (stubCoupons) GetUsable(context.Context, int64, int64) (*couponmodel.UserCouponView, error) {
 	return nil, nil
 }
-func (stubCoupons) UseCoupon(context.Context, *gorm.DB, int64, int64) error      { return nil }
-func (stubCoupons) RollbackCoupon(context.Context, *gorm.DB, int64, int64) error { return nil }
+func (stubCoupons) UseCoupon(context.Context, *transaction.Handle, int64, int64) error {
+	return nil
+}
+func (stubCoupons) RollbackCoupon(context.Context, *transaction.Handle, int64, int64) error {
+	return nil
+}
 
 type stubCart struct{}
 
 func (stubCart) ListItems(context.Context, int64) ([]cartmodel.CartItemView, error) { return nil, nil }
-func (stubCart) LockItems(context.Context, *gorm.DB, int64) ([]cartmodel.CartItem, error) {
+func (stubCart) LockItems(context.Context, *transaction.Handle, int64) ([]cartmodel.CartItem, error) {
 	return nil, nil
 }
-func (stubCart) DeletePurchased(context.Context, *gorm.DB, int64, []int64) error { return nil }
+func (stubCart) DeletePurchased(context.Context, *transaction.Handle, int64, []int64) error {
+	return nil
+}
 
 type stubActivity struct{}
 
-func (stubActivity) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
+func (stubActivity) DeductStock(context.Context, *transaction.Handle, int64, int) (bool, error) {
 	return true, nil
 }
 
-func (stubActivity) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
-func (stubActivity) RestoreRedis(context.Context, int64, int64, int) error    { return nil }
+func (stubActivity) RestoreStock(context.Context, *transaction.Handle, int64, int) error {
+	return nil
+}
+func (stubActivity) RestoreRedis(context.Context, int64, int64, int) error { return nil }
 
 func testDSN(dbName string) string {
 	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=Local",

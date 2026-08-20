@@ -11,6 +11,7 @@ import { useAuthStore } from "../store/auth";
 import { useChatStore } from "../store/chat";
 import { formatDate } from "../lib/format";
 import { makeClientRequestID } from "../lib/format";
+import { latestMessageID } from "../lib/chat";
 import { IMAGE_ACCEPT, MESSAGE_FILE_ACCEPT, validateImage, validateMessageFile } from "../lib/media";
 
 export function ChatPage() {
@@ -178,32 +179,26 @@ function ActiveThread({
   me: number;
   onBack: () => void;
 }) {
-  const { setMessages, handleMessage } = useChatStore();
+  const { setMessages, handleMessage, markConversationReadLocally } = useChatStore();
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // 进入会话：无本地缓存拉最近 30 条；已有缓存按 after_id 补拉（追加不覆盖，
-  // 避免补拉空结果清掉本地已显示的消息）。拉取完成后标记已读。
+  // 首次进入始终拉最近 30 条并与 WS 缓存合并。缓存可能只有一条实时消息，
+  // 不能据此使用 after_id，否则该消息之前的历史将永远不可见。
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    const lastId = messages[messages.length - 1]?.id;
-    const pull = lastId
-      ? getMessages(conversationKey, { afterId: lastId, limit: 30 })
-      : getMessages(conversationKey, { limit: 30 });
-    void pull
+    void getMessages(conversationKey, { limit: 30 })
       .then(({ items, has_more }) => {
         if (cancelled) return;
-        if (lastId) {
-          if (items.length > 0) setMessages(conversationKey, [...messages, ...items]);
-        } else {
-          setMessages(conversationKey, items);
-          setHasMore(has_more);
-        }
-        const newest = items[items.length - 1];
-        if (newest) {
-          void markConversationRead(conversationKey, newest.id).catch(() => undefined);
+        setMessages(conversationKey, items);
+        setHasMore(has_more);
+        const readThroughID = latestMessageID(messages, items);
+        if (readThroughID) {
+          void markConversationRead(conversationKey, readThroughID)
+            .then(() => markConversationReadLocally(conversationKey, readThroughID))
+            .catch(() => undefined);
         }
       })
       .catch(() => undefined)
@@ -215,7 +210,7 @@ function ActiveThread({
     };
     // messages 仅作初始引用：拉取结果按分支整体替换/追加。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversationKey, setMessages]);
+  }, [conversationKey, markConversationReadLocally, setMessages]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" });

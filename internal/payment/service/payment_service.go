@@ -11,8 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-
-	"gorm.io/gorm"
+	"unicode/utf8"
 
 	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
@@ -20,6 +19,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/payment/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -38,7 +38,7 @@ var (
 // OrderService order 模块最小接口：读取订单（owner 校验）+ 支付成功状态迁移。
 type OrderService interface {
 	GetDetail(ctx context.Context, userID int64, orderNo string) (*ordermodel.OrderView, error)
-	MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error)
+	MarkPaid(ctx context.Context, tx *transaction.Handle, orderNo string, payAmount int64) (bool, error)
 }
 
 // PayParams 模拟支付回调参数。
@@ -94,7 +94,6 @@ func (s *paymentService) MockPay(ctx context.Context, userID int64, p PayParams)
 
 // mockPay 单次支付回调处理（真实执行体，见 MockPay 流程说明）。
 func (s *paymentService) mockPay(ctx context.Context, userID int64, p PayParams) (*paymentmodel.Payment, error) {
-	p.PaymentID = strings.TrimSpace(p.PaymentID)
 	if err := validateParams(userID, p); err != nil {
 		return nil, err
 	}
@@ -131,7 +130,7 @@ func (s *paymentService) mockPay(ctx context.Context, userID int64, p PayParams)
 		Amount:    p.Amount,
 		Result:    p.Result,
 	}
-	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+	err = s.store.Tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 		if err := s.store.Payments.Create(ctx, tx, payment); err != nil {
 			return translateRepoError(err)
 		}
@@ -176,7 +175,7 @@ func validateParams(userID int64, p PayParams) error {
 		return fmt.Errorf("%w: invalid order_no", ErrInvalidInput)
 	}
 	pid := p.PaymentID
-	if pid == "" || len(pid) > 64 {
+	if strings.TrimSpace(pid) == "" || utf8.RuneCountInString(pid) > 64 {
 		return fmt.Errorf("%w: invalid payment_id", ErrInvalidInput)
 	}
 	if p.Amount < 0 {

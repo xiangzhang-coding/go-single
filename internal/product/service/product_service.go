@@ -12,12 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"go.uber.org/zap"
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	"github.com/xiangzhang-coding/go-single/internal/product/model"
 	"github.com/xiangzhang-coding/go-single/internal/product/repository"
+	"go.uber.org/zap"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -86,12 +85,12 @@ type Service interface {
 	// GetProduct 供购物车直读状态、秒杀页读取 SPU 标题等摘要信息。
 	GetProduct(ctx context.Context, id int64) (*model.Product, error)
 	// GetSKUForUpdate 在订单事务内锁定 SKU 并校验商品仍上架，供订单固化成交价。
-	GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.SKU, error)
+	GetSKUForUpdate(ctx context.Context, tx *transaction.Handle, id int64) (*model.SKU, error)
 	// DeductStock 事务内条件扣减库存（stock>=N 防超卖），供 order 模块下单调用。
 	// 返回是否扣减成功；调用方在事务前后维护详情写入围栏。
-	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
+	DeductStock(ctx context.Context, tx *transaction.Handle, skuID int64, quantity int) (bool, error)
 	// RestoreStock 事务内回补库存；调用方在事务前后维护详情写入围栏。
-	RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error
+	RestoreStock(ctx context.Context, tx *transaction.Handle, skuID int64, quantity int) error
 	// BeginDetailMutation 在调用方事务写入前建立缓存回填围栏。
 	BeginDetailMutation(ctx context.Context, productID int64) (string, error)
 	// FinishDetailMutation 在调用方事务结束后推进代次、删除详情并解除围栏。
@@ -392,7 +391,7 @@ func (s *productService) GetProduct(ctx context.Context, id int64) (*model.Produ
 
 // GetSKUForUpdate 锁定 SKU 行，并读取商品状态；库存扣减随后仍会在 SQL
 // 条件中再次校验 on_sale，避免下架与下单并发时售出已下架商品。
-func (s *productService) GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.SKU, error) {
+func (s *productService) GetSKUForUpdate(ctx context.Context, tx *transaction.Handle, id int64) (*model.SKU, error) {
 	// 先用非锁定读取得 product_id，再按 product → SKU 的固定顺序加锁；
 	// 所有订单都遵守同一顺序，避免多 SKU/多商品订单形成锁环。
 	sku, err := s.store.SKU.GetByID(ctx, id)
@@ -421,7 +420,7 @@ func (s *productService) GetSKUForUpdate(ctx context.Context, tx *gorm.DB, id in
 
 // DeductStock 在调用方事务内条件扣减；事务由 order 模块开启并提交，
 // 调用方必须在事务前后调用 BeginDetailMutation / FinishDetailMutation。
-func (s *productService) DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error) {
+func (s *productService) DeductStock(ctx context.Context, tx *transaction.Handle, skuID int64, quantity int) (bool, error) {
 	if quantity < 1 {
 		return false, fmt.Errorf("%w: invalid quantity", ErrInvalidInput)
 	}
@@ -450,7 +449,7 @@ func (s *productService) DeductStock(ctx context.Context, tx *gorm.DB, skuID int
 }
 
 // RestoreStock 在调用方事务内回补库存；调用方必须在事务前后维护详情围栏。
-func (s *productService) RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error {
+func (s *productService) RestoreStock(ctx context.Context, tx *transaction.Handle, skuID int64, quantity int) error {
 	if quantity < 1 {
 		return fmt.Errorf("%w: invalid quantity", ErrInvalidInput)
 	}

@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/payment/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // isDuplicate MySQL 1062：唯一键冲突（payment_id 重复回调）。
@@ -27,12 +28,16 @@ func NewGORMPayment(db *gorm.DB) *GORMPaymentStore {
 }
 
 // WithinTx 开启支付事务（流水落库 + 跨模块订单状态迁移）；fn 返回错误则整体回滚。
-func (s *GORMPaymentStore) WithinTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
-	return s.db.WithContext(ctx).Transaction(fn)
+func (s *GORMPaymentStore) WithinTx(ctx context.Context, fn func(tx *transaction.Handle) error) error {
+	return transaction.WithinGORM(ctx, s.db, fn)
 }
 
 // Create 事务内创建支付流水；payment_id 唯一键冲突（重复回调）映射为 ErrPaymentDuplicate。
-func (s *GORMPaymentStore) Create(ctx context.Context, tx *gorm.DB, p *model.Payment) error {
+func (s *GORMPaymentStore) Create(ctx context.Context, handle *transaction.Handle, p *model.Payment) error {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return err
+	}
 	if err := tx.WithContext(ctx).Create(p).Error; err != nil {
 		if isDuplicate(err) {
 			return ErrPaymentDuplicate

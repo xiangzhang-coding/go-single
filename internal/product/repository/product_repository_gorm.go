@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	"github.com/xiangzhang-coding/go-single/internal/product/model"
 )
 
@@ -91,6 +92,12 @@ func NewGORMProduct(db *gorm.DB) *GORMProductRepository {
 	return &GORMProductRepository{db: db}
 }
 
+// WithinTx is an adapter-level test and composition seam; business interfaces
+// receive only the resulting opaque handle.
+func (r *GORMProductRepository) WithinTx(ctx context.Context, fn func(*transaction.Handle) error) error {
+	return transaction.WithinGORM(ctx, r.db, fn)
+}
+
 func (r *GORMProductRepository) Create(ctx context.Context, p *model.Product) error {
 	return r.db.WithContext(ctx).Create(p).Error
 }
@@ -116,9 +123,13 @@ func (r *GORMProductRepository) GetByID(ctx context.Context, id int64) (*model.P
 }
 
 // GetByIDForUpdate 在订单事务内读取并锁定商品状态。
-func (r *GORMProductRepository) GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.Product, error) {
+func (r *GORMProductRepository) GetByIDForUpdate(ctx context.Context, handle *transaction.Handle, id int64) (*model.Product, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return nil, err
+	}
 	var p model.Product
-	if err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&p, id).Error; err != nil {
+	if err = tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&p, id).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
@@ -189,9 +200,13 @@ func (r *GORMSKURepository) GetByID(ctx context.Context, id int64) (*model.SKU, 
 }
 
 // GetByIDForUpdate 在订单事务内读取并锁定 SKU 行。
-func (r *GORMSKURepository) GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.SKU, error) {
+func (r *GORMSKURepository) GetByIDForUpdate(ctx context.Context, handle *transaction.Handle, id int64) (*model.SKU, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return nil, err
+	}
 	var s model.SKU
-	if err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&s, id).Error; err != nil {
+	if err = tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&s, id).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
@@ -211,7 +226,11 @@ func (r *GORMSKURepository) ListByProduct(ctx context.Context, productID int64) 
 // DeductStock 条件更新：stock=stock-N WHERE stock>=N 且商品仍上架；
 // RowsAffected=0 表示库存不足、SKU 不存在或商品已下架。tx 由调用方
 // （order 下单事务）提供，与订单创建同事务原子提交。
-func (r *GORMSKURepository) DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error) {
+func (r *GORMSKURepository) DeductStock(ctx context.Context, handle *transaction.Handle, skuID int64, quantity int) (bool, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return false, err
+	}
 	res := tx.WithContext(ctx).Exec(`
 		UPDATE skus s
 		JOIN products p ON p.id = s.product_id
@@ -225,7 +244,11 @@ func (r *GORMSKURepository) DeductStock(ctx context.Context, tx *gorm.DB, skuID 
 }
 
 // RestoreStock 回补库存（取消订单）；SKU 已删除时影响 0 行，视为空操作。
-func (r *GORMSKURepository) RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error {
+func (r *GORMSKURepository) RestoreStock(ctx context.Context, handle *transaction.Handle, skuID int64, quantity int) error {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return err
+	}
 	return tx.WithContext(ctx).Model(&model.SKU{}).
 		Where("id = ?", skuID).
 		Update("stock", gorm.Expr("stock + ?", quantity)).Error

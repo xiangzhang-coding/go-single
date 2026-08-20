@@ -1,33 +1,29 @@
-import { useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useState } from "react";
+import { Link, useLocation, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { cancelOrder, confirmOrder, getOrder, mockPay } from "../api/endpoints";
-import { getApiErrorMessage } from "../api/client";
+import { ApiRequestError, getApiErrorMessage } from "../api/client";
 import { formatAddress, formatDate, formatMoney, formatSpecs } from "../lib/format";
+import { shouldRetryOrderDetail } from "../lib/order";
 import { Button, ErrorState, Icon, LoadingBlock, ProductVisual, Spinner, StatusBadge } from "../components/ui";
 
 export function OrderDetailPage() {
   const { orderNo = "" } = useParams();
+  const location = useLocation();
   const queryClient = useQueryClient();
   const [actionError, setActionError] = useState("");
-  const processingPolls = useRef(0);
+  const awaitingCreation = Boolean((location.state as { awaitingCreation?: boolean } | null)?.awaitingCreation);
   const orderQuery = useQuery({
     queryKey: ["order", orderNo],
     queryFn: () => getOrder(orderNo),
     enabled: Boolean(orderNo),
-    retry: 2,
-    refetchInterval: (query) => {
-      if (query.state.data?.status !== "") {
-        processingPolls.current = 0;
-        return false;
-      }
-      if (processingPolls.current >= 30) {
-        return false;
-      }
-      processingPolls.current += 1;
-      return 1500;
-    },
+    retry: (failureCount, error) => shouldRetryOrderDetail(
+      failureCount,
+      error instanceof ApiRequestError ? error.status : undefined,
+      awaitingCreation,
+    ),
+    retryDelay: 1500,
   });
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ["order", orderNo] });
@@ -53,6 +49,9 @@ export function OrderDetailPage() {
   });
 
   if (orderQuery.isPending) {
+    if (awaitingCreation) {
+      return <section className="site-container page-section"><div className="processing-panel"><span className="processing-mark"><Icon name="clock" size={23} /></span><div><h1 className="font-nantes text-3xl">订单正在生成。</h1><p className="mt-2 text-sm leading-6 text-smoke">安全的重复提交仍在落库，页面会继续查询结果。</p></div><Spinner label="每 1.5 秒更新" /></div></section>;
+    }
     return <div className="site-container page-section"><LoadingBlock label="正在读取订单详情" /></div>;
   }
   if (orderQuery.isError || !orderQuery.data) {
@@ -60,7 +59,6 @@ export function OrderDetailPage() {
   }
 
   const order = orderQuery.data;
-  const processing = !order.status;
   const isPending = order.status === "pending_payment";
   const busy = payMutation.isPending || cancelMutation.isPending || confirmMutation.isPending;
 
@@ -80,16 +78,13 @@ export function OrderDetailPage() {
     <section className="site-container page-section pt-8 sm:pt-14">
       <Link to="/orders" className="back-link"><Icon name="arrow-left" size={16} /> 返回订单列表</Link>
       <div className="section-heading-row mt-8 sm:mt-12">
-        <div><p className="eyebrow text-smoke">订单详情 / {order.order_type === "seckill" ? "秒杀" : "普通"}订单</p><h1 className="mt-3 font-nantes text-5xl">{processing ? "订单正在生成。" : "这一单，已被记下。"}</h1><p className="mt-3 font-mono text-xs text-smoke">{order.order_no}</p></div>
+        <div><p className="eyebrow text-smoke">订单详情 / {order.order_type === "seckill" ? "秒杀" : "普通"}订单</p><h1 className="mt-3 font-nantes text-5xl">这一单，已被记下。</h1><p className="mt-3 font-mono text-xs text-smoke">{order.order_no}</p></div>
         <StatusBadge status={order.status} />
       </div>
 
       {actionError && <div className={`notice mt-8 ${actionError.includes("成功") ? "notice-success" : "notice-error"}`}>{actionError}</div>}
 
-      {processing ? (
-        <div className="processing-panel mt-10"><span className="processing-mark"><Icon name="clock" size={23} /></span><div><h2 className="font-nantes text-3xl">正在等待订单落库。</h2><p className="mt-2 text-sm leading-6 text-smoke">这是一次安全的重复提交保护，页面最多查询 30 次。</p></div><Spinner label="每 1.5 秒更新" /></div>
-      ) : (
-        <div className="order-detail-layout mt-10">
+      <div className="order-detail-layout mt-10">
           <div className="order-detail-main">
             <section className="detail-panel">
               <div className="detail-panel-heading"><div><p className="eyebrow text-smoke">商品明细</p><h2 className="mt-2 font-nantes text-3xl">你选择的东西</h2></div><span className="text-sm text-smoke">{order.items.length} 件</span></div>
@@ -113,8 +108,7 @@ export function OrderDetailPage() {
             {order.status === "completed" && <div className="waiting-panel mt-8"><p className="eyebrow text-smoke">订单已完成</p><h2 className="mt-3 font-nantes text-3xl">谢谢你的选择。</h2><p className="mt-3 text-sm leading-6 text-smoke">这笔订单的生命周期已经结束。</p></div>}
             {order.status === "cancelled" && <div className="waiting-panel mt-8"><p className="eyebrow text-smoke">订单已取消</p><h2 className="mt-3 font-nantes text-3xl">这次先到这里。</h2><p className="mt-3 text-sm leading-6 text-smoke">如果需要，可以重新回到商品目录。</p><Link to="/" className="button button-secondary mt-6 w-full justify-center">返回目录 <Icon name="arrow-right" size={16} /></Link></div>}
           </aside>
-        </div>
-      )}
+      </div>
     </section>
   );
 }

@@ -261,6 +261,18 @@ func pollOrder(t *testing.T, e *mqEnv, orderNo, token string) map[string]any {
 	return nil
 }
 
+func pollPurchase(t *testing.T, e *mqEnv, preDeductionID, token string) map[string]any {
+	t.Helper()
+	for i := 0; i < pollRounds; i++ {
+		w, body := doJSONOn(t, e.router, http.MethodGet, "/api/flashsales/purchases/"+preDeductionID, "", token)
+		if w.Code == http.StatusOK && (body["status"] == "ordered" || body["status"] == "rolled_back") {
+			return body
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil
+}
+
 // countSeckillOrders 统计活动已落单数（含不同购买槽位和已取消历史订单）。
 func countSeckillOrders(t *testing.T, e *mqEnv, activityID int64) int {
 	t.Helper()
@@ -311,7 +323,7 @@ func seedPublishedOnSale(t *testing.T, admin string, stock int, limits ...int) i
 
 // ---- 测试 ----
 
-// 完整闭环：抢购（202 排队中 + order_no）→ 消费者异步落单 → 轮询订单可查询；
+// 完整闭环：抢购（202 + pre_deduction_id）→ 消费者异步落单 → 生命周期收敛 ordered；
 // 订单类型/活动/秒杀价/地址快照正确，活动 MySQL 库存同步扣减。
 func TestSeckillOrderFullLoop(t *testing.T) {
 	requireEnv(t) // 初始化共享 env（adminToken/seed 依赖）
@@ -323,12 +335,16 @@ func TestSeckillOrderFullLoop(t *testing.T) {
 	w, body := purchaseOn(t, e, id, token)
 	require.Equal(t, http.StatusAccepted, w.Code, "预扣成功应 202 排队中: %s", w.Body.String())
 	require.Equal(t, "queued", body["status"])
-	orderNo, ok := body["order_no"].(string)
-	require.True(t, ok && orderNo != "", "响应应携带 order_no 供前端轮询")
+	preDeductionID, ok := body["pre_deduction_id"].(string)
+	require.True(t, ok && preDeductionID != "", "响应应携带 pre_deduction_id 供前端轮询")
 
-	// 轮询订单详情：异步落单完成 → 订单可查询。
-	order := pollOrder(t, e, orderNo, token)
-	require.NotNil(t, order, "异步落单应在轮询窗口内完成")
+	purchase := pollPurchase(t, e, preDeductionID, token)
+	require.NotNil(t, purchase, "预扣生命周期应在轮询窗口内进入终态")
+	require.Equal(t, "ordered", purchase["status"])
+	orderNo, ok := purchase["order_no"].(string)
+	require.True(t, ok && orderNo != "")
+	w, order := doJSONOn(t, e.router, http.MethodGet, "/api/orders/"+orderNo, "", token)
+	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, orderNo, order["order_no"])
 	require.Equal(t, "seckill", order["order_type"])
 	require.Equal(t, "pending_payment", order["status"])

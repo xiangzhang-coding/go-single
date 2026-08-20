@@ -46,6 +46,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
@@ -68,12 +69,14 @@ const (
 // noopActivity 秒杀活动库存端口替身：本包不触达秒杀落单，恒成功即可。
 type noopActivity struct{}
 
-func (noopActivity) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
+func (noopActivity) DeductStock(context.Context, *transaction.Handle, int64, int) (bool, error) {
 	return true, nil
 }
 
-func (noopActivity) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
-func (noopActivity) RestoreRedis(context.Context, int64, int64, int) error    { return nil }
+func (noopActivity) RestoreStock(context.Context, *transaction.Handle, int64, int) error {
+	return nil
+}
+func (noopActivity) RestoreRedis(context.Context, int64, int64, int) error { return nil }
 
 type testEnv struct {
 	router http.Handler
@@ -371,6 +374,34 @@ func TestMockPayFailKeepsPendingThenRetrySucceeds(t *testing.T) {
 	require.Equal(t, http.StatusCreated, w.Code)
 	require.Equal(t, "success", resp["result"])
 	require.Equal(t, model.OrderStatusPaid, orderByNo(t, env, orderNo).Status)
+}
+
+func TestPaymentIDUsesExactUnicodeText(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("payment-case"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+	body := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 1)
+	orderNo := body["order_no"].(string)
+	payAmount := int64(body["pay_amount"].(float64))
+	paymentID := fmt.Sprintf("Case-Key-%d", time.Now().UnixNano())
+
+	w, _ := mockPay(t, env, token, orderNo, paymentID, payAmount, "fail")
+	require.Equal(t, http.StatusCreated, w.Code)
+	w, _ = mockPay(t, env, token, orderNo, strings.ToLower(paymentID), payAmount, "fail")
+	require.Equal(t, http.StatusCreated, w.Code)
+	w, _ = mockPay(t, env, token, orderNo, paymentID+"-space", payAmount, "fail")
+	require.Equal(t, http.StatusCreated, w.Code)
+	w, _ = mockPay(t, env, token, orderNo, paymentID+"-space ", payAmount, "fail")
+	require.Equal(t, http.StatusCreated, w.Code)
+	unicodeSuffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	unicodePaymentID := strings.Repeat("键", 64-len(unicodeSuffix)) + unicodeSuffix
+	w, _ = mockPay(t, env, token, orderNo, unicodePaymentID, payAmount, "fail")
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	var count int64
+	require.NoError(t, env.gdb.Model(&paymentmodel.Payment{}).Where("order_no = ?", orderNo).Count(&count).Error)
+	require.Equal(t, int64(5), count)
 }
 
 // 重复回调拒绝：同一 payment_id 流水唯一拒绝；新 payment_id 状态机拒绝。

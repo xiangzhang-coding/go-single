@@ -8,13 +8,12 @@ import (
 	"errors"
 	"fmt"
 
-	"gorm.io/gorm"
-
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 
 	"github.com/xiangzhang-coding/go-single/internal/cart/model"
 	"github.com/xiangzhang-coding/go-single/internal/cart/repository"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -49,9 +48,9 @@ type Service interface {
 	// ListItems 我的购物车列表（含 SKU/商品展示快照，新加购的排最前）。
 	ListItems(ctx context.Context, userID int64) ([]model.CartItemView, error)
 	// LockItems 结算事务内锁定并读取当前购物车条目。
-	LockItems(ctx context.Context, tx *gorm.DB, userID int64) ([]model.CartItem, error)
+	LockItems(ctx context.Context, tx *transaction.Handle, userID int64) ([]model.CartItem, error)
 	// DeletePurchased 事务内删除已锁定、已结算的条目。
-	DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error
+	DeletePurchased(ctx context.Context, tx *transaction.Handle, userID int64, itemIDs []int64) error
 }
 
 type cartService struct {
@@ -110,7 +109,7 @@ func (s *cartService) UpdateQuantity(ctx context.Context, userID, itemID int64, 
 		return err
 	}
 	if err := s.store.Items.UpdateQuantity(ctx, itemID, quantity); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(err, repository.ErrCartItemNotFound) {
 			return ErrCartItemNotFound
 		}
 		return err
@@ -134,12 +133,12 @@ func (s *cartService) ListItems(ctx context.Context, userID int64) ([]model.Cart
 }
 
 // LockItems 结算事务内锁定当前购物车条目，调用方（order 模块）负责开启事务。
-func (s *cartService) LockItems(ctx context.Context, tx *gorm.DB, userID int64) ([]model.CartItem, error) {
+func (s *cartService) LockItems(ctx context.Context, tx *transaction.Handle, userID int64) ([]model.CartItem, error) {
 	return s.store.Items.LockByUser(ctx, tx, userID)
 }
 
 // DeletePurchased 按锁定的条目 ID 清理，避免按 SKU 误删并发变更。
-func (s *cartService) DeletePurchased(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error {
+func (s *cartService) DeletePurchased(ctx context.Context, tx *transaction.Handle, userID int64, itemIDs []int64) error {
 	return s.store.Items.DeleteByIDs(ctx, tx, userID, itemIDs)
 }
 

@@ -15,10 +15,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/chat/model"
 	"github.com/xiangzhang-coding/go-single/internal/chat/repository"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
 )
@@ -76,7 +76,7 @@ func newFakeConversations() *fakeConversations {
 	return &fakeConversations{byID: map[string]*model.Conversation{}}
 }
 
-func (f *fakeConversations) Ensure(_ context.Context, _ *gorm.DB, c *model.Conversation) error {
+func (f *fakeConversations) Ensure(_ context.Context, _ *transaction.Handle, c *model.Conversation) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.byID[c.ConversationKey]; !ok {
@@ -116,7 +116,7 @@ func (f *fakeConversations) ListByUser(_ context.Context, userID int64, beforeLa
 	return out, nil
 }
 
-func (f *fakeConversations) TouchLastMessage(_ context.Context, _ *gorm.DB, key string, messageID int64) error {
+func (f *fakeConversations) TouchLastMessage(_ context.Context, _ *transaction.Handle, key string, messageID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if c, ok := f.byID[key]; ok {
@@ -139,7 +139,7 @@ func newFakeMessages() *fakeMessages {
 	return &fakeMessages{byID: map[int64]*model.Message{}}
 }
 
-func (f *fakeMessages) Create(_ context.Context, _ *gorm.DB, m *model.Message) error {
+func (f *fakeMessages) Create(_ context.Context, _ *transaction.Handle, m *model.Message) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if m.ClientRequestID != nil {
@@ -301,7 +301,9 @@ var _ repository.ReadStateRepository = (*fakeReads)(nil)
 
 type fakeTx struct{}
 
-func (fakeTx) WithinTx(_ context.Context, fn func(tx *gorm.DB) error) error { return fn(nil) }
+func (fakeTx) WithinTx(_ context.Context, fn func(tx *transaction.Handle) error) error {
+	return fn(nil)
+}
 
 var _ repository.TxRunner = fakeTx{}
 

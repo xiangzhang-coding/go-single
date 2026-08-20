@@ -40,6 +40,7 @@ import (
 	chatsvc "github.com/xiangzhang-coding/go-single/internal/chat/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/file"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	"github.com/xiangzhang-coding/go-single/internal/platform/ws"
 	socialhandler "github.com/xiangzhang-coding/go-single/internal/social/handler"
 	socialrepo "github.com/xiangzhang-coding/go-single/internal/social/repository"
@@ -63,6 +64,7 @@ type testEnv struct {
 	router   http.Handler
 	verifier auth.TokenVerifier
 	hub      *ws.Hub
+	gdb      *gorm.DB
 }
 
 var (
@@ -161,7 +163,7 @@ func buildEnv() (*testEnv, error) {
 	socialhandler.New(socialSvc, postSvc, verifier).RegisterRoutes(api)
 	chathandler.New(chatSvc, verifier).RegisterRoutes(api)
 	file.NewHandler(fileSvc, verifier, chatMediaAuthorizer{chat: chatSvc}).RegisterRoutes(api)
-	return &testEnv{router: r, verifier: verifier, hub: wsHub}, nil
+	return &testEnv{router: r, verifier: verifier, hub: wsHub, gdb: gdb}, nil
 }
 
 type chatMediaAuthorizer struct{ chat chatsvc.Service }
@@ -589,6 +591,56 @@ func TestChatIdempotentReplay(t *testing.T) {
 
 	items, _ := messagesOf(t, env, bobToken, conversationKeyOf(aliceID, bobID), "")
 	require.Len(t, items, 1, "幂等重放不产生新消息")
+}
+
+func TestChatIdempotencyKeyUsesExactText(t *testing.T) {
+	env := requireEnv(t)
+	aliceID, aliceToken := register(t, env, "ava_case")
+	bobID, bobToken := register(t, env, "bob_case")
+	befriend(t, env, aliceToken, bobID, bobToken)
+	requestID := fmt.Sprintf("Case-Key-%d", time.Now().UnixNano())
+
+	first := sendMsg(t, env, aliceToken, bobID, "text", "大写键", "", requestID)
+	second := sendMsg(t, env, aliceToken, bobID, "text", "小写键", "", strings.ToLower(requestID))
+	third := sendMsg(t, env, aliceToken, bobID, "text", "无空格", "", requestID+"-space")
+	fourth := sendMsg(t, env, aliceToken, bobID, "text", "尾随空格", "", requestID+"-space ")
+
+	require.NotEqual(t, first["id"], second["id"])
+	require.NotEqual(t, third["id"], fourth["id"])
+	items, _ := messagesOf(t, env, bobToken, conversationKeyOf(aliceID, bobID), "")
+	require.Len(t, items, 4)
+}
+
+func TestChatIdempotencyKeyAllowsSixtyFourUnicodeCharacters(t *testing.T) {
+	env := requireEnv(t)
+	_, aliceToken := register(t, env, "aukey")
+	bobID, bobToken := register(t, env, "bukey")
+	befriend(t, env, aliceToken, bobID, bobToken)
+
+	message := sendMsg(t, env, aliceToken, bobID, "text", "Unicode 键", "", strings.Repeat("键", 64))
+	require.NotZero(t, message["id"])
+}
+
+func TestConversationLastMessageNeverMovesBackward(t *testing.T) {
+	env := requireEnv(t)
+	aliceID, aliceToken := register(t, env, "ava_last")
+	bobID, bobToken := register(t, env, "bob_last")
+	befriend(t, env, aliceToken, bobID, bobToken)
+
+	first := sendMsg(t, env, aliceToken, bobID, "text", "第一条", "", "")
+	second := sendMsg(t, env, aliceToken, bobID, "text", "第二条", "", "")
+	firstID := int64(first["id"].(float64))
+	secondID := int64(second["id"].(float64))
+	require.Greater(t, secondID, firstID)
+
+	repo := chatrepo.NewGORMConversation(env.gdb)
+	key := conversationKeyOf(aliceID, bobID)
+	require.NoError(t, repo.WithinTx(context.Background(), func(tx *transaction.Handle) error {
+		return repo.TouchLastMessage(context.Background(), tx, key, firstID)
+	}))
+	conversation, err := repo.GetByKey(context.Background(), key)
+	require.NoError(t, err)
+	require.Equal(t, secondID, conversation.LastMessageID)
 }
 
 func TestChatIdempotencyKeyLength(t *testing.T) {

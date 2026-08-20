@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
+	"github.com/xiangzhang-coding/go-single/internal/platform/config"
 	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
@@ -40,6 +41,14 @@ func TestRequestLogsDoNotContainWebSocketCredentials(t *testing.T) {
 
 	require.NotContains(t, output.String(), token)
 	require.Contains(t, output.String(), `"path":"/ws"`)
+}
+
+func TestNewRouterRejectsInvalidMode(t *testing.T) {
+	_, _, err := newRouter(
+		&config.Config{Server: config.Server{Mode: "invalid"}},
+		zap.NewNop(), nil, nil, nil, nil, nil, nil,
+	)
+	require.ErrorContains(t, err, "invalid Gin mode")
 }
 
 func TestRecoveryLogsDoNotContainWebSocketCredentials(t *testing.T) {

@@ -37,6 +37,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
@@ -600,6 +601,31 @@ func TestInProgressEditSyncFailureFailsClosed(t *testing.T) {
 	require.Equal(t, http.StatusConflict, w.Code, "failed synchronization must not continue selling")
 }
 
+func TestPurchaseRequestIDUsesExactUnicodeText(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	skuID := seedSKU(t, env, admin)
+	id := createActivity(t, env, admin, skuID, 5, 5, -time.Minute, time.Hour)
+	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", id), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	user := registerAndToken(t, env, uniqueName("case-request"))
+	requestID := fmt.Sprintf("Case-Key-%d", time.Now().UnixNano())
+
+	w, first := purchase(t, env.router, id, user, requestID)
+	require.Equal(t, http.StatusAccepted, w.Code)
+	w, second := purchase(t, env.router, id, user, strings.ToLower(requestID))
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.NotEqual(t, first["pre_deduction_id"], second["pre_deduction_id"])
+	w, third := purchase(t, env.router, id, user, requestID+"-space")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	w, fourth := purchase(t, env.router, id, user, requestID+"-space ")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.NotEqual(t, third["pre_deduction_id"], fourth["pre_deduction_id"])
+	w, unicodeKey := purchase(t, env.router, id, user, strings.Repeat("键", 64))
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.NotEqual(t, fourth["pre_deduction_id"], unicodeKey["pre_deduction_id"])
+}
+
 func TestInProgressEditRecomputesDeltaAfterConcurrentConsumer(t *testing.T) {
 	env := requireEnv(t)
 	admin := adminToken(t, env)
@@ -628,7 +654,7 @@ func TestInProgressEditRecomputesDeltaAfterConcurrentConsumer(t *testing.T) {
 		})
 	}()
 	<-paused
-	require.NoError(t, activities.WithinTx(context.Background(), func(tx *gorm.DB) error {
+	require.NoError(t, activities.WithinTx(context.Background(), func(tx *transaction.Handle) error {
 		ok, deductErr := activities.DeductStock(context.Background(), tx, id, 1)
 		require.True(t, ok)
 		return deductErr

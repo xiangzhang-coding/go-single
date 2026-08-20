@@ -6,8 +6,7 @@ import (
 	"context"
 	"errors"
 
-	"gorm.io/gorm"
-
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	"github.com/xiangzhang-coding/go-single/internal/product/model"
 )
 
@@ -35,7 +34,7 @@ type ProductRepository interface {
 	SetStatus(ctx context.Context, id int64, status string) error
 	GetByID(ctx context.Context, id int64) (*model.Product, error)
 	// GetByIDForUpdate 在订单事务内锁定商品状态，和 SKU 锁形成稳定快照。
-	GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.Product, error)
+	GetByIDForUpdate(ctx context.Context, tx *transaction.Handle, id int64) (*model.Product, error)
 	// List 按类目（nil 为全部）与状态分页查询，返回条目与总数。
 	List(ctx context.Context, categoryID *int64, status string, offset, limit int) ([]model.Product, int64, error)
 	// CountByCategory 统计类目下商品数（删除类目前校验）。
@@ -49,14 +48,14 @@ type SKURepository interface {
 	Delete(ctx context.Context, id int64) error
 	GetByID(ctx context.Context, id int64) (*model.SKU, error)
 	// GetByIDForUpdate 在订单事务内锁定 SKU，保证成交价读取与库存扣减使用同一版本。
-	GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.SKU, error)
+	GetByIDForUpdate(ctx context.Context, tx *transaction.Handle, id int64) (*model.SKU, error)
 	ListByProduct(ctx context.Context, productID int64) ([]model.SKU, error)
 	// DeductStock 事务内条件扣减库存（stock>=quantity 才更新，防超卖）：
 	// 返回是否实际扣减。tx 由调用方（order 模块）开启，同一事务保证
 	// 订单创建与库存扣减的原子性。
-	DeductStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) (bool, error)
+	DeductStock(ctx context.Context, tx *transaction.Handle, skuID int64, quantity int) (bool, error)
 	// RestoreStock 事务内回补库存（取消订单回补；SKU 已删则空操作）。
-	RestoreStock(ctx context.Context, tx *gorm.DB, skuID int64, quantity int) error
+	RestoreStock(ctx context.Context, tx *transaction.Handle, skuID int64, quantity int) error
 }
 
 // Store 聚合三个仓储的具体实现，作为 service 的构造入参。

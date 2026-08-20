@@ -4,9 +4,8 @@ package repository
 import (
 	"context"
 
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // ClaimResult is the complete outcome set of an authoritative database claim.
@@ -51,9 +50,9 @@ type UserCouponRepository interface {
 	GetViewByID(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error)
 	// Use 事务内条件核销：unused→used（并发下仅一次成功），供 order 下单调用。
 	// 返回是否核销成功；tx 由调用方（order 模块）开启。
-	Use(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error)
+	Use(ctx context.Context, tx *transaction.Handle, userID, couponID int64) (bool, error)
 	// Rollback 事务内条件回退：used→unused（取消订单回退券）。
-	Rollback(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error)
+	Rollback(ctx context.Context, tx *transaction.Handle, userID, couponID int64) (bool, error)
 }
 
 // Store 聚合两个仓储，作为 service 的构造入参。

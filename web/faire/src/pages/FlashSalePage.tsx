@@ -6,6 +6,7 @@ import { getFlashSalePurchase, getFlashSales, purchaseFlashSale } from "../api/e
 import { getApiErrorMessage } from "../api/client";
 import type { FlashSaleActivity, FlashSalePurchaseResponse } from "../api/types";
 import { formatMoney, formatSpecs, makeClientRequestID } from "../lib/format";
+import { recordPollAttempt, resetPollBudget, type PollBudget } from "../lib/flashsale-poll";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, ProductVisual, Spinner } from "../components/ui";
 
 const POLL_INTERVAL_MS = 1500;
@@ -57,21 +58,21 @@ function useServerClock(serverTime?: string) {
 function useSeckillPoll(purchase: FlashSalePurchaseResponse | undefined, enabled: boolean) {
   const [phase, setPhase] = useState<SeckillPhase>("idle");
   const [attempt, setAttempt] = useState(0);
-  const attemptsRef = useRef(0);
+  const attemptsRef = useRef<PollBudget>({ attempts: 0 });
 
   useEffect(() => {
-    if (enabled && purchase) {
-      setPhase("queued");
-    }
-  }, [enabled, purchase]);
+    attemptsRef.current = resetPollBudget(attemptsRef.current, purchase?.pre_deduction_id);
+    setAttempt(attemptsRef.current.attempts);
+    setPhase(enabled && purchase ? "queued" : "idle");
+  }, [enabled, purchase?.pre_deduction_id]);
 
   const query = useQuery({
     queryKey: ["seckill-poll", purchase?.pre_deduction_id],
     // 尝试次数在 queryFn（异步执行）中累计：refetchInterval 回调会在渲染期
     // 被调用，若在其中 setState 会引发渲染循环、interval 反复重建（轮询中断）。
     queryFn: () => {
-      attemptsRef.current += 1;
-      setAttempt(attemptsRef.current);
+      attemptsRef.current = recordPollAttempt(attemptsRef.current, purchase!.pre_deduction_id);
+      setAttempt(attemptsRef.current.attempts);
       return getFlashSalePurchase(purchase!.pre_deduction_id);
     },
     enabled: enabled && Boolean(purchase),
@@ -81,7 +82,7 @@ function useSeckillPoll(purchase: FlashSalePurchaseResponse | undefined, enabled
       if (
         pollQuery.state.data?.status === "ordered" ||
         pollQuery.state.data?.status === "rolled_back" ||
-        attemptsRef.current >= POLL_MAX_ATTEMPTS
+        attemptsRef.current.attempts >= POLL_MAX_ATTEMPTS
       ) {
         return false;
       }
@@ -96,7 +97,7 @@ function useSeckillPoll(purchase: FlashSalePurchaseResponse | undefined, enabled
       setPhase("rolled_back");
     } else if (
       enabled &&
-      attemptsRef.current >= POLL_MAX_ATTEMPTS &&
+      attemptsRef.current.attempts >= POLL_MAX_ATTEMPTS &&
       query.fetchStatus === "idle"
     ) {
       setPhase("timeout");
@@ -104,7 +105,7 @@ function useSeckillPoll(purchase: FlashSalePurchaseResponse | undefined, enabled
   }, [enabled, query.data, query.fetchStatus]);
 
   function retry() {
-    attemptsRef.current = 0;
+    attemptsRef.current = { lifecycleID: purchase?.pre_deduction_id, attempts: 0 };
     setAttempt(0);
     setPhase("queued");
     query.refetch();

@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/limiter"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 type fakePreDeductions struct {
@@ -77,7 +77,7 @@ func (f *fakePreDeductions) GetByID(_ context.Context, id int64) (*model.PreDedu
 	return &copy, nil
 }
 
-func (f *fakePreDeductions) GetByIDForUpdate(ctx context.Context, _ *gorm.DB, id int64) (*model.PreDeduction, error) {
+func (f *fakePreDeductions) GetByIDForUpdate(ctx context.Context, _ *transaction.Handle, id int64) (*model.PreDeduction, error) {
 	return f.GetByID(ctx, id)
 }
 
@@ -126,7 +126,7 @@ func (f *fakePreDeductions) ReservationTargets(_ context.Context, activityID, us
 	return pending, user, nil
 }
 
-func (f *fakePreDeductions) PendingReservationQuantityForUpdate(ctx context.Context, _ *gorm.DB, activityID int64) (int, error) {
+func (f *fakePreDeductions) PendingReservationQuantityForUpdate(ctx context.Context, _ *transaction.Handle, activityID int64) (int, error) {
 	pending, _, err := f.ReservationTargets(ctx, activityID, 0)
 	return pending, err
 }
@@ -205,11 +205,11 @@ func (f *fakePreDeductions) RecordPublishFailure(_ context.Context, id int64, ma
 	})
 }
 
-func (f *fakePreDeductions) MarkOrdered(_ context.Context, _ *gorm.DB, id int64) error {
+func (f *fakePreDeductions) MarkOrdered(_ context.Context, _ *transaction.Handle, id int64) error {
 	return f.update(id, func(p *model.PreDeduction) { p.Status = model.PreDeductionStatusOrdered })
 }
 
-func (f *fakePreDeductions) MarkPendingRollback(_ context.Context, _ *gorm.DB, id int64, detail string) error {
+func (f *fakePreDeductions) MarkPendingRollback(_ context.Context, id int64, detail string) error {
 	return f.update(id, func(p *model.PreDeduction) {
 		switch p.Status {
 		case model.PreDeductionStatusPreparing, model.PreDeductionStatusPendingPublish,
@@ -220,7 +220,7 @@ func (f *fakePreDeductions) MarkPendingRollback(_ context.Context, _ *gorm.DB, i
 	})
 }
 
-func (f *fakePreDeductions) EnsurePendingRollback(_ context.Context, _ *gorm.DB, seed *model.PreDeduction) (*model.PreDeduction, error) {
+func (f *fakePreDeductions) EnsurePendingRollback(_ context.Context, _ *transaction.Handle, seed *model.PreDeduction) (*model.PreDeduction, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, p := range f.byID {
@@ -410,7 +410,7 @@ func TestRecoverPreDeductionRetriesFailedCancellationCompensation(t *testing.T) 
 	a := fx.publishedActivity(t)
 	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
-	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), nil, result.PreDeductionID, "order cancelled"))
+	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), result.PreDeductionID, "order cancelled"))
 
 	fx.base.cache.err = errors.New("redis down")
 	stats, err := fx.svc.RecoverPreDeductions(context.Background())
@@ -494,7 +494,7 @@ func TestRollbackRecoversWhenUnflushedRedisMutationIsLost(t *testing.T) {
 	a := fx.publishedActivity(t)
 	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
-	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), nil, result.PreDeductionID, "order cancelled"))
+	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), result.PreDeductionID, "order cancelled"))
 	delete(fx.base.cache.stock, stockKey(a.ID))
 	delete(fx.base.cache.count, countKey(a.ID, 42))
 	delete(fx.base.cache.idem, slotIdemKey(a.ID, 42, result.PreDeductionID))
@@ -516,7 +516,7 @@ func TestRollbackDoesNotAdvanceWhenAOFConfirmationFails(t *testing.T) {
 	a := fx.publishedActivity(t)
 	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
-	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), nil, result.PreDeductionID, "order cancelled"))
+	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), result.PreDeductionID, "order cancelled"))
 
 	fx.base.cache.aofErr = errors.New("WAITAOF timeout")
 	_, err = fx.svc.RecoverPreDeductions(context.Background())

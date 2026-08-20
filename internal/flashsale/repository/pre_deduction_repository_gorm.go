@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 type GORMPreDeductionRepository struct {
@@ -56,8 +57,12 @@ func (r *GORMPreDeductionRepository) GetByRequestID(ctx context.Context, userID,
 	return &p, nil
 }
 
-func (r *GORMPreDeductionRepository) GetByIDForUpdate(ctx context.Context, tx *gorm.DB, id int64) (*model.PreDeduction, error) {
-	return r.getByID(r.exec(ctx, tx).Clauses(clause.Locking{Strength: "UPDATE"}), id)
+func (r *GORMPreDeductionRepository) GetByIDForUpdate(ctx context.Context, handle *transaction.Handle, id int64) (*model.PreDeduction, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return nil, err
+	}
+	return r.getByID(tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}), id)
 }
 
 func (r *GORMPreDeductionRepository) EnsureLegacyPendingOrder(ctx context.Context, seed *model.PreDeduction) (*model.PreDeduction, error) {
@@ -129,9 +134,13 @@ func (r *GORMPreDeductionRepository) ReservationTargets(ctx context.Context, act
 	return pending, user, nil
 }
 
-func (r *GORMPreDeductionRepository) PendingReservationQuantityForUpdate(ctx context.Context, tx *gorm.DB, activityID int64) (int, error) {
+func (r *GORMPreDeductionRepository) PendingReservationQuantityForUpdate(ctx context.Context, handle *transaction.Handle, activityID int64) (int, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return 0, err
+	}
 	var rows []model.PreDeduction
-	err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+	err = tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
 		Select("id", "quantity").
 		Where("activity_id = ? AND status IN ?", activityID, []model.PreDeductionStatus{
 			model.PreDeductionStatusPendingPublish,
@@ -232,9 +241,13 @@ func (r *GORMPreDeductionRepository) RecordPublishFailure(ctx context.Context, i
 	))
 }
 
-func (r *GORMPreDeductionRepository) MarkOrdered(ctx context.Context, tx *gorm.DB, id int64) error {
+func (r *GORMPreDeductionRepository) MarkOrdered(ctx context.Context, handle *transaction.Handle, id int64) error {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return err
+	}
 	now := time.Now()
-	return requirePreDeductionTransition(r.exec(ctx, tx).Model(&model.PreDeduction{}).
+	return requirePreDeductionTransition(tx.WithContext(ctx).Model(&model.PreDeduction{}).
 		Where("id = ? AND status IN ?", id, []model.PreDeductionStatus{
 			model.PreDeductionStatusPendingPublish, model.PreDeductionStatusPendingOrder,
 		}).Updates(map[string]any{
@@ -242,8 +255,8 @@ func (r *GORMPreDeductionRepository) MarkOrdered(ctx context.Context, tx *gorm.D
 	}))
 }
 
-func (r *GORMPreDeductionRepository) MarkPendingRollback(ctx context.Context, tx *gorm.DB, id int64, detail string) error {
-	return r.exec(ctx, tx).Model(&model.PreDeduction{}).
+func (r *GORMPreDeductionRepository) MarkPendingRollback(ctx context.Context, id int64, detail string) error {
+	return r.db.WithContext(ctx).Model(&model.PreDeduction{}).
 		Where("id = ? AND status IN ?", id, []model.PreDeductionStatus{
 			model.PreDeductionStatusPreparing,
 			model.PreDeductionStatusPendingPublish,
@@ -253,10 +266,14 @@ func (r *GORMPreDeductionRepository) MarkPendingRollback(ctx context.Context, tx
 		Updates(map[string]any{"status": model.PreDeductionStatusPendingRollback, "last_error": detail}).Error
 }
 
-func (r *GORMPreDeductionRepository) EnsurePendingRollback(ctx context.Context, tx *gorm.DB, seed *model.PreDeduction) (*model.PreDeduction, error) {
-	db := r.exec(ctx, tx)
+func (r *GORMPreDeductionRepository) EnsurePendingRollback(ctx context.Context, handle *transaction.Handle, seed *model.PreDeduction) (*model.PreDeduction, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return nil, err
+	}
+	db := tx.WithContext(ctx)
 	var p model.PreDeduction
-	err := db.Clauses(clause.Locking{Strength: "UPDATE"}).Where("order_no = ?", seed.OrderNumber()).First(&p).Error
+	err = db.Clauses(clause.Locking{Strength: "UPDATE"}).Where("order_no = ?", seed.OrderNumber()).First(&p).Error
 	if err == nil {
 		if err := db.Model(&model.PreDeduction{}).
 			Where("id = ? AND status <> ?", p.ID, model.PreDeductionStatusRolledBack).
@@ -314,13 +331,6 @@ func (r *GORMPreDeductionRepository) HasUnresolved(ctx context.Context, activity
 			model.PreDeductionStatusPendingRollback,
 		}).Count(&count).Error
 	return count > 0, err
-}
-
-func (r *GORMPreDeductionRepository) exec(ctx context.Context, tx *gorm.DB) *gorm.DB {
-	if tx != nil {
-		return tx.WithContext(ctx)
-	}
-	return r.db.WithContext(ctx)
 }
 
 func requirePreDeductionTransition(result *gorm.DB) error {

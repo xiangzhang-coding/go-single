@@ -51,7 +51,7 @@
 
 24. 作为用户，我想在秒杀页查看进行中/即将开始的活动（倒计时、库存余量、每人限购数），以便参与抢购
 25. 作为用户，我想抢购秒杀商品，预扣成功后立即返回"排队中"，以便快速获得抢购结果
-26. 作为用户，我想轮询订单接口（`GET /api/orders/{order_no}`，1.5s×30 次上限）得知异步落单结果
+26. 作为用户，我想轮询预扣生命周期接口（`GET /api/flashsales/purchases/{pre_deduction_id}`，1.5s×30 次上限）得知异步落单或回退结果
 27. 作为用户，我期望每人限购（`per_user_limit`，后台可配，默认 1）被原子强制
 28. 作为用户，我期望同一 `client_request_id` 重试返回原预扣，而新的请求在 `per_user_limit` 内获得独立购买槽位；订单按 `user_id:activity_id:purchase_slot` 去重，取消只释放对应槽位
 29. 作为用户，我期望秒杀订单超时未支付取消后，库存与购买机会回补（允许再次抢购）
@@ -179,7 +179,7 @@
 - 工程选型：react-router v7（admin 按角色分组 + role 守卫）、TanStack Query（服务端状态）+ zustand（客户端状态）、axios 拦截器（JWT 头 + 401 跳登录）、JWT 存 localStorage、手写组件、TS 类型手写对齐后端 json tag（ADR-0006）
 - 对接：`VITE_API_BASE` / `VITE_WS_BASE`（dev 用 /api、/ws 代理到 :8080）；媒体上传 `POST /api/files`、授权读取 `GET /api/files/:reference` 均走后端代理，前端通过 Axios 获取 Blob 后展示/下载并复用统一 401 处理（presigned 明确不做）
 - 页面清单（13 页）：登录/注册、首页、商品详情、购物车、结算、订单列表/详情、秒杀页、优惠券中心、好友列表/申请、好友圈、聊天、个人中心（地址簿）、后台管理
-- 交互约定：秒杀排队中轮询订单接口 1.5s×30；倒计时由轮询接口带服务端时间；401 跳登录；支付为订单详情页内动作（不设独立页）
+- 交互约定：秒杀排队中轮询 `GET /api/flashsales/purchases/{pre_deduction_id}` 1.5s×30，直到 `ordered` / `rolled_back`；倒计时由活动列表携带服务端时间；401 跳登录；支付为订单详情页内动作（不设独立页）
 - 部署双路径：本地 Nginx（托管选定主题 dist + /api 反代 + try_files + upstream 双实例示例）；云端 Cloudflare Pages（`public/_redirects` + `VITE_API_BASE` 跨源 + 后端 CORS）
 - 桌面优先，不做移动端适配
 

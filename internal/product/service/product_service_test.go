@@ -12,12 +12,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	"github.com/xiangzhang-coding/go-single/internal/product/model"
 	"github.com/xiangzhang-coding/go-single/internal/product/repository"
+	"go.uber.org/zap"
 )
 
 // ---- fake 仓储 ----
@@ -103,7 +102,7 @@ func (f *fakeProducts) GetByID(_ context.Context, id int64) (*model.Product, err
 	return f.byID[id], nil
 }
 
-func (f *fakeProducts) GetByIDForUpdate(ctx context.Context, _ *gorm.DB, id int64) (*model.Product, error) {
+func (f *fakeProducts) GetByIDForUpdate(ctx context.Context, _ *transaction.Handle, id int64) (*model.Product, error) {
 	return f.GetByID(ctx, id)
 }
 
@@ -173,7 +172,7 @@ func (f *fakeSKUs) GetByID(_ context.Context, id int64) (*model.SKU, error) {
 	return f.byID[id], nil
 }
 
-func (f *fakeSKUs) GetByIDForUpdate(ctx context.Context, _ *gorm.DB, id int64) (*model.SKU, error) {
+func (f *fakeSKUs) GetByIDForUpdate(ctx context.Context, _ *transaction.Handle, id int64) (*model.SKU, error) {
 	return f.GetByID(ctx, id)
 }
 
@@ -188,7 +187,7 @@ func (f *fakeSKUs) ListByProduct(_ context.Context, productID int64) ([]model.SK
 }
 
 // DeductStock 条件扣减：库存不足返回 (false, nil)；tx 参数忽略（单测无真实事务）。
-func (f *fakeSKUs) DeductStock(_ context.Context, _ *gorm.DB, skuID int64, quantity int) (bool, error) {
+func (f *fakeSKUs) DeductStock(_ context.Context, _ *transaction.Handle, skuID int64, quantity int) (bool, error) {
 	v, ok := f.byID[skuID]
 	if !ok || v.Stock < quantity {
 		return false, nil
@@ -197,7 +196,7 @@ func (f *fakeSKUs) DeductStock(_ context.Context, _ *gorm.DB, skuID int64, quant
 	return true, nil
 }
 
-func (f *fakeSKUs) RestoreStock(_ context.Context, _ *gorm.DB, skuID int64, quantity int) error {
+func (f *fakeSKUs) RestoreStock(_ context.Context, _ *transaction.Handle, skuID int64, quantity int) error {
 	if v, ok := f.byID[skuID]; ok {
 		v.Stock += quantity
 	}

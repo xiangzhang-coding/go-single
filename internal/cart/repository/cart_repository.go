@@ -3,11 +3,13 @@ package repository
 
 import (
 	"context"
-
-	"gorm.io/gorm"
+	"errors"
 
 	"github.com/xiangzhang-coding/go-single/internal/cart/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
+
+var ErrCartItemNotFound = errors.New("cart item not found")
 
 // CartItemRepository 购物车条目数据访问接口。
 type CartItemRepository interface {
@@ -20,9 +22,9 @@ type CartItemRepository interface {
 	// ListByUser 我的购物车列表：条目 + SKU/商品只读快照（跨表读模型，一次查询）。
 	ListByUser(ctx context.Context, userID int64) ([]model.CartItemView, error)
 	// LockByUser 在结算事务内读取并锁定当前条目，避免读取数量后被并发改量。
-	LockByUser(ctx context.Context, tx *gorm.DB, userID int64) ([]model.CartItem, error)
+	LockByUser(ctx context.Context, tx *transaction.Handle, userID int64) ([]model.CartItem, error)
 	// DeleteByIDs 事务内按条目 ID 删除已结算的行，避免按 SKU 删除并发新增/修改的条目。
-	DeleteByIDs(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error
+	DeleteByIDs(ctx context.Context, tx *transaction.Handle, userID int64, itemIDs []int64) error
 }
 
 // Store 聚合仓储实现，作为 service 的构造入参。

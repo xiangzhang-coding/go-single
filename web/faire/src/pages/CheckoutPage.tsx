@@ -13,6 +13,7 @@ import {
 import { getApiErrorMessage } from "../api/client";
 import type { Address, CreateAddressRequest, UserCouponView } from "../api/types";
 import { buildOrderRequest, parseCheckoutIntent } from "../lib/checkout";
+import { isOrderProcessingResponse } from "../lib/order";
 import { formatAddress, formatMoney, formatSpecs, isCouponUsable, makeClientRequestID } from "../lib/format";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, Spinner } from "../components/ui";
 
@@ -113,7 +114,9 @@ export function CheckoutPage() {
       }
       queryClient.invalidateQueries({ queryKey: ["orders"] });
       queryClient.invalidateQueries({ queryKey: ["coupons"] });
-      navigate(`/orders/${order.order_no}`);
+      navigate(`/orders/${order.order_no}`, {
+        state: isOrderProcessingResponse(order) ? { awaitingCreation: true } : undefined,
+      });
     },
     onError: (error) => setActionError(getApiErrorMessage(error)),
   });

@@ -12,10 +12,12 @@ import type {
   CreateAddressRequest,
   CreateCouponTemplateRequest,
   CreateFlashSaleRequest,
+  CreateOrderResponse,
   CreateOrderRequest,
   CreateProductRequest,
   CreateSKURequest,
   FlashSaleActivity,
+  FlashSaleActivityRecord,
   FlashSaleAdminListResponse,
   FlashSaleListResponse,
   FlashSalePurchase,
@@ -169,7 +171,7 @@ export async function getFlashSalePurchase(id: string) {
 }
 
 export async function createOrder(request: CreateOrderRequest) {
-  const { data } = await api.post<OrderView>("/orders", request);
+  const { data } = await api.post<CreateOrderResponse>("/orders", request);
   return data;
 }
 
@@ -416,7 +418,7 @@ export const adminApi = {
     return data.items;
   },
   async createFlashSale(request: CreateFlashSaleRequest) {
-    const { data } = await api.post<FlashSaleActivity>("/admin/flashsales", request);
+    const { data } = await api.post<FlashSaleActivityRecord>("/admin/flashsales", request);
     return data;
   },
   async updateFlashSale(id: number, request: CreateFlashSaleRequest) {

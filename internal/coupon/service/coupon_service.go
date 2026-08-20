@@ -9,12 +9,11 @@ import (
 	"strings"
 	"time"
 
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 	"github.com/xiangzhang-coding/go-single/internal/coupon/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // 业务错误：handler 据此映射 HTTP 状态码。
@@ -87,9 +86,9 @@ type Service interface {
 	GetUsable(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error)
 	// UseCoupon 事务内条件核销（unused→used + 有效期窗口原子校验，并发仅一次
 	// 成功），供 order 模块下单调用；失败时区分已用/已过期/不存在。
-	UseCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) error
+	UseCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error
 	// RollbackCoupon 事务内条件回退（used→unused），供 order 模块取消订单调用。
-	RollbackCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) error
+	RollbackCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error
 }
 
 type couponService struct {
@@ -333,7 +332,7 @@ func (s *couponService) GetUsable(ctx context.Context, userID, couponID int64) (
 // UseCoupon 事务内核销（条件更新 unused→used + 有效期窗口），事务由 order
 // 模块开启并提交。条件更新失败时重查区分原因：已用 / 过期 / 不存在，
 // 避免"结算通过但事务内过期"被误报为已用。
-func (s *couponService) UseCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) error {
+func (s *couponService) UseCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error {
 	ok, err := s.store.UserCoupon.Use(ctx, tx, userID, couponID)
 	if err != nil {
 		return err
@@ -357,7 +356,7 @@ func (s *couponService) UseCoupon(ctx context.Context, tx *gorm.DB, userID, coup
 }
 
 // RollbackCoupon 事务内回退（条件更新 used→unused），取消订单回退券。
-func (s *couponService) RollbackCoupon(ctx context.Context, tx *gorm.DB, userID, couponID int64) error {
+func (s *couponService) RollbackCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error {
 	ok, err := s.store.UserCoupon.Rollback(ctx, tx, userID, couponID)
 	if err != nil {
 		return err

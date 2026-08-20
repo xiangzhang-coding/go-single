@@ -17,11 +17,11 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 
 	flashsalerepo "github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
 	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 
 	flashsalesvc "github.com/xiangzhang-coding/go-single/internal/flashsale/service"
 )
@@ -30,7 +30,7 @@ type failingRestoreActivities struct {
 	flashsalerepo.ActivityRepository
 }
 
-func (failingRestoreActivities) RestoreStock(context.Context, *gorm.DB, int64, int) error {
+func (failingRestoreActivities) RestoreStock(context.Context, *transaction.Handle, int64, int) error {
 	return errors.New("restore activity stock")
 }
 

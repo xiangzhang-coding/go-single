@@ -46,6 +46,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	producthandler "github.com/xiangzhang-coding/go-single/internal/product/handler"
 	productrepo "github.com/xiangzhang-coding/go-single/internal/product/repository"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
@@ -68,12 +69,14 @@ const (
 // noopActivity 秒杀活动库存端口替身：本包不触达秒杀落单，恒成功即可。
 type noopActivity struct{}
 
-func (noopActivity) DeductStock(context.Context, *gorm.DB, int64, int) (bool, error) {
+func (noopActivity) DeductStock(context.Context, *transaction.Handle, int64, int) (bool, error) {
 	return true, nil
 }
 
-func (noopActivity) RestoreStock(context.Context, *gorm.DB, int64, int) error { return nil }
-func (noopActivity) RestoreRedis(context.Context, int64, int64, int) error    { return nil }
+func (noopActivity) RestoreStock(context.Context, *transaction.Handle, int64, int) error {
+	return nil
+}
+func (noopActivity) RestoreRedis(context.Context, int64, int64, int) error { return nil }
 
 // testEnv 每个测试包只构建一次；MySQL 或 Redis 不可达时本地跳过、CI 失败。
 type testEnv struct {
@@ -929,6 +932,10 @@ func TestOrderConcurrentIdempotency(t *testing.T) {
 			w, body := createOrder(t, env, token, rid, addrID, skuID, 1, 0)
 			require.True(t, w.Code == http.StatusCreated || w.Code == http.StatusOK || w.Code == http.StatusAccepted,
 				"并发提交应返回 201/200/202，实际 %d: %s", w.Code, w.Body.String())
+			if w.Code == http.StatusAccepted {
+				require.Equal(t, "processing", body["state"])
+				require.Len(t, body, 2, "202 响应只暴露判别状态和订单号")
+			}
 			orderNos <- body["order_no"].(string)
 		}()
 	}
@@ -942,6 +949,49 @@ func TestOrderConcurrentIdempotency(t *testing.T) {
 	require.Len(t, seen, 1, "并发重复提交必须只生成一个订单号")
 	require.Equal(t, int64(1), countOrdersByUser(t, env, username))
 	require.Equal(t, 9, skuStock(t, env, skuID), "库存只扣一次")
+}
+
+func TestOrderInFlightReplayReturnsProcessingContract(t *testing.T) {
+	env := requireEnv(t)
+	username := uniqueName("processing")
+	token := registerAndToken(t, env, username)
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 10)
+	rid := uniqueName("processing-request")
+	var userID int64
+	require.NoError(t, env.gdb.Table("users").Select("id").Where("username = ?", username).Scan(&userID).Error)
+	require.Positive(t, userID)
+
+	lockTx := env.gdb.Begin()
+	require.NoError(t, lockTx.Error)
+	t.Cleanup(func() { _ = lockTx.Rollback().Error })
+	require.NoError(t, lockTx.Exec("SELECT id FROM skus WHERE id = ? FOR UPDATE", skuID).Error)
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- performJSON(env, http.MethodPost, "/api/orders", orderRequestBody(rid, addrID, skuID, 1, 0), token)
+	}()
+	idempotencyKey := fmt.Sprintf("order:idem:%d:%s", userID, rid)
+	require.Eventually(t, func() bool {
+		return env.redis.Exists(context.Background(), idempotencyKey).Val() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	replay := performJSON(env, http.MethodPost, "/api/orders", orderRequestBody(rid, addrID, skuID, 1, 0), token)
+	require.Equal(t, http.StatusAccepted, replay.Code, replay.Body.String())
+	require.JSONEq(t, fmt.Sprintf(`{"state":"processing","order_no":%q}`, jsonField(t, replay, "order_no")), replay.Body.String())
+
+	require.NoError(t, lockTx.Rollback().Error)
+	first := <-firstDone
+	require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
+}
+
+func jsonField(t *testing.T, response *httptest.ResponseRecorder, field string) string {
+	t.Helper()
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+	value, ok := body[field].(string)
+	require.True(t, ok)
+	return value
 }
 
 // 并发抢购：库存 5，并发 6 单各买 1 → 恰好 5 成功、1 失败，库存归零不超卖。

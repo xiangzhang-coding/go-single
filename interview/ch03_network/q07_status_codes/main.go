@@ -15,7 +15,7 @@ func main() {
 	table := []outcome{
 		{"令牌桶限流", 429, "全局 QPS 超限，让客户端退避重试"},
 		{"幂等键冲突", 409, "同用户同活动重复提交"},
-		{"预扣成功", 202, "排队中：异步落单，轮询订单号"},
+		{"预扣成功", 202, "排队中：异步落单，轮询 pre_deduction_id"},
 		{"活动抢光", 409, "Lua 返回 0 → ErrSoldOut"},
 		{"窗口外/下架", 409, "ErrNotInWindow / ErrOffline"},
 		{"超过限购", 409, "ErrLimitReached（每人限购）"},
@@ -30,5 +30,5 @@ func main() {
 }
 
 // 项目位置：internal/flashsale/handler/flashsale_handler.go 的 Purchase 返回 202
-// {"status":"queued","order_no":...}；writeError 统一映射（flashsale_handler.go 197-217，
+// {"status":"queued","pre_deduction_id":"...","pre_deduction_status":"pending_publish"}；writeError 统一映射（flashsale_handler.go，
 // order_handler.go 209-228）；限流 429 在 limiter 中间件。

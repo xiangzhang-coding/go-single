@@ -82,7 +82,7 @@ curl -sk https://127.0.0.1:8443/api/products
 
 ### 构建环境变量
 
-- **web/faire**：Cloudflare 构建必须提供 `VITE_API_BASE`（后端 HTTPS 绝对地址，如 `https://api.example.com`）和 `VITE_WS_BASE`（后端 WSS 绝对地址，如 `wss://api.example.com/ws`），缺失或协议错误时 workflow 在安装依赖前失败。本地 Nginx 构建仍可省略并使用 `/api`、`/ws` 同源回退。跨源时后端 `platform/cors` 按白名单放行（见 configs/config.yaml `cors.allowed_origins`）。
+- **web/faire**：Cloudflare 构建必须提供 `VITE_API_BASE`（包含后端路由前缀且以 `/api` 结尾，如 `https://api.example.com/api`）和 `VITE_WS_BASE`（后端 WSS 绝对地址，如 `wss://api.example.com/ws`），缺失、协议错误或缺少 `/api` 时 workflow 在安装依赖前失败。本地 Nginx 构建仍可省略并使用 `/api`、`/ws` 同源回退。跨源时后端 `platform/cors` 按白名单放行（见 configs/config.yaml `cors.allowed_origins`）。
 - **website**：无环境变量。
 
 ### 域名 / HTTPS
@@ -94,11 +94,11 @@ curl -sk https://127.0.0.1:8443/api/products
 
 ### 自动部署（GitHub Actions）
 
-`.github/workflows/pages-deploy.yml`：push main（web/ 或 website/ 变更）或手动触发，自动构建并 `wrangler pages deploy`。首次配置：
+`.github/workflows/pages-deploy.yml`：main 分支的 CI 全部通过后由 `ci.yml` 调用；也可手动触发，自动构建并 `wrangler pages deploy`。首次配置：
 
 ```bash
 # 1) 仓库 Secrets：CLOUDFLARE_API_TOKEN（Cloudflare 令牌，Pages:Edit 权限）、CLOUDFLARE_ACCOUNT_ID
-# 2) 仓库 Variables：VITE_API_BASE / VITE_WS_BASE（后端地址）
+# 2) 仓库 Variables：VITE_API_BASE=https://api.example.com/api / VITE_WS_BASE=wss://api.example.com/ws
 # 3) 预创建两个 Pages 项目（或让首次部署自动创建）
 npx wrangler pages project create go-single-web-faire
 npx wrangler pages project create go-single-website
@@ -122,7 +122,7 @@ npx wrangler pages project create go-single-website
 # 3) 证书：Let's Encrypt（certbot --nginx 或云厂商证书），替换 deploy/nginx/certs/ 自签证书
 # 4) 起服务：docker compose up -d（mysql/redis/rabbitmq/minio/nginx + 可观测全家桶）
 # 5) 后端守护：systemd unit 跑 go 构建产物（bin/server），开机自启 + 崩溃重启
-# 6) 域名解析：api.example.com → VPS；Pages 前端 VITE_API_BASE 指向它
+# 6) 域名解析：api.example.com → VPS；Pages 前端 VITE_API_BASE 设为 https://api.example.com/api
 # 7) 备份与监控：MySQL 定时 dump + Redis/RabbitMQ 卷快照；Prometheus/Grafana/Loki 已预置且仅回环可达，通过 SSH 隧道/VPN 访问
 ```
 

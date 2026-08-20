@@ -14,10 +14,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/chat/model"
 	"github.com/xiangzhang-coding/go-single/internal/chat/repository"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
 )
@@ -180,7 +179,7 @@ func (s *messageService) Send(ctx context.Context, senderID int64, p SendParams)
 		msg.ClientRequestID = &reqID
 	}
 
-	err = s.store.Tx.WithinTx(ctx, func(tx *gorm.DB) error {
+	err = s.store.Tx.WithinTx(ctx, func(tx *transaction.Handle) error {
 		conv := &model.Conversation{ConversationKey: key, UserA: userA, UserB: userB}
 		if err := s.store.Conversations.Ensure(ctx, tx, conv); err != nil {
 			return err

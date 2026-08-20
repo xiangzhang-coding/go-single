@@ -8,6 +8,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/cart/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // GORMCartItemRepository 购物车条目仓储（GORM 实现）。
@@ -58,7 +59,11 @@ func (r *GORMCartItemRepository) UpdateQuantity(ctx context.Context, id int64, q
 	if res.RowsAffected == 0 {
 		// MySQL 将"改成原值"报告为 0 行；先确认条目仍存在，避免把合法幂等改量误报 404。
 		var item model.CartItem
-		return r.db.WithContext(ctx).Select("id").First(&item, id).Error
+		err := r.db.WithContext(ctx).Select("id").First(&item, id).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrCartItemNotFound
+		}
+		return err
 	}
 	return nil
 }
@@ -89,18 +94,26 @@ func (r *GORMCartItemRepository) ListByUser(ctx context.Context, userID int64) (
 // LockByUser 结算事务内读取当前条目并加排他锁。
 // 在 InnoDB 下，用户索引范围锁住后，改量/新增会等待本次结算提交，
 // 结算使用的数量与随后删除的条目 ID 保持同一事务快照。
-func (r *GORMCartItemRepository) LockByUser(ctx context.Context, tx *gorm.DB, userID int64) ([]model.CartItem, error) {
+func (r *GORMCartItemRepository) LockByUser(ctx context.Context, handle *transaction.Handle, userID int64) ([]model.CartItem, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return nil, err
+	}
 	items := make([]model.CartItem, 0)
-	err := tx.WithContext(ctx).
+	err = tx.WithContext(ctx).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("user_id = ?", userID).Order("id ASC").Find(&items).Error
 	return items, err
 }
 
 // DeleteByIDs 结算后按锁定的条目 ID 清理（与订单创建同一事务）。
-func (r *GORMCartItemRepository) DeleteByIDs(ctx context.Context, tx *gorm.DB, userID int64, itemIDs []int64) error {
+func (r *GORMCartItemRepository) DeleteByIDs(ctx context.Context, handle *transaction.Handle, userID int64, itemIDs []int64) error {
 	if len(itemIDs) == 0 {
 		return nil
+	}
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return err
 	}
 	return tx.WithContext(ctx).Where("user_id = ? AND id IN ?", userID, itemIDs).
 		Delete(&model.CartItem{}).Error

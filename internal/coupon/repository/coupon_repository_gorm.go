@@ -9,6 +9,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // derivedStatusExpr 派生状态 SQL 片段：used 落库优先；未用且已过有效期 → expired。
@@ -205,7 +206,11 @@ func (r *GORMUserCouponRepository) GetViewByID(ctx context.Context, userID, coup
 // 结算后券恰好过期仍被核销）；RowsAffected=0 即券已用/过期/不存在。
 // 窗口上界与 used_at 均经 Go 传入而非 NOW(3)：DATETIME 按 Go 本地墙钟写入
 // （go-sql-driver 的 loc=Local 行为），与 MySQL 服务器时区解耦，任何时区组合都自洽。
-func (r *GORMUserCouponRepository) Use(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error) {
+func (r *GORMUserCouponRepository) Use(ctx context.Context, handle *transaction.Handle, userID, couponID int64) (bool, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return false, err
+	}
 	now := time.Now()
 	res := tx.WithContext(ctx).Model(&model.UserCoupon{}).
 		Where("id = ? AND user_id = ? AND status = ?", couponID, userID, model.CouponStatusUnused).
@@ -219,7 +224,11 @@ func (r *GORMUserCouponRepository) Use(ctx context.Context, tx *gorm.DB, userID,
 }
 
 // Rollback 条件回退：used→unused，清空 used_at。
-func (r *GORMUserCouponRepository) Rollback(ctx context.Context, tx *gorm.DB, userID, couponID int64) (bool, error) {
+func (r *GORMUserCouponRepository) Rollback(ctx context.Context, handle *transaction.Handle, userID, couponID int64) (bool, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return false, err
+	}
 	res := tx.WithContext(ctx).Model(&model.UserCoupon{}).
 		Where("id = ? AND user_id = ? AND status = ?", couponID, userID, model.CouponStatusUsed).
 		Updates(map[string]any{"status": model.CouponStatusUnused, "used_at": nil})

@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 
 	cartmodel "github.com/xiangzhang-coding/go-single/internal/cart/model"
 	couponmodel "github.com/xiangzhang-coding/go-single/internal/coupon/model"
@@ -25,6 +24,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/retry"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 	productmodel "github.com/xiangzhang-coding/go-single/internal/product/model"
 	productsvc "github.com/xiangzhang-coding/go-single/internal/product/service"
 	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
@@ -47,7 +47,7 @@ func newFakeOrders() *fakeOrders {
 	return &fakeOrders{byID: map[string]*model.Order{}, skipCancel: map[string]bool{}, duplicate: map[string]bool{}}
 }
 
-func (f *fakeOrders) Create(_ context.Context, _ *gorm.DB, o *model.Order) error {
+func (f *fakeOrders) Create(_ context.Context, _ *transaction.Handle, o *model.Order) error {
 	f.createLog = append(f.createLog, o)
 	if f.duplicate[o.OrderNo] {
 		return repository.ErrOrderDuplicate
@@ -94,7 +94,7 @@ func (f *fakeOrders) GetNormalByClientRequestID(_ context.Context, userID int64,
 	return nil, nil
 }
 
-func (f *fakeOrders) GetByNoInTx(ctx context.Context, _ *gorm.DB, orderNo string) (*model.Order, error) {
+func (f *fakeOrders) GetByNoInTx(ctx context.Context, _ *transaction.Handle, orderNo string) (*model.Order, error) {
 	return f.GetByNo(ctx, orderNo)
 }
 
@@ -181,7 +181,7 @@ func (f *fakeOrders) CountValidByActivity(_ context.Context, activityID int64) (
 	return n, nil
 }
 
-func (f *fakeOrders) Cancel(_ context.Context, tx *gorm.DB, orderNo string) (bool, error) {
+func (f *fakeOrders) Cancel(_ context.Context, _ *transaction.Handle, orderNo string) (bool, error) {
 	if f.skipCancel[orderNo] {
 		return false, nil
 	}
@@ -194,7 +194,7 @@ func (f *fakeOrders) Cancel(_ context.Context, tx *gorm.DB, orderNo string) (boo
 	return true, nil
 }
 
-func (f *fakeOrders) MarkPaid(_ context.Context, _ *gorm.DB, orderNo string, payAmount int64) (bool, error) {
+func (f *fakeOrders) MarkPaid(_ context.Context, _ *transaction.Handle, orderNo string, payAmount int64) (bool, error) {
 	o, ok := f.byID[orderNo]
 	if !ok || o.Status != model.OrderStatusPendingPayment || o.PayAmount != payAmount || !o.ExpireAt.After(time.Now()) {
 		return false, nil
@@ -203,7 +203,7 @@ func (f *fakeOrders) MarkPaid(_ context.Context, _ *gorm.DB, orderNo string, pay
 	return true, nil
 }
 
-func (f *fakeOrders) Ship(_ context.Context, _ *gorm.DB, orderNo string) (bool, error) {
+func (f *fakeOrders) Ship(_ context.Context, orderNo string) (bool, error) {
 	o, ok := f.byID[orderNo]
 	if !ok || o.Status != model.OrderStatusPaid {
 		return false, nil
@@ -212,7 +212,7 @@ func (f *fakeOrders) Ship(_ context.Context, _ *gorm.DB, orderNo string) (bool, 
 	return true, nil
 }
 
-func (f *fakeOrders) ConfirmReceipt(_ context.Context, _ *gorm.DB, orderNo string) (bool, error) {
+func (f *fakeOrders) ConfirmReceipt(_ context.Context, orderNo string) (bool, error) {
 	o, ok := f.byID[orderNo]
 	if !ok || o.Status != model.OrderStatusShipped {
 		return false, nil
@@ -224,9 +224,9 @@ func (f *fakeOrders) ConfirmReceipt(_ context.Context, _ *gorm.DB, orderNo strin
 // fakeTx 单测事务运行器：执行回调并暴露事务活动窗口供围栏时序断言。
 type fakeTx struct{ active *bool }
 
-var serviceTestTx = &gorm.DB{}
+var serviceTestTx = new(transaction.Handle)
 
-func (f fakeTx) WithinTx(_ context.Context, fn func(tx *gorm.DB) error) error {
+func (f fakeTx) WithinTx(_ context.Context, fn func(tx *transaction.Handle) error) error {
 	if f.active != nil {
 		*f.active = true
 		defer func() { *f.active = false }()
@@ -244,7 +244,7 @@ func newFakeItems() *fakeItems {
 	return &fakeItems{byOrder: map[string][]model.OrderItem{}, purchased: map[int64]bool{}}
 }
 
-func (f *fakeItems) Create(_ context.Context, _ *gorm.DB, item *model.OrderItem) error {
+func (f *fakeItems) Create(_ context.Context, _ *transaction.Handle, item *model.OrderItem) error {
 	f.byOrder[item.OrderNo] = append(f.byOrder[item.OrderNo], *item)
 	return nil
 }
@@ -372,7 +372,7 @@ func (f *fakeProducts) GetSKU(_ context.Context, id int64) (*productmodel.SKU, e
 	return s, nil
 }
 
-func (f *fakeProducts) GetSKUForUpdate(ctx context.Context, _ *gorm.DB, id int64) (*productmodel.SKU, error) {
+func (f *fakeProducts) GetSKUForUpdate(ctx context.Context, _ *transaction.Handle, id int64) (*productmodel.SKU, error) {
 	s, err := f.GetSKU(ctx, id)
 	if err != nil {
 		return nil, err
@@ -394,7 +394,7 @@ func (f *fakeProducts) GetDetail(_ context.Context, productID int64) (*productmo
 	return d, nil
 }
 
-func (f *fakeProducts) DeductStock(_ context.Context, _ *gorm.DB, skuID int64, quantity int) (bool, error) {
+func (f *fakeProducts) DeductStock(_ context.Context, _ *transaction.Handle, skuID int64, quantity int) (bool, error) {
 	f.deductCalls++
 	if f.deductErr != nil {
 		return false, f.deductErr
@@ -411,7 +411,7 @@ func (f *fakeProducts) DeductStock(_ context.Context, _ *gorm.DB, skuID int64, q
 	return true, nil
 }
 
-func (f *fakeProducts) RestoreStock(_ context.Context, _ *gorm.DB, skuID int64, quantity int) error {
+func (f *fakeProducts) RestoreStock(_ context.Context, _ *transaction.Handle, skuID int64, quantity int) error {
 	if s, ok := f.skus[skuID]; ok {
 		s.Stock += quantity
 	}
@@ -457,7 +457,7 @@ func (f *fakeCoupons) GetUsable(_ context.Context, userID, couponID int64) (*cou
 	return c, nil
 }
 
-func (f *fakeCoupons) UseCoupon(_ context.Context, _ *gorm.DB, userID, couponID int64) error {
+func (f *fakeCoupons) UseCoupon(_ context.Context, _ *transaction.Handle, userID, couponID int64) error {
 	c, ok := f.coupons[couponID]
 	if !ok || f.owners[couponID] != userID {
 		return couponsvc.ErrCouponNotFound
@@ -473,7 +473,7 @@ func (f *fakeCoupons) UseCoupon(_ context.Context, _ *gorm.DB, userID, couponID 
 	return nil
 }
 
-func (f *fakeCoupons) RollbackCoupon(_ context.Context, _ *gorm.DB, userID, couponID int64) error {
+func (f *fakeCoupons) RollbackCoupon(_ context.Context, _ *transaction.Handle, userID, couponID int64) error {
 	c, ok := f.coupons[couponID]
 	if !ok || f.owners[couponID] != userID {
 		return couponsvc.ErrCouponNotFound
@@ -506,7 +506,7 @@ func (f *fakeCart) ListItems(_ context.Context, userID int64) ([]cartmodel.CartI
 	return append([]cartmodel.CartItemView(nil), f.items[userID]...), nil
 }
 
-func (f *fakeCart) LockItems(_ context.Context, _ *gorm.DB, userID int64) ([]cartmodel.CartItem, error) {
+func (f *fakeCart) LockItems(_ context.Context, _ *transaction.Handle, userID int64) ([]cartmodel.CartItem, error) {
 	items := make([]cartmodel.CartItem, 0, len(f.items[userID]))
 	for _, view := range f.items[userID] {
 		items = append(items, view.CartItem)
@@ -514,7 +514,7 @@ func (f *fakeCart) LockItems(_ context.Context, _ *gorm.DB, userID int64) ([]car
 	return items, nil
 }
 
-func (f *fakeCart) DeletePurchased(_ context.Context, _ *gorm.DB, userID int64, itemIDs []int64) error {
+func (f *fakeCart) DeletePurchased(_ context.Context, _ *transaction.Handle, userID int64, itemIDs []int64) error {
 	ids := make(map[int64]bool, len(itemIDs))
 	for _, id := range itemIDs {
 		ids[id] = true

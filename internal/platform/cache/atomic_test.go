@@ -548,6 +548,28 @@ func TestPauseFlashSaleStockFencesPreDeductionUntilReleased(t *testing.T) {
 	require.Equal(t, FlashSalePreDeducted, result)
 }
 
+func TestHoldFlashSalePauseDurablyRemovesExpiryAndChangesOwnership(t *testing.T) {
+	c := newAtomicRedis(t)
+	stockKey := atomicTestKey(t, "flashsale-hold-stock")
+	pauseKey := atomicTestKey(t, "flashsale-hold-pause")
+	t.Cleanup(func() {
+		require.NoError(t, c.Del(context.Background(), stockKey))
+		require.NoError(t, c.Del(context.Background(), pauseKey))
+	})
+	require.NoError(t, c.Set(context.Background(), stockKey, "2", time.Minute))
+	_, err := c.PauseFlashSaleStockDurably(context.Background(), FlashSalePauseParams{
+		StockKey: stockKey, PauseKey: pauseKey, Token: "edit-1", TTL: 30 * time.Second,
+	}, 2*time.Second)
+	require.NoError(t, err)
+	require.NoError(t, c.HoldFlashSalePauseDurably(context.Background(), pauseKey, 2*time.Second))
+
+	ttl, err := c.(*redisCache).client.TTL(context.Background(), pauseKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, time.Duration(-1), ttl)
+	require.NoError(t, c.ReleaseFlashSalePauseDurably(context.Background(), pauseKey, "edit-1", 2*time.Second))
+	requireCacheState(t, c, pauseKey, "fail-closed", true)
+}
+
 func TestPreDeductFlashSaleResultsAndState(t *testing.T) {
 	now := time.Now()
 	tests := []struct {

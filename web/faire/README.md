@@ -9,7 +9,7 @@ bun install
 bun run dev
 ```
 
-Start the Go server on port `8080` first. The Vite dev proxy forwards `/api` and `/ws` to that server. `VITE_API_BASE` can be set to an absolute API URL when deploying the SPA separately.
+Start the Go server on port `8080` first. The Vite dev proxy forwards `/api` and `/ws` to that server. For a separately deployed SPA, set `VITE_API_BASE` to an absolute URL ending in `/api`.
 
 ## Main flow
 

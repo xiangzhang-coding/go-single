@@ -17,7 +17,7 @@ func main() {
 		{"[3] 幂等键抢占（flashsale:idem:{activity}:{user}）", true},
 		{"[4] Lua 原子预扣（校验→DECR 库存 + INCR 计数）", true},
 		{"[5] 生成雪花订单号 → 发布 MQ flashsale.order.create", true},
-		{"[6] 返回 202 排队中 + order_no，前端轮询订单", true},
+		{"[6] 返回 202 + pre_deduction_id，前端轮询预扣生命周期", true},
 		{"[7] 消费者事务落单（订单+订单项+条件扣活动库存）", true},
 	}
 	for _, f := range flow {

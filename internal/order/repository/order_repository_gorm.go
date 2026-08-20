@@ -9,6 +9,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // GORMOrderStore 订单仓储实现（GORM）：开启事务 + 订单读写。
@@ -32,13 +33,17 @@ func NewGORMOrderItem(db *gorm.DB) *GORMOrderItemStore {
 }
 
 // WithinTx 开启跨模块事务；fn 返回错误则整体回滚。
-func (s *GORMOrderStore) WithinTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
-	return s.db.WithContext(ctx).Transaction(fn)
+func (s *GORMOrderStore) WithinTx(ctx context.Context, fn func(tx *transaction.Handle) error) error {
+	return transaction.WithinGORM(ctx, s.db, fn)
 }
 
 // Create 创建订单；MySQL 1062（订单号、普通订单请求身份或秒杀购买槽位）
 // 映射为 ErrOrderDuplicate，由服务层读取对应持久事实判定是否幂等命中。
-func (s *GORMOrderStore) Create(ctx context.Context, tx *gorm.DB, order *model.Order) error {
+func (s *GORMOrderStore) Create(ctx context.Context, handle *transaction.Handle, order *model.Order) error {
+	tx, unwrapErr := transaction.GORM(handle)
+	if unwrapErr != nil {
+		return unwrapErr
+	}
 	err := tx.WithContext(ctx).Create(order).Error
 	if err == nil {
 		return nil
@@ -68,7 +73,11 @@ func (s *GORMOrderStore) GetNormalByClientRequestID(ctx context.Context, userID 
 	return &o, nil
 }
 
-func (s *GORMOrderStore) GetByNoInTx(ctx context.Context, tx *gorm.DB, orderNo string) (*model.Order, error) {
+func (s *GORMOrderStore) GetByNoInTx(ctx context.Context, handle *transaction.Handle, orderNo string) (*model.Order, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return nil, err
+	}
 	return s.getByNo(tx.WithContext(ctx), orderNo)
 }
 
@@ -161,12 +170,12 @@ func (s *GORMOrderStore) CountValidByActivity(ctx context.Context, activityID in
 // Cancel 条件更新 待支付→已取消，并同事务置空秒杀去重键 user_activity_key
 // （取消后允许再次抢购：MySQL 唯一索引允许多个 NULL，不占 (user, activity)
 // 去重位）；RowsAffected=0 表示状态已变（并发/非法跃迁）。
-func (s *GORMOrderStore) Cancel(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error) {
-	exec := tx
-	if exec == nil {
-		exec = s.db.WithContext(ctx)
+func (s *GORMOrderStore) Cancel(ctx context.Context, handle *transaction.Handle, orderNo string) (bool, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return false, err
 	}
-	res := exec.Model(&model.Order{}).
+	res := tx.WithContext(ctx).Model(&model.Order{}).
 		Where("order_no = ? AND status = ?", orderNo, model.OrderStatusPendingPayment).
 		Updates(map[string]any{"status": model.OrderStatusCancelled, "cancelled_at": time.Now(), "user_activity_key": nil})
 	if res.Error != nil {
@@ -177,13 +186,13 @@ func (s *GORMOrderStore) Cancel(ctx context.Context, tx *gorm.DB, orderNo string
 
 // MarkPaid 条件更新 待支付→已支付（支付回调）；WHERE 同时校验 status、
 // pay_amount 与 expire_at。过期订单即使 cron 尚未扫描也不能支付成功。
-func (s *GORMOrderStore) MarkPaid(ctx context.Context, tx *gorm.DB, orderNo string, payAmount int64) (bool, error) {
-	exec := tx
-	if exec == nil {
-		exec = s.db.WithContext(ctx)
+func (s *GORMOrderStore) MarkPaid(ctx context.Context, handle *transaction.Handle, orderNo string, payAmount int64) (bool, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return false, err
 	}
 	paidAt := time.Now()
-	res := exec.Model(&model.Order{}).
+	res := tx.WithContext(ctx).Model(&model.Order{}).
 		Where("order_no = ? AND status = ? AND pay_amount = ? AND expire_at > ?",
 			orderNo, model.OrderStatusPendingPayment, payAmount, paidAt).
 		Updates(map[string]any{"status": model.OrderStatusPaid, "paid_at": paidAt})
@@ -194,25 +203,20 @@ func (s *GORMOrderStore) MarkPaid(ctx context.Context, tx *gorm.DB, orderNo stri
 }
 
 // Ship 条件更新 已支付→已发货（admin 发货）。
-func (s *GORMOrderStore) Ship(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error) {
-	return s.transition(ctx, tx, orderNo, model.OrderStatusPaid, model.OrderStatusShipped, "shipped_at")
+func (s *GORMOrderStore) Ship(ctx context.Context, orderNo string) (bool, error) {
+	return s.transition(ctx, orderNo, model.OrderStatusPaid, model.OrderStatusShipped, "shipped_at")
 }
 
 // ConfirmReceipt 条件更新 已发货→已完成（用户确认收货）。
-func (s *GORMOrderStore) ConfirmReceipt(ctx context.Context, tx *gorm.DB, orderNo string) (bool, error) {
-	return s.transition(ctx, tx, orderNo, model.OrderStatusShipped, model.OrderStatusCompleted, "completed_at")
+func (s *GORMOrderStore) ConfirmReceipt(ctx context.Context, orderNo string) (bool, error) {
+	return s.transition(ctx, orderNo, model.OrderStatusShipped, model.OrderStatusCompleted, "completed_at")
 }
 
 // transition 状态机条件更新：WHERE status=from → status=to，并记录迁移时间。
 // 迁移时间经 Go 传入而非 NOW(3)：DATETIME 按 Go 本地墙钟写入（go-sql-driver
 // 的 loc=Local 行为），与 created_at/expire_at 同源，与 MySQL 服务器时区解耦。
-// tx 为 nil 时使用仓储自身连接（单条 UPDATE，无需事务）。
-func (s *GORMOrderStore) transition(ctx context.Context, tx *gorm.DB, orderNo, from, to, atColumn string) (bool, error) {
-	exec := tx
-	if exec == nil {
-		exec = s.db.WithContext(ctx)
-	}
-	res := exec.Model(&model.Order{}).
+func (s *GORMOrderStore) transition(ctx context.Context, orderNo, from, to, atColumn string) (bool, error) {
+	res := s.db.WithContext(ctx).Model(&model.Order{}).
 		Where("order_no = ? AND status = ?", orderNo, from).
 		Updates(map[string]any{"status": to, atColumn: time.Now()})
 	if res.Error != nil {
@@ -223,7 +227,11 @@ func (s *GORMOrderStore) transition(ctx context.Context, tx *gorm.DB, orderNo, f
 
 // ---- 订单项 ----
 
-func (s *GORMOrderItemStore) Create(ctx context.Context, tx *gorm.DB, item *model.OrderItem) error {
+func (s *GORMOrderItemStore) Create(ctx context.Context, handle *transaction.Handle, item *model.OrderItem) error {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return err
+	}
 	return tx.WithContext(ctx).Create(item).Error
 }
 

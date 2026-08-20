@@ -10,13 +10,13 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 
 	ordermodel "github.com/xiangzhang-coding/go-single/internal/order/model"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	paymentmodel "github.com/xiangzhang-coding/go-single/internal/payment/model"
 	"github.com/xiangzhang-coding/go-single/internal/payment/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // ---- fake 支付仓储 ----
@@ -34,7 +34,7 @@ func newFakePayments() *fakePayments {
 	}
 }
 
-func (f *fakePayments) Create(_ context.Context, _ *gorm.DB, p *paymentmodel.Payment) error {
+func (f *fakePayments) Create(_ context.Context, _ *transaction.Handle, p *paymentmodel.Payment) error {
 	if f.create != nil {
 		if err := f.create(p); err != nil {
 			return err
@@ -76,7 +76,7 @@ func (f *fakeOrderSvc) GetDetail(_ context.Context, userID int64, orderNo string
 	return view, nil
 }
 
-func (f *fakeOrderSvc) MarkPaid(_ context.Context, _ *gorm.DB, orderNo string, payAmount int64) (bool, error) {
+func (f *fakeOrderSvc) MarkPaid(_ context.Context, _ *transaction.Handle, orderNo string, payAmount int64) (bool, error) {
 	if f.markPaid != nil {
 		return f.markPaid(orderNo, payAmount)
 	}
@@ -107,7 +107,7 @@ func newFixture() *fixture {
 // （镜像 GORM Transaction 语义），验证流水与订单状态保持一致。
 type fixtureTx struct{ f *fixture }
 
-func (t fixtureTx) WithinTx(_ context.Context, fn func(tx *gorm.DB) error) error {
+func (t fixtureTx) WithinTx(_ context.Context, fn func(tx *transaction.Handle) error) error {
 	byID := make(map[string]*paymentmodel.Payment, len(t.f.pays.byID))
 	for k, v := range t.f.pays.byID {
 		cp := *v

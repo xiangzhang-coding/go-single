@@ -7,16 +7,16 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	ordersvc "github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 type fakeSeckillTx struct{}
 
-func (fakeSeckillTx) WithinTx(_ context.Context, fn func(*gorm.DB) error) error {
+func (fakeSeckillTx) WithinTx(_ context.Context, fn func(*transaction.Handle) error) error {
 	return fn(nil)
 }
 
@@ -31,7 +31,7 @@ func (f *fakeSeckillCancellations) ListExpiredSeckill(context.Context) ([]orders
 	return f.expired, f.listErr
 }
 
-func (f *fakeSeckillCancellations) CancelSeckill(_ context.Context, _ *gorm.DB, orderNo string) (bool, error) {
+func (f *fakeSeckillCancellations) CancelSeckill(_ context.Context, _ *transaction.Handle, orderNo string) (bool, error) {
 	f.cancelled = append(f.cancelled, orderNo)
 	return !f.changed[orderNo], nil
 }

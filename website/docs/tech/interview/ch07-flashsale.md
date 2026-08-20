@@ -12,7 +12,7 @@ sidebar_position: 8
 - **幂等键**：先于预扣抢占，挡并发重复提交。
 - **Redis 原子预扣**：状态/窗口/库存/限购一次校验 + 扣减，扛峰值。
 - **MQ 异步落单**：DB 只按消费速率写单，天然串行。
-- 返回 **202 + order_no**，前端轮询；失败分支有对应状态码。
+- 返回 **202 + pre_deduction_id**，前端轮询预扣生命周期；失败分支有对应状态码。
 
 **可运行代码**
 
@@ -34,7 +34,7 @@ func main() {
 		{"[3] 幂等键抢占（flashsale:idem:{activity}:{user}）", true},
 		{"[4] Lua 原子预扣（校验→DECR 库存 + INCR 计数）", true},
 		{"[5] 生成雪花订单号 → 发布 MQ flashsale.order.create", true},
-		{"[6] 返回 202 排队中 + order_no，前端轮询订单", true},
+		{"[6] 返回 202 + pre_deduction_id，前端轮询预扣生命周期", true},
 		{"[7] 消费者事务落单（订单+订单项+条件扣活动库存）", true},
 	}
 	for _, f := range flow {
@@ -45,7 +45,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/handler/flashsale_handler.go` 的 `Purchase`（202 排队 + order_no）；`internal/flashsale/service/flashsale_service.go` 的 `Seckill`；消费者 `flashsale_consumer.go`；时序图 `docs/DESIGN.md`。
+**项目位置**：`internal/flashsale/handler/flashsale_handler.go` 的 `Purchase`（202 + pre_deduction_id）；`internal/flashsale/service/flashsale_service.go` 的 `Seckill`；消费者 `flashsale_consumer.go`；时序图 `docs/DESIGN.md`。
 
 ## Q2. 令牌桶限流：平滑突发流量
 

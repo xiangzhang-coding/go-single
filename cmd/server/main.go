@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -137,8 +138,13 @@ func run() error {
 		MaxConnectionsPerUser: cfg.WS.MaxConnectionsPerUser,
 		MaxConnectionsPerIP:   cfg.WS.MaxConnectionsPerIP,
 	}, log)
+	defer wsHub.Close()
 
-	router, cronRegistry := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient, fileSvc, wsHub)
+	router, background, err := newRouter(cfg, log, db, sqlDB, cacheClient, mqClient, fileSvc, wsHub)
+	if err != nil {
+		return err
+	}
+	background.Start()
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
@@ -146,9 +152,6 @@ func run() error {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
-	// WebSocket 连接经 hijack 脱离 http.Server 超时管理，需显式关闭（优雅关闭最后一步）。
-	defer wsHub.Close()
-
 	go func() {
 		log.Info("HTTP 服务启动", zap.Int("port", cfg.Server.Port))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -164,11 +167,11 @@ func run() error {
 	<-quit
 	log.Info("收到退出信号，正在关闭")
 
-	cronCtx, cronCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := cronRegistry.Stop(cronCtx); err != nil {
-		log.Warn("cron 停止超时", zap.Error(err))
+	backgroundCtx, backgroundCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := background.Stop(backgroundCtx); err != nil {
+		log.Warn("后台任务停止超时", zap.Error(err))
 	}
-	cronCancel()
+	backgroundCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -213,7 +216,99 @@ func runMigrations(cfg *config.Config, log *zap.Logger) error {
 	return nil
 }
 
-func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Client, mqClient mq.MQ, fileSvc *file.MinIO, wsHub *ws.Hub) (*gin.Engine, *platformcron.Registry) {
+type consumerBinding struct {
+	queue   string
+	name    string
+	handler mq.MessageHandler
+}
+
+type applicationRuntime struct {
+	log                *zap.Logger
+	mq                 mq.MQ
+	cron               *platformcron.Registry
+	recovery           flashsalesvc.PreDeductionRecovery
+	reservationCleanup flashsalesvc.ReservationCleanup
+	consumers          []consumerBinding
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+func (a *applicationRuntime) Start() {
+	a.mu.Lock()
+	if a.cancel != nil {
+		a.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.cancel = cancel
+	a.mu.Unlock()
+
+	if stats, err := recoverPreDeductionsAtStartup(a.recovery, 10*time.Second); err != nil {
+		a.log.Error("秒杀预扣启动恢复失败（定时任务将重试）", zap.Error(err))
+	} else if stats.Published+stats.RolledBack+stats.Failed > 0 {
+		a.log.Info("秒杀预扣启动恢复完成", zap.Int("published", stats.Published),
+			zap.Int("rolled_back", stats.RolledBack), zap.Int("failed", stats.Failed))
+	}
+	if cleaned, err := cleanupReservationsAtStartup(a.reservationCleanup, 10*time.Second); err != nil {
+		a.log.Error("秒杀 ordered reservation 启动修复失败（定时任务将重试）", zap.Error(err))
+	} else if cleaned > 0 {
+		a.log.Info("秒杀 ordered reservation 启动清理完成", zap.Int("cleaned", cleaned))
+	}
+
+	for _, binding := range a.consumers {
+		binding := binding
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			for {
+				err := a.mq.Consume(ctx, binding.queue, binding.handler)
+				if ctx.Err() != nil {
+					return
+				}
+				if err == nil {
+					return
+				}
+				a.log.Error(binding.name+"中断，3s 后重连", zap.Error(err))
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(3 * time.Second):
+				}
+			}
+		}()
+	}
+	a.cron.Start()
+}
+
+func (a *applicationRuntime) Stop(ctx context.Context) error {
+	a.mu.Lock()
+	cancel := a.cancel
+	a.cancel = nil
+	a.mu.Unlock()
+	if cancel == nil {
+		return nil
+	}
+	cancel()
+	cronErr := a.cron.Stop(ctx)
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return cronErr
+	case <-ctx.Done():
+		return errors.Join(cronErr, ctx.Err())
+	}
+}
+
+func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, cacheClient cache.Client, mqClient mq.MQ, fileSvc *file.MinIO, wsHub *ws.Hub) (*gin.Engine, *applicationRuntime, error) {
+	if cfg.Server.Mode != gin.DebugMode && cfg.Server.Mode != gin.ReleaseMode && cfg.Server.Mode != gin.TestMode {
+		return nil, nil, fmt.Errorf("invalid Gin mode %q", cfg.Server.Mode)
+	}
 	gin.SetMode(cfg.Server.Mode)
 
 	r := gin.New()
@@ -265,7 +360,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		},
 	})
 	if err != nil {
-		log.Fatal("初始化认证限流失败", zap.Error(err))
+		return nil, nil, fmt.Errorf("初始化认证限流: %w", err)
 	}
 	userHandler := userhandler.New(userSvc, verifier, authLimits)
 	addressHandler := userhandler.NewAddress(userSvc, verifier)
@@ -286,7 +381,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// 雪花订单号生成器：普通下单与秒杀抢购共用同一实例（worker_id 单实例唯一）。
 	orderNoGen, err := snowflake.New(cfg.Snowflake.WorkerID)
 	if err != nil {
-		log.Fatal("初始化雪花订单号生成器失败", zap.Error(err))
+		return nil, nil, fmt.Errorf("初始化雪花订单号生成器: %w", err)
 	}
 
 	// 幂等操作有限重试配置（T20）：仅下单/支付回调/秒杀消息发布启用，
@@ -306,7 +401,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 		Burst: cfg.FlashSale.Burst,
 	})
 	if err != nil {
-		log.Fatal("初始化秒杀令牌桶限流失败", zap.Error(err))
+		return nil, nil, fmt.Errorf("初始化秒杀令牌桶限流: %w", err)
 	}
 	flashsaleActivityStore := flashsalerepo.NewGORMActivity(db)
 	flashsalePreDeductions := flashsalerepo.NewGORMPreDeduction(db)
@@ -367,32 +462,6 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	seckillConsumer := flashsalesvc.NewSeckillOrderConsumer(
 		flashsaleStore.Activities, flashsaleStore.PreDeductions, cacheClient, flashsaleStore.Tx,
 		orderSvc, userSvc, businessMetrics, log)
-	startConsumer := func(queue, name string, handler mq.MessageHandler) {
-		go func() {
-			for {
-				err := mqClient.Consume(context.Background(), queue, handler)
-				if err != nil {
-					log.Error(name+"中断，3s 后重连", zap.Error(err))
-					time.Sleep(3 * time.Second)
-					continue
-				}
-				return
-			}
-		}()
-	}
-	if stats, err := recoverPreDeductionsAtStartup(flashsaleSvc, 10*time.Second); err != nil {
-		log.Error("秒杀预扣启动恢复失败（定时任务将重试）", zap.Error(err))
-	} else if stats.Published+stats.RolledBack+stats.Failed > 0 {
-		log.Info("秒杀预扣启动恢复完成", zap.Int("published", stats.Published),
-			zap.Int("rolled_back", stats.RolledBack), zap.Int("failed", stats.Failed))
-	}
-	if cleaned, err := cleanupReservationsAtStartup(reservationCleanup, 10*time.Second); err != nil {
-		log.Error("秒杀 ordered reservation 启动修复失败（定时任务将重试）", zap.Error(err))
-	} else if cleaned > 0 {
-		log.Info("秒杀 ordered reservation 启动清理完成", zap.Int("cleaned", cleaned))
-	}
-	startConsumer(flashsalesvc.SeckillOrderQueue, "秒杀落单消费者", seckillConsumer.Handle)
-	startConsumer(flashsalesvc.SeckillOrderDeadLetterQueue, "秒杀死信消费者", seckillConsumer.HandleDeadLetter)
 
 	// payment 模块：模拟支付回调（成功/失败），流水唯一约束（payment_id）挡重复回调，
 	// 成功路径单事务（流水 + 订单 待支付→已支付，WHERE 校验状态机、金额与期限）；
@@ -409,8 +478,10 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// T13 秒杀超时取消——每分钟扫描待支付秒杀订单，回补活动库存 + Redis 库存 +
 	// 用户计数（允许再次抢购）；对账——每小时进行中只比对告警（补单信号）、
 	// 每分钟收尾以 MySQL 对齐刚结束活动的 Redis 库存。
-	cronRegistry := registerCron(log, orderSvc, flashsaleSvc, reservationCleanup, seckillTimeout, reconcile)
-	cronRegistry.Start()
+	cronRegistry, err := registerCron(log, orderSvc, flashsaleSvc, reservationCleanup, seckillTimeout, reconcile)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// file 基础设施：统一文件上传代理（类型白名单 + ≤5MB + MinIO 私有桶）。
 	fileHandler := file.NewHandler(fileSvc, verifier, mediaAccessAuthorizer{users: userSvc, posts: postSvc, chat: chatSvc})
@@ -424,7 +495,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	api := r.Group("/api")
 	jsonLimit, err := requestbody.LimitJSON(cfg.Server.MaxJSONBodyBytes)
 	if err != nil {
-		log.Fatal("初始化 JSON 请求体上限失败", zap.Error(err))
+		return nil, nil, fmt.Errorf("初始化 JSON 请求体上限: %w", err)
 	}
 	api.Use(requestTimeout(cfg.Server.RequestTimeout), jsonLimit)
 	userHandler.RegisterRoutes(api)
@@ -443,7 +514,15 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	fileAPI.Use(requestTimeout(cfg.Server.RequestTimeout))
 	fileHandler.RegisterRoutes(fileAPI)
 
-	return r, cronRegistry
+	background := &applicationRuntime{
+		log: log, mq: mqClient, cron: cronRegistry,
+		recovery: flashsaleSvc, reservationCleanup: reservationCleanup,
+		consumers: []consumerBinding{
+			{queue: flashsalesvc.SeckillOrderQueue, name: "秒杀落单消费者", handler: seckillConsumer.Handle},
+			{queue: flashsalesvc.SeckillOrderDeadLetterQueue, name: "秒杀死信消费者", handler: seckillConsumer.HandleDeadLetter},
+		},
+	}
+	return r, background, nil
 }
 
 func recoverPreDeductionsAtStartup(recovery flashsalesvc.PreDeductionRecovery, timeout time.Duration) (flashsalesvc.RecoveryStats, error) {
@@ -519,7 +598,7 @@ var _ file.AccessAuthorizer = mediaAccessAuthorizer{}
 func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsalesvc.PreDeductionRecovery,
 	reservationCleanup flashsalesvc.ReservationCleanup,
 	seckillTimeout flashsalesvc.SeckillTimeout,
-	reconcile flashsalesvc.Reconciliation) *platformcron.Registry {
+	reconcile flashsalesvc.Reconciliation) (*platformcron.Registry, error) {
 	registry := platformcron.New(log, 5*time.Minute)
 	if err := registry.Register(platformcron.Job{
 		Name: "order-timeout-cancel",
@@ -533,7 +612,7 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		log.Fatal("注册超时取消任务失败", zap.Error(err))
+		return nil, fmt.Errorf("注册超时取消任务: %w", err)
 	}
 	if err := registry.Register(platformcron.Job{
 		Name: "flashsale-pre-deduction-recovery",
@@ -550,7 +629,7 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		log.Fatal("注册秒杀预扣恢复任务失败", zap.Error(err))
+		return nil, fmt.Errorf("注册秒杀预扣恢复任务: %w", err)
 	}
 	if err := registry.Register(platformcron.Job{
 		Name: "flashsale-reservation-cleanup",
@@ -566,7 +645,7 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		log.Fatal("注册秒杀 reservation marker 清理任务失败", zap.Error(err))
+		return nil, fmt.Errorf("注册秒杀 reservation marker 清理任务: %w", err)
 	}
 	if err := registry.Register(platformcron.Job{
 		Name: "seckill-timeout-cancel",
@@ -581,7 +660,7 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		log.Fatal("注册秒杀超时取消任务失败", zap.Error(err))
+		return nil, fmt.Errorf("注册秒杀超时取消任务: %w", err)
 	}
 	if err := registry.Register(platformcron.Job{
 		Name: "flashsale-reconcile-active",
@@ -605,7 +684,7 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		log.Fatal("注册秒杀对账任务失败", zap.Error(err))
+		return nil, fmt.Errorf("注册秒杀对账任务: %w", err)
 	}
 	if err := registry.Register(platformcron.Job{
 		Name: "flashsale-reconcile-ended",
@@ -621,7 +700,7 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		log.Fatal("注册秒杀收尾对账任务失败", zap.Error(err))
+		return nil, fmt.Errorf("注册秒杀收尾对账任务: %w", err)
 	}
-	return registry
+	return registry, nil
 }

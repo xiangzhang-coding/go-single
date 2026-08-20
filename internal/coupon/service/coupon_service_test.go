@@ -12,12 +12,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
-
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 	"github.com/xiangzhang-coding/go-single/internal/coupon/repository"
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
+	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
 )
 
 // ---- fake 仓储 ----
@@ -215,7 +214,7 @@ func (f *fakeUserCoupons) GetViewByID(_ context.Context, userID, couponID int64)
 }
 
 // Use 条件核销：unused→used + 有效期窗口（镜像 GORM 实现）；tx 忽略（单测无真实事务）。
-func (f *fakeUserCoupons) Use(_ context.Context, _ *gorm.DB, userID, couponID int64) (bool, error) {
+func (f *fakeUserCoupons) Use(_ context.Context, _ *transaction.Handle, userID, couponID int64) (bool, error) {
 	c, ok := f.byID[couponID]
 	if !ok || c.UserID != userID || c.Status != model.CouponStatusUnused {
 		return false, nil
@@ -235,7 +234,7 @@ func (f *fakeUserCoupons) Use(_ context.Context, _ *gorm.DB, userID, couponID in
 }
 
 // Rollback 条件回退：used→unused。
-func (f *fakeUserCoupons) Rollback(_ context.Context, _ *gorm.DB, userID, couponID int64) (bool, error) {
+func (f *fakeUserCoupons) Rollback(_ context.Context, _ *transaction.Handle, userID, couponID int64) (bool, error) {
 	c, ok := f.byID[couponID]
 	if !ok || c.UserID != userID || c.Status != model.CouponStatusUsed {
 		return false, nil
