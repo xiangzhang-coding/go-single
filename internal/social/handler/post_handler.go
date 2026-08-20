@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 	"github.com/xiangzhang-coding/go-single/internal/social/service"
 )
@@ -21,12 +22,12 @@ type sharePostRequest struct {
 func (h *Handler) SharePost(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req sharePostRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "sku_id is required"})
+		httpresponse.Write(c, http.StatusBadRequest, "sku_id is required")
 		return
 	}
 	post, err := h.posts.Share(c.Request.Context(), claims.UserID, service.ShareParams{
@@ -45,7 +46,7 @@ func (h *Handler) SharePost(c *gin.Context) {
 func (h *Handler) MyPosts(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	p := pagination.FromQuery(c)
@@ -61,7 +62,7 @@ func (h *Handler) MyPosts(c *gin.Context) {
 func (h *Handler) FeedPosts(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	p := pagination.FromQuery(c)
@@ -77,7 +78,7 @@ func (h *Handler) FeedPosts(c *gin.Context) {
 func (h *Handler) DeletePost(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	id, ok := idParam(c)

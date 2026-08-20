@@ -641,8 +641,9 @@ func TestClaimEdgeCases(t *testing.T) {
 	user := registerAndToken(t, env, uniqueName("bob"))
 
 	// 不存在的模板 → 404。
-	w, _ := doJSON(t, env, http.MethodPost, "/api/coupons/999999/claim", "", user)
+	w, body := doJSON(t, env, http.MethodPost, "/api/coupons/999999/claim", "", user)
 	require.Equal(t, http.StatusNotFound, w.Code)
+	require.Equal(t, map[string]any{"error": "coupon template not found"}, body)
 
 	// 未开始 → 409。
 	notStarted := createTemplate(t, env, admin, uniqueName("未开始券"), 10, 1, 500, 0, time.Hour, 2*time.Hour)

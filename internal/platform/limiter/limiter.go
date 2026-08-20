@@ -16,6 +16,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/cache"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // ErrConfig 配置非法（构造校验用，防 x/time/rate 参数非法 panic）。
@@ -38,7 +39,8 @@ func NewTokenBucket(cfg TokenBucketConfig) (gin.HandlerFunc, error) {
 	lim := rate.NewLimiter(rate.Limit(cfg.QPS), cfg.Burst)
 	return func(c *gin.Context) {
 		if !lim.Allow() {
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
+			c.Abort()
+			httpresponse.Write(c, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 		c.Next()

@@ -3,7 +3,6 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 	"github.com/xiangzhang-coding/go-single/internal/user/model"
 	"github.com/xiangzhang-coding/go-single/internal/user/service"
 )
@@ -63,7 +63,7 @@ type credentialsRequest struct {
 func (h *Handler) Register(c *gin.Context) {
 	var req credentialsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "username and password are required"})
+		httpresponse.Write(c, http.StatusBadRequest, "username and password are required")
 		return
 	}
 	if !h.allowAuthAttempt(c, req.Username, false) {
@@ -72,14 +72,7 @@ func (h *Handler) Register(c *gin.Context) {
 
 	u, err := h.svc.Register(c.Request.Context(), req.Username, req.Password)
 	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrUsernameTaken):
-			c.JSON(http.StatusConflict, gin.H{"error": "username already taken"})
-		case errors.Is(err, service.ErrInvalidUsername), errors.Is(err, service.ErrInvalidPassword):
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		}
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusCreated, u)
@@ -88,7 +81,7 @@ func (h *Handler) Register(c *gin.Context) {
 func (h *Handler) Login(c *gin.Context) {
 	var req credentialsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "username and password are required"})
+		httpresponse.Write(c, http.StatusBadRequest, "username and password are required")
 		return
 	}
 	if !h.allowAuthAttempt(c, req.Username, true) {
@@ -97,11 +90,7 @@ func (h *Handler) Login(c *gin.Context) {
 
 	u, token, err := h.svc.Login(c.Request.Context(), req.Username, req.Password)
 	if err != nil {
-		if errors.Is(err, service.ErrInvalidCredentials) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"token": token, "user": u})
@@ -118,11 +107,15 @@ func (h *Handler) allowAuthAttempt(c *gin.Context, account string, login bool) b
 		allowed, err = h.authLimits.AllowRegister(c.Request.Context(), c.ClientIP(), account)
 	}
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "authentication temporarily unavailable"})
+		if httpresponse.IsTimeout(err) {
+			httpresponse.WriteError(c, err)
+		} else {
+			httpresponse.Write(c, http.StatusServiceUnavailable, "authentication temporarily unavailable")
+		}
 		return false
 	}
 	if !allowed {
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
+		httpresponse.Write(c, http.StatusTooManyRequests, "rate limit exceeded")
 		return false
 	}
 	return true
@@ -132,16 +125,12 @@ func (h *Handler) allowAuthAttempt(c *gin.Context, account string, login bool) b
 func (h *Handler) Me(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	u, err := h.svc.GetByID(c.Request.Context(), claims.UserID)
 	if err != nil {
-		if errors.Is(err, service.ErrUserNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, u)
@@ -158,12 +147,12 @@ type updateProfileRequest struct {
 func (h *Handler) UpdateMe(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req updateProfileRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	u, err := h.svc.UpdateProfile(c.Request.Context(), claims.UserID, service.ProfileParams{
@@ -171,14 +160,7 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 		AvatarURL: req.AvatarURL,
 	})
 	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidProfile):
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		case errors.Is(err, service.ErrUserNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		}
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, u)
@@ -189,17 +171,13 @@ func (h *Handler) UpdateMe(c *gin.Context) {
 func (h *Handler) SearchUsers(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
 	users, err := h.svc.Search(c.Request.Context(), strings.TrimSpace(c.Query("username")), limit)
 	if err != nil {
-		if errors.Is(err, service.ErrInvalidUsername) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		writeError(c, err)
 		return
 	}
 	items := make([]model.PublicUser, 0, len(users))
@@ -216,27 +194,23 @@ func (h *Handler) SearchUsers(c *gin.Context) {
 func (h *Handler) GetUser(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid user id")
 		return
 	}
 	if claims.UserID != id && claims.Role != model.RoleAdmin {
-		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		httpresponse.Write(c, http.StatusForbidden, "forbidden")
 		return
 	}
 
 	u, err := h.svc.GetByID(c.Request.Context(), id)
 	if err != nil {
-		if errors.Is(err, service.ErrUserNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, u)

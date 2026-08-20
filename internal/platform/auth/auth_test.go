@@ -16,6 +16,12 @@ import (
 
 const testSecret = "test-secret"
 
+type verifierFunc func(context.Context, string) (*Claims, error)
+
+func (f verifierFunc) Verify(ctx context.Context, token string) (*Claims, error) {
+	return f(ctx, token)
+}
+
 func newTestJWT(ttl time.Duration) *JWT {
 	return NewJWT(JWTConfig{Secret: testSecret, TTL: ttl})
 }
@@ -149,6 +155,24 @@ func TestMiddlewareRequiresValidToken(t *testing.T) {
 	router.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 	require.JSONEq(t, `{"user_id":7,"role":"admin"}`, w.Body.String())
+}
+
+func TestMiddlewareReportsVerifierTimeout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/protected", Middleware(verifierFunc(func(context.Context, string) (*Claims, error) {
+		return nil, context.DeadlineExceeded
+	})), func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusGatewayTimeout, w.Code)
+	require.JSONEq(t, `{"error":"request timeout"}`, w.Body.String())
 }
 
 func TestRequireAdmin(t *testing.T) {

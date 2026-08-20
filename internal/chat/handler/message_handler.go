@@ -3,8 +3,6 @@
 package handler
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"strconv"
 
@@ -12,6 +10,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/chat/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // Handler chat 模块的 HTTP 处理器。
@@ -50,12 +49,12 @@ type sendMessageRequest struct {
 func (h *Handler) Send(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req sendMessageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "to_user_id and type are required"})
+		httpresponse.Write(c, http.StatusBadRequest, "to_user_id and type are required")
 		return
 	}
 	result, err := h.svc.Send(c.Request.Context(), claims.UserID, service.SendParams{
@@ -80,7 +79,7 @@ func (h *Handler) Send(c *gin.Context) {
 func (h *Handler) ListConversations(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	beforeID, _ := strconv.ParseInt(c.Query("before_id"), 10, 64)
@@ -96,7 +95,7 @@ func (h *Handler) ListConversations(c *gin.Context) {
 func (h *Handler) ListMessages(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	afterID, _ := strconv.ParseInt(c.Query("after_id"), 10, 64)
@@ -118,12 +117,12 @@ type markReadRequest struct {
 func (h *Handler) MarkRead(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req markReadRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "last_message_id is required"})
+		httpresponse.Write(c, http.StatusBadRequest, "last_message_id is required")
 		return
 	}
 	if err := h.svc.MarkRead(c.Request.Context(), claims.UserID, c.Param("key"), req.LastMessageID); err != nil {
@@ -135,16 +134,11 @@ func (h *Handler) MarkRead(c *gin.Context) {
 
 // writeError 消息业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
-	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, service.ErrSelfMessage):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrRecipientNotFound), errors.Is(err, service.ErrConversationNotFound), errors.Is(err, service.ErrMessageNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrNotFriends):
-		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
+	httpresponse.WriteError(c, err,
+		httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{service.ErrInvalidInput, service.ErrSelfMessage}},
+		httpresponse.Rule{Status: http.StatusForbidden, Errors: []error{service.ErrNotFriends}},
+		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{
+			service.ErrRecipientNotFound, service.ErrConversationNotFound, service.ErrMessageNotFound,
+		}},
+	)
 }

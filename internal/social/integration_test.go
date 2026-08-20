@@ -673,8 +673,9 @@ func TestFriendRequestOwnerCheck(t *testing.T) {
 	reqID := int64(req["id"].(float64))
 
 	// 申请人 / 无关第三人 处理申请 → 403。
-	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/accept", reqID), "", aliceToken)
+	w, body := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/accept", reqID), "", aliceToken)
 	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Equal(t, map[string]any{"error": "friend request does not belong to user"}, body)
 	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/reject", reqID), "", carolToken)
 	require.Equal(t, http.StatusForbidden, w.Code)
 

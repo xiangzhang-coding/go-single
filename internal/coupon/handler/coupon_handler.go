@@ -3,8 +3,6 @@
 package handler
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -13,6 +11,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/coupon/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 )
 
@@ -112,7 +111,7 @@ func (h *Handler) ListTemplates(c *gin.Context) {
 func (h *Handler) ListClaimable(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	list, err := h.svc.ListClaimable(c.Request.Context(), claims.UserID)
@@ -126,7 +125,7 @@ func (h *Handler) ListClaimable(c *gin.Context) {
 func (h *Handler) Claim(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	id, ok := idParam(c)
@@ -144,14 +143,14 @@ func (h *Handler) Claim(c *gin.Context) {
 func (h *Handler) ListMine(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	status := c.Query("status")
 	switch status {
 	case "", "unused", "used", "expired":
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid status")
 		return
 	}
 	p := pagination.FromQuery(c)
@@ -178,7 +177,7 @@ func templateParams(req templateRequest) service.TemplateParams {
 
 func bindJSON(c *gin.Context, req any) bool {
 	if err := c.ShouldBindJSON(req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return false
 	}
 	return true
@@ -187,7 +186,7 @@ func bindJSON(c *gin.Context, req any) bool {
 func idParam(c *gin.Context) (int64, bool) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid id")
 		return 0, false
 	}
 	return id, true
@@ -195,16 +194,11 @@ func idParam(c *gin.Context) (int64, bool) {
 
 // writeError 业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
-	case errors.Is(err, service.ErrInvalidInput):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrTemplateNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrSoldOut), errors.Is(err, service.ErrClaimLimitReached), errors.Is(err, service.ErrNotInWindow):
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
+	httpresponse.WriteError(c, err,
+		httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{service.ErrInvalidInput}},
+		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{service.ErrTemplateNotFound}},
+		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{
+			service.ErrSoldOut, service.ErrClaimLimitReached, service.ErrNotInWindow,
+		}},
+	)
 }

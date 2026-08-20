@@ -622,9 +622,10 @@ func TestChatSendRejections(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code)
 
 	// 非好友 → 403（T14 好友关系为前置条件）。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/messages",
+	w, errorBody := doJSON(t, env, http.MethodPost, "/api/messages",
 		fmt.Sprintf(`{"to_user_id":%d,"type":"text","content":"x"}`, bobID), aliceToken)
 	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Equal(t, map[string]any{"error": "recipient is not your friend"}, errorBody)
 
 	// 接收方不存在 → 404。
 	w, _ = doJSON(t, env, http.MethodPost, "/api/messages", `{"to_user_id":999999,"type":"text","content":"x"}`, aliceToken)

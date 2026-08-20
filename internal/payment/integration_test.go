@@ -388,8 +388,9 @@ func TestMockPayDuplicateCallbackRejected(t *testing.T) {
 	require.Equal(t, http.StatusCreated, w.Code)
 
 	// 同一 payment_id 重放：流水唯一约束拒绝（409）。
-	w, _ = mockPay(t, env, token, orderNo, uniqueName("pay_dup1"), payAmount, "success")
+	w, errorBody := mockPay(t, env, token, orderNo, uniqueName("pay_dup1"), payAmount, "success")
 	require.Equal(t, http.StatusConflict, w.Code, "重复流水号应被拒: %s", w.Body.String())
+	require.Equal(t, map[string]any{"error": "illegal order status transition"}, errorBody)
 
 	// 新 payment_id 但订单已支付：状态机校验拒绝（409）。
 	w, _ = mockPay(t, env, token, orderNo, uniqueName("pay_dup2"), payAmount, "success")

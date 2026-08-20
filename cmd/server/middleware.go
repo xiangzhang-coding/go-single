@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
-	"errors"
-	"net/http"
 	"runtime/debug"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // requestLogger 以 zap 结构化日志输出每请求访问日志。
@@ -40,7 +40,8 @@ func safeRecovery(log *zap.Logger) gin.HandlerFunc {
 				zap.ByteString("stack", debug.Stack()),
 			)
 			if !c.Writer.Written() {
-				c.AbortWithStatus(http.StatusInternalServerError)
+				c.Abort()
+				httpresponse.WriteInternal(c)
 				return
 			}
 			c.Abort()
@@ -70,8 +71,9 @@ func requestTimeout(d time.Duration) gin.HandlerFunc {
 		c.Next()
 
 		// gin ResponseWriter 未写任何内容时 Size() 为 -1（已写为累计字节数）。
-		if c.Writer.Size() < 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			c.AbortWithStatusJSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
+		if c.Writer.Size() < 0 && httpresponse.IsTimeout(ctx.Err()) {
+			c.Abort()
+			httpresponse.WriteError(c, ctx.Err())
 		}
 	}
 }

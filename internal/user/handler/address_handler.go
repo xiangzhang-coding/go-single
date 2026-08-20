@@ -1,13 +1,13 @@
 package handler
 
 import (
-	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 	"github.com/xiangzhang-coding/go-single/internal/user/service"
 )
 
@@ -62,17 +62,17 @@ type addressUpdateRequest struct {
 func (h *AddressHandler) Create(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req addressRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	a, err := h.svc.CreateAddress(c.Request.Context(), claims.UserID, addressParams(req))
 	if err != nil {
-		writeAddressError(c, err)
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusCreated, a)
@@ -81,7 +81,7 @@ func (h *AddressHandler) Create(c *gin.Context) {
 func (h *AddressHandler) Update(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	id, ok := idParam(c)
@@ -90,11 +90,11 @@ func (h *AddressHandler) Update(c *gin.Context) {
 	}
 	var req addressUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if err := h.svc.UpdateAddress(c.Request.Context(), claims.UserID, id, updateAddressParams(req)); err != nil {
-		writeAddressError(c, err)
+		writeError(c, err)
 		return
 	}
 	c.Status(http.StatusNoContent)
@@ -103,7 +103,7 @@ func (h *AddressHandler) Update(c *gin.Context) {
 func (h *AddressHandler) Delete(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	id, ok := idParam(c)
@@ -111,7 +111,7 @@ func (h *AddressHandler) Delete(c *gin.Context) {
 		return
 	}
 	if err := h.svc.DeleteAddress(c.Request.Context(), claims.UserID, id); err != nil {
-		writeAddressError(c, err)
+		writeError(c, err)
 		return
 	}
 	c.Status(http.StatusNoContent)
@@ -120,12 +120,12 @@ func (h *AddressHandler) Delete(c *gin.Context) {
 func (h *AddressHandler) List(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	list, err := h.svc.ListAddresses(c.Request.Context(), claims.UserID)
 	if err != nil {
-		writeAddressError(c, err)
+		writeError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"items": list})
@@ -134,7 +134,7 @@ func (h *AddressHandler) List(c *gin.Context) {
 func (h *AddressHandler) SetDefault(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	id, ok := idParam(c)
@@ -142,7 +142,7 @@ func (h *AddressHandler) SetDefault(c *gin.Context) {
 		return
 	}
 	if err := h.svc.SetDefaultAddress(c.Request.Context(), claims.UserID, id); err != nil {
-		writeAddressError(c, err)
+		writeError(c, err)
 		return
 	}
 	c.Status(http.StatusNoContent)
@@ -174,22 +174,8 @@ func updateAddressParams(req addressUpdateRequest) service.AddressParams {
 func idParam(c *gin.Context) (int64, bool) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid id")
 		return 0, false
 	}
 	return id, true
-}
-
-// writeAddressError 地址簿业务错误 → HTTP 状态码。
-func writeAddressError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, service.ErrInvalidAddress):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrAddressNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrAddressForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
 }

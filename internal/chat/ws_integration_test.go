@@ -134,7 +134,7 @@ func TestWSHandshakeRejectsPerUserConnectionOverflow(t *testing.T) {
 	for range 5 {
 		require.NotNil(t, dialWS(t, env, token))
 	}
-	require.JSONEq(t, `{"error":"websocket connection limit exceeded","scope":"user"}`,
+	require.JSONEq(t, `{"error":"websocket connection limit exceeded"}`,
 		dialWSRejected(t, env, token, http.StatusTooManyRequests))
 }
 

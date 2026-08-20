@@ -3,8 +3,6 @@
 package handler
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"strconv"
 
@@ -12,6 +10,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/order/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 )
 
@@ -69,12 +68,12 @@ type itemReq struct {
 func (h *Handler) Create(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req createOrderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	params := service.CreateParams{
@@ -105,7 +104,7 @@ func (h *Handler) Create(c *gin.Context) {
 func (h *Handler) List(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	p := pagination.FromQuery(c)
@@ -120,7 +119,7 @@ func (h *Handler) List(c *gin.Context) {
 func (h *Handler) GetDetail(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	orderNo, ok2 := orderNoParam(c)
@@ -138,7 +137,7 @@ func (h *Handler) GetDetail(c *gin.Context) {
 func (h *Handler) Cancel(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	orderNo, ok2 := orderNoParam(c)
@@ -155,7 +154,7 @@ func (h *Handler) Cancel(c *gin.Context) {
 func (h *Handler) ConfirmReceipt(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	orderNo, ok2 := orderNoParam(c)
@@ -198,7 +197,7 @@ func orderNoParam(c *gin.Context) (string, bool) {
 	raw := c.Param("order_no")
 	id, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || id <= 0 || len(raw) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid order_no"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid order_no")
 		return "", false
 	}
 	return raw, true
@@ -206,22 +205,16 @@ func orderNoParam(c *gin.Context) (string, bool) {
 
 // writeError 订单业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
-	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, service.ErrCartEmpty):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrOrderNotFound), errors.Is(err, service.ErrSKUNotFound),
-		errors.Is(err, service.ErrCouponNotFound), errors.Is(err, service.ErrAddressNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrOrderForbidden), errors.Is(err, service.ErrAddressForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrInsufficientStock), errors.Is(err, service.ErrSKUUnavailable),
-		errors.Is(err, service.ErrCouponUsed), errors.Is(err, service.ErrCouponExpired),
-		errors.Is(err, service.ErrCouponThresholdNotMet), errors.Is(err, service.ErrIllegalTransition),
-		errors.Is(err, service.ErrOrderChanged):
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
+	httpresponse.WriteError(c, err,
+		httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{service.ErrInvalidInput, service.ErrCartEmpty}},
+		httpresponse.Rule{Status: http.StatusForbidden, Errors: []error{service.ErrOrderForbidden, service.ErrAddressForbidden}},
+		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{
+			service.ErrOrderNotFound, service.ErrSKUNotFound, service.ErrCouponNotFound, service.ErrAddressNotFound,
+		}},
+		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{
+			service.ErrInsufficientStock, service.ErrSKUUnavailable, service.ErrSeckillOrderConflict,
+			service.ErrCouponUsed, service.ErrCouponExpired, service.ErrCouponThresholdNotMet,
+			service.ErrIllegalTransition, service.ErrOrderChanged,
+		}},
+	)
 }

@@ -384,8 +384,9 @@ func TestAdminProductSKUCRUD(t *testing.T) {
 	pID := createProduct(t, env, token, catID, "T恤")
 
 	// 不存在类目 → 404。
-	w, _ := doJSON(t, env, http.MethodPost, "/api/admin/products", `{"category_id":999999,"title":"x"}`, token)
+	w, body := doJSON(t, env, http.MethodPost, "/api/admin/products", `{"category_id":999999,"title":"x"}`, token)
 	require.Equal(t, http.StatusNotFound, w.Code)
+	require.Equal(t, map[string]any{"error": "category not found"}, body)
 
 	// 非法 specs（非 JSON）→ 400。
 	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/products/%d/skus", pID), `{"specs":{"color":"红","price":100}`, token)

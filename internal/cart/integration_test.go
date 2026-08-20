@@ -456,8 +456,9 @@ func TestCartAddRejects(t *testing.T) {
 	offSKU := offSaleSKU(t, env)
 
 	// 不存在的 SKU → 404。
-	w, _ := doJSON(t, env, http.MethodPost, "/api/cart", `{"sku_id":999999,"quantity":1}`, token)
+	w, body := doJSON(t, env, http.MethodPost, "/api/cart", `{"sku_id":999999,"quantity":1}`, token)
 	require.Equal(t, http.StatusNotFound, w.Code)
+	require.Equal(t, map[string]any{"error": "sku not found"}, body)
 
 	// 下架商品的 SKU → 409。
 	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, offSKU), token)

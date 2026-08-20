@@ -213,7 +213,7 @@ func TestLoginRejected(t *testing.T) {
 
 	code, body := login(t, env, username, "wrong-pass")
 	require.Equal(t, http.StatusUnauthorized, code)
-	require.NotEmpty(t, body["error"])
+	require.Equal(t, map[string]any{"error": "invalid username or password"}, body)
 
 	code, _ = login(t, env, "ghost_"+username, "secret123")
 	require.Equal(t, http.StatusUnauthorized, code)

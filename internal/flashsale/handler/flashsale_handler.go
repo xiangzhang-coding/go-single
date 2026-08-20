@@ -4,8 +4,6 @@
 package handler
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -14,6 +12,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // Handler flashsale 模块的 HTTP 处理器。
@@ -154,7 +153,7 @@ func (h *Handler) Purchase(c *gin.Context) {
 	}
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req purchaseRequest
@@ -182,7 +181,7 @@ func (h *Handler) GetPurchase(c *gin.Context) {
 	}
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	pd, err := h.svc.GetPreDeduction(c.Request.Context(), claims.UserID, id)
@@ -211,7 +210,7 @@ func activityParams(req activityRequest) service.ActivityParams {
 
 func bindJSON(c *gin.Context, req any) bool {
 	if err := c.ShouldBindJSON(req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return false
 	}
 	return true
@@ -220,7 +219,7 @@ func bindJSON(c *gin.Context, req any) bool {
 func idParam(c *gin.Context) (int64, bool) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid id")
 		return 0, false
 	}
 	return id, true
@@ -228,27 +227,14 @@ func idParam(c *gin.Context) (int64, bool) {
 
 // writeError 业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
-	case errors.Is(err, service.ErrInvalidInput):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrActivityNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrPreDeductionNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrRateLimited):
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrStockIncreaseInProgress),
-		errors.Is(err, service.ErrActivityFieldsLocked),
-		errors.Is(err, service.ErrStockBelowAcceptedReservations),
-		errors.Is(err, service.ErrReservationsUnsettled),
-		errors.Is(err, service.ErrNotInWindow),
-		errors.Is(err, service.ErrSoldOut),
-		errors.Is(err, service.ErrLimitReached),
-		errors.Is(err, service.ErrOffline):
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
+	httpresponse.WriteError(c, err,
+		httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{service.ErrInvalidInput}},
+		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{service.ErrActivityNotFound, service.ErrPreDeductionNotFound}},
+		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{
+			service.ErrStockIncreaseInProgress, service.ErrActivityFieldsLocked,
+			service.ErrStockBelowAcceptedReservations, service.ErrReservationsUnsettled,
+			service.ErrNotInWindow, service.ErrSoldOut, service.ErrLimitReached, service.ErrOffline,
+		}},
+		httpresponse.Rule{Status: http.StatusTooManyRequests, Errors: []error{service.ErrRateLimited}},
+	)
 }

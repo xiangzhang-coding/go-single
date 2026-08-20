@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 const authSubprotocol = "bearer"
@@ -36,12 +37,20 @@ func (h *Hub) Handler(verifier auth.TokenVerifier) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := tokenFromSubprotocol(c.Request)
 		if token == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+			httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 			return
 		}
 		claims, err := verifier.Verify(c.Request.Context(), token)
-		if err != nil || claims == nil || claims.ExpiresAt.IsZero() || !claims.ExpiresAt.After(time.Now()) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+		if err != nil {
+			if httpresponse.IsTimeout(err) {
+				httpresponse.WriteError(c, err)
+				return
+			}
+			httpresponse.Write(c, http.StatusUnauthorized, "invalid or expired token")
+			return
+		}
+		if claims == nil || claims.ExpiresAt.IsZero() || !claims.ExpiresAt.After(time.Now()) {
+			httpresponse.Write(c, http.StatusUnauthorized, "invalid or expired token")
 			return
 		}
 
@@ -49,7 +58,7 @@ func (h *Hub) Handler(verifier auth.TokenVerifier) gin.HandlerFunc {
 		release, scope, ok := h.reserve(claims.UserID, sourceIP)
 		if !ok {
 			if scope == rejectionScopeShutdown {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "websocket service unavailable"})
+				httpresponse.Write(c, http.StatusServiceUnavailable, "websocket service unavailable")
 				return
 			}
 			h.log.Warn("WS 连接拒绝",
@@ -58,10 +67,7 @@ func (h *Hub) Handler(verifier auth.TokenVerifier) gin.HandlerFunc {
 				zap.String("client_ip", sourceIP),
 			)
 			c.Header("Retry-After", "1")
-			c.JSON(http.StatusTooManyRequests, gin.H{
-				"error": "websocket connection limit exceeded",
-				"scope": scope,
-			})
+			httpresponse.Write(c, http.StatusTooManyRequests, "websocket connection limit exceeded")
 			return
 		}
 		defer release()

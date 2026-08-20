@@ -264,7 +264,7 @@ func TestHubEnforcesConnectionLimitsAndReleasesSlots(t *testing.T) {
 		require.NotNil(t, c1)
 		require.NotNil(t, c2)
 		require.Eventually(t, func() bool { return hub.ConnectedCount() == 2 }, time.Second, 10*time.Millisecond)
-		require.JSONEq(t, `{"error":"websocket connection limit exceeded","scope":"user"}`,
+		require.JSONEq(t, `{"error":"websocket connection limit exceeded"}`,
 			dialRejected(t, handler, "valid-token", http.StatusTooManyRequests))
 
 		require.NoError(t, c1.conn.Close())
@@ -281,7 +281,7 @@ func TestHubEnforcesConnectionLimitsAndReleasesSlots(t *testing.T) {
 		})
 		require.NotNil(t, dialClient(t, handler, "valid-token"))
 		require.NotNil(t, dialClient(t, handler, "user-43-token"))
-		require.JSONEq(t, `{"error":"websocket connection limit exceeded","scope":"ip"}`,
+		require.JSONEq(t, `{"error":"websocket connection limit exceeded"}`,
 			dialRejected(t, handler, "user-44-token", http.StatusTooManyRequests))
 
 		_, independentHandler := newTestHubWithConfig(t, Config{
@@ -302,7 +302,7 @@ func TestHubEnforcesConnectionLimitsAndReleasesSlots(t *testing.T) {
 		})
 		require.NotNil(t, dialClient(t, handler, "valid-token"))
 		require.NotNil(t, dialClient(t, handler, "user-43-token"))
-		require.JSONEq(t, `{"error":"websocket connection limit exceeded","scope":"global"}`,
+		require.JSONEq(t, `{"error":"websocket connection limit exceeded"}`,
 			dialRejected(t, handler, "user-44-token", http.StatusTooManyRequests))
 	})
 }

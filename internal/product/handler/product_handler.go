@@ -2,15 +2,14 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 	"github.com/xiangzhang-coding/go-single/internal/product/service"
 )
@@ -240,7 +239,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	if raw := c.Query("category_id"); raw != "" {
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || id <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category_id"})
+			httpresponse.Write(c, http.StatusBadRequest, "invalid category_id")
 			return
 		}
 		categoryID = &id
@@ -290,7 +289,7 @@ func (h *Handler) ListAdminProducts(c *gin.Context) {
 	if raw := c.Query("category_id"); raw != "" {
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || id <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid category_id"})
+			httpresponse.Write(c, http.StatusBadRequest, "invalid category_id")
 			return
 		}
 		categoryID = &id
@@ -306,7 +305,7 @@ func (h *Handler) ListAdminProducts(c *gin.Context) {
 
 func bindJSON(c *gin.Context, req any) bool {
 	if err := c.ShouldBindJSON(req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return false
 	}
 	return true
@@ -315,7 +314,7 @@ func bindJSON(c *gin.Context, req any) bool {
 func idParam(c *gin.Context) (int64, bool) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid id")
 		return 0, false
 	}
 	return id, true
@@ -323,16 +322,11 @@ func idParam(c *gin.Context) (int64, bool) {
 
 // writeError 业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
-	case errors.Is(err, service.ErrInvalidInput):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrProductNotFound), errors.Is(err, service.ErrSKUNotFound), errors.Is(err, service.ErrCategoryNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrCategoryInUse):
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
+	httpresponse.WriteError(c, err,
+		httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{service.ErrInvalidInput}},
+		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{
+			service.ErrProductNotFound, service.ErrSKUNotFound, service.ErrCategoryNotFound,
+		}},
+		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{service.ErrCategoryInUse}},
+	)
 }

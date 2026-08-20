@@ -21,6 +21,10 @@ spec 与 DESIGN.md 早期将 swaggo/swag 列为选型、前端边界表述为 "S
 3. **替换路径保留**：swaggo（注解 + `/swagger` 路由）与 openapi-typescript（OpenAPI → TS 自动生成）
    均移入 BACKLOG 组件替换清单——若未来出现第二套主题/外部消费方，可按"模块分批试点注解 →
    openapi-typescript 替换手写类型"路径升级。
+4. **错误响应统一**：业务 API 失败响应使用 `{ "error": string }`，由后端共享响应包与前端
+   `ErrorResponse` 共同固定。校验失败、未认证、无权限、未找到、冲突、限流和超时分别使用
+   400、401、403、404、409、429 和 504；未知内部错误使用 500 且不返回依赖错误内容。
+   各模块仍在自己的 handler 内声明业务 sentinel 到状态码的映射，platform 层不依赖领域模块。
 
 ## 后果
 

@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 func testLogger() (*zap.Logger, *bytes.Buffer) {
@@ -53,6 +55,7 @@ func TestRecoveryLogsDoNotContainWebSocketCredentials(t *testing.T) {
 	r.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.JSONEq(t, `{"error":"internal error"}`, rec.Body.String())
 	require.NotContains(t, output.String(), token)
 	require.Contains(t, output.String(), `"path":"/ws"`)
 }
@@ -109,7 +112,7 @@ func TestRequestTimeoutFastFail(t *testing.T) {
 		// 模拟依赖挂起：不响应 ctx，但底层调用会感知截止时间快速返回。
 		select {
 		case <-c.Request.Context().Done():
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "dependency failed fast"})
+			httpresponse.WriteError(c, c.Request.Context().Err())
 		case <-time.After(time.Hour):
 		}
 	})
@@ -121,7 +124,8 @@ func TestRequestTimeoutFastFail(t *testing.T) {
 	start := time.Now()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/slow", nil))
 	require.Less(t, time.Since(start), 2*time.Second, "依赖超时必须快速失败，不挂起")
-	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Equal(t, http.StatusGatewayTimeout, rec.Code)
+	require.JSONEq(t, `{"error":"request timeout"}`, rec.Body.String())
 
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/fast", nil))
@@ -140,7 +144,7 @@ func TestRequestTimeoutWrites504WhenNothingWritten(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/silent", nil))
 	require.Equal(t, http.StatusGatewayTimeout, rec.Code)
-	require.Contains(t, rec.Body.String(), "request timeout")
+	require.JSONEq(t, `{"error":"request timeout"}`, rec.Body.String())
 }
 
 func TestRequestTimeoutPropagatesDeadline(t *testing.T) {

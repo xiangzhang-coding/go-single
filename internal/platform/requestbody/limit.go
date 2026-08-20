@@ -8,6 +8,8 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // LimitJSON buffers at most maxBytes+1 bytes before JSON handlers run. Oversize
@@ -18,17 +20,20 @@ func LimitJSON(maxBytes int64) (gin.HandlerFunc, error) {
 	}
 	return func(c *gin.Context) {
 		if c.Request.ContentLength > maxBytes {
-			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+			c.Abort()
+			httpresponse.Write(c, http.StatusRequestEntityTooLarge, "request body too large")
 			return
 		}
 
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxBytes+1))
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			c.Abort()
+			httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 			return
 		}
 		if int64(len(body)) > maxBytes {
-			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+			c.Abort()
+			httpresponse.Write(c, http.StatusRequestEntityTooLarge, "request body too large")
 			return
 		}
 

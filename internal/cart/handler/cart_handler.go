@@ -2,8 +2,6 @@
 package handler
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"strconv"
 
@@ -11,6 +9,7 @@ import (
 
 	"github.com/xiangzhang-coding/go-single/internal/cart/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // Handler cart 模块的 HTTP 处理器。
@@ -50,12 +49,12 @@ type updateQuantityRequest struct {
 func (h *Handler) AddItem(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req addItemRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	item, err := h.svc.AddItem(c.Request.Context(), claims.UserID, req.SKUID, req.Quantity)
@@ -69,7 +68,7 @@ func (h *Handler) AddItem(c *gin.Context) {
 func (h *Handler) UpdateQuantity(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	id, ok := idParam(c)
@@ -78,7 +77,7 @@ func (h *Handler) UpdateQuantity(c *gin.Context) {
 	}
 	var req updateQuantityRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if err := h.svc.UpdateQuantity(c.Request.Context(), claims.UserID, id, req.Quantity); err != nil {
@@ -91,7 +90,7 @@ func (h *Handler) UpdateQuantity(c *gin.Context) {
 func (h *Handler) DeleteItem(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	id, ok := idParam(c)
@@ -108,7 +107,7 @@ func (h *Handler) DeleteItem(c *gin.Context) {
 func (h *Handler) List(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	list, err := h.svc.ListItems(c.Request.Context(), claims.UserID)
@@ -122,7 +121,7 @@ func (h *Handler) List(c *gin.Context) {
 func idParam(c *gin.Context) (int64, bool) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid id")
 		return 0, false
 	}
 	return id, true
@@ -130,20 +129,10 @@ func idParam(c *gin.Context) (int64, bool) {
 
 // writeError 购物车业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
-	case errors.Is(err, service.ErrInvalidInput):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrSKUNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrSKUUnavailable):
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrCartItemNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrCartItemForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
+	httpresponse.WriteError(c, err,
+		httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{service.ErrInvalidInput}},
+		httpresponse.Rule{Status: http.StatusForbidden, Errors: []error{service.ErrCartItemForbidden}},
+		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{service.ErrSKUNotFound, service.ErrCartItemNotFound}},
+		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{service.ErrSKUUnavailable}},
+	)
 }

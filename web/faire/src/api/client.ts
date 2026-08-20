@@ -2,6 +2,7 @@ import axios, { AxiosError } from "axios";
 
 import { ACCESS_TOKEN_KEY } from "../lib/auth-storage";
 import { endSession } from "../lib/session";
+import type { ErrorResponse } from "./types";
 
 export const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE || "/api",
@@ -35,7 +36,7 @@ api.interceptors.response.use(
     }
     return response;
   },
-  async (error: AxiosError<{ error?: string } | Blob>) => {
+  async (error: AxiosError<ErrorResponse | Blob>) => {
     const status = error.response?.status;
     const message = await responseErrorMessage(error.response?.data);
     const requestError = new ApiRequestError(message, status);
@@ -67,10 +68,10 @@ function responseBelongsToCurrentSession(authorization: unknown): boolean {
   return requestToken === currentToken;
 }
 
-async function responseErrorMessage(data: { error?: string } | Blob | undefined): Promise<string> {
+async function responseErrorMessage(data: ErrorResponse | Blob | undefined): Promise<string> {
   if (data instanceof Blob) {
     try {
-      const parsed = JSON.parse(await data.text()) as { error?: string };
+      const parsed = JSON.parse(await data.text()) as Partial<ErrorResponse>;
       return parsed.error || "请求失败，请稍后再试";
     } catch {
       return "请求失败，请稍后再试";

@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // claimsKey 为 gin 上下文中当前用户声明的键。
@@ -31,6 +33,11 @@ func Middleware(verifier TokenVerifier) gin.HandlerFunc {
 		}
 		claims, err := verifier.Verify(c.Request.Context(), token)
 		if err != nil {
+			if httpresponse.IsTimeout(err) {
+				c.Abort()
+				httpresponse.WriteError(c, err)
+				return
+			}
 			abortUnauthorized(c, "invalid or expired token")
 			return
 		}
@@ -48,7 +55,8 @@ func RequireAdmin() gin.HandlerFunc {
 			return
 		}
 		if claims.Role != "admin" {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "admin required"})
+			c.Abort()
+			httpresponse.Write(c, http.StatusForbidden, "admin required")
 			return
 		}
 		c.Next()
@@ -65,5 +73,6 @@ func bearerToken(c *gin.Context) (string, bool) {
 }
 
 func abortUnauthorized(c *gin.Context, msg string) {
-	c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": msg})
+	c.Abort()
+	httpresponse.Write(c, http.StatusUnauthorized, msg)
 }

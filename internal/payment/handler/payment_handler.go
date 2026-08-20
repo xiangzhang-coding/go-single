@@ -2,14 +2,13 @@
 package handler
 
 import (
-	"context"
-	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/payment/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // Handler payment 模块的 HTTP 处理器。
@@ -43,16 +42,16 @@ type mockPayRequest struct {
 func (h *Handler) MockPay(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req mockPayRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.Amount == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: amount required"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid request body: amount required")
 		return
 	}
 	payment, err := h.svc.MockPay(c.Request.Context(), claims.UserID, service.PayParams{
@@ -70,19 +69,12 @@ func (h *Handler) MockPay(c *gin.Context) {
 
 // writeError 支付业务错误 → HTTP 状态码。
 func writeError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
-	case errors.Is(err, service.ErrInvalidInput):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrOrderNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrOrderForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrPaymentDuplicate), errors.Is(err, service.ErrAmountMismatch),
-		errors.Is(err, service.ErrIllegalTransition), errors.Is(err, service.ErrOrderChanged):
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
+	httpresponse.WriteError(c, err,
+		httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{service.ErrInvalidInput}},
+		httpresponse.Rule{Status: http.StatusForbidden, Errors: []error{service.ErrOrderForbidden}},
+		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{service.ErrOrderNotFound}},
+		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{
+			service.ErrPaymentDuplicate, service.ErrAmountMismatch, service.ErrIllegalTransition, service.ErrOrderChanged,
+		}},
+	)
 }

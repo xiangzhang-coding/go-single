@@ -518,8 +518,9 @@ func TestOrderInsufficientStock(t *testing.T) {
 	addrID := address(t, env, token)
 	_, skuID := onSaleSKU(t, env, 9900, 1)
 
-	w, _ := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 2, 0)
+	w, errorBody := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 2, 0)
 	require.Equal(t, http.StatusConflict, w.Code)
+	require.Equal(t, map[string]any{"error": "insufficient stock"}, errorBody)
 	require.Equal(t, 1, skuStock(t, env, skuID))
 
 	require.Equal(t, int64(0), countOrdersByUser(t, env, username), "库存不足不得生成订单")

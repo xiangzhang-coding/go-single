@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // AccessAuthorizer 判定非上传者能否读取已绑定到业务对象的媒体引用。
@@ -35,11 +36,11 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 func (h *Handler) Upload(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	if c.Request.ContentLength > MaxMultipartBodySize {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "multipart body too large"})
+		httpresponse.Write(c, http.StatusRequestEntityTooLarge, "multipart body too large")
 		return
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxMultipartBodySize)
@@ -49,21 +50,21 @@ func (h *Handler) Upload(c *gin.Context) {
 	}
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "multipart body too large"})
+		httpresponse.Write(c, http.StatusRequestEntityTooLarge, "multipart body too large")
 		return
 	}
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid multipart body"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid multipart body")
 		return
 	}
 	fh, err := c.FormFile("file")
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": `file is required (multipart field "file")`})
+		httpresponse.Write(c, http.StatusBadRequest, `file is required (multipart field "file")`)
 		return
 	}
 	f, err := fh.Open()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		httpresponse.WriteError(c, err)
 		return
 	}
 	defer f.Close()
@@ -74,16 +75,11 @@ func (h *Handler) Upload(c *gin.Context) {
 	}
 	info, err := h.svc.Upload(c.Request.Context(), claims.UserID, kind, f, fh.Size, fh.Filename)
 	if err != nil {
-		switch {
-		case errors.Is(err, ErrTooLarge):
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
-		case errors.Is(err, ErrQuotaExceeded):
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-		case errors.Is(err, ErrInvalidType), errors.Is(err, ErrInvalidKind):
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		}
+		httpresponse.WriteError(c, err,
+			httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{ErrInvalidType, ErrInvalidKind}},
+			httpresponse.Rule{Status: http.StatusRequestEntityTooLarge, Errors: []error{ErrTooLarge}},
+			httpresponse.Rule{Status: http.StatusConflict, Errors: []error{ErrQuotaExceeded}},
+		)
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
@@ -97,18 +93,15 @@ func (h *Handler) Upload(c *gin.Context) {
 func (h *Handler) Read(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	reference := referencePrefix + c.Param("reference")
 	object, err := h.svc.Open(c.Request.Context(), reference)
 	if err != nil {
-		switch {
-		case errors.Is(err, ErrInvalidReference), errors.Is(err, ErrObjectNotFound):
-			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
-		default:
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		}
+		httpresponse.WriteError(c, err,
+			httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{ErrInvalidReference, ErrObjectNotFound}, Message: "file not found"},
+		)
 		return
 	}
 	defer object.Close()
@@ -117,12 +110,12 @@ func (h *Handler) Read(c *gin.Context) {
 	if !allowed && h.authorizer != nil {
 		allowed, err = h.authorizer.CanRead(c.Request.Context(), claims.UserID, reference)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			httpresponse.WriteError(c, err)
 			return
 		}
 	}
 	if !allowed {
-		c.JSON(http.StatusForbidden, gin.H{"error": "file access forbidden"})
+		httpresponse.Write(c, http.StatusForbidden, "file access forbidden")
 		return
 	}
 

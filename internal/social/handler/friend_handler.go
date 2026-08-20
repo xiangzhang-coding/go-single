@@ -3,14 +3,13 @@
 package handler
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 	"github.com/xiangzhang-coding/go-single/internal/platform/pagination"
 	"github.com/xiangzhang-coding/go-single/internal/social/service"
 )
@@ -58,12 +57,12 @@ type sendRequestRequest struct {
 func (h *Handler) SendRequest(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	var req sendRequestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "to_user_id is required"})
+		httpresponse.Write(c, http.StatusBadRequest, "to_user_id is required")
 		return
 	}
 	r, err := h.svc.SendRequest(c.Request.Context(), claims.UserID, req.ToUserID)
@@ -77,19 +76,19 @@ func (h *Handler) SendRequest(c *gin.Context) {
 func (h *Handler) ListRequests(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	scope := c.DefaultQuery("scope", service.ScopeIncoming)
 	if scope != service.ScopeIncoming && scope != service.ScopeOutgoing {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scope"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid scope")
 		return
 	}
 	status := c.Query("status")
 	switch status {
 	case "", "pending", "accepted", "rejected":
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid status")
 		return
 	}
 	page := pagination.FromQuery(c)
@@ -104,7 +103,7 @@ func (h *Handler) ListRequests(c *gin.Context) {
 func (h *Handler) Accept(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	id, ok := idParam(c)
@@ -121,7 +120,7 @@ func (h *Handler) Accept(c *gin.Context) {
 func (h *Handler) Reject(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	id, ok := idParam(c)
@@ -138,7 +137,7 @@ func (h *Handler) Reject(c *gin.Context) {
 func (h *Handler) ListFriends(c *gin.Context) {
 	claims, ok := auth.ClaimsFrom(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		httpresponse.Write(c, http.StatusUnauthorized, "missing token")
 		return
 	}
 	items, err := h.svc.ListFriends(c.Request.Context(), claims.UserID)
@@ -152,7 +151,7 @@ func (h *Handler) ListFriends(c *gin.Context) {
 func idParam(c *gin.Context) (int64, bool) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		httpresponse.Write(c, http.StatusBadRequest, "invalid id")
 		return 0, false
 	}
 	return id, true
@@ -160,18 +159,16 @@ func idParam(c *gin.Context) (int64, bool) {
 
 // writeError 好友与动态业务错误 → HTTP 状态码（两套错误共用单一映射，新增错误单点维护）。
 func writeError(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout"})
-	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, service.ErrSelfRequest):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrTargetUserNotFound), errors.Is(err, service.ErrRequestNotFound), errors.Is(err, service.ErrPostNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrRequestForbidden), errors.Is(err, service.ErrNotPurchased), errors.Is(err, service.ErrPostForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
-	case errors.Is(err, service.ErrAlreadyFriends), errors.Is(err, service.ErrDuplicateRequest), errors.Is(err, service.ErrRequestNotPending):
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
+	httpresponse.WriteError(c, err,
+		httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{service.ErrInvalidInput, service.ErrSelfRequest}},
+		httpresponse.Rule{Status: http.StatusForbidden, Errors: []error{
+			service.ErrRequestForbidden, service.ErrNotPurchased, service.ErrPostForbidden,
+		}},
+		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{
+			service.ErrTargetUserNotFound, service.ErrRequestNotFound, service.ErrPostNotFound,
+		}},
+		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{
+			service.ErrAlreadyFriends, service.ErrDuplicateRequest, service.ErrRequestNotPending,
+		}},
+	)
 }
