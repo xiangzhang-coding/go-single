@@ -94,7 +94,7 @@ curl -sk https://127.0.0.1:8443/api/products
 
 ### 自动部署（GitHub Actions）
 
-`.github/workflows/pages-deploy.yml`：main 分支的 CI 全部通过后由 `ci.yml` 调用；也可手动触发，自动构建并 `wrangler pages deploy`。首次配置：
+`.github/workflows/pages-deploy.yml`：main 分支的 CI 全部通过后由 `ci.yml` 调用；也可手动触发。仓库 Variables/Secrets 尚未配置时明确跳过对应发布，不影响代码质量门禁；配置完成后自动构建并 `wrangler pages deploy`。首次配置：
 
 ```bash
 # 1) 仓库 Secrets：CLOUDFLARE_API_TOKEN（Cloudflare 令牌，Pages:Edit 权限）、CLOUDFLARE_ACCOUNT_ID

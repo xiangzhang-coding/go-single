@@ -10,13 +10,47 @@ name: Deploy Cloudflare Pages
 
 on:
   workflow_call:
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        required: false
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  configuration:
+    runs-on: ubuntu-24.04
+    outputs:
+      cloudflare_configured: ${{ steps.check.outputs.cloudflare_configured }}
+      web_configured: ${{ steps.check.outputs.web_configured }}
+    steps:
+      - id: check
+        name: 检查 Pages 仓库配置
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VITE_API_BASE: ${{ vars.VITE_API_BASE }}
+          VITE_WS_BASE: ${{ vars.VITE_WS_BASE }}
+        run: |
+          if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "cloudflare_configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cloudflare_configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 Cloudflare Secrets，跳过 Pages 发布"
+          fi
+          if [ -n "$VITE_API_BASE" ] && [ -n "$VITE_WS_BASE" ]; then
+            echo "web_configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "web_configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 VITE_API_BASE/VITE_WS_BASE，跳过 Faire 发布"
+          fi
+
   deploy-web-faire:
+    needs: configuration
+    if: needs.configuration.outputs.cloudflare_configured == 'true' && needs.configuration.outputs.web_configured == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,6 +78,8 @@ jobs:
           command: pages deploy dist --project-name=go-single-web-faire --branch=main
 
   deploy-website:
+    needs: configuration
+    if: needs.configuration.outputs.cloudflare_configured == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

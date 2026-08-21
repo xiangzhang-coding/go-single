@@ -126,6 +126,17 @@ func TestPagesDeploymentRunsAfterSuccessfulCI(t *testing.T) {
 	require.Regexp(t, regexp.MustCompile(`(?s)deploy-pages:.*?needs: lint-and-test.*?uses: \./\.github/workflows/pages-deploy\.yml`), ciWorkflow)
 }
 
+func TestPagesDeploymentSkipsWhenRepositoryConfigurationIsMissing(t *testing.T) {
+	pages, err := os.ReadFile("../.github/workflows/pages-deploy.yml")
+	require.NoError(t, err)
+	workflow := string(pages)
+	require.Contains(t, workflow, "configuration:")
+	require.Contains(t, workflow, "cloudflare_configured")
+	require.Contains(t, workflow, "web_configured")
+	require.Contains(t, workflow, "needs.configuration.outputs.cloudflare_configured == 'true'")
+	require.Contains(t, workflow, "needs.configuration.outputs.web_configured == 'true'")
+}
+
 func TestCloudflareAPIBaseIncludesBackendAPIPrefix(t *testing.T) {
 	docs, err := os.ReadFile("../docs/DEPLOYMENT.md")
 	require.NoError(t, err)
