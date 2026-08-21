@@ -4,8 +4,10 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -139,6 +141,39 @@ func TestRequestTimeoutFastFail(t *testing.T) {
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/fast", nil))
 	require.Equal(t, http.StatusOK, rec.Code)
+}
+
+type blockingRequestBody struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *blockingRequestBody) Read([]byte) (int, error) {
+	<-b.closed
+	return 0, io.EOF
+}
+
+func (b *blockingRequestBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+func TestRequestTimeoutInterruptsSlowRequestBody(t *testing.T) {
+	body := &blockingRequestBody{closed: make(chan struct{})}
+	r := gin.New()
+	r.Use(requestTimeout(20 * time.Millisecond))
+	r.POST("/json", func(c *gin.Context) { _, _ = io.ReadAll(c.Request.Body) })
+	req := httptest.NewRequest(http.MethodPost, "/json", nil)
+	req.Body = body
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusGatewayTimeout, rec.Code)
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("超时必须关闭请求体以中断慢速上传")
+	}
 }
 
 func TestRequestTimeoutWrites504WhenNothingWritten(t *testing.T) {

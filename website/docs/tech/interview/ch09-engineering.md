@@ -52,7 +52,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/service` 的消费者、`SeckillTimeout` 声明 order 最小接口并完成应用编排；order 不持有 flashsale；装配在 `cmd/server/main.go`；依赖 DAG 见 `docs/DESIGN.md`。
+**项目位置**：`internal/flashsale/service` 的消费者、`SeckillCancellation` 声明 order 最小接口并完成应用编排；order 不持有 flashsale；装配在 `cmd/server/main.go`；依赖 DAG 见 `docs/DESIGN.md`。
 
 ## Q2. 端口-适配器（Ports & Adapters）
 

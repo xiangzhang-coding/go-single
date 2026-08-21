@@ -34,23 +34,24 @@ import (
 
 // 业务错误：handler 据此映射 HTTP 状态码。
 var (
-	ErrInvalidInput            = errors.New("invalid input")
-	ErrOrderNotFound           = errors.New("order not found")
-	ErrOrderForbidden          = errors.New("order does not belong to user")
-	ErrOrderChanged            = errors.New("order status changed, retry")
-	ErrIllegalTransition       = errors.New("illegal order status transition")
-	ErrCartEmpty               = errors.New("cart is empty")
-	ErrInsufficientStock       = errors.New("insufficient stock")
-	ErrSKUNotFound             = errors.New("sku not found")
-	ErrSKUUnavailable          = errors.New("sku product is not on sale")
-	ErrSeckillOrderConflict    = errors.New("seckill order conflicts with an existing purchase")
-	ErrCouponNotFound          = errors.New("coupon not found")
-	ErrCouponUsed              = errors.New("coupon already used")
-	ErrCouponExpired           = errors.New("coupon not in valid period")
-	ErrCouponThresholdNotMet   = errors.New("coupon threshold not met")
-	ErrAddressNotFound         = errors.New("address not found")
-	ErrAddressForbidden        = errors.New("address does not belong to user")
-	errCartChangedWhileFencing = errors.New("cart changed while fencing product details")
+	ErrInvalidInput                = errors.New("invalid input")
+	ErrOrderNotFound               = errors.New("order not found")
+	ErrOrderForbidden              = errors.New("order does not belong to user")
+	ErrOrderChanged                = errors.New("order status changed, retry")
+	ErrIllegalTransition           = errors.New("illegal order status transition")
+	ErrCartEmpty                   = errors.New("cart is empty")
+	ErrInsufficientStock           = errors.New("insufficient stock")
+	ErrSKUNotFound                 = errors.New("sku not found")
+	ErrSKUUnavailable              = errors.New("sku product is not on sale")
+	ErrSeckillOrderConflict        = errors.New("seckill order conflicts with an existing purchase")
+	ErrCouponNotFound              = errors.New("coupon not found")
+	ErrCouponUsed                  = errors.New("coupon already used")
+	ErrCouponExpired               = errors.New("coupon not in valid period")
+	ErrCouponThresholdNotMet       = errors.New("coupon threshold not met")
+	ErrAddressNotFound             = errors.New("address not found")
+	ErrAddressForbidden            = errors.New("address does not belong to user")
+	ErrSeckillCancellationRequired = errors.New("seckill cancellation requires flashsale compensation")
+	errCartChangedWhileFencing     = errors.New("cart changed while fencing product details")
 )
 
 // 超时取消：普通订单默认 15min（expire_at 写入订单，T09 定时任务扫描）；
@@ -148,9 +149,9 @@ type SeckillCreateParams struct {
 	Address      *usermodel.Address // 默认地址快照（用户后续改地址不影响历史订单）
 }
 
-// ExpiredSeckillOrder 是秒杀超时取消编排所需的最小订单快照。
+// SeckillCancellationOrder 是秒杀取消编排所需的最小订单快照。
 // order 模块负责从订单与订单项聚合该数据，flashsale 模块负责活动库存回补。
-type ExpiredSeckillOrder struct {
+type SeckillCancellationOrder struct {
 	OrderNo      string
 	UserID       int64
 	ActivityID   int64
@@ -183,9 +184,11 @@ type Service interface {
 	CancelExpired(ctx context.Context) (cancelled, failed int, err error)
 	// ListExpiredSeckill 返回待支付且已超时的秒杀订单最小快照，供 flashsale
 	// 模块在应用编排层完成订单取消与活动库存回补。
-	ListExpiredSeckill(ctx context.Context) ([]ExpiredSeckillOrder, error)
+	ListExpiredSeckill(ctx context.Context) ([]SeckillCancellationOrder, error)
 	// CancelSeckill 在调用方事务内条件取消一笔待支付秒杀订单。
 	CancelSeckill(ctx context.Context, tx *transaction.Handle, orderNo string) (bool, error)
+	// SeckillCancellation 返回归属当前用户的待支付秒杀订单补偿快照。
+	SeckillCancellation(ctx context.Context, userID int64, orderNo string) (*SeckillCancellationOrder, error)
 	// CountValidSeckill 活动的秒杀有效订单数（非取消），对账端口
 	// （flashsale 模块 ReconcileActive 进程内调用）。
 	CountValidSeckill(ctx context.Context, activityID int64) (int, error)
@@ -882,15 +885,15 @@ func (s *orderService) GetDetail(ctx context.Context, userID int64, orderNo stri
 
 // Cancel 取消待支付订单：事务内 条件更新 待支付→已取消 + 回补库存 + 回退券。
 // 重复取消（或状态已变）由条件更新 RowsAffected=0 兜底，不重复回补。
-// 秒杀订单拒绝用户主动取消（其取消路径由 flashsale.SeckillTimeout 编排：
-// 回补活动库存 + Redis 库存 + 用户计数；禁止走普通订单的 SKU 回补以免错补库存）。
+// 秒杀订单交给 flashsale 编排回补活动库存、Redis 库存与用户计数；
+// 禁止走普通订单的 SKU 回补路径。
 func (s *orderService) Cancel(ctx context.Context, userID int64, orderNo string) error {
 	view, err := s.loadOwned(ctx, userID, orderNo)
 	if err != nil {
 		return err
 	}
 	if view.OrderType == model.OrderTypeSeckill {
-		return fmt.Errorf("%w: seckill cancel not supported yet", ErrIllegalTransition)
+		return ErrSeckillCancellationRequired
 	}
 	if !model.CanTransition(view.Status, model.OrderStatusCancelled) {
 		return fmt.Errorf("%w: %s → %s", ErrIllegalTransition, view.Status, model.OrderStatusCancelled)
@@ -962,7 +965,7 @@ func (s *orderService) CancelExpired(ctx context.Context) (cancelled, failed int
 
 // ListExpiredSeckill 聚合超时秒杀订单与订单项数量；数据异常保留为零值，
 // 由调用方计入失败并跳过，避免在缺少活动或数量信息时错误回补库存。
-func (s *orderService) ListExpiredSeckill(ctx context.Context) ([]ExpiredSeckillOrder, error) {
+func (s *orderService) ListExpiredSeckill(ctx context.Context) ([]SeckillCancellationOrder, error) {
 	orders, err := s.store.Orders.ListExpiredSeckillPending(ctx, time.Now(), cancelExpiredBatch)
 	if err != nil {
 		return nil, err
@@ -976,10 +979,10 @@ func (s *orderService) ListExpiredSeckill(ctx context.Context) ([]ExpiredSeckill
 		return nil, err
 	}
 
-	result := make([]ExpiredSeckillOrder, 0, len(orders))
+	result := make([]SeckillCancellationOrder, 0, len(orders))
 	for _, o := range orders {
 		items := itemsByOrder[o.OrderNo]
-		item := ExpiredSeckillOrder{
+		item := SeckillCancellationOrder{
 			OrderNo:  o.OrderNo,
 			UserID:   o.UserID,
 			Quantity: sumItemQuantity(items),
@@ -1006,6 +1009,31 @@ func (s *orderService) CancelSeckill(ctx context.Context, tx *transaction.Handle
 		return false, fmt.Errorf("%w: transaction required", ErrInvalidInput)
 	}
 	return s.store.Orders.Cancel(ctx, tx, orderNo)
+}
+
+func (s *orderService) SeckillCancellation(ctx context.Context, userID int64, orderNo string) (*SeckillCancellationOrder, error) {
+	view, err := s.loadOwned(ctx, userID, orderNo)
+	if err != nil {
+		return nil, err
+	}
+	if view.OrderType != model.OrderTypeSeckill || !model.CanTransition(view.Status, model.OrderStatusCancelled) {
+		return nil, fmt.Errorf("%w: %s → %s", ErrIllegalTransition, view.Status, model.OrderStatusCancelled)
+	}
+	result := &SeckillCancellationOrder{OrderNo: view.OrderNo, UserID: view.UserID, Quantity: sumItemQuantity(view.Items)}
+	if view.ActivityID != nil {
+		result.ActivityID = *view.ActivityID
+	}
+	if view.PurchaseSlot != nil {
+		result.PurchaseSlot = *view.PurchaseSlot
+	}
+	if len(view.Items) > 0 {
+		result.SKUID = view.Items[0].SKUID
+		result.Price = view.Items[0].Price
+	}
+	if result.ActivityID <= 0 || result.Quantity < 1 {
+		return nil, fmt.Errorf("%w: invalid seckill cancellation snapshot", ErrInvalidInput)
+	}
+	return result, nil
 }
 
 // CountValidSeckill 活动的秒杀有效订单数（非取消），对账端口实现

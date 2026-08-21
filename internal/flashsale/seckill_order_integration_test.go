@@ -8,6 +8,7 @@ package flashsale_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -90,8 +91,21 @@ type mqEnv struct {
 	preDeductions flashsalerepo.PreDeductionRepository
 	tx            flashsalerepo.TxRunner
 	consumer      *flashsalesvc.SeckillOrderConsumer
-	timeout       flashsalesvc.SeckillTimeout
+	timeout       flashsalesvc.SeckillCancellation
 	reconcile     flashsalesvc.Reconciliation
+}
+
+type testOrderCancellation struct {
+	orders  ordersvc.Service
+	seckill flashsalesvc.SeckillCancellation
+}
+
+func (c testOrderCancellation) Cancel(ctx context.Context, userID int64, orderNo string) error {
+	err := c.orders.Cancel(ctx, userID, orderNo)
+	if errors.Is(err, ordersvc.ErrSeckillCancellationRequired) {
+		return c.seckill.Cancel(ctx, userID, orderNo)
+	}
+	return err
 }
 
 var (
@@ -164,10 +178,10 @@ func buildMQEnv() (*mqEnv, error) {
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, metrics.New().Business())
-	orderHandler := orderhandler.New(orderSvc, verifier)
-	timeout := flashsalesvc.NewSeckillTimeout(
+	timeout := flashsalesvc.NewSeckillCancellation(
 		flashsaleStore.Tx, orderSvc, flashsaleStore.Activities, flashsaleStore.PreDeductions,
 		flashsaleSvc, metrics.New().Business())
+	orderHandler := orderhandler.New(orderSvc, verifier, testOrderCancellation{orders: orderSvc, seckill: timeout})
 
 	// T13 秒杀库存对账：有效订单数经 order 服务端口统计。
 	reconcile := flashsalesvc.NewReconciliation(flashsaleStore, cacheClient, orderSvc)
@@ -341,6 +355,8 @@ func TestSeckillOrderFullLoop(t *testing.T) {
 	purchase := pollPurchase(t, e, preDeductionID, token)
 	require.NotNil(t, purchase, "预扣生命周期应在轮询窗口内进入终态")
 	require.Equal(t, "ordered", purchase["status"])
+	require.NotEmpty(t, purchase["ordered_at"])
+	require.NotContains(t, purchase, "rolled_back_at")
 	orderNo, ok := purchase["order_no"].(string)
 	require.True(t, ok && orderNo != "")
 	w, order := doJSONOn(t, e.router, http.MethodGet, "/api/orders/"+orderNo, "", token)
@@ -535,6 +551,10 @@ func TestSeckillOrderDeadLetterTriggersAutomaticRollback(t *testing.T) {
 	var status string
 	require.NoError(t, env.gdb.Table("flashsale_pre_deductions").Select("status").Where("id = ?", pdID).Scan(&status).Error)
 	require.Equal(t, "rolled_back", status)
+	w, rolledBack := doJSONOn(t, e.router, http.MethodGet, "/api/flashsales/purchases/"+pdID, "", token)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotEmpty(t, rolledBack["rolled_back_at"])
+	require.NotContains(t, rolledBack, "ordered_at")
 	require.Equal(t, "10", *redisGet(t, fmt.Sprintf("flashsale:stock:%d", id)))
 	require.Nil(t, redisGet(t, fmt.Sprintf("flashsale:idem:%d:%d", id, claims.UserID)))
 }

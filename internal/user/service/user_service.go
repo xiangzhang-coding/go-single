@@ -216,13 +216,22 @@ func (s *userService) UpdateProfile(ctx context.Context, userID int64, p Profile
 	if cleaned.AvatarURL != nil {
 		u.AvatarURL = *cleaned.AvatarURL
 	}
-	if err := s.store.Users.UpdateProfile(ctx, u); err != nil {
+	if err := s.store.Users.UpdateProfile(ctx, userID, repository.ProfilePatch{
+		Nickname: cleaned.Nickname, AvatarURL: cleaned.AvatarURL,
+	}); err != nil {
 		if errors.Is(err, repository.ErrUserNotFound) {
 			return nil, ErrUserNotFound
 		}
 		return nil, err
 	}
-	return u, nil
+	updated, err := s.store.Users.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil {
+		return nil, ErrUserNotFound
+	}
+	return updated, nil
 }
 
 func (s *userService) CanReadAvatar(ctx context.Context, reference string) (bool, error) {

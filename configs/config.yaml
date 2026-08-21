@@ -68,6 +68,8 @@ upload:
   # 累计字节与对象数双配额，防止重复合法上传无限占用 MinIO。
   max_bytes_per_user: 536870912
   max_objects_per_user: 1000
+  # 20 MiB 文件允许较慢网络完成读取与 MinIO 写入；普通 JSON 仍使用 5s 预算。
+  request_timeout: 2m
 
 snowflake:
   # 多实例部署时每个实例必须配置不同的 worker_id（0-1023）。

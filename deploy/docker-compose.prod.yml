@@ -1,0 +1,7 @@
+services:
+  nginx:
+    ports: !override
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/https-port.prod.conf:/etc/nginx/conf.d/https-port.conf:ro

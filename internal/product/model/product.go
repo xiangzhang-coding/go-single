@@ -48,6 +48,13 @@ type SKU struct {
 	UpdatedAt time.Time       `json:"updated_at"`
 }
 
+// SKUSummary is the product module's batch read model for callers that need
+// SKU facts together with the owning Product title.
+type SKUSummary struct {
+	SKU
+	ProductTitle string `json:"product_title"`
+}
+
 // ProductDetail 商品详情：SPU 完整信息 + 全部 SKU（游客可见视图）。
 type ProductDetail struct {
 	Product

@@ -57,7 +57,7 @@ pending_payment(待支付) ──支付回调──▶ paid(已支付) ──后
 | POST | /api/orders | 下单 `{client_request_id, address_id, coupon_id?, from_cart 或 items[]}`；创建 201 / 幂等命中 200 / 幂等键占用未落库 **202**（客户端轮询详情） |
 | GET | /api/orders | 我的订单（status 筛选 + 分页） |
 | GET | /api/orders/:order_no | 订单详情（owner 校验） |
-| POST | /api/orders/:order_no/cancel | 取消待支付订单（**秒杀订单拒绝**——走超时取消路径） |
+| POST | /api/orders/:order_no/cancel | 取消待支付订单；普通订单回补 SKU/券，秒杀订单转交 flashsale 编排回补活动库存、Redis 与购买槽位 |
 | POST | /api/orders/:order_no/confirm | 确认收货（已发货 → 已完成，owner 校验） |
 
 admin（Bearer + admin）：
@@ -99,13 +99,14 @@ POST /api/orders {client_request_id, address_id, ...}
 ### 取消与超时取消
 
 ```text
-Cancel（用户取消，仅普通订单）
+Cancel（用户取消）
   → 事务：条件更新 待支付→已取消（RowsAffected=0 即状态已变，不重复回补）
-        + RestoreStock 回补库存 + RollbackCoupon 回退券
+        · 普通订单：RestoreStock 回补 SKU 库存 + RollbackCoupon 回退券
+        · 秒杀订单：handler 转交 flashsale 编排，与活动库存回补和 pending_rollback 事实同事务
 CancelExpired（cron 每分钟 order-timeout-cancel，批量上限 500）
   → 扫描待支付且已过 expire_at 的普通订单 → 逐个同事务取消（同上）
   → 单订单失败跳过计失败数，下个 tick 重试（不阻断整轮）
-flashsale.SeckillTimeout（cron 每分钟 seckill-timeout-cancel）
+flashsale.SeckillCancellation（用户主动取消；cron 每分钟 seckill-timeout-cancel 处理超时）
   → order.ListExpiredSeckill 扫描待支付秒杀订单
   → 事务：order.CancelSeckill 条件更新取消 + flashsale 活动仓储回补 MySQL 库存
   → 事务提交后按订单槽位回补 Redis（库存按数量 INCR + 用户槽位计数 DECR 1 + 释放对应槽位键；

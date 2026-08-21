@@ -1034,10 +1034,8 @@ func TestCancelRestoresStockAndCoupon(t *testing.T) {
 	require.Equal(t, 10, fx.prods.skus[1].Stock, "重复取消不得重复回补")
 }
 
-// 秒杀订单禁止用户主动取消（T12 守卫，T13 保留）：回补路径（活动库存 + Redis +
-// 用户计数）仅由 flashsale 超时取消编排触发；用户取消走普通订单回补
-// 会错补 SKU 库存，故仍拒绝。
-func TestCancelRejectsSeckillOrders(t *testing.T) {
+// 秒杀订单取消必须转交 flashsale 补偿编排，不能走普通 SKU 回补路径。
+func TestCancelDelegatesSeckillOrdersToCompensation(t *testing.T) {
 	fx := newFixture()
 	fx.seed(t)
 	created, err := fx.svc.CreateSeckillInTx(context.Background(), serviceTestTx, fx.seckillParams("SK1"))
@@ -1045,7 +1043,7 @@ func TestCancelRejectsSeckillOrders(t *testing.T) {
 	require.True(t, created)
 
 	err = fx.svc.Cancel(context.Background(), 42, "SK1")
-	require.ErrorIs(t, err, ErrIllegalTransition, "秒杀订单应拒绝普通取消路径")
+	require.ErrorIs(t, err, ErrSeckillCancellationRequired)
 
 	o := fx.orders.byID["SK1"]
 	require.Equal(t, model.OrderStatusPendingPayment, o.Status, "状态不得被改写")
@@ -1147,7 +1145,7 @@ func TestListExpiredSeckillReturnsCancellationSnapshot(t *testing.T) {
 	orders, err := fx.svc.ListExpiredSeckill(context.Background())
 
 	require.NoError(t, err)
-	require.Equal(t, []ExpiredSeckillOrder{{
+	require.Equal(t, []SeckillCancellationOrder{{
 		OrderNo: "SK1", UserID: 42, ActivityID: 100, PurchaseSlot: 1,
 		SKUID: 1, Price: 9900, Quantity: 1,
 	}}, orders)

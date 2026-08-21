@@ -721,4 +721,18 @@ func TestRecoveryDoesNotRollbackLivePreparingRequest(t *testing.T) {
 	require.Equal(t, model.PreDeductionStatusRolledBack, stored.Status)
 }
 
+func TestStartupRecoveryForcesFreshPreparingFactsToTerminalState(t *testing.T) {
+	fx := newRecoveryFixture(nil, nil)
+	a := fx.publishedActivity(t)
+	pd := &model.PreDeduction{UserID: 42, ActivityID: a.ID, Quantity: 1, Status: model.PreDeductionStatusPreparing}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+
+	stats, err := fx.svc.RecoverPreDeductionsAtStartup(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.RolledBack)
+	stored, err := fx.pd.GetByID(context.Background(), pd.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.PreDeductionStatusRolledBack, stored.Status)
+}
+
 var _ repository.PreDeductionRepository = (*fakePreDeductions)(nil)

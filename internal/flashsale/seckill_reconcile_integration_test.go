@@ -103,6 +103,29 @@ func TestSeckillTimeoutCancelReleasesOnlyItsSlotAndAllowsReplacement(t *testing.
 	require.Equal(t, "2", *redisGet(t, countKey))
 }
 
+func TestUserCancelSeckillOrderRestoresInventoryAndPurchaseSlot(t *testing.T) {
+	requireEnv(t)
+	e := requireMQEnv(t)
+	admin := adminToken(t, env)
+	id := seedPublishedOnSale(t, admin, 3)
+	token, userID := registerWithAddress(t, e, uniqueName("user-cancel"))
+	stockKey, countKey := fmt.Sprintf("flashsale:stock:%d", id), fmt.Sprintf("flashsale:count:%d:%d", id, userID)
+
+	w, purchase := purchaseOn(t, e, id, token, "user-cancel-slot")
+	require.Equal(t, http.StatusAccepted, w.Code)
+	orderNo := purchase["order_no"].(string)
+	require.NotNil(t, pollOrder(t, e, orderNo, token))
+	require.Equal(t, "2", *redisGet(t, stockKey))
+	require.Equal(t, "1", *redisGet(t, countKey))
+
+	w, body := doJSONOn(t, e.router, http.MethodPost, "/api/orders/"+orderNo+"/cancel", "", token)
+	require.Equal(t, http.StatusNoContent, w.Code, "主动取消失败: %v", body)
+	require.Equal(t, ordermodel.OrderStatusCancelled, orderStatus(t, orderNo))
+	require.Equal(t, 3, mysqlStock(t, e, id))
+	require.Equal(t, "3", *redisGet(t, stockKey))
+	require.Equal(t, "0", *redisGet(t, countKey))
+}
+
 func TestSeckillTimeoutTransactionRollsBackWhenActivityRestoreFails(t *testing.T) {
 	requireEnv(t)
 	e := requireMQEnv(t)
@@ -124,7 +147,7 @@ func TestSeckillTimeoutTransactionRollsBackWhenActivityRestoreFails(t *testing.T
 			t.Errorf("清理回滚测试订单: %v", err)
 		}
 	})
-	timeout := flashsalesvc.NewSeckillTimeout(
+	timeout := flashsalesvc.NewSeckillCancellation(
 		e.tx, e.orderSvc, failingRestoreActivities{e.activities},
 		flashsalerepo.NewGORMPreDeduction(env.gdb), e.flashsaleSvc, metrics.New().Business(),
 	)

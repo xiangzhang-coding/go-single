@@ -400,11 +400,22 @@ func TestAdminProductSKUCRUD(t *testing.T) {
 	skuID := createSKU(t, env, token, pID, 3900, 10)
 
 	// 编辑 SKU（价格/库存）→ 204。
-	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/skus/%d", skuID), `{"specs":{"color":"蓝"},"price":4900,"stock":5}`, token)
+	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/skus/%d", skuID), `{"specs":{"color":"蓝"},"price":4900,"stock":5,"expected_stock":10}`, token)
 	require.Equal(t, http.StatusNoContent, w.Code)
+	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/skus/%d", skuID), `{"specs":{"color":"蓝"},"price":4900,"stock":5,"expected_stock":5}`, token)
+	require.Equal(t, http.StatusNoContent, w.Code, "幂等提交相同 SKU 值不应误报库存冲突")
+
+	// 管理员读取后若订单并发扣减库存，旧表单不能把库存覆盖回去。
+	require.NoError(t, env.gdb.Exec("UPDATE skus SET stock = stock - 1 WHERE id = ?", skuID).Error)
+	w, body = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/skus/%d", skuID), `{"specs":{"color":"蓝"},"price":4900,"stock":8,"expected_stock":5}`, token)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Equal(t, map[string]any{"error": "sku stock changed"}, body)
+	var currentStock int
+	require.NoError(t, env.gdb.Table("skus").Select("stock").Where("id = ?", skuID).Scan(&currentStock).Error)
+	require.Equal(t, 4, currentStock)
 
 	// 编辑不存在的 SKU → 404。
-	w, _ = doJSON(t, env, http.MethodPut, "/api/admin/skus/999999", `{"specs":{},"price":1,"stock":1}`, token)
+	w, _ = doJSON(t, env, http.MethodPut, "/api/admin/skus/999999", `{"specs":{},"price":1,"stock":1,"expected_stock":0}`, token)
 	require.Equal(t, http.StatusNotFound, w.Code)
 
 	// 编辑商品 → 204；不存在的商品 → 404。
@@ -421,7 +432,17 @@ func TestAdminProductSKUCRUD(t *testing.T) {
 	w, _ = doJSON(t, env, http.MethodPost, "/api/admin/products/999999/publish", "", token)
 	require.Equal(t, http.StatusNotFound, w.Code)
 
-	// 删除 SKU → 204；重复删除 → 404。
+	// 被秒杀活动引用的 SKU 删除为业务冲突，不泄漏数据库错误。
+	res := env.gdb.Exec(`INSERT INTO flashsale_activities
+		(sku_id, title, price, stock, per_user_limit, status, start_at, end_at)
+		VALUES (?, '引用测试', 100, 1, 1, 'off_sale', ?, ?)`, skuID, time.Now().Add(time.Hour), time.Now().Add(2*time.Hour))
+	require.NoError(t, res.Error)
+	w, body = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/admin/skus/%d", skuID), "", token)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Equal(t, map[string]any{"error": "sku in use"}, body)
+	require.NoError(t, env.gdb.Exec("DELETE FROM flashsale_activities WHERE sku_id = ?", skuID).Error)
+
+	// 无引用 SKU 可删 → 204；重复删除 → 404。
 	w, _ = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/admin/skus/%d", skuID), "", token)
 	require.Equal(t, http.StatusNoContent, w.Code)
 	w, _ = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/admin/skus/%d", skuID), "", token)
@@ -632,7 +653,7 @@ func TestOlderCacheMissCannotRefillAfterSKUUpdate(t *testing.T) {
 	result := startDetailRead(ctx, race.reader, productID)
 	<-race.block.loaded
 
-	require.NoError(t, race.writer.UpdateSKU(ctx, skuID, json.RawMessage(`{"color":"蓝"}`), 200, 5))
+	require.NoError(t, race.writer.UpdateSKU(ctx, skuID, json.RawMessage(`{"color":"蓝"}`), 200, 5, 10))
 	close(race.block.release)
 	stale := <-result
 	require.NoError(t, stale.err)

@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -50,6 +51,7 @@ func TestLoad(t *testing.T) {
 	require.Equal(t, 3, cfg.Auth.RegisterRateLimit.PerAccountMax)
 	require.Equal(t, int64(512<<20), cfg.Upload.MaxBytesPerUser)
 	require.Equal(t, int64(1000), cfg.Upload.MaxObjectsPerUser)
+	require.Equal(t, 2*time.Minute, cfg.Upload.RequestTimeout)
 }
 
 func TestMySQLDSN(t *testing.T) {

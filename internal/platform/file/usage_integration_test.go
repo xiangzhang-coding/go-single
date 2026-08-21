@@ -35,27 +35,34 @@ func TestGORMUsageConcurrentReservationsNeverExceedQuota(t *testing.T) {
 
 	usage := file.NewGORMUsage(db)
 	const attempts = 10
-	errs := make(chan error, attempts)
+	type reserveResult struct {
+		key string
+		err error
+	}
+	results := make(chan reserveResult, attempts)
 	var wg sync.WaitGroup
 	for i := 0; i < attempts; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			errs <- usage.Reserve(context.Background(), ownerID, 10, 30, 3)
-		}()
+			key := fmt.Sprintf("users/%d/file/20260822/%032x.txt", ownerID, i+1)
+			results <- reserveResult{key: key, err: usage.Reserve(context.Background(), ownerID, fmt.Sprintf("request-%d", i), key, 10, 30, 3)}
+		}(i)
 	}
 	wg.Wait()
-	close(errs)
+	close(results)
 
 	allowed, rejected := 0, 0
-	for reserveErr := range errs {
+	var reserved []string
+	for result := range results {
 		switch {
-		case reserveErr == nil:
+		case result.err == nil:
 			allowed++
-		case errors.Is(reserveErr, file.ErrQuotaExceeded):
+			reserved = append(reserved, result.key)
+		case errors.Is(result.err, file.ErrQuotaExceeded):
 			rejected++
 		default:
-			require.NoError(t, reserveErr)
+			require.NoError(t, result.err)
 		}
 	}
 	require.Equal(t, 3, allowed)
@@ -70,6 +77,25 @@ func TestGORMUsageConcurrentReservationsNeverExceedQuota(t *testing.T) {
 	).Scan(&stored).Error)
 	require.Equal(t, int64(30), stored.UsedBytes)
 	require.Equal(t, int64(3), stored.ObjectCount)
+	recent, err := usage.ListPending(context.Background(), 10*time.Minute, 10)
+	require.NoError(t, err)
+	require.Empty(t, recent, "10 分钟保护期内的在途上传不得被对账清理")
+
+	pending, err := usage.ListPending(context.Background(), 0, 10)
+	require.NoError(t, err)
+	require.Len(t, pending, 3)
+	require.NoError(t, usage.Commit(context.Background(), ownerID, reserved[0]))
+	for _, key := range reserved[1:] {
+		require.NoError(t, usage.Release(context.Background(), ownerID, key, 10))
+	}
+	pending, err = usage.ListPending(context.Background(), 0, 10)
+	require.NoError(t, err)
+	require.Empty(t, pending)
+	require.NoError(t, db.Raw(
+		"SELECT used_bytes, object_count FROM user_upload_usage WHERE user_id = ?", ownerID,
+	).Scan(&stored).Error)
+	require.Equal(t, int64(10), stored.UsedBytes)
+	require.Equal(t, int64(1), stored.ObjectCount)
 }
 
 func openUsageTestDB() (*gorm.DB, error) {

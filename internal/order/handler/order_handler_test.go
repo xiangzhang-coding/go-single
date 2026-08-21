@@ -36,7 +36,7 @@ func TestCreateProcessingResponseHasExplicitContract(t *testing.T) {
 
 	router := gin.New()
 	api := router.Group("/api")
-	orderhandler.New(processingOrderService{}, verifier).RegisterRoutes(api)
+	orderhandler.New(processingOrderService{}, verifier, processingOrderService{}).RegisterRoutes(api)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/orders", bytes.NewBufferString(
 		`{"client_request_id":"same-request","address_id":1,"items":[{"sku_id":1,"quantity":1}]}`,

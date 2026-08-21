@@ -27,7 +27,7 @@ sidebar_position: 4
 
 ### CartItemView（列表读模型）
 
-条目 + SKU/商品只读快照：`product_id` / `title` / `specs` / `price` / `stock`（仓储跨表拼装，不含商品域写路径）。
+条目 + SKU/商品只读事实：`product_id` / `title` / `specs` / `price` / `stock`。cart 仓储只读取 `cart_items`，service 经 product 的 `GetSKUSummaries` 批量端口补齐展示字段。
 
 ## 接口
 

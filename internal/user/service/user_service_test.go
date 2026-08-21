@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -55,16 +56,20 @@ func (f *fakeUsers) GetByID(_ context.Context, id int64) (*model.User, error) {
 	return f.byID[id], nil
 }
 
-func (f *fakeUsers) UpdateProfile(_ context.Context, u *model.User) error {
+func (f *fakeUsers) UpdateProfile(_ context.Context, userID int64, patch repository.ProfilePatch) error {
 	if f.updateErr != nil {
 		return f.updateErr
 	}
-	stored, ok := f.byID[u.ID]
+	stored, ok := f.byID[userID]
 	if !ok {
 		return repository.ErrUserNotFound
 	}
-	stored.Nickname = u.Nickname
-	stored.AvatarURL = u.AvatarURL
+	if patch.Nickname != nil {
+		stored.Nickname = *patch.Nickname
+	}
+	if patch.AvatarURL != nil {
+		stored.AvatarURL = *patch.AvatarURL
+	}
 	return nil
 }
 
@@ -326,6 +331,70 @@ func TestUpdateProfilePartialAndClear(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "王老", got.Nickname)
 	assert.Empty(t, got.AvatarURL)
+}
+
+type interleavingUsers struct {
+	*fakeUsers
+	mu            sync.Mutex
+	nicknameReady chan struct{}
+	avatarDone    chan struct{}
+}
+
+func (f *interleavingUsers) GetByID(_ context.Context, id int64) (*model.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u := f.byID[id]
+	if u == nil {
+		return nil, nil
+	}
+	copy := *u
+	return &copy, nil
+}
+
+func (f *interleavingUsers) UpdateProfile(_ context.Context, userID int64, patch repository.ProfilePatch) error {
+	if patch.Nickname != nil && *patch.Nickname == "新昵称" {
+		close(f.nicknameReady)
+		<-f.avatarDone
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	stored := f.byID[userID]
+	if patch.Nickname != nil {
+		stored.Nickname = *patch.Nickname
+	}
+	if patch.AvatarURL != nil {
+		stored.AvatarURL = *patch.AvatarURL
+		close(f.avatarDone)
+	}
+	return nil
+}
+
+func TestConcurrentPartialProfileUpdatesPreserveBothFields(t *testing.T) {
+	base := newFakeUsers()
+	u := &model.User{ID: 1, Username: "parallel", Nickname: "旧昵称"}
+	base.byID[u.ID] = u
+	base.byUsername[u.Username] = u
+	repo := &interleavingUsers{
+		fakeUsers: base, nicknameReady: make(chan struct{}), avatarDone: make(chan struct{}),
+	}
+	svc := NewWithMedia(repository.Store{Users: repo, Addresses: newFakeAddresses()}, &fakeIssuer{}, fakeMedia{})
+
+	nicknameErr := make(chan error, 1)
+	go func() {
+		_, err := svc.UpdateProfile(context.Background(), u.ID, ProfileParams{Nickname: strPtr("新昵称")})
+		nicknameErr <- err
+	}()
+	<-repo.nicknameReady
+
+	avatar := fmt.Sprintf("/files/user-%d-image", u.ID)
+	_, err := svc.UpdateProfile(context.Background(), u.ID, ProfileParams{AvatarURL: &avatar})
+	require.NoError(t, err)
+	require.NoError(t, <-nicknameErr)
+
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	require.Equal(t, "新昵称", repo.byID[u.ID].Nickname)
+	require.Equal(t, avatar, repo.byID[u.ID].AvatarURL)
 }
 
 func TestUpdateProfileValidation(t *testing.T) {

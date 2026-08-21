@@ -36,6 +36,10 @@ var (
 	ErrInvalidKind = errors.New("file kind must be image or file")
 	// ErrTooLarge 超过对应媒体类型的大小上限。
 	ErrTooLarge = errors.New("file too large")
+	// ErrInvalidUploadRequestID 上传幂等键为空、过长或包含控制字符。
+	ErrInvalidUploadRequestID = errors.New("invalid upload request id")
+	// ErrUploadInProgress 同一上传请求仍处于 pending，等待完成或对账回收。
+	ErrUploadInProgress = errors.New("upload request is still processing")
 )
 
 // allowedTypes 类型白名单：检测到的 MIME → 对象扩展名。

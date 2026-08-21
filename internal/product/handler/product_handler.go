@@ -178,6 +178,13 @@ type skuRequest struct {
 	Stock int             `json:"stock"`
 }
 
+type updateSKURequest struct {
+	Specs         json.RawMessage `json:"specs" binding:"required"`
+	Price         int64           `json:"price"`
+	Stock         int             `json:"stock"`
+	ExpectedStock *int            `json:"expected_stock" binding:"required"`
+}
+
 func (h *Handler) CreateSKU(c *gin.Context) {
 	productID, ok := idParam(c)
 	if !ok {
@@ -200,11 +207,11 @@ func (h *Handler) UpdateSKU(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var req skuRequest
+	var req updateSKURequest
 	if !bindJSON(c, &req) {
 		return
 	}
-	if err := h.svc.UpdateSKU(c.Request.Context(), id, req.Specs, req.Price, req.Stock); err != nil {
+	if err := h.svc.UpdateSKU(c.Request.Context(), id, req.Specs, req.Price, req.Stock, *req.ExpectedStock); err != nil {
 		writeError(c, err)
 		return
 	}
@@ -327,6 +334,8 @@ func writeError(c *gin.Context, err error) {
 		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{
 			service.ErrProductNotFound, service.ErrSKUNotFound, service.ErrCategoryNotFound,
 		}},
-		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{service.ErrCategoryInUse}},
+		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{
+			service.ErrCategoryInUse, service.ErrSKUInUse, service.ErrSKUStockChanged,
+		}},
 	)
 }

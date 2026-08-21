@@ -228,7 +228,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "{container=~\".+\"}",
+          "expr": "{job=\"docker-containers\"}",
           "queryType": "range",
           "refId": "A"
         }

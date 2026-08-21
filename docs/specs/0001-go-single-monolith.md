@@ -158,7 +158,7 @@
 - JWT 自签 HS256（2h，无 refresh）+ bcrypt；TokenVerifier 接口（自签实现，OIDC 换实现进 backlog）
 - `user.role`（user/admin）+ admin 中间件；admin 种子账号 admin/admin123（migration 种入）
 - 对象级授权：订单/购物车/地址簿/聊天/好友操作强制校验 `owner_id`，防 IDOR
-- HTTPS 与安全头（Nginx 终止 SSL + X-Content-Type-Options/X-Frame-Options/CSP）；JSON 解析前硬上限 64 KiB；multipart 请求硬上限 21 MiB，图片按魔数限定 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB；上传受可配置的每用户累计字节/对象数配额约束并返回绑定上传者与类型的托管引用，业务拒绝外链/他人引用/类型错配；MinIO 桶私有，读取经 Bearer 后端代理并按头像、好友关系或会话参与者授权；日志不记录密码与 token
+- HTTPS 与安全头（Nginx 终止 SSL + X-Content-Type-Options/X-Frame-Options/CSP）；JSON 解析前硬上限 64 KiB；multipart 请求硬上限 21 MiB，图片按魔数限定 png/jpeg/webp/gif 且 ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD 且 ≤20 MiB，并使用独立 2min 请求预算；上传以 `Idempotency-Key` 持久回放同一用户的重试，受可配置的每用户累计字节/对象数配额约束，逐对象 pending 账本使崩溃后的孤儿对象和配额可由启动/定时任务回收；返回绑定上传者与类型的托管引用，业务拒绝外链/他人引用/类型错配；MinIO 桶私有，读取经 Bearer 后端代理并按头像、好友关系或会话参与者授权；日志不记录密码与 token
 
 ### 社交 / 即时通信
 

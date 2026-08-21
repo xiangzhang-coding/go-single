@@ -17,6 +17,10 @@ func (blockingPreDeductionRecovery) RecoverPreDeductions(ctx context.Context) (f
 	return flashsalesvc.RecoveryStats{}, ctx.Err()
 }
 
+func (blockingPreDeductionRecovery) RecoverPreDeductionsAtStartup(ctx context.Context) (flashsalesvc.RecoveryStats, error) {
+	return blockingPreDeductionRecovery{}.RecoverPreDeductions(ctx)
+}
+
 type blockingReservationCleanup struct{}
 
 func (blockingReservationCleanup) CleanupOrderedReservations(ctx context.Context) (int, error) {

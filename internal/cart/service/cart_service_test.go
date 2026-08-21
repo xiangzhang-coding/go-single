@@ -57,11 +57,11 @@ func (f *fakeItems) Delete(_ context.Context, id int64) error {
 	return nil
 }
 
-func (f *fakeItems) ListByUser(_ context.Context, userID int64) ([]model.CartItemView, error) {
-	var out []model.CartItemView
+func (f *fakeItems) ListByUser(_ context.Context, userID int64) ([]model.CartItem, error) {
+	var out []model.CartItem
 	for _, v := range f.byID {
 		if v.UserID == userID {
-			out = append(out, model.CartItemView{CartItem: *v})
+			out = append(out, *v)
 		}
 	}
 	return out, nil
@@ -121,7 +121,18 @@ func (f *fakeProducts) GetProduct(_ context.Context, productID int64) (*productm
 	if f.offSale[productID] {
 		status = productmodel.ProductStatusOffSale
 	}
-	return &productmodel.Product{ID: productID, Status: status}, nil
+	return &productmodel.Product{ID: productID, Title: "商品10", Status: status}, nil
+}
+
+func (f *fakeProducts) GetSKUSummaries(_ context.Context, ids []int64) (map[int64]productmodel.SKUSummary, error) {
+	out := make(map[int64]productmodel.SKUSummary, len(ids))
+	for _, id := range ids {
+		sku := f.skus[id]
+		if sku != nil {
+			out[id] = productmodel.SKUSummary{SKU: *sku, ProductTitle: "商品10"}
+		}
+	}
+	return out, nil
 }
 
 // ---- 测试夹具 ----
@@ -262,4 +273,14 @@ func TestListItems(t *testing.T) {
 	require.Len(t, list, 1)
 	assert.Equal(t, int64(1), list[0].SKUID)
 	assert.Equal(t, 2, list[0].Quantity)
+	assert.Equal(t, int64(10), list[0].ProductID)
+	assert.Equal(t, "商品10", list[0].Title)
+	assert.JSONEq(t, `{}`, string(list[0].Specs))
+	assert.Equal(t, int64(100), list[0].Price)
+	assert.Equal(t, 5, list[0].Stock)
+
+	delete(fx.products.skus, 1)
+	list, err = fx.svc.ListItems(context.Background(), 100)
+	require.NoError(t, err)
+	require.Empty(t, list, "两次查询间已级联删除的 SKU 不应让整车返回 404")
 }

@@ -44,6 +44,28 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	testsupport.RequireDependency(t, "MySQL", root.PingContext(ctx))
+
+	const migrationUser = "migration_password_test"
+	const migrationPassword = "strong+password%not-url-escaped"
+	const migrationDatabase = "go_shop_migration_password_test"
+	_, _ = root.ExecContext(ctx, "DROP DATABASE IF EXISTS "+migrationDatabase)
+	_, _ = root.ExecContext(ctx, "DROP USER IF EXISTS '"+migrationUser+"'@'%'")
+	_, err = root.ExecContext(ctx, "CREATE DATABASE "+migrationDatabase)
+	require.NoError(t, err)
+	_, err = root.ExecContext(ctx, "CREATE USER '"+migrationUser+"'@'%' IDENTIFIED BY '"+migrationPassword+"'")
+	require.NoError(t, err)
+	_, err = root.ExecContext(ctx, "GRANT ALL PRIVILEGES ON "+migrationDatabase+".* TO '"+migrationUser+"'@'%'")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = root.Exec("DROP DATABASE IF EXISTS " + migrationDatabase)
+		_, _ = root.Exec("DROP USER IF EXISTS '" + migrationUser + "'@'%'")
+	})
+	migrationCfg := *cfg
+	migrationCfg.MySQL.User = migrationUser
+	migrationCfg.MySQL.Password = migrationPassword
+	migrationCfg.MySQL.Database = migrationDatabase
+	require.NoError(t, runMigrations(&migrationCfg, zap.NewNop()))
+
 	_, err = root.ExecContext(ctx, "DROP DATABASE IF EXISTS "+cfg.MySQL.Database)
 	require.NoError(t, err)
 	_, err = root.ExecContext(ctx, "CREATE DATABASE "+cfg.MySQL.Database)
@@ -138,9 +160,9 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 			require.Equal(t, want, collation, column.table+"."+column.name)
 		}
 	}
-	require.NoError(t, migrations.Steps(-1), "latest migration must downgrade cleanly without conflicting data")
+	require.NoError(t, migrations.Steps(-2), "collation migration must downgrade cleanly without conflicting data")
 	assertIdempotencyCollations("utf8mb4_unicode_ci")
-	require.NoError(t, migrations.Steps(1), "latest migration must reapply cleanly")
+	require.NoError(t, migrations.Steps(2), "collation and upload migrations must reapply cleanly")
 	assertIdempotencyCollations("utf8mb4_0900_bin")
 	sourceErr, databaseErr := migrations.Close()
 	require.NoError(t, sourceErr)
@@ -158,7 +180,7 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 		conversationKey, adminID, insertedUserID, conversationKey, adminID, insertedUserID).Error)
 	conflictingDown, err := migrate.New("file://"+cfg.Migrations.Path, "mysql://"+cfg.MySQL.DSN())
 	require.NoError(t, err)
-	require.Error(t, conflictingDown.Steps(-1), "downgrade must reject identities that old collation would merge")
+	require.Error(t, conflictingDown.Steps(-2), "downgrade must reject identities that old collation would merge")
 	assertIdempotencyCollations("utf8mb4_0900_bin")
 	_, _ = conflictingDown.Close()
 }

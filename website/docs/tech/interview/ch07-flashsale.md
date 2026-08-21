@@ -293,7 +293,7 @@ func main() {
 
 ```
 
-**项目位置**：`internal/flashsale/service/seckill_timeout.go`——调用 `order.ListExpiredSeckill` → 同事务 `order.CancelSeckill` + 活动仓储 `RestoreStock` → 提交后 `RestoreRedis`；cron `seckill-timeout-cancel` 每分钟（`cmd/server/main.go`）。
+**项目位置**：`internal/flashsale/service/seckill_cancellation.go`——调用 `order.ListExpiredSeckill` → 同事务 `order.CancelSeckill` + 活动仓储 `RestoreStock` → 提交后 `RestoreRedis`；cron `seckill-timeout-cancel` 每分钟（`cmd/server/main.go`）。
 
 ## Q7. 雪花 ID：全局唯一、趋势递增、无中心依赖
 

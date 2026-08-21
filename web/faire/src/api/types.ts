@@ -185,6 +185,8 @@ export interface FlashSalePurchase {
   last_error?: string;
   created_at: string;
   updated_at: string;
+  ordered_at?: string;
+  rolled_back_at?: string;
 }
 
 export interface FlashSalePurchaseResponse {
@@ -304,6 +306,10 @@ export interface CreateSKURequest {
   specs: unknown;
   price: number;
   stock: number;
+}
+
+export interface UpdateSKURequest extends CreateSKURequest {
+  expected_stock: number;
 }
 
 export interface CreateFlashSaleRequest {

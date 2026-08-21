@@ -16,8 +16,7 @@ type CartItem struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// CartItemView 购物车列表条目：条目 + SKU/商品只读快照（标题/规格/价格/库存），
-// 供列表展示；快照为跨表读模型（见仓储实现），不含商品域写路径。
+// CartItemView 购物车列表条目：条目 + 经 product 服务端口取得的 SKU/商品展示事实。
 type CartItemView struct {
 	CartItem
 	ProductID int64           `json:"product_id"`

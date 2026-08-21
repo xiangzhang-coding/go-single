@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
@@ -16,13 +17,18 @@ import (
 
 // Handler order 模块的 HTTP 处理器。
 type Handler struct {
-	svc      service.Service
-	verifier auth.TokenVerifier
+	svc           service.Service
+	verifier      auth.TokenVerifier
+	cancellations CancellationService
+}
+
+type CancellationService interface {
+	Cancel(ctx context.Context, userID int64, orderNo string) error
 }
 
 // New 构造处理器。
-func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
-	return &Handler{svc: svc, verifier: verifier}
+func New(svc service.Service, verifier auth.TokenVerifier, cancellations CancellationService) *Handler {
+	return &Handler{svc: svc, verifier: verifier, cancellations: cancellations}
 }
 
 // RegisterRoutes 注册订单路由。
@@ -149,7 +155,8 @@ func (h *Handler) Cancel(c *gin.Context) {
 	if !ok2 {
 		return
 	}
-	if err := h.svc.Cancel(c.Request.Context(), claims.UserID, orderNo); err != nil {
+	err := h.cancellations.Cancel(c.Request.Context(), claims.UserID, orderNo)
+	if err != nil {
 		writeError(c, err)
 		return
 	}
@@ -219,7 +226,7 @@ func writeError(c *gin.Context, err error) {
 		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{
 			service.ErrInsufficientStock, service.ErrSKUUnavailable, service.ErrSeckillOrderConflict,
 			service.ErrCouponUsed, service.ErrCouponExpired, service.ErrCouponThresholdNotMet,
-			service.ErrIllegalTransition, service.ErrOrderChanged,
+			service.ErrIllegalTransition, service.ErrOrderChanged, service.ErrSeckillCancellationRequired,
 		}},
 	)
 }

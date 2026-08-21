@@ -48,17 +48,29 @@ func (r *GORMUserRepository) GetByID(ctx context.Context, id int64) (*model.User
 	return r.findOne(ctx, "id = ?", id)
 }
 
-// UpdateProfile 按主键更新个人资料字段；Select 限定列使零值（清空昵称/头像）也生效。
-func (r *GORMUserRepository) UpdateProfile(ctx context.Context, u *model.User) error {
+// UpdateProfile 按主键只更新请求显式提交的字段；map 使空串清空也生效。
+func (r *GORMUserRepository) UpdateProfile(ctx context.Context, userID int64, patch ProfilePatch) error {
+	updates := make(map[string]any, 2)
+	if patch.Nickname != nil {
+		updates["nickname"] = *patch.Nickname
+	}
+	if patch.AvatarURL != nil {
+		updates["avatar_url"] = *patch.AvatarURL
+	}
 	res := r.db.WithContext(ctx).Model(&model.User{}).
-		Where("id = ?", u.ID).
-		Select("nickname", "avatar_url").
-		Updates(u)
+		Where("id = ?", userID).
+		Updates(updates)
 	if res.Error != nil {
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
-		return ErrUserNotFound
+		var count int64
+		if err := r.db.WithContext(ctx).Model(&model.User{}).Where("id = ?", userID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return ErrUserNotFound
+		}
 	}
 	return nil
 }

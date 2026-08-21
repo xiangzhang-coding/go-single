@@ -1286,6 +1286,31 @@ func TestSeckillOK(t *testing.T) {
 	require.Equal(t, result.PreDeductionID, msg.PurchaseSlot)
 }
 
+func TestSeckillFailsClosedWhileStartupRecoveryIsIncomplete(t *testing.T) {
+	fx := newFixture()
+	activity := fx.createActivity(t, nil)
+	fx.svc.BlockPurchases()
+
+	_, err := fx.svc.Seckill(context.Background(), 42, activity.ID, "blocked-during-recovery")
+	require.ErrorIs(t, err, ErrRecoveryIncomplete)
+	rows, listErr := fx.preDeductions.ListRecoverable(context.Background(), 10)
+	require.NoError(t, listErr)
+	require.Empty(t, rows, "恢复门禁关闭时不得创建新的预扣事实")
+}
+
+func TestSeckillReplaysExistingRequestWhileRecoveryGateIsClosed(t *testing.T) {
+	fx := newFixture()
+	activity := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), activity.ID))
+	first, err := fx.svc.Seckill(context.Background(), 42, activity.ID, "replay-during-recovery")
+	require.NoError(t, err)
+	fx.svc.BlockPurchases()
+
+	replayed, err := fx.svc.Seckill(context.Background(), 42, activity.ID, "replay-during-recovery")
+	require.NoError(t, err)
+	require.Equal(t, first, replayed)
+}
+
 // MQ 发布失败：保留幂等键与 pending_publish 事实，不重复预扣；后台恢复接管。
 func TestSeckillPublishFailureKeepsIdemKey(t *testing.T) {
 	fx := newFixture()

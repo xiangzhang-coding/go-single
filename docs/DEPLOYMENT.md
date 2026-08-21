@@ -26,6 +26,8 @@ WebSocket JWT 经 `Sec-WebSocket-Protocol` 而非 URL query 携带；Nginx 的 `
 
 Grafana、Prometheus 和 Loki 的 compose 端口默认绑定回环地址，供本机浏览器或 `ssh -L 3000:127.0.0.1:3000 <vps>` 访问。生产不要为方便排障改成 `0.0.0.0`；需要团队访问时应通过受控管理网/VPN，并在其入口增加认证和访问审计。Grafana 管理密码必须通过部署环境覆盖，不能保留 `admin/admin`。
 
+Promtail 只读挂载 `/var/lib/docker/containers` 采集容器 JSON 日志，不挂载可控制 Docker daemon 的 `/var/run/docker.sock`。非 Docker 默认数据目录的主机需把该挂载源改为实际日志目录，但不得退回直接暴露 Docker socket。
+
 ### Release 启动前检查
 
 `debug` / `test` 保留开箱即用的演示配置；`release` 在连接业务依赖前拒绝短于 32 字节或公开默认的 JWT 密钥，并在 migration 完成后用 bcrypt 检查 `admin` 是否仍使用演示密码。数据库检查失败时同样拒绝启动，避免因检查服务不可用而绕过门禁。先完成以下准备：
@@ -146,7 +148,8 @@ npx wrangler pages project create go-single-website
 # 1) 基础环境：安装 Docker Engine + compose 插件、ufw（只放 22/80/443）、clone 仓库
 # 2) 配置：用不入库环境变量注入强凭据/JWT，轮换种子管理员；server.mode=release
 # 3) 证书：Let's Encrypt（certbot --nginx 或云厂商证书），替换 deploy/nginx/certs/ 自签证书
-# 4) 起服务：docker compose up -d（mysql/redis/rabbitmq/minio/nginx + 可观测全家桶）
+# 4) 起服务：生产 override 将 Nginx 从本地 8081/8443 切换为标准 80/443
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml up -d
 # 5) 后端守护：systemd unit 跑 go 构建产物（bin/server）；先限制 8080 仅容器反代可达
 # 6) 域名解析：api.example.com → VPS；Pages 前端 VITE_API_BASE 设为 https://api.example.com/api
 # 7) 备份与监控：MySQL 定时 dump + Redis/RabbitMQ 卷快照；Prometheus/Grafana/Loki 已预置且仅回环可达，通过 SSH 隧道/VPN 访问

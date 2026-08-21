@@ -180,12 +180,32 @@ func (r *GORMSKURepository) Create(ctx context.Context, s *model.SKU) error {
 	return r.db.WithContext(ctx).Create(s).Error
 }
 
-func (r *GORMSKURepository) Update(ctx context.Context, s *model.SKU) error {
-	return r.db.WithContext(ctx).Model(s).Select("specs", "price", "stock").Updates(s).Error
+func (r *GORMSKURepository) Update(ctx context.Context, s *model.SKU, expectedStock int) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&model.SKU{}).
+		Where("id = ? AND stock = ?", s.ID, expectedStock).
+		Updates(map[string]any{"specs": s.Specs, "price": s.Price, "stock": s.Stock})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	if res.RowsAffected == 1 {
+		return true, nil
+	}
+	var count int64
+	if err := r.db.WithContext(ctx).Model(&model.SKU{}).
+		Where("id = ? AND stock = ?", s.ID, expectedStock).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count == 1, nil
 }
 
 func (r *GORMSKURepository) Delete(ctx context.Context, id int64) error {
-	return r.db.WithContext(ctx).Delete(&model.SKU{}, id).Error
+	if err := r.db.WithContext(ctx).Delete(&model.SKU{}, id).Error; err != nil {
+		if isFKRestrict(err) {
+			return ErrSKUInUse
+		}
+		return err
+	}
+	return nil
 }
 
 func (r *GORMSKURepository) GetByID(ctx context.Context, id int64) (*model.SKU, error) {
@@ -221,6 +241,20 @@ func (r *GORMSKURepository) ListByProduct(ctx context.Context, productID int64) 
 		return nil, err
 	}
 	return list, nil
+}
+
+func (r *GORMSKURepository) ListSummariesByIDs(ctx context.Context, ids []int64) ([]model.SKUSummary, error) {
+	if len(ids) == 0 {
+		return []model.SKUSummary{}, nil
+	}
+	summaries := make([]model.SKUSummary, 0, len(ids))
+	err := r.db.WithContext(ctx).Table("skus AS s").
+		Select(`s.id, s.product_id, s.specs, s.price, s.stock, s.created_at, s.updated_at,
+		        p.title AS product_title`).
+		Joins("JOIN products AS p ON p.id = s.product_id").
+		Where("s.id IN ?", ids).
+		Scan(&summaries).Error
+	return summaries, err
 }
 
 // DeductStock 条件更新：stock=stock-N WHERE stock>=N 且商品仍上架；

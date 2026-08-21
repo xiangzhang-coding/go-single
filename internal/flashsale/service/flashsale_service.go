@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -40,6 +41,7 @@ var (
 	ErrOffline                        = errors.New("flashsale activity offline")
 	ErrRateLimited                    = errors.New("flashsale rate limited")
 	ErrPreDeductionNotFound           = errors.New("flashsale purchase not found")
+	ErrRecoveryIncomplete             = errors.New("flashsale recovery incomplete")
 )
 
 // Redis key 约定（DESIGN.md）：flashsale:stock:{id}（活动库存，上架预热）/
@@ -112,6 +114,13 @@ type RecoveryStats struct {
 
 type PreDeductionRecovery interface {
 	RecoverPreDeductions(ctx context.Context) (RecoveryStats, error)
+	RecoverPreDeductionsAtStartup(ctx context.Context) (RecoveryStats, error)
+}
+
+type PurchaseRecoveryGate interface {
+	BlockPurchases()
+	AllowPurchases()
+	PurchasesBlocked() bool
 }
 
 // ActivityParams 活动参数（创建/编辑共用；状态经 上架/下架 端点变更）。
@@ -128,6 +137,7 @@ type ActivityParams struct {
 // Service flashsale 模块的业务接口。
 type Service interface {
 	PreDeductionRecovery
+	PurchaseRecoveryGate
 	// ---- admin ----
 	CreateActivity(ctx context.Context, p ActivityParams) (*model.Activity, error)
 	UpdateActivity(ctx context.Context, id int64, p ActivityParams) error
@@ -186,17 +196,32 @@ type flashSaleCache interface {
 }
 
 type flashsaleService struct {
-	store          repository.Store
-	products       ProductService
-	cache          flashSaleCache
-	perUser        *limiter.RedisCounter
-	publisher      MessagePublisher
-	nos            OrderNoGenerator
-	metrics        *metrics.Business // 业务指标打点（T19c）
-	retryCfg       retry.Config      // 幂等操作有限重试（T20）：仅"抢购成功"消息发布
-	adminMu        sync.RWMutex      // 编辑与“读取活动→接受预扣”互斥，抢购之间仍可并发
-	preDeductionMu [preDeductionLockStripes]sync.Mutex
+	store           repository.Store
+	products        ProductService
+	cache           flashSaleCache
+	perUser         *limiter.RedisCounter
+	publisher       MessagePublisher
+	nos             OrderNoGenerator
+	metrics         *metrics.Business // 业务指标打点（T19c）
+	retryCfg        retry.Config      // 幂等操作有限重试（T20）：仅"抢购成功"消息发布
+	adminMu         sync.RWMutex      // 编辑与“读取活动→接受预扣”互斥，抢购之间仍可并发
+	recoveryBlocked atomic.Bool
+	preDeductionMu  [preDeductionLockStripes]sync.Mutex
 }
+
+func (s *flashsaleService) BlockPurchases() {
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+	s.recoveryBlocked.Store(true)
+}
+
+func (s *flashsaleService) AllowPurchases() {
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+	s.recoveryBlocked.Store(false)
+}
+
+func (s *flashsaleService) PurchasesBlocked() bool { return s.recoveryBlocked.Load() }
 
 // New 构造秒杀服务。userLimiter 为按用户限流配置（Max<=0 不启用）；
 // publisher 为 MQ 发布端口（预扣成功后发"抢购成功"消息，T12）；
@@ -627,6 +652,9 @@ func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64
 			s.adminMu.RUnlock()
 		}
 	}()
+	if s.PurchasesBlocked() {
+		return nil, ErrRecoveryIncomplete
+	}
 	activity, err := s.store.Activities.GetByID(ctx, activityID)
 	if err != nil {
 		return nil, err
@@ -806,6 +834,14 @@ func (s *flashsaleService) GetPreDeduction(ctx context.Context, userID, id int64
 }
 
 func (s *flashsaleService) RecoverPreDeductions(ctx context.Context) (RecoveryStats, error) {
+	return s.recoverPreDeductions(ctx, false)
+}
+
+func (s *flashsaleService) RecoverPreDeductionsAtStartup(ctx context.Context) (RecoveryStats, error) {
+	return s.recoverPreDeductions(ctx, true)
+}
+
+func (s *flashsaleService) recoverPreDeductions(ctx context.Context, forcePreparing bool) (RecoveryStats, error) {
 	var stats RecoveryStats
 	if s.store.PreDeductions == nil {
 		return stats, nil
@@ -831,7 +867,7 @@ func (s *flashsaleService) RecoverPreDeductions(ctx context.Context) (RecoverySt
 			if (phase == 0 && isRollback) || (phase == 1 && !isRollback) {
 				continue
 			}
-			before, after, err := s.recoverPreDeductionByID(ctx, list[i].ID)
+			before, after, err := s.recoverPreDeductionByID(ctx, list[i].ID, forcePreparing)
 			if err != nil {
 				if ctx.Err() != nil {
 					return stats, ctx.Err()
@@ -854,11 +890,11 @@ func (s *flashsaleService) RecoverPreDeduction(ctx context.Context, id int64) er
 	if s.store.PreDeductions == nil {
 		return ErrPreDeductionNotFound
 	}
-	_, _, err := s.recoverPreDeductionByID(ctx, id)
+	_, _, err := s.recoverPreDeductionByID(ctx, id, false)
 	return err
 }
 
-func (s *flashsaleService) recoverPreDeductionByID(ctx context.Context, id int64) (model.PreDeductionStatus, model.PreDeductionStatus, error) {
+func (s *flashsaleService) recoverPreDeductionByID(ctx context.Context, id int64, forcePreparing bool) (model.PreDeductionStatus, model.PreDeductionStatus, error) {
 	mu := &s.preDeductionMu[uint64(id)%uint64(len(s.preDeductionMu))]
 	mu.Lock()
 	defer mu.Unlock()
@@ -873,7 +909,7 @@ func (s *flashsaleService) recoverPreDeductionByID(ctx context.Context, id int64
 		return "", "", ErrPreDeductionNotFound
 	}
 	before := pd.Status
-	recoverErr := s.recoverPreDeductionLocked(ctx, pd)
+	recoverErr := s.recoverPreDeductionLocked(ctx, pd, forcePreparing)
 	current, getErr := s.store.PreDeductions.GetByID(ctx, id)
 	if getErr != nil {
 		return before, before, errors.Join(recoverErr, getErr)
@@ -885,12 +921,12 @@ func (s *flashsaleService) recoverPreDeductionByID(ctx context.Context, id int64
 	return before, after, recoverErr
 }
 
-func (s *flashsaleService) recoverPreDeductionLocked(ctx context.Context, pd *model.PreDeduction) error {
+func (s *flashsaleService) recoverPreDeductionLocked(ctx context.Context, pd *model.PreDeduction, forcePreparing bool) error {
 	switch pd.Status {
 	case model.PreDeductionStatusPreparing:
 		// A live request creates the MySQL fact before running Redis Lua. Do not
 		// let startup/cron recovery mistake that normal window for a crash.
-		if !pd.UpdatedAt.IsZero() && time.Since(pd.UpdatedAt) < preparingRecoveryDelay {
+		if !forcePreparing && !pd.UpdatedAt.IsZero() && time.Since(pd.UpdatedAt) < preparingRecoveryDelay {
 			return nil
 		}
 		token, err := s.cache.Get(ctx, reservationKey(pd.ID))

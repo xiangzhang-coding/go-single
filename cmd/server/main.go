@@ -8,17 +8,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/go-sql-driver/mysql"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/golang-migrate/migrate/v4"
-	_ "github.com/golang-migrate/migrate/v4/database/mysql"
+	migratemysql "github.com/golang-migrate/migrate/v4/database/mysql"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"go.uber.org/zap"
-	"gorm.io/driver/mysql"
+	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
@@ -79,7 +80,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-
 	log, err := logger.New(cfg.Log.Level, cfg.Log.File)
 	if err != nil {
 		return err
@@ -133,6 +133,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	uploadRecoveryCtx, uploadRecoveryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	resolvedUploads, uploadRecoveryErr := fileSvc.ReconcilePendingUploads(uploadRecoveryCtx)
+	uploadRecoveryCancel()
+	if uploadRecoveryErr != nil {
+		log.Warn("未完成上传启动对账失败（定时任务将重试）", zap.Error(uploadRecoveryErr))
+	} else if resolvedUploads > 0 {
+		log.Warn("未完成上传启动对账已清理", zap.Int("resolved", resolvedUploads))
+	}
 
 	// WebSocket 实时通道：JWT 授权期限、连接配额与心跳共同约束会话生命周期；
 	// 关闭在 HTTP 优雅关闭之后执行。
@@ -153,25 +161,30 @@ func run() error {
 	background.Start()
 
 	srv := &http.Server{
-		Addr:         listenAddress(cfg.Server),
-		Handler:      router,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:              listenAddress(cfg.Server),
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.Upload.RequestTimeout + 10*time.Second,
+		WriteTimeout:      cfg.Upload.RequestTimeout + 10*time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+	serverErr := make(chan error, 1)
 	go func() {
 		log.Info("HTTP 服务启动", zap.String("host", cfg.Server.Host), zap.Int("port", cfg.Server.Port))
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("HTTP 服务异常退出", zap.Error(err))
-			os.Exit(1)
-		}
+		serverErr <- srv.ListenAndServe()
 	}()
 
 	// 优雅关闭：等待 SIGINT / SIGTERM；先停 cron（等待执行中的任务），再关 HTTP。
 	// 两段使用独立超时预算：cron 停止不应耗尽 HTTP 关闭的时间。
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Info("收到退出信号，正在关闭")
+	defer signal.Stop(quit)
+	serveErr := waitForServerStop(quit, serverErr)
+	if serveErr != nil {
+		log.Error("HTTP 服务异常退出，正在关闭", zap.Error(serveErr))
+	} else {
+		log.Info("收到退出信号，正在关闭")
+	}
 
 	backgroundCtx, backgroundCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := background.Stop(backgroundCtx); err != nil {
@@ -181,11 +194,23 @@ func run() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return srv.Shutdown(ctx)
+	return errors.Join(serveErr, srv.Shutdown(ctx))
+}
+
+func waitForServerStop(quit <-chan os.Signal, serverErr <-chan error) error {
+	select {
+	case <-quit:
+		return nil
+	case err := <-serverErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
 }
 
 func openMySQL(cfg *config.Config, log *zap.Logger) (*gorm.DB, error) {
-	gdb, err := gorm.Open(mysql.Open(cfg.MySQL.DSN()), &gorm.Config{
+	gdb, err := gorm.Open(gormmysql.Open(cfg.MySQL.DSN()), &gorm.Config{
 		// SQL 始终保留占位符，错误与慢查询不输出绑定参数或原始数据库错误。
 		Logger: logger.NewGORM(log, gormlogger.Warn, 200*time.Millisecond),
 	})
@@ -209,8 +234,28 @@ func openMySQL(cfg *config.Config, log *zap.Logger) (*gorm.DB, error) {
 }
 
 func runMigrations(cfg *config.Config, log *zap.Logger) error {
-	m, err := migrate.New("file://"+cfg.Migrations.Path, "mysql://"+cfg.MySQL.DSN())
+	driverCfg := mysqldriver.NewConfig()
+	driverCfg.User = cfg.MySQL.User
+	driverCfg.Passwd = cfg.MySQL.Password
+	driverCfg.Net = "tcp"
+	driverCfg.Addr = cfg.MySQL.Host + ":" + strconv.Itoa(cfg.MySQL.Port)
+	driverCfg.DBName = cfg.MySQL.Database
+	driverCfg.ParseTime = true
+	driverCfg.Loc = time.Local
+	driverCfg.MultiStatements = true
+	connector, err := mysqldriver.NewConnector(driverCfg)
 	if err != nil {
+		return fmt.Errorf("构造迁移连接: %w", err)
+	}
+	migrationDB := sql.OpenDB(connector)
+	driver, err := migratemysql.WithInstance(migrationDB, &migratemysql.Config{})
+	if err != nil {
+		_ = migrationDB.Close()
+		return fmt.Errorf("初始化迁移驱动: %w", err)
+	}
+	m, err := migrate.NewWithDatabaseInstance("file://"+cfg.Migrations.Path, "mysql", driver)
+	if err != nil {
+		_ = driver.Close()
 		return fmt.Errorf("初始化迁移: %w", err)
 	}
 	defer m.Close()
@@ -228,11 +273,25 @@ type consumerBinding struct {
 	handler mq.MessageHandler
 }
 
+type orderCancellationCoordinator struct {
+	orders  ordersvc.Service
+	seckill flashsalesvc.SeckillCancellation
+}
+
+func (c orderCancellationCoordinator) Cancel(ctx context.Context, userID int64, orderNo string) error {
+	err := c.orders.Cancel(ctx, userID, orderNo)
+	if errors.Is(err, ordersvc.ErrSeckillCancellationRequired) {
+		return c.seckill.Cancel(ctx, userID, orderNo)
+	}
+	return err
+}
+
 type applicationRuntime struct {
 	log                *zap.Logger
 	mq                 mq.MQ
 	cron               *platformcron.Registry
 	recovery           flashsalesvc.PreDeductionRecovery
+	recoveryGate       flashsalesvc.PurchaseRecoveryGate
 	reservationCleanup flashsalesvc.ReservationCleanup
 	consumers          []consumerBinding
 
@@ -251,16 +310,33 @@ func (a *applicationRuntime) Start() {
 	a.cancel = cancel
 	a.mu.Unlock()
 
+	if a.recoveryGate != nil {
+		a.recoveryGate.BlockPurchases()
+	}
+	recoveryComplete := false
 	if stats, err := recoverPreDeductionsAtStartup(a.recovery, 10*time.Second); err != nil {
 		a.log.Error("秒杀预扣启动恢复失败（定时任务将重试）", zap.Error(err))
+	} else if stats.Failed > 0 {
+		a.log.Error("秒杀预扣启动恢复不完整，抢购保持关闭（定时任务将重试）",
+			zap.Int("published", stats.Published), zap.Int("rolled_back", stats.RolledBack), zap.Int("failed", stats.Failed))
 	} else if stats.Published+stats.RolledBack+stats.Failed > 0 {
 		a.log.Info("秒杀预扣启动恢复完成", zap.Int("published", stats.Published),
 			zap.Int("rolled_back", stats.RolledBack), zap.Int("failed", stats.Failed))
+		recoveryComplete = true
+	} else {
+		recoveryComplete = true
 	}
+	cleanupComplete := false
 	if cleaned, err := cleanupReservationsAtStartup(a.reservationCleanup, 10*time.Second); err != nil {
 		a.log.Error("秒杀 ordered reservation 启动修复失败（定时任务将重试）", zap.Error(err))
 	} else if cleaned > 0 {
 		a.log.Info("秒杀 ordered reservation 启动清理完成", zap.Int("cleaned", cleaned))
+		cleanupComplete = true
+	} else {
+		cleanupComplete = true
+	}
+	if recoveryComplete && cleanupComplete && a.recoveryGate != nil {
+		a.recoveryGate.AllowPurchases()
 	}
 
 	for _, binding := range a.consumers {
@@ -427,12 +503,12 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	orderStore := orderrepo.NewGORMOrder(db)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(db), Tx: orderStore},
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, businessMetrics, retryCfg)
-	orderHandler := orderhandler.New(orderSvc, verifier)
 	reservationCleanup := flashsalesvc.NewReservationCleanup(
 		flashsaleStore.Activities, flashsaleStore.PreDeductions, cacheClient, orderSvc)
-	seckillTimeout := flashsalesvc.NewSeckillTimeout(
+	seckillCancellation := flashsalesvc.NewSeckillCancellation(
 		flashsaleStore.Tx, orderSvc, flashsaleStore.Activities, flashsaleStore.PreDeductions,
 		flashsaleSvc, businessMetrics)
+	orderHandler := orderhandler.New(orderSvc, verifier, orderCancellationCoordinator{orders: orderSvc, seckill: seckillCancellation})
 
 	// 秒杀库存对账（T13）：进行中只比对告警（补单信号），收尾以 MySQL 对齐 Redis；
 	// 有效订单数经 order 服务端口统计（进程内调用，flashsale → order 单向依赖）。
@@ -484,7 +560,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// T13 秒杀超时取消——每分钟扫描待支付秒杀订单，回补活动库存 + Redis 库存 +
 	// 用户计数（允许再次抢购）；对账——每小时进行中只比对告警（补单信号）、
 	// 每分钟收尾以 MySQL 对齐刚结束活动的 Redis 库存。
-	cronRegistry, err := registerCron(log, orderSvc, flashsaleSvc, reservationCleanup, seckillTimeout, reconcile)
+	cronRegistry, err := registerCron(log, orderSvc, flashsaleSvc, flashsaleSvc, reservationCleanup, fileSvc, seckillCancellation, reconcile)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -517,12 +593,12 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 
 	// Multipart 上传使用独立的 21 MiB 解析前预算，不能经过 64 KiB JSON 路由组。
 	fileAPI := r.Group("/api")
-	fileAPI.Use(requestTimeout(cfg.Server.RequestTimeout))
+	fileAPI.Use(requestTimeout(cfg.Upload.RequestTimeout))
 	fileHandler.RegisterRoutes(fileAPI)
 
 	background := &applicationRuntime{
 		log: log, mq: mqClient, cron: cronRegistry,
-		recovery: flashsaleSvc, reservationCleanup: reservationCleanup,
+		recovery: flashsaleSvc, recoveryGate: flashsaleSvc, reservationCleanup: reservationCleanup,
 		consumers: []consumerBinding{
 			{queue: flashsalesvc.SeckillOrderQueue, name: "秒杀落单消费者", handler: seckillConsumer.Handle},
 			{queue: flashsalesvc.SeckillOrderDeadLetterQueue, name: "秒杀死信消费者", handler: seckillConsumer.HandleDeadLetter},
@@ -534,7 +610,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 func recoverPreDeductionsAtStartup(recovery flashsalesvc.PreDeductionRecovery, timeout time.Duration) (flashsalesvc.RecoveryStats, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return recovery.RecoverPreDeductions(ctx)
+	return recovery.RecoverPreDeductionsAtStartup(ctx)
 }
 
 func cleanupReservationsAtStartup(cleanup flashsalesvc.ReservationCleanup, timeout time.Duration) (int, error) {
@@ -602,8 +678,12 @@ var _ file.AccessAuthorizer = mediaAccessAuthorizer{}
 
 // registerCron 注册全部定时任务并返回调度器（Start 由调用方执行）。
 func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsalesvc.PreDeductionRecovery,
+	recoveryGate flashsalesvc.PurchaseRecoveryGate,
 	reservationCleanup flashsalesvc.ReservationCleanup,
-	seckillTimeout flashsalesvc.SeckillTimeout,
+	uploadRecovery interface {
+		ReconcilePendingUploads(context.Context) (int, error)
+	},
+	seckillCancellation flashsalesvc.SeckillCancellation,
 	reconcile flashsalesvc.Reconciliation) (*platformcron.Registry, error) {
 	registry := platformcron.New(log, 5*time.Minute)
 	if err := registry.Register(platformcron.Job{
@@ -621,29 +701,27 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 		return nil, fmt.Errorf("注册超时取消任务: %w", err)
 	}
 	if err := registry.Register(platformcron.Job{
-		Name: "flashsale-pre-deduction-recovery",
+		Name: "flashsale-recovery",
 		Spec: "* * * * *",
 		Fn: func(ctx context.Context) error {
 			stats, err := recovery.RecoverPreDeductions(ctx)
 			if err != nil {
+				recoveryGate.BlockPurchases()
 				return err
 			}
+			if stats.Failed > 0 {
+				recoveryGate.BlockPurchases()
+				return fmt.Errorf("%d flash-sale pre-deductions failed recovery", stats.Failed)
+			}
+			cleaned, err := reservationCleanup.CleanupOrderedReservations(ctx)
+			if err != nil {
+				recoveryGate.BlockPurchases()
+				return err
+			}
+			recoveryGate.AllowPurchases()
 			if stats.Published+stats.RolledBack+stats.Failed > 0 {
 				log.Info("秒杀预扣恢复完成", zap.Int("published", stats.Published),
 					zap.Int("rolled_back", stats.RolledBack), zap.Int("failed", stats.Failed))
-			}
-			return nil
-		},
-	}); err != nil {
-		return nil, fmt.Errorf("注册秒杀预扣恢复任务: %w", err)
-	}
-	if err := registry.Register(platformcron.Job{
-		Name: "flashsale-reservation-cleanup",
-		Spec: "* * * * *",
-		Fn: func(ctx context.Context) error {
-			cleaned, err := reservationCleanup.CleanupOrderedReservations(ctx)
-			if err != nil {
-				return err
 			}
 			if cleaned > 0 {
 				log.Info("秒杀 reservation marker 清理完成", zap.Int("cleaned", cleaned))
@@ -651,13 +729,29 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		return nil, fmt.Errorf("注册秒杀 reservation marker 清理任务: %w", err)
+		return nil, fmt.Errorf("注册秒杀预扣恢复任务: %w", err)
+	}
+	if err := registry.Register(platformcron.Job{
+		Name: "upload-reservation-recovery",
+		Spec: "* * * * *",
+		Fn: func(ctx context.Context) error {
+			resolved, err := uploadRecovery.ReconcilePendingUploads(ctx)
+			if err != nil {
+				return err
+			}
+			if resolved > 0 {
+				log.Warn("未完成上传对账已清理", zap.Int("resolved", resolved))
+			}
+			return nil
+		},
+	}); err != nil {
+		return nil, fmt.Errorf("注册未完成上传对账任务: %w", err)
 	}
 	if err := registry.Register(platformcron.Job{
 		Name: "seckill-timeout-cancel",
 		Spec: "* * * * *",
 		Fn: func(ctx context.Context) error {
-			cancelled, failed, redisFailed, err := seckillTimeout.CancelExpired(ctx)
+			cancelled, failed, redisFailed, err := seckillCancellation.CancelExpired(ctx)
 			if err != nil {
 				return err
 			}

@@ -66,6 +66,11 @@ func TestUpdateProfileAndMe(t *testing.T) {
 	require.Equal(t, "阿艾", updated["nickname"])
 	require.Equal(t, "", updated["avatar_url"])
 
+	// 重复提交当前值仍是成功的幂等更新，不能把 MySQL changed rows=0 误判为用户不存在。
+	w, updated = doJSON(t, env, http.MethodPatch, "/api/users/me", `{"nickname":"阿艾"}`, token)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "阿艾", updated["nickname"])
+
 	// 空串清空头像。
 	w, updated = doJSON(t, env, http.MethodPatch, "/api/users/me", `{"avatar_url":""}`, token)
 	require.Equal(t, http.StatusOK, w.Code)
@@ -258,6 +263,7 @@ func uploadMultipart(t *testing.T, r http.Handler, token, filename string, conte
 
 	req := httptest.NewRequest(http.MethodPost, "/api/files", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Idempotency-Key", fmt.Sprintf("upload-%d", time.Now().UnixNano()))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

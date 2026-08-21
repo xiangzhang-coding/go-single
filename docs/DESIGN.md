@@ -94,7 +94,7 @@ go_single/
 - **主题资产**：四件套放 `web/<theme>/design/`——DESIGN.md（设计规范，供人/AI 参考）/ CSS_Variables.css / Design_Tokens.json（W3C DTCG）/ Tailwind_V4.css（`@theme`）；组件代码一律用语义化 Tailwind 类，不写死颜色
 - **工具链**：bun（`bun install` / `bun run dev` / `bun run build`）；Vite dev proxy 把 `/api`、`/ws` 转发到后端 :8080
 - **API 对接**：HTTP base 由 `VITE_API_BASE` 控制（dev 用 `/api` 代理，云端构建传包含路由前缀且以 `/api` 结尾的后端绝对地址）；WebSocket 地址由 `VITE_WS_BASE` 控制（dev 用 `/ws` 代理）；后端 `platform/cors` 中间件允许前端域名（跨源场景）
-- **私有媒体**：统一后端代理——`POST /api/files` 将图片（png/jpeg/webp/gif，魔数校验，≤5 MiB）或普通文件（PDF/ZIP/TXT/CSV/MD，≤20 MiB）写入 MinIO 私有桶，返回 `/files/<opaque-ref>` 托管引用；Nginx 与后端均以 21 MiB 作为 multipart 请求硬上限（为 20 MiB 文件预留 1 MiB 开销），后端解析仅保留 1 MiB 内存，超限返回 413；每用户累计字节与对象数先在 MySQL 原子预留，默认 512 MiB/1000 个，防止合法重复上传无限占用存储。引用固化上传者与 `image/file` 类型，头像/动态/消息保存前校验归属与类型。`GET /api/files/:reference` 经 Bearer 代理读取：头像对登录用户可见，动态图片跟随好友关系，聊天媒体仅会话双方可读；前端以 Axios 拉取 Blob 展示/下载，不直连 MinIO（presigned 直传明确不做）
+- **私有媒体**：统一后端代理——`POST /api/files` 携带最多 64 字节的 `Idempotency-Key`，将图片（png/jpeg/webp/gif，魔数校验，≤5 MiB）或普通文件（PDF/ZIP/TXT/CSV/MD，≤20 MiB）写入 MinIO 私有桶；同一用户和幂等键重试返回原 `/files/<opaque-ref>` 托管引用。Nginx 与后端均以 21 MiB 作为 multipart 请求硬上限，上传使用独立 2min 请求预算，后端解析仅保留 1 MiB 内存，超限返回 413；每用户累计字节与对象数先在 MySQL 原子预留，默认 512 MiB/1000 个。逐对象 `pending/committed` 账本连接配额与 MinIO 写入，启动和每分钟任务清理超过 10min 的未提交对象并释放配额。引用固化上传者与 `image/file` 类型，头像/动态/消息保存前校验归属与类型。`GET /api/files/:reference` 经 Bearer 代理读取：头像对登录用户可见，动态图片跟随好友关系，聊天媒体仅会话双方可读；前端以 Axios 拉取 Blob 展示/下载，不直连 MinIO（presigned 直传明确不做）
 - **页面清单**（演示前端功能范围，各主题通用）：
   - 登录/注册 → user；首页（商品列表）→ product；商品详情 → product + cart；购物车 → cart + product
   - 结算（下单）→ order + user(地址簿) + coupon；订单列表/详情 → order；秒杀页 → flashsale
@@ -165,7 +165,7 @@ go_single/
 ```
 
 - **库存事实源**：秒杀期以 Redis 预扣为准；活动库存落单时同步扣减、取消时回补，用于对账
-- **可恢复生命周期**：`flashsale_pre_deductions` 是逐购买槽位的持久事实源，包含 `client_request_id`、SKU、成交价、数量和槽位，状态为 `preparing → pending_publish → pending_order → ordered → pending_rollback → rolled_back`；所有影响终态的 Redis Lua 都在同一专用连接上紧跟 `WAITAOF`，只有本地 AOF 明确 fsync 后才推进 MySQL 状态或释放 marker。回退先写 `rolled_back` tombstone，MySQL 写入终态后再清理；ordered 事实也会在启动和 cron 中重建/验证库存、计数、槽位键和 marker。取消只回补对应 marker 并将该订单 `user_activity_key` 置 NULL，不影响同一用户的其他槽位
+- **可恢复生命周期**：`flashsale_pre_deductions` 是逐购买槽位的持久事实源，包含 `client_request_id`、SKU、成交价、数量和槽位，状态为 `preparing → pending_publish → pending_order → ordered → pending_rollback → rolled_back`；所有影响终态的 Redis Lua 都在同一专用连接上紧跟 `WAITAOF`，只有本地 AOF 明确 fsync 后才推进 MySQL 状态或释放 marker。回退先写 `rolled_back` tombstone，MySQL 写入终态后再清理；ordered 事实也会在启动和 cron 中重建/验证库存、计数、槽位键和 marker。启动恢复存在任一失败时全局抢购门禁保持关闭（503），每分钟恢复全部成功后才重新开放。取消只回补对应 marker 并将该订单 `user_activity_key` 置 NULL，不影响同一用户的其他槽位
 - **升级兼容**：pre-R04 的 durable 主队列/DLQ 消息缺少 `pre_deduction_id` 时，消费者按 `order_no` 收编为 legacy 生命周期，再执行落单或持久回退，不直接丢弃
 - **限购**：`per_user_limit=N` 表示同一用户最多持有 N 个有效购买槽位；同请求 ID 重试不新增槽位，取消一个槽位后计数减一并可补购
 
@@ -237,7 +237,7 @@ go_single/
   - MQ：发布/消费/消费失败计数
   - 优惠券：发放/核销计数
 - **大盘**：Grafana 预配置 datasource（prometheus/loki）+ 项目仪表盘（HTTP 三件套、秒杀指标、订单指标）
-- **日志**：zap 输出结构化 JSON（stdout，可选 `log.file` 镜像到 `./logs/app.log`）；promtail 采集 docker 容器日志 + 宿主后端日志文件 → Loki → Grafana 查询
+- **日志**：zap 输出结构化 JSON（stdout，可选 `log.file` 镜像到 `./logs/app.log`）；promtail 通过只读 `/var/lib/docker/containers` 日志目录采集容器 JSON 日志（不挂载 Docker socket），并采集宿主后端日志文件 → Loki → Grafana 查询
 - **部署**：prometheus/grafana/loki/promtail 直接进 docker-compose（默认开启）
 
 ## 容错与降级
@@ -245,7 +245,7 @@ go_single/
 - **超时**：全链路 `context.WithTimeout` 逐层传递（HTTP handler → service → 存储/MQ），超时快速失败
 - **有限重试**：仅幂等操作可重试（MQ 消费失败重投已有；下单/支付等幂等接口有限次重试 + 退避），非幂等操作不重试
 - **熔断**：gobreaker 包住 MQ 消费者（连续失败熔断快速失败、半开探活）；进程内调用与本地 Redis/MySQL 不包
-- **降级**：缓存兜底——商品详情（key `product:detail:{id}`，TTL 5min）/秒杀状态优先读 Redis 缓存，缓存不可用时降级直查 DB。商品详情另有永久代次 key `product:detail-version:{id}` 与写入围栏 `product:detail-mutation:{id}`（按过期时间保存活动 mutation token 的 Redis Sorted Set，每个 token TTL 30min）：数据库变更前由 Lua 原子加入独立 token、递增代次并删除详情，紧跟 `WAITAOF` 确认本地 AOF fsync 后才允许 MySQL 写入；回填脚本先清理过期 token，再在仍有 token 或代次变化时拒绝写入；数据库事务结束后再次递增代次、删除详情并只移除自己的 token，同样经 `WAITAOF` 确认。迟到的旧事务不能解除新围栏，重叠事务也不会延长已失效 token，Redis 重启也不会回退已确认围栏。建立围栏失败时不执行数据库变更；结束步骤失败时围栏保留，详情降级直查而不会重新发布旧快照。订单库存扣减/回补由 order 包围整个 MySQL 事务维护围栏。购物车加购不以详情缓存判断可售性，直接读取商品状态；同一用户与 SKU 的数量通过 MySQL `INSERT ... ON DUPLICATE KEY UPDATE` 原子累加并封顶 99
+- **降级**：缓存兜底——商品详情（key `product:detail:{id}`，TTL 5min）/秒杀状态优先读 Redis 缓存，缓存不可用时降级直查 DB。商品详情另有永久代次 key `product:detail-version:{id}` 与写入围栏 `product:detail-mutation:{id}`（按过期时间保存活动 mutation token 的 Redis Sorted Set，每个 token TTL 30min）：数据库变更前由 Lua 原子加入独立 token、递增代次并删除详情，紧跟 `WAITAOF` 确认本地 AOF fsync 后才允许 MySQL 写入；回填脚本先清理过期 token，再在仍有 token 或代次变化时拒绝写入；数据库事务结束后再次递增代次、删除详情并只移除自己的 token，同样经 `WAITAOF` 确认。迟到的旧事务不能解除新围栏，重叠事务也不会延长已失效 token，Redis 重启也不会回退已确认围栏。建立围栏失败时不执行数据库变更；结束步骤失败时围栏保留，详情降级直查而不会重新发布旧快照。订单库存扣减/回补由 order 包围整个 MySQL 事务维护围栏。后台 SKU 编辑携带 `expected_stock` 做条件更新，库存已被订单并发改变时返回 409。购物车加购不以详情缓存判断可售性，直接读取商品状态；列表由 cart 仅读自身条目，再经 product 批量端口补齐 SKU/商品事实；同一用户与 SKU 的数量通过 MySQL `INSERT ... ON DUPLICATE KEY UPDATE` 原子累加并封顶 99
 - 舱壁（semaphore 并发池）与 Sentinel-golang 进 backlog
 
 ## 模块依赖 DAG

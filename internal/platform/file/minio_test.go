@@ -49,12 +49,16 @@ type testEnv struct {
 	bucket   string
 	endpoint string
 	client   *minio.Client
+	svc      *file.MinIO
+	usage    *memoryUsage
 }
 
 type memoryUsage struct {
-	mu      sync.Mutex
-	bytes   map[int64]int64
-	objects map[int64]int64
+	mu           sync.Mutex
+	bytes        map[int64]int64
+	objects      map[int64]int64
+	reservations map[string]file.UploadReservation
+	commitErr    error
 }
 
 type contextCheckingUsage struct {
@@ -62,37 +66,105 @@ type contextCheckingUsage struct {
 	releaseCtxErr error
 }
 
-func (*contextCheckingUsage) Reserve(context.Context, int64, int64, int64, int64) error {
+func (*contextCheckingUsage) Reserve(context.Context, int64, string, string, int64, int64, int64) error {
 	return nil
 }
 
-func (u *contextCheckingUsage) Release(ctx context.Context, _ int64, _ int64) error {
+func (*contextCheckingUsage) Commit(context.Context, int64, string) error { return nil }
+
+func (u *contextCheckingUsage) Release(ctx context.Context, _ int64, _ string, _ int64) error {
 	u.released = true
 	u.releaseCtxErr = ctx.Err()
 	return nil
 }
 
-func newMemoryUsage() *memoryUsage {
-	return &memoryUsage{bytes: map[int64]int64{}, objects: map[int64]int64{}}
+func (*contextCheckingUsage) ListPending(context.Context, time.Duration, int) ([]file.UploadReservation, error) {
+	return nil, nil
 }
 
-func (u *memoryUsage) Reserve(_ context.Context, ownerID, size, maxBytes, maxObjects int64) error {
+func (*contextCheckingUsage) GetByRequestID(context.Context, int64, string) (*file.UploadReservation, error) {
+	return nil, nil
+}
+
+func newMemoryUsage() *memoryUsage {
+	return &memoryUsage{
+		bytes: map[int64]int64{}, objects: map[int64]int64{}, reservations: map[string]file.UploadReservation{},
+	}
+}
+
+func (u *memoryUsage) Reserve(_ context.Context, ownerID int64, requestID, objectKey string, size, maxBytes, maxObjects int64) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	for _, reservation := range u.reservations {
+		if reservation.OwnerID == ownerID && reservation.RequestID == requestID {
+			return file.ErrUploadRequestExists
+		}
+	}
 	if u.bytes[ownerID]+size > maxBytes || u.objects[ownerID]+1 > maxObjects {
 		return file.ErrQuotaExceeded
 	}
 	u.bytes[ownerID] += size
 	u.objects[ownerID]++
+	u.reservations[objectKey] = file.UploadReservation{
+		OwnerID: ownerID, RequestID: requestID, ObjectKey: objectKey, Size: size,
+		Status: file.UploadStatusPending, CreatedAt: time.Now(),
+	}
 	return nil
 }
 
-func (u *memoryUsage) Release(_ context.Context, ownerID, size int64) error {
+func (u *memoryUsage) Commit(_ context.Context, _ int64, objectKey string) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.commitErr != nil {
+		return u.commitErr
+	}
+	reservation := u.reservations[objectKey]
+	reservation.Status = file.UploadStatusCommitted
+	u.reservations[objectKey] = reservation
+	return nil
+}
+
+func (u *memoryUsage) Release(_ context.Context, ownerID int64, objectKey string, size int64) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if _, ok := u.reservations[objectKey]; !ok {
+		return nil
+	}
+	delete(u.reservations, objectKey)
 	u.bytes[ownerID] -= size
 	u.objects[ownerID]--
 	return nil
+}
+
+func (u *memoryUsage) ListPending(_ context.Context, minAge time.Duration, limit int) ([]file.UploadReservation, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	out := make([]file.UploadReservation, 0, len(u.reservations))
+	for _, reservation := range u.reservations {
+		if reservation.Status != file.UploadStatusPending {
+			continue
+		}
+		if time.Since(reservation.CreatedAt) < minAge {
+			continue
+		}
+		out = append(out, reservation)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (u *memoryUsage) GetByRequestID(_ context.Context, ownerID int64, requestID string) (*file.UploadReservation, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for _, reservation := range u.reservations {
+		if reservation.OwnerID == ownerID && reservation.RequestID == requestID {
+			copy := reservation
+			return &copy, nil
+		}
+	}
+	return nil, nil
 }
 
 var (
@@ -116,7 +188,8 @@ func buildEnv() (*testEnv, error) {
 		Bucket:    envOr("GO_SINGLE_MINIO_BUCKET", "go-shop-test"),
 		UseSSL:    false,
 	}
-	svc, err := file.NewMinIO(cfg, newMemoryUsage(), file.QuotaConfig{
+	usage := newMemoryUsage()
+	svc, err := file.NewMinIO(cfg, usage, file.QuotaConfig{
 		MaxBytesPerUser: 256 << 20, MaxObjectsPerUser: 100,
 	})
 	if err != nil {
@@ -136,7 +209,7 @@ func buildEnv() (*testEnv, error) {
 	r := gin.New()
 	api := r.Group("/api")
 	file.NewHandler(svc, verifier, nil).RegisterRoutes(api)
-	return &testEnv{router: r, bucket: cfg.Bucket, endpoint: cfg.Endpoint, client: client}, nil
+	return &testEnv{router: r, bucket: cfg.Bucket, endpoint: cfg.Endpoint, client: client, svc: svc, usage: usage}, nil
 }
 
 func envOr(key, def string) string {
@@ -152,6 +225,10 @@ func uploadFile(t *testing.T, e *testEnv, token, filename string, content []byte
 }
 
 func uploadFileKind(t *testing.T, e *testEnv, token, filename string, content []byte, kind string) *httptest.ResponseRecorder {
+	return uploadFileKindWithRequestID(t, e, token, filename, content, kind, fmt.Sprintf("upload-%d", time.Now().UnixNano()))
+}
+
+func uploadFileKindWithRequestID(t *testing.T, e *testEnv, token, filename string, content []byte, kind, requestID string) *httptest.ResponseRecorder {
 	t.Helper()
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -166,6 +243,7 @@ func uploadFileKind(t *testing.T, e *testEnv, token, filename string, content []
 
 	req := httptest.NewRequest(http.MethodPost, "/api/files", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Idempotency-Key", requestID)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -222,6 +300,19 @@ func TestUploadValidImageReturnsURL(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(len(png1x1)), obj.Size)
 	require.Equal(t, "image/png", obj.ContentType)
+}
+
+func TestUploadIdempotentRetryReturnsOriginalReference(t *testing.T) {
+	e := requireEnv(t)
+	requestID := fmt.Sprintf("retry-%d", time.Now().UnixNano())
+	first := uploadFileKindWithRequestID(t, e, token(t), "same.png", png1x1, file.KindImage, requestID)
+	require.Equal(t, http.StatusCreated, first.Code)
+	second := uploadFileKindWithRequestID(t, e, token(t), "ignored.png", png1x1, file.KindImage, requestID)
+	require.Equal(t, http.StatusOK, second.Code)
+	var firstBody, secondBody map[string]any
+	require.NoError(t, json.Unmarshal(first.Body.Bytes(), &firstBody))
+	require.NoError(t, json.Unmarshal(second.Body.Bytes(), &secondBody))
+	require.Equal(t, firstBody["url"], secondBody["url"])
 }
 
 func TestUploadAcceptsImagesFromOneToFiveMiB(t *testing.T) {
@@ -353,6 +444,21 @@ func TestMultipartHardLimitStopsChunkedStream(t *testing.T) {
 	require.Less(t, result.bytes, int64(file.MaxMultipartBodySize+1), "parser must stop before buffering the whole stream")
 }
 
+func TestExpiredMultipartRequestReturnsTimeoutContract(t *testing.T) {
+	e := requireEnv(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/files", strings.NewReader("incomplete multipart"))
+	ctx, cancel := context.WithDeadline(req.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	req = req.WithContext(ctx)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=missing")
+	req.Header.Set("Authorization", "Bearer "+token(t))
+	req.Header.Set("Idempotency-Key", "expired-multipart")
+	w := httptest.NewRecorder()
+	e.router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusGatewayTimeout, w.Code)
+	require.JSONEq(t, `{"error":"request timeout"}`, w.Body.String())
+}
+
 func TestUploadQuotaStopsRepeatedLegalUploads(t *testing.T) {
 	e := requireEnv(t)
 	cfg := file.MinIOConfig{
@@ -376,6 +482,55 @@ func TestUploadQuotaStopsRepeatedLegalUploads(t *testing.T) {
 	require.Contains(t, w.Body.String(), "quota")
 }
 
+func TestReconcilePendingUploadRemovesOrphanAndReleasesQuota(t *testing.T) {
+	e := requireEnv(t)
+	const ownerID int64 = 987654
+	key := fmt.Sprintf("users/%d/file/20260822/%032x.txt", ownerID, time.Now().UnixNano())
+	content := "orphaned upload"
+	require.NoError(t, e.usage.Reserve(context.Background(), ownerID, "orphan-request", key, int64(len(content)), 1<<20, 10))
+	e.usage.mu.Lock()
+	reservation := e.usage.reservations[key]
+	reservation.CreatedAt = time.Now().Add(-11 * time.Minute)
+	e.usage.reservations[key] = reservation
+	e.usage.mu.Unlock()
+	_, err := e.client.PutObject(context.Background(), e.bucket, key, strings.NewReader(content), int64(len(content)), minio.PutObjectOptions{})
+	require.NoError(t, err)
+
+	resolved, err := e.svc.ReconcilePendingUploads(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, resolved)
+	_, err = e.client.StatObject(context.Background(), e.bucket, key, minio.StatObjectOptions{})
+	require.Error(t, err)
+	e.usage.mu.Lock()
+	defer e.usage.mu.Unlock()
+	require.Zero(t, e.usage.bytes[ownerID])
+	require.Zero(t, e.usage.objects[ownerID])
+}
+
+func TestUncertainQuotaCommitDoesNotDeletePossiblyCommittedObject(t *testing.T) {
+	e := requireEnv(t)
+	usage := newMemoryUsage()
+	usage.commitErr = file.ErrUploadCommitUncertain
+	svc, err := file.NewMinIO(file.MinIOConfig{
+		Endpoint: e.endpoint, AccessKey: envOr("GO_SINGLE_MINIO_ACCESS_KEY", "minioadmin"),
+		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"), Bucket: e.bucket,
+	}, usage, file.QuotaConfig{MaxBytesPerUser: 1 << 20, MaxObjectsPerUser: 10})
+	require.NoError(t, err)
+
+	_, err = svc.Upload(context.Background(), 123456, "uncertain-request", "file", strings.NewReader("uncertain"), 9, "uncertain.txt")
+	require.ErrorIs(t, err, file.ErrUploadCommitUncertain)
+	usage.mu.Lock()
+	var reservation file.UploadReservation
+	for _, candidate := range usage.reservations {
+		reservation = candidate
+	}
+	usage.mu.Unlock()
+	require.NotEmpty(t, reservation.ObjectKey)
+	_, err = e.client.StatObject(context.Background(), e.bucket, reservation.ObjectKey, minio.StatObjectOptions{})
+	require.NoError(t, err, "提交结果未知时必须保留对象，等待独立确认或对账")
+	require.NoError(t, e.client.RemoveObject(context.Background(), e.bucket, reservation.ObjectKey, minio.RemoveObjectOptions{}))
+}
+
 func TestUploadFailureReleasesQuotaAfterRequestCancellation(t *testing.T) {
 	e := requireEnv(t)
 	usage := &contextCheckingUsage{}
@@ -387,7 +542,7 @@ func TestUploadFailureReleasesQuotaAfterRequestCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = svc.Upload(ctx, 1, file.KindImage, bytes.NewReader(png1x1), int64(len(png1x1)), "avatar.png")
+	_, err = svc.Upload(ctx, 1, "cancelled-request", file.KindImage, bytes.NewReader(png1x1), int64(len(png1x1)), "avatar.png")
 	require.Error(t, err)
 	require.True(t, usage.released)
 	require.NoError(t, usage.releaseCtxErr)

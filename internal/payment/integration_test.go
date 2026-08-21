@@ -176,7 +176,7 @@ func buildEnv() (*testEnv, error) {
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, metrics.New().Business())
-	orderHandler := orderhandler.New(orderSvc, verifier)
+	orderHandler := orderhandler.New(orderSvc, verifier, orderSvc)
 
 	paymentStore := paymentrepo.NewGORMPayment(gdb)
 	paymentHandler := paymenthandler.New(

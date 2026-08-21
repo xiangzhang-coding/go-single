@@ -14,6 +14,13 @@ var ErrUsernameExists = errors.New("username already exists")
 // ErrUserNotFound 按 ID 更新时用户不存在（并发删除的极端场景）。
 var ErrUserNotFound = errors.New("user not found")
 
+// ProfilePatch carries only fields explicitly submitted by PATCH /users/me.
+// A non-nil pointer with an empty value means clear the field.
+type ProfilePatch struct {
+	Nickname  *string
+	AvatarURL *string
+}
+
 // UserRepository 用户数据访问接口。
 type UserRepository interface {
 	Create(ctx context.Context, u *model.User) error
@@ -22,8 +29,8 @@ type UserRepository interface {
 	// exactly matching the unique index's utf8mb4_unicode_ci collation.
 	UsernameRateLimitKey(ctx context.Context, username string) (string, error)
 	GetByID(ctx context.Context, id int64) (*model.User, error)
-	// UpdateProfile 按主键更新个人资料字段（nickname/avatar_url，零值生效允许清空）。
-	UpdateProfile(ctx context.Context, u *model.User) error
+	// UpdateProfile 按主键只更新显式提交的资料字段，避免并发部分更新互相覆盖。
+	UpdateProfile(ctx context.Context, userID int64, patch ProfilePatch) error
 	// HasAvatarURL 判断托管引用是否仍绑定为用户头像。
 	HasAvatarURL(ctx context.Context, reference string) (bool, error)
 	// SearchByUsername 按用户名前缀搜索（"加好友"发现入口），id 升序

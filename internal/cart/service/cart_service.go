@@ -1,6 +1,6 @@
 // Package service 承载 cart 模块业务：登录用户加购/改量/删条目/查列表。
 // 加购校验 SKU 存在与所属商品上架（跨模块经 product 服务接口进程内调用）；
-// 列表由仓储跨表拼装展示快照（读模型）；条目修改强制 owner 校验防 IDOR。
+// 列表经 product 批量端口补齐展示事实；条目修改强制 owner 校验防 IDOR。
 package service
 
 import (
@@ -35,6 +35,7 @@ type ProductService interface {
 	GetSKU(ctx context.Context, id int64) (*productmodel.SKU, error)
 	// GetProduct 直读商品事实；加购可售性不能依赖详情缓存。
 	GetProduct(ctx context.Context, id int64) (*productmodel.Product, error)
+	GetSKUSummaries(ctx context.Context, ids []int64) (map[int64]productmodel.SKUSummary, error)
 }
 
 // Service cart 模块的业务接口。
@@ -129,7 +130,36 @@ func (s *cartService) DeleteItem(ctx context.Context, userID, itemID int64) erro
 }
 
 func (s *cartService) ListItems(ctx context.Context, userID int64) ([]model.CartItemView, error) {
-	return s.store.Items.ListByUser(ctx, userID)
+	items, err := s.store.Items.ListByUser(ctx, userID)
+	if err != nil || len(items) == 0 {
+		return []model.CartItemView{}, err
+	}
+	skuIDs := make([]int64, 0, len(items))
+	seen := make(map[int64]struct{}, len(items))
+	for i := range items {
+		if _, ok := seen[items[i].SKUID]; !ok {
+			seen[items[i].SKUID] = struct{}{}
+			skuIDs = append(skuIDs, items[i].SKUID)
+		}
+	}
+	summaries, err := s.products.GetSKUSummaries(ctx, skuIDs)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]model.CartItemView, 0, len(items))
+	for i := range items {
+		summary, ok := summaries[items[i].SKUID]
+		if !ok {
+			// SKU deletion cascades to cart_items. If it happens between the two
+			// reads, omit that now-deleted row rather than failing the whole cart.
+			continue
+		}
+		views = append(views, model.CartItemView{
+			CartItem: items[i], ProductID: summary.ProductID, Title: summary.ProductTitle,
+			Specs: summary.Specs, Price: summary.Price, Stock: summary.Stock,
+		})
+	}
+	return views, nil
 }
 
 // LockItems 结算事务内锁定当前购物车条目，调用方（order 模块）负责开启事务。

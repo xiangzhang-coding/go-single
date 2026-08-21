@@ -77,7 +77,7 @@ admin（Bearer + admin）：
 
 ### 跨模块端口
 
-**应用编排（flashsale → order 单向依赖）**：消费者通过 flashsale `TxRunner` 开启事务，调用 `order.CreateSeckillInTx` 后由活动仓储条件扣减库存；超时取消通过 `order.ListExpiredSeckill` / `CancelSeckill` 与活动仓储完成事务内取消和 MySQL 回补，提交后 `RestoreRedis`；对账调用 `order.CountValidSeckill`。**其他依赖**：`product.GetSKU` / `GetProduct`（活动校验与秒杀页摘要）。order 不反向持有 flashsale 实例。
+**应用编排（flashsale → order 单向依赖）**：消费者通过 flashsale `TxRunner` 开启事务，调用 `order.CreateSeckillInTx` 后由活动仓储条件扣减库存；用户主动取消与超时取消都通过 `order.SeckillCancellation` / `CancelSeckill` 和活动仓储完成事务内取消、MySQL 回补及持久回退事实，提交后恢复 Redis；对账调用 `order.CountValidSeckill`。order handler 只依赖调用方声明的取消端口，由组合根注入 flashsale 实现，因此 order 不反向导入 flashsale。
 
 ## 关键流程
 
@@ -92,7 +92,7 @@ POST /api/flashsales/:id/purchase
         · 业务拒绝（抢光/限购/窗口外/下架）→ 释放幂等键（允许窗口内重试）
         · 基础设施失败 → 保留幂等键（防瞬时故障下重复预扣）
   [4] 持久化雪花订单号 → 发布 MQ；确认成功转 pending_order
-      订单号生成/发布失败由启动恢复与每分钟任务继续；重投前验证或重建 Redis reservation；仅 pending_publish 10 次仍失败转回退，pending_order 不因补发失败误回退
+      订单号生成/发布失败由启动恢复与每分钟任务继续；重投前验证或重建 Redis reservation；启动恢复任一失败时抢购门禁保持关闭（503），全部恢复后开放；仅 pending_publish 10 次仍失败转回退，pending_order 不因补发失败误回退
   [5] 返回 202，前端按 pre_deduction_id 轮询 ordered / rolled_back
 ```
 
@@ -114,8 +114,7 @@ POST /api/flashsales/:id/purchase
 
 | 任务 | 频率 | 语义 |
 | --- | --- | --- |
-| flashsale-pre-deduction-recovery | 启动时 + 每分钟 | 扫描 preparing/pending_publish/pending_order/pending_rollback，继续发布、重投或幂等回退 |
-| flashsale-reservation-cleanup | 每分钟 | 查询 ordered 对应订单状态；离开待支付态后清理无需再补偿的持久 marker，并记录清理时间防重复扫描 |
+| flashsale-recovery | 启动时 + 每分钟 | 扫描 preparing/pending_publish/pending_order/pending_rollback，继续发布、重投或幂等回退；同时修复 ordered marker。两部分全部成功才开放抢购门禁 |
 
 pre-R04 durable 主队列或 DLQ 消息没有 `pre_deduction_id` 时，会先按 `order_no` 创建/复用 legacy 生命周期，再进入同一落单和回退状态机。
 | flashsale-reconcile-active | 每小时 | 输出具体 pre_deduction_id/user_id/order_no/status，并保留聚合库存差异作为最终不变量告警 |

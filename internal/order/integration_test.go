@@ -183,7 +183,7 @@ func buildEnv() (*testEnv, error) {
 	orderStore := orderrepo.NewGORMOrder(gdb)
 	orderSvc := ordersvc.New(orderrepo.Store{Orders: orderStore, Items: orderrepo.NewGORMOrderItem(gdb), Tx: orderStore},
 		cacheClient, orderNoGen, productSvc, couponSvc, cartSvc, userSvc, metrics.New().Business())
-	orderHandler := orderhandler.New(orderSvc, verifier)
+	orderHandler := orderhandler.New(orderSvc, verifier, orderSvc)
 	paymentStore := paymentrepo.NewGORMPayment(gdb)
 	paymentHandler := paymenthandler.New(
 		paymentsvc.New(paymentrepo.Store{Payments: paymentStore, Tx: paymentStore}, orderSvc, metrics.New().Business()),
@@ -1092,7 +1092,7 @@ func TestOrderSnapshotImmutability(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, w.Code)
 	admin := adminToken(t, env)
 	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/skus/%d", skuID),
-		`{"specs":{"color":"红"},"price":100,"stock":10}`, admin)
+		`{"specs":{"color":"红"},"price":100,"stock":10,"expected_stock":8}`, admin)
 	require.Equal(t, http.StatusNoContent, w.Code)
 
 	// 订单详情仍为下单时快照。

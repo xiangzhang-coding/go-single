@@ -98,8 +98,9 @@ type AuthRateLimit struct {
 
 // Upload is the durable per-user object-storage budget.
 type Upload struct {
-	MaxBytesPerUser   int64 `mapstructure:"max_bytes_per_user"`
-	MaxObjectsPerUser int64 `mapstructure:"max_objects_per_user"`
+	MaxBytesPerUser   int64         `mapstructure:"max_bytes_per_user"`
+	MaxObjectsPerUser int64         `mapstructure:"max_objects_per_user"`
+	RequestTimeout    time.Duration `mapstructure:"request_timeout"`
 }
 
 // Snowflake 雪花订单号生成器配置；多实例部署时每个实例必须使用不同 worker_id。
@@ -237,6 +238,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.request_timeout", "5s")
 	v.SetDefault("server.max_json_body_bytes", 64<<10)
 	v.SetDefault("log.level", "info")
+	v.SetDefault("upload.request_timeout", "2m")
 	v.SetDefault("mysql.host", "127.0.0.1")
 	v.SetDefault("mysql.port", 3306)
 	v.SetDefault("mysql.user", "root")

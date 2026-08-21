@@ -15,6 +15,8 @@ var (
 	ErrCategoryNameExists = errors.New("category name already exists")
 	// ErrCategoryInUse 类目下仍有商品，禁止删除。
 	ErrCategoryInUse = errors.New("category in use")
+	// ErrSKUInUse SKU 已被订单、动态、秒杀活动或预扣事实引用，禁止删除。
+	ErrSKUInUse = errors.New("sku in use")
 )
 
 // CategoryRepository 类目数据访问接口。
@@ -44,12 +46,14 @@ type ProductRepository interface {
 // SKURepository SKU 数据访问接口。
 type SKURepository interface {
 	Create(ctx context.Context, s *model.SKU) error
-	Update(ctx context.Context, s *model.SKU) error
+	// Update 仅在库存仍等于 expectedStock 时更新，避免后台旧表单覆盖订单并发扣减。
+	Update(ctx context.Context, s *model.SKU, expectedStock int) (bool, error)
 	Delete(ctx context.Context, id int64) error
 	GetByID(ctx context.Context, id int64) (*model.SKU, error)
 	// GetByIDForUpdate 在订单事务内锁定 SKU，保证成交价读取与库存扣减使用同一版本。
 	GetByIDForUpdate(ctx context.Context, tx *transaction.Handle, id int64) (*model.SKU, error)
 	ListByProduct(ctx context.Context, productID int64) ([]model.SKU, error)
+	ListSummariesByIDs(ctx context.Context, ids []int64) ([]model.SKUSummary, error)
 	// DeductStock 事务内条件扣减库存（stock>=quantity 才更新，防超卖）：
 	// 返回是否实际扣减。tx 由调用方（order 模块）开启，同一事务保证
 	// 订单创建与库存扣减的原子性。

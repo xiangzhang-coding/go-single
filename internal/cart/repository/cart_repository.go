@@ -19,8 +19,8 @@ type CartItemRepository interface {
 	// UpdateQuantity 改量（修改数量时校验归属在 service 层完成）。
 	UpdateQuantity(ctx context.Context, id int64, quantity int) error
 	Delete(ctx context.Context, id int64) error
-	// ListByUser 我的购物车列表：条目 + SKU/商品只读快照（跨表读模型，一次查询）。
-	ListByUser(ctx context.Context, userID int64) ([]model.CartItemView, error)
+	// ListByUser 只读取 cart 模块自己的条目；商品展示事实由 service 经 product 端口补齐。
+	ListByUser(ctx context.Context, userID int64) ([]model.CartItem, error)
 	// LockByUser 在结算事务内读取并锁定当前条目，避免读取数量后被并发改量。
 	LockByUser(ctx context.Context, tx *transaction.Handle, userID int64) ([]model.CartItem, error)
 	// DeleteByIDs 事务内按条目 ID 删除已结算的行，避免按 SKU 删除并发新增/修改的条目。

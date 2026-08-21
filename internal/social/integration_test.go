@@ -291,6 +291,7 @@ func uploadMedia(t *testing.T, env *testEnv, token, filename, kind string, conte
 	require.NoError(t, mw.Close())
 	req := httptest.NewRequest(http.MethodPost, "/api/files", &body)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Idempotency-Key", fmt.Sprintf("upload-%d", time.Now().UnixNano()))
 	req.Header.Set("Authorization", "Bearer "+token)
 	w := httptest.NewRecorder()
 	env.router.ServeHTTP(w, req)

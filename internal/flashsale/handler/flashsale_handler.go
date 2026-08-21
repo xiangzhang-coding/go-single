@@ -236,5 +236,6 @@ func writeError(c *gin.Context, err error) {
 			service.ErrNotInWindow, service.ErrSoldOut, service.ErrLimitReached, service.ErrOffline,
 		}},
 		httpresponse.Rule{Status: http.StatusTooManyRequests, Errors: []error{service.ErrRateLimited}},
+		httpresponse.Rule{Status: http.StatusServiceUnavailable, Errors: []error{service.ErrRecoveryIncomplete}},
 	)
 }

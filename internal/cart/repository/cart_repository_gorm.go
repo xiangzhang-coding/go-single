@@ -72,23 +72,10 @@ func (r *GORMCartItemRepository) Delete(ctx context.Context, id int64) error {
 	return r.db.WithContext(ctx).Delete(&model.CartItem{}, id).Error
 }
 
-// ListByUser 一次查询拼装列表读模型：cart_items JOIN skus JOIN products。
-// 跨表读取仅用于展示快照（不修改商品域数据），避免逐条补查的 N+1。
-func (r *GORMCartItemRepository) ListByUser(ctx context.Context, userID int64) ([]model.CartItemView, error) {
-	views := make([]model.CartItemView, 0)
-	err := r.db.WithContext(ctx).Raw(`
-		SELECT ci.id, ci.user_id, ci.sku_id, ci.quantity, ci.created_at, ci.updated_at,
-		       s.product_id, s.specs, s.price, s.stock,
-		       p.title
-		FROM cart_items ci
-		JOIN skus s ON s.id = ci.sku_id
-		JOIN products p ON p.id = s.product_id
-		WHERE ci.user_id = ?
-		ORDER BY ci.id DESC`, userID).Scan(&views).Error
-	if err != nil {
-		return nil, err
-	}
-	return views, nil
+func (r *GORMCartItemRepository) ListByUser(ctx context.Context, userID int64) ([]model.CartItem, error) {
+	items := make([]model.CartItem, 0)
+	err := r.db.WithContext(ctx).Where("user_id = ?", userID).Order("id DESC").Find(&items).Error
+	return items, err
 }
 
 // LockByUser 结算事务内读取当前条目并加排他锁。

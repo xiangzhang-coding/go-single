@@ -143,8 +143,9 @@ func (f *fakeProducts) CountByCategory(_ context.Context, categoryID int64) (int
 }
 
 type fakeSKUs struct {
-	byID  map[int64]*model.SKU
-	order int64
+	byID      map[int64]*model.SKU
+	order     int64
+	deleteErr error
 }
 
 func newFakeSKUs() *fakeSKUs { return &fakeSKUs{byID: map[int64]*model.SKU{}} }
@@ -156,14 +157,21 @@ func (f *fakeSKUs) Create(_ context.Context, s *model.SKU) error {
 	return nil
 }
 
-func (f *fakeSKUs) Update(_ context.Context, s *model.SKU) error {
+func (f *fakeSKUs) Update(_ context.Context, s *model.SKU, expectedStock int) (bool, error) {
 	if v, ok := f.byID[s.ID]; ok {
+		if v.Stock != expectedStock {
+			return false, nil
+		}
 		v.Specs, v.Price, v.Stock = s.Specs, s.Price, s.Stock
+		return true, nil
 	}
-	return nil
+	return false, nil
 }
 
 func (f *fakeSKUs) Delete(_ context.Context, id int64) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	delete(f.byID, id)
 	return nil
 }
@@ -181,6 +189,16 @@ func (f *fakeSKUs) ListByProduct(_ context.Context, productID int64) ([]model.SK
 	for _, v := range f.byID {
 		if v.ProductID == productID {
 			out = append(out, *v)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeSKUs) ListSummariesByIDs(_ context.Context, ids []int64) ([]model.SKUSummary, error) {
+	out := make([]model.SKUSummary, 0, len(ids))
+	for _, id := range ids {
+		if sku := f.byID[id]; sku != nil {
+			out = append(out, model.SKUSummary{SKU: *sku})
 		}
 	}
 	return out, nil
@@ -488,7 +506,7 @@ func TestUpdateSKUInvalidatesCache(t *testing.T) {
 	_, err = fx.svc.GetDetail(context.Background(), p.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, fx.svc.UpdateSKU(context.Background(), sku.ID, json.RawMessage(`{"color":"蓝"}`), 200, 3))
+	require.NoError(t, fx.svc.UpdateSKU(context.Background(), sku.ID, json.RawMessage(`{"color":"蓝"}`), 200, 3, 5))
 	d, err := fx.svc.GetDetail(context.Background(), p.ID)
 	require.NoError(t, err)
 	require.Len(t, d.Skus, 1)
@@ -496,7 +514,7 @@ func TestUpdateSKUInvalidatesCache(t *testing.T) {
 	assert.Equal(t, int64(3), int64(d.Skus[0].Stock))
 
 	// 更新不存在的 SKU → 404。
-	require.ErrorIs(t, fx.svc.UpdateSKU(context.Background(), 999, json.RawMessage(`{}`), 1, 1), ErrSKUNotFound)
+	require.ErrorIs(t, fx.svc.UpdateSKU(context.Background(), 999, json.RawMessage(`{}`), 1, 1, 0), ErrSKUNotFound)
 
 	// 删除后详情不再含该 SKU。
 	require.NoError(t, fx.svc.DeleteSKU(context.Background(), sku.ID))
@@ -504,6 +522,18 @@ func TestUpdateSKUInvalidatesCache(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, d.Skus)
 	require.ErrorIs(t, fx.svc.DeleteSKU(context.Background(), sku.ID), ErrSKUNotFound)
+}
+
+func TestDeleteSKUReportsReferencedSKUAsConflict(t *testing.T) {
+	fx := newFixture()
+	c := fx.category(t, "数码")
+	p := fx.publishedProduct(t, c.ID, "手机")
+	sku, err := fx.svc.CreateSKU(context.Background(), p.ID, json.RawMessage(`{}`), 100, 5)
+	require.NoError(t, err)
+	fx.skus.deleteErr = repository.ErrSKUInUse
+
+	err = fx.svc.DeleteSKU(context.Background(), sku.ID)
+	require.ErrorIs(t, err, ErrSKUInUse)
 }
 
 func TestUpdateSKUKeepsCacheFencedWhenFinishFails(t *testing.T) {
@@ -516,7 +546,7 @@ func TestUpdateSKUKeepsCacheFencedWhenFinishFails(t *testing.T) {
 	staleVersion := fx.cache.versions[keys.Version]
 
 	fx.cache.finishErr = errors.New("redis unavailable")
-	require.NoError(t, fx.svc.UpdateSKU(context.Background(), sku.ID, json.RawMessage(`{"color":"蓝"}`), 200, 3))
+	require.NoError(t, fx.svc.UpdateSKU(context.Background(), sku.ID, json.RawMessage(`{"color":"蓝"}`), 200, 3, 5))
 	fx.cache.finishErr = nil
 
 	written, err := fx.cache.SetProductDetailIfVersion(context.Background(), keys, staleVersion, `{"old":true}`, detailCacheTTL)
@@ -536,7 +566,7 @@ func TestUpdateSKURequiresCacheMutationFence(t *testing.T) {
 	require.NoError(t, err)
 
 	fx.cache.beginErr = errors.New("redis unavailable")
-	err = fx.svc.UpdateSKU(context.Background(), sku.ID, json.RawMessage(`{}`), 200, 3)
+	err = fx.svc.UpdateSKU(context.Background(), sku.ID, json.RawMessage(`{}`), 200, 3, 5)
 	require.Error(t, err)
 	require.Equal(t, int64(100), fx.skus.byID[sku.ID].Price, "围栏未建立时不得提交商品变更")
 }
@@ -662,7 +692,9 @@ func TestGetDetailCacheHitMissAndFill(t *testing.T) {
 	require.Equal(t, before+1, fx.cache.getCalls)
 
 	// 绕过缓存改 DB：第二次访问仍返回旧值（命中缓存）。
-	require.NoError(t, fx.skus.Update(context.Background(), &model.SKU{ID: d.Skus[0].ID, Specs: d.Skus[0].Specs, Price: 1, Stock: 1}))
+	updated, err := fx.skus.Update(context.Background(), &model.SKU{ID: d.Skus[0].ID, Specs: d.Skus[0].Specs, Price: 1, Stock: 1}, 10)
+	require.NoError(t, err)
+	require.True(t, updated)
 	cached, err := fx.svc.GetDetail(context.Background(), p.ID)
 	require.NoError(t, err)
 	assert.Equal(t, int64(9900), cached.Skus[0].Price, "命中缓存应返回旧价格")

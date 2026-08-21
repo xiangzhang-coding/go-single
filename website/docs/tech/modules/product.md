@@ -60,7 +60,7 @@ admin 管理（Bearer + admin 角色）：
 | GET | /api/admin/products | 后台商品列表（`status` 筛选，含草稿/下架） |
 | POST | /api/admin/products/:id/publish · /unpublish | 上架 / 下架 |
 | POST | /api/admin/products/:id/skus | 新建 SKU |
-| PUT / DELETE | /api/admin/skus/:id | 编辑 / 删除 SKU |
+| PUT / DELETE | /api/admin/skus/:id | 编辑携带 `expected_stock` 做乐观并发控制（库存已变化返回 409）/ 删除被业务历史引用时返回 409 |
 
 ### 跨模块端口（service 最小接口，进程内调用）
 
@@ -69,6 +69,7 @@ admin 管理（Bearer + admin 角色）：
 | `GetSKU` | cart、flashsale、order | SKU 存在性校验 |
 | `GetDetail` | order | 详情仅上架可见（404 即下架） |
 | `GetProduct` | cart、flashsale | 直读商品事实；cart 用于绕过详情缓存判断可售性，flashsale 用于商品标题 |
+| `GetSKUSummaries` | cart | 批量返回 SKU 与商品标题，避免 cart 仓储穿透 product 表结构 |
 | `GetSKUForUpdate` | order | 订单事务内锁定 SKU 并校验商品仍上架 |
 | `DeductStock` / `RestoreStock` | order | 事务内条件扣减 / 回补库存 |
 | `BeginDetailMutation` / `FinishDetailMutation` | order | 包围 MySQL 事务建立 / 解除详情写入围栏 |

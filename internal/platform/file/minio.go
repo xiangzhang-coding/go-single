@@ -28,8 +28,10 @@ type MinIOConfig struct {
 }
 
 const (
-	sniffSize = 512
-	probeKey  = "users/.privacy-probe-ensure-private"
+	sniffSize                = 512
+	probeKey                 = "users/.privacy-probe-ensure-private"
+	pendingUploadGracePeriod = 10 * time.Minute
+	pendingUploadBatch       = 500
 )
 
 var (
@@ -45,6 +47,11 @@ type ObjectInfo struct {
 	ContentType string
 	Size        int64
 	Filename    string
+}
+
+type UploadResult struct {
+	*ObjectInfo
+	Idempotent bool
 }
 
 // StoredObject 是经 MinIO 读取的私有对象流。
@@ -85,7 +92,7 @@ func NewMinIO(cfg MinIOConfig, usage UsageStore, quotaCfg QuotaConfig) (*MinIO, 
 			return nil, fmt.Errorf("创建桶 %s: %w", cfg.Bucket, err)
 		}
 	}
-	if err := ensurePrivate(ctx, client, cfg.Endpoint, cfg.Bucket); err != nil {
+	if err := ensurePrivate(ctx, client, cfg.Endpoint, cfg.Bucket, cfg.UseSSL); err != nil {
 		return nil, err
 	}
 	return &MinIO{client: client, bucket: cfg.Bucket, usage: usage, quotaCfg: quotaCfg}, nil
@@ -93,9 +100,17 @@ func NewMinIO(cfg MinIOConfig, usage UsageStore, quotaCfg QuotaConfig) (*MinIO, 
 
 // Upload 按媒体类型校验内容后写入私有桶。对象 key 固化上传者和类型，
 // 返回后端文件接口引用，不暴露 MinIO 地址。
-func (s *MinIO) Upload(ctx context.Context, ownerID int64, kind string, r io.Reader, size int64, filename string) (*ObjectInfo, error) {
+func (s *MinIO) Upload(ctx context.Context, ownerID int64, requestID, kind string, r io.Reader, size int64, filename string) (*UploadResult, error) {
 	if ownerID <= 0 {
 		return nil, ErrReferenceForbidden
+	}
+	if !validUploadRequestID(requestID) {
+		return nil, ErrInvalidUploadRequestID
+	}
+	if existing, err := s.usage.GetByRequestID(ctx, ownerID, requestID); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return s.replayUpload(ctx, existing)
 	}
 	br := bufio.NewReader(r)
 	header, _ := br.Peek(sniffSize)
@@ -103,11 +118,19 @@ func (s *MinIO) Upload(ctx context.Context, ownerID int64, kind string, r io.Rea
 	if err != nil {
 		return nil, err
 	}
-	if err := s.usage.Reserve(ctx, ownerID, size, s.quotaCfg.MaxBytesPerUser, s.quotaCfg.MaxObjectsPerUser); err != nil {
+	key := fmt.Sprintf("users/%d/%s/%s/%s.%s", ownerID, kind, time.Now().Format("20060102"), randHex(32), ext)
+	if err := s.usage.Reserve(ctx, ownerID, requestID, key, size, s.quotaCfg.MaxBytesPerUser, s.quotaCfg.MaxObjectsPerUser); err != nil {
+		if errors.Is(err, ErrUploadRequestExists) {
+			existing, getErr := s.usage.GetByRequestID(ctx, ownerID, requestID)
+			if getErr != nil {
+				return nil, errors.Join(err, getErr)
+			}
+			if existing != nil {
+				return s.replayUpload(ctx, existing)
+			}
+		}
 		return nil, err
 	}
-
-	key := fmt.Sprintf("users/%d/%s/%s/%s.%s", ownerID, kind, time.Now().Format("20060102"), randHex(32), ext)
 	cleanName := sanitizeFilename(filename)
 	_, err = s.client.PutObject(ctx, s.bucket, key, br, size, minio.PutObjectOptions{
 		ContentType: contentType,
@@ -117,17 +140,88 @@ func (s *MinIO) Upload(ctx context.Context, ownerID int64, kind string, r io.Rea
 	})
 	if err != nil {
 		uploadErr := fmt.Errorf("上传对象 %s: %w", key, err)
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
-		if releaseErr := s.usage.Release(releaseCtx, ownerID, size); releaseErr != nil {
+		if removeErr := s.client.RemoveObject(cleanupCtx, s.bucket, key, minio.RemoveObjectOptions{}); removeErr != nil {
+			return nil, errors.Join(uploadErr, removeErr)
+		}
+		if releaseErr := s.usage.Release(cleanupCtx, ownerID, key, size); releaseErr != nil {
 			return nil, errors.Join(uploadErr, releaseErr)
 		}
 		return nil, uploadErr
 	}
-	return &ObjectInfo{
+	if err := s.usage.Commit(ctx, ownerID, key); err != nil {
+		commitErr := fmt.Errorf("提交上传配额 %s: %w", key, err)
+		if errors.Is(err, ErrUploadCommitUncertain) {
+			return nil, commitErr
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		removeErr := s.client.RemoveObject(cleanupCtx, s.bucket, key, minio.RemoveObjectOptions{})
+		if removeErr != nil {
+			return nil, errors.Join(commitErr, removeErr)
+		}
+		releaseErr := s.usage.Release(cleanupCtx, ownerID, key, size)
+		return nil, errors.Join(commitErr, releaseErr)
+	}
+	return &UploadResult{ObjectInfo: &ObjectInfo{
 		Reference: referenceForKey(key), OwnerID: ownerID, Kind: kind,
 		ContentType: contentType, Size: size, Filename: cleanName,
-	}, nil
+	}}, nil
+}
+
+func (s *MinIO) replayUpload(ctx context.Context, reservation *UploadReservation) (*UploadResult, error) {
+	if reservation.Status == UploadStatusPending {
+		return nil, ErrUploadInProgress
+	}
+	if reservation.Status != UploadStatusCommitted {
+		return nil, fmt.Errorf("unknown upload reservation status %q", reservation.Status)
+	}
+	managed, err := parseReference(referenceForKey(reservation.ObjectKey))
+	if err != nil {
+		return nil, err
+	}
+	info, err := s.stat(ctx, managed)
+	if err != nil {
+		return nil, err
+	}
+	return &UploadResult{ObjectInfo: info, Idempotent: true}, nil
+}
+
+func validUploadRequestID(requestID string) bool {
+	if requestID == "" || len(requestID) > 64 {
+		return false
+	}
+	for _, r := range requestID {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// ReconcilePendingUploads removes stale objects that were never committed to
+// the API response and releases their durable quota reservations.
+func (s *MinIO) ReconcilePendingUploads(ctx context.Context) (int, error) {
+	rows, err := s.usage.ListPending(ctx, pendingUploadGracePeriod, pendingUploadBatch)
+	if err != nil {
+		return 0, err
+	}
+	resolved := 0
+	var reconcileErr error
+	for i := range rows {
+		row := rows[i]
+		if err := s.client.RemoveObject(ctx, s.bucket, row.ObjectKey, minio.RemoveObjectOptions{}); err != nil {
+			reconcileErr = errors.Join(reconcileErr, fmt.Errorf("删除未完成上传 %s: %w", row.ObjectKey, err))
+			continue
+		}
+		if err := s.usage.Release(ctx, row.OwnerID, row.ObjectKey, row.Size); err != nil {
+			reconcileErr = errors.Join(reconcileErr, err)
+			continue
+		}
+		resolved++
+	}
+	return resolved, reconcileErr
 }
 
 // IsOwned 校验引用由本系统管理、对象真实存在，且上传者和类型匹配。
@@ -240,7 +334,7 @@ func mapObjectError(key string, err error) error {
 	return fmt.Errorf("读取对象 %s: %w", key, err)
 }
 
-func ensurePrivate(ctx context.Context, client *minio.Client, endpoint, bucket string) error {
+func ensurePrivate(ctx context.Context, client *minio.Client, endpoint, bucket string, secure bool) error {
 	policy, err := client.GetBucketPolicy(ctx, bucket)
 	if err == nil {
 		if strings.TrimSpace(policy) != "" {
@@ -250,7 +344,7 @@ func ensurePrivate(ctx context.Context, client *minio.Client, endpoint, bucket s
 		return fmt.Errorf("检查桶 %s 访问策略: %w", bucket, err)
 	}
 
-	anon, err := minio.New(endpoint, &minio.Options{})
+	anon, err := newAnonymousClient(endpoint, secure)
 	if err != nil {
 		return fmt.Errorf("构造匿名客户端: %w", err)
 	}
@@ -260,6 +354,10 @@ func ensurePrivate(ctx context.Context, client *minio.Client, endpoint, bucket s
 		return nil
 	}
 	return fmt.Errorf("桶 %s 非私有（匿名可探测），请配置为私有或换桶", bucket)
+}
+
+func newAnonymousClient(endpoint string, secure bool) (*minio.Client, error) {
+	return minio.New(endpoint, &minio.Options{Secure: secure})
 }
 
 func randHex(n int) string {

@@ -54,6 +54,10 @@ func (h *Handler) Upload(c *gin.Context) {
 		return
 	}
 	if err != nil {
+		if httpresponse.IsTimeout(err) || httpresponse.IsTimeout(c.Request.Context().Err()) {
+			httpresponse.WriteError(c, errors.Join(err, c.Request.Context().Err()))
+			return
+		}
 		httpresponse.Write(c, http.StatusBadRequest, "invalid multipart body")
 		return
 	}
@@ -73,18 +77,22 @@ func (h *Handler) Upload(c *gin.Context) {
 	if kind == "" {
 		kind = KindImage
 	}
-	info, err := h.svc.Upload(c.Request.Context(), claims.UserID, kind, f, fh.Size, fh.Filename)
+	result, err := h.svc.Upload(c.Request.Context(), claims.UserID, c.GetHeader("Idempotency-Key"), kind, f, fh.Size, fh.Filename)
 	if err != nil {
 		httpresponse.WriteError(c, err,
-			httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{ErrInvalidType, ErrInvalidKind}},
+			httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{ErrInvalidType, ErrInvalidKind, ErrInvalidUploadRequestID}},
 			httpresponse.Rule{Status: http.StatusRequestEntityTooLarge, Errors: []error{ErrTooLarge}},
-			httpresponse.Rule{Status: http.StatusConflict, Errors: []error{ErrQuotaExceeded}},
+			httpresponse.Rule{Status: http.StatusConflict, Errors: []error{ErrQuotaExceeded, ErrUploadInProgress}},
 		)
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{
-		"url": info.Reference, "kind": info.Kind, "filename": info.Filename,
-		"content_type": info.ContentType, "size": info.Size,
+	status := http.StatusCreated
+	if result.Idempotent {
+		status = http.StatusOK
+	}
+	c.JSON(status, gin.H{
+		"url": result.Reference, "kind": result.Kind, "filename": result.Filename,
+		"content_type": result.ContentType, "size": result.Size,
 	})
 }
 

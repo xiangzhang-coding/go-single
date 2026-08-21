@@ -71,6 +71,35 @@ func TestPromtailRedactsJWTsFromEveryScrapeJob(t *testing.T) {
 	}
 }
 
+func TestPromtailReadsContainerLogsWithoutDockerSocket(t *testing.T) {
+	compose, err := os.ReadFile("docker-compose.yml")
+	require.NoError(t, err)
+	require.NotContains(t, string(compose), "/var/run/docker.sock")
+	require.Contains(t, string(compose), "/var/lib/docker/containers:/var/lib/docker/containers:ro")
+
+	promtail, err := os.ReadFile("monitoring/promtail/config.yml")
+	require.NoError(t, err)
+	require.NotContains(t, string(promtail), "docker_sd_configs")
+	require.Contains(t, string(promtail), "/var/lib/docker/containers/*/*.log")
+	dashboard, err := os.ReadFile("monitoring/grafana/dashboards/logs.json")
+	require.NoError(t, err)
+	require.Contains(t, string(dashboard), `{job=\"docker-containers\"}`)
+}
+
+func TestProductionNginxUsesStandardHTTPSPorts(t *testing.T) {
+	compose, err := os.ReadFile("docker-compose.prod.yml")
+	require.NoError(t, err)
+	require.Contains(t, string(compose), `"80:80"`)
+	require.Contains(t, string(compose), `"443:443"`)
+
+	nginx, err := os.ReadFile("nginx/nginx.conf")
+	require.NoError(t, err)
+	require.Contains(t, string(nginx), "return 301 https://$host$https_redirect_port$request_uri;")
+	productionPort, err := os.ReadFile("nginx/https-port.prod.conf")
+	require.NoError(t, err)
+	require.NotContains(t, string(productionPort), ":8443")
+}
+
 func TestMonitoringPortsBindToLoopbackByDefault(t *testing.T) {
 	type composeConfig struct {
 		Services map[string]struct {
@@ -172,6 +201,7 @@ func TestNginxBodyBudgetsMatchBackendContracts(t *testing.T) {
 	require.Contains(t, config, "location = /api/files")
 	require.Equal(t, 1, strings.Count(config, "client_max_body_size 21m;"))
 	require.Regexp(t, regexp.MustCompile(`(?s)location = /api/files\s*\{.*?client_max_body_size 21m;`), config)
+	require.Regexp(t, regexp.MustCompile(`(?s)location = /api/files\s*\{.*?proxy_read_timeout 140s;`), config)
 }
 
 func TestPagesDeploymentRunsAfterSuccessfulCI(t *testing.T) {

@@ -67,6 +67,9 @@ func requestTimeout(d time.Duration) gin.HandlerFunc {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), d)
 		defer cancel()
 		c.Request = c.Request.WithContext(ctx)
+		body := c.Request.Body
+		stopBodyClose := context.AfterFunc(ctx, func() { _ = body.Close() })
+		defer stopBodyClose()
 
 		c.Next()
 

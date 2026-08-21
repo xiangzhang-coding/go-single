@@ -21,19 +21,32 @@ func (fakeSeckillTx) WithinTx(_ context.Context, fn func(*transaction.Handle) er
 }
 
 type fakeSeckillCancellations struct {
-	expired   []ordersvc.ExpiredSeckillOrder
+	expired   []ordersvc.SeckillCancellationOrder
 	cancelled []string
 	changed   map[string]bool
 	listErr   error
 }
 
-func (f *fakeSeckillCancellations) ListExpiredSeckill(context.Context) ([]ordersvc.ExpiredSeckillOrder, error) {
+func (f *fakeSeckillCancellations) ListExpiredSeckill(context.Context) ([]ordersvc.SeckillCancellationOrder, error) {
 	return f.expired, f.listErr
 }
 
 func (f *fakeSeckillCancellations) CancelSeckill(_ context.Context, _ *transaction.Handle, orderNo string) (bool, error) {
 	f.cancelled = append(f.cancelled, orderNo)
 	return !f.changed[orderNo], nil
+}
+
+func (f *fakeSeckillCancellations) SeckillCancellation(_ context.Context, userID int64, orderNo string) (*ordersvc.SeckillCancellationOrder, error) {
+	for i := range f.expired {
+		if f.expired[i].OrderNo == orderNo {
+			if f.expired[i].UserID != userID {
+				return nil, ordersvc.ErrOrderForbidden
+			}
+			copy := f.expired[i]
+			return &copy, nil
+		}
+	}
+	return nil, ordersvc.ErrOrderNotFound
 }
 
 type fakeSeckillRedisRestorer struct {
@@ -50,12 +63,12 @@ func TestSeckillTimeoutCountsRedisFailureAfterDatabaseCommit(t *testing.T) {
 	activities := newFakeActivities()
 	activity := &model.Activity{Stock: 4}
 	require.NoError(t, activities.Create(context.Background(), activity))
-	orders := &fakeSeckillCancellations{expired: []ordersvc.ExpiredSeckillOrder{{
+	orders := &fakeSeckillCancellations{expired: []ordersvc.SeckillCancellationOrder{{
 		OrderNo: "S1", UserID: 42, ActivityID: activity.ID, Quantity: 1,
 	}}}
 	redis := &fakeSeckillRedisRestorer{err: errors.New("redis down")}
 	pd := newFakePreDeductions()
-	timeout := NewSeckillTimeout(fakeSeckillTx{}, orders, activities, pd, redis, metrics.New().Business())
+	timeout := NewSeckillCancellation(fakeSeckillTx{}, orders, activities, pd, redis, metrics.New().Business())
 
 	cancelled, failed, redisFailed, err := timeout.CancelExpired(context.Background())
 
@@ -76,14 +89,14 @@ func TestSeckillTimeoutSkipsChangedAndMalformedOrders(t *testing.T) {
 	activity := &model.Activity{Stock: 4}
 	require.NoError(t, activities.Create(context.Background(), activity))
 	orders := &fakeSeckillCancellations{
-		expired: []ordersvc.ExpiredSeckillOrder{
+		expired: []ordersvc.SeckillCancellationOrder{
 			{OrderNo: "changed", UserID: 42, ActivityID: activity.ID, Quantity: 1},
 			{OrderNo: "malformed", UserID: 43, Quantity: 1},
 		},
 		changed: map[string]bool{"changed": true},
 	}
 	redis := &fakeSeckillRedisRestorer{}
-	timeout := NewSeckillTimeout(fakeSeckillTx{}, orders, activities, newFakePreDeductions(), redis, metrics.New().Business())
+	timeout := NewSeckillCancellation(fakeSeckillTx{}, orders, activities, newFakePreDeductions(), redis, metrics.New().Business())
 
 	cancelled, failed, redisFailed, err := timeout.CancelExpired(context.Background())
 
@@ -96,7 +109,7 @@ func TestSeckillTimeoutSkipsChangedAndMalformedOrders(t *testing.T) {
 }
 
 func TestSeckillTimeoutPropagatesScanFailure(t *testing.T) {
-	timeout := NewSeckillTimeout(
+	timeout := NewSeckillCancellation(
 		fakeSeckillTx{},
 		&fakeSeckillCancellations{listErr: errors.New("mysql down")},
 		newFakeActivities(),
@@ -118,11 +131,11 @@ func TestSeckillTimeoutRestoresActivityStockAndRedis(t *testing.T) {
 	activities := newFakeActivities()
 	activity := &model.Activity{Stock: 9}
 	require.NoError(t, activities.Create(context.Background(), activity))
-	orders := &fakeSeckillCancellations{expired: []ordersvc.ExpiredSeckillOrder{{
+	orders := &fakeSeckillCancellations{expired: []ordersvc.SeckillCancellationOrder{{
 		OrderNo: "S1", UserID: 42, ActivityID: activity.ID, Quantity: 1,
 	}}}
 	redis := &fakeSeckillRedisRestorer{}
-	timeout := NewSeckillTimeout(fakeSeckillTx{}, orders, activities, newFakePreDeductions(), redis, metrics.New().Business())
+	timeout := NewSeckillCancellation(fakeSeckillTx{}, orders, activities, newFakePreDeductions(), redis, metrics.New().Business())
 
 	cancelled, failed, redisFailed, err := timeout.CancelExpired(context.Background())
 
@@ -130,6 +143,23 @@ func TestSeckillTimeoutRestoresActivityStockAndRedis(t *testing.T) {
 	require.Equal(t, 1, cancelled)
 	require.Zero(t, failed)
 	require.Zero(t, redisFailed)
+	require.Equal(t, []string{"S1"}, orders.cancelled)
+	require.Equal(t, 10, activity.Stock)
+	require.Len(t, redis.restored, 1)
+}
+
+func TestUserCanCancelOwnedPendingSeckillOrder(t *testing.T) {
+	activities := newFakeActivities()
+	activity := &model.Activity{Stock: 9}
+	require.NoError(t, activities.Create(context.Background(), activity))
+	orders := &fakeSeckillCancellations{expired: []ordersvc.SeckillCancellationOrder{{
+		OrderNo: "S1", UserID: 42, ActivityID: activity.ID, SKUID: 7, Price: 100, Quantity: 1, PurchaseSlot: 99,
+	}}}
+	redis := &fakeSeckillRedisRestorer{}
+	pd := newFakePreDeductions()
+	canceller := NewSeckillCancellation(fakeSeckillTx{}, orders, activities, pd, redis, metrics.New().Business())
+
+	require.NoError(t, canceller.Cancel(context.Background(), 42, "S1"))
 	require.Equal(t, []string{"S1"}, orders.cancelled)
 	require.Equal(t, 10, activity.Stock)
 	require.Len(t, redis.restored, 1)

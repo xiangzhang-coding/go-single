@@ -1,4 +1,5 @@
 import { api } from "./client";
+import { makeClientRequestID } from "../lib/format";
 import type {
   Address,
   Category,
@@ -17,6 +18,7 @@ import type {
   CreateOrderRequest,
   CreateProductRequest,
   CreateSKURequest,
+  UpdateSKURequest,
   FlashSaleActivity,
   FlashSaleActivityRecord,
   FlashSaleAdminListResponse,
@@ -309,13 +311,21 @@ export async function markConversationRead(conversationKey: string, lastMessageI
 
 // ---- 文件上传（图片消息 / 动态配图）----
 
+const uploadRequestIDs = new WeakMap<File, string>();
+
 export async function uploadFile(file: File, kind: MediaKind = "image") {
+	let requestID = uploadRequestIDs.get(file);
+	if (!requestID) {
+		requestID = makeClientRequestID();
+		uploadRequestIDs.set(file, requestID);
+	}
   const form = new FormData();
   form.append("file", file);
   form.append("kind", kind);
   const { data } = await api.post<UploadedMedia>("/files", form, {
-    headers: { "Content-Type": "multipart/form-data" },
+    headers: { "Content-Type": "multipart/form-data", "Idempotency-Key": requestID },
   });
+  uploadRequestIDs.delete(file);
   return data;
 }
 
@@ -392,7 +402,7 @@ export const adminApi = {
     const { data } = await api.post<SKU>(`/admin/products/${productId}/skus`, request);
     return data;
   },
-  async updateSKU(id: number, request: CreateSKURequest) {
+  async updateSKU(id: number, request: UpdateSKURequest) {
     await api.put(`/admin/skus/${id}`, request);
   },
   async deleteSKU(id: number) {

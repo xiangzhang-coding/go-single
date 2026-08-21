@@ -25,6 +25,8 @@ var (
 	ErrCategoryInUse    = errors.New("category has products")
 	ErrProductNotFound  = errors.New("product not found")
 	ErrSKUNotFound      = errors.New("sku not found")
+	ErrSKUInUse         = errors.New("sku in use")
+	ErrSKUStockChanged  = errors.New("sku stock changed")
 	ErrInvalidInput     = errors.New("invalid input")
 )
 
@@ -67,7 +69,7 @@ type Service interface {
 	UnpublishProduct(ctx context.Context, id int64) error
 
 	CreateSKU(ctx context.Context, productID int64, specs json.RawMessage, price int64, stock int) (*model.SKU, error)
-	UpdateSKU(ctx context.Context, id int64, specs json.RawMessage, price int64, stock int) error
+	UpdateSKU(ctx context.Context, id int64, specs json.RawMessage, price int64, stock, expectedStock int) error
 	DeleteSKU(ctx context.Context, id int64) error
 	// ListAllProducts 后台商品列表（T25）：可选类目/状态筛选 + 分页，
 	// 与 ListProducts 的区别是不过滤上架状态（admin 需管理草稿/下架商品）。
@@ -84,6 +86,8 @@ type Service interface {
 	GetSKU(ctx context.Context, id int64) (*model.SKU, error)
 	// GetProduct 供购物车直读状态、秒杀页读取 SPU 标题等摘要信息。
 	GetProduct(ctx context.Context, id int64) (*model.Product, error)
+	// GetSKUSummaries 批量返回 SKU 与所属商品标题，供其他模块构建读模型。
+	GetSKUSummaries(ctx context.Context, ids []int64) (map[int64]model.SKUSummary, error)
 	// GetSKUForUpdate 在订单事务内锁定 SKU 并校验商品仍上架，供订单固化成交价。
 	GetSKUForUpdate(ctx context.Context, tx *transaction.Handle, id int64) (*model.SKU, error)
 	// DeductStock 事务内条件扣减库存（stock>=N 防超卖），供 order 模块下单调用。
@@ -242,9 +246,12 @@ func (s *productService) CreateSKU(ctx context.Context, productID int64, specs j
 	return sku, nil
 }
 
-func (s *productService) UpdateSKU(ctx context.Context, id int64, specs json.RawMessage, price int64, stock int) error {
+func (s *productService) UpdateSKU(ctx context.Context, id int64, specs json.RawMessage, price int64, stock, expectedStock int) error {
 	if err := validateSKU(specs, price, stock); err != nil {
 		return err
+	}
+	if expectedStock < 0 {
+		return fmt.Errorf("%w: invalid expected_stock", ErrInvalidInput)
 	}
 	sku, err := s.store.SKU.GetByID(ctx, id)
 	if err != nil {
@@ -254,7 +261,14 @@ func (s *productService) UpdateSKU(ctx context.Context, id int64, specs json.Raw
 		return ErrSKUNotFound
 	}
 	return s.withDetailMutation(ctx, sku.ProductID, func() error {
-		return s.store.SKU.Update(ctx, &model.SKU{ID: id, Specs: specs, Price: price, Stock: stock})
+		updated, err := s.store.SKU.Update(ctx, &model.SKU{ID: id, Specs: specs, Price: price, Stock: stock}, expectedStock)
+		if err != nil {
+			return err
+		}
+		if !updated {
+			return ErrSKUStockChanged
+		}
+		return nil
 	})
 }
 
@@ -267,12 +281,30 @@ func (s *productService) DeleteSKU(ctx context.Context, id int64) error {
 		return ErrSKUNotFound
 	}
 	return s.withDetailMutation(ctx, sku.ProductID, func() error {
-		return s.store.SKU.Delete(ctx, id)
+		if err := s.store.SKU.Delete(ctx, id); err != nil {
+			if errors.Is(err, repository.ErrSKUInUse) {
+				return ErrSKUInUse
+			}
+			return err
+		}
+		return nil
 	})
 }
 
 func (s *productService) ListCategories(ctx context.Context) ([]model.Category, error) {
 	return s.store.Category.List(ctx)
+}
+
+func (s *productService) GetSKUSummaries(ctx context.Context, ids []int64) (map[int64]model.SKUSummary, error) {
+	rows, err := s.store.SKU.ListSummariesByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int64]model.SKUSummary, len(rows))
+	for i := range rows {
+		byID[rows[i].ID] = rows[i]
+	}
+	return byID, nil
 }
 
 func (s *productService) ListProducts(ctx context.Context, categoryID *int64, page, pageSize int) ([]model.Product, int64, error) {

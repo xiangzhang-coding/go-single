@@ -481,7 +481,7 @@ function SKUForm({
         stock: Number(form.stock),
       };
       return initial
-        ? adminApi.updateSKU(initial.id, request).then(() => undefined)
+        ? adminApi.updateSKU(initial.id, { ...request, expected_stock: initial.stock }).then(() => undefined)
         : adminApi.createSKU(productId, request).then(() => undefined);
     },
     onSuccess: () => {

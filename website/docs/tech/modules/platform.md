@@ -12,7 +12,7 @@ sidebar_position: 11
 
 | 组件 | 职责 | 关键点 |
 | --- | --- | --- |
-| config | viper 加载 `configs/config.yaml` + 环境变量覆盖（`GO_SINGLE_*`，如 `GO_SINGLE_AUTH_SECRET`） | 含默认值（port 8080、request_timeout 5s、JSON 64 KiB、JWT 2h、上传配额 512 MiB/1000 个等） |
+| config | viper 加载 `configs/config.yaml` + 环境变量覆盖（`GO_SINGLE_*`，如 `GO_SINGLE_AUTH_SECRET`） | 含默认值（port 8080、JSON request_timeout 5s、上传 request_timeout 2min、JSON 64 KiB、JWT 2h、上传配额 512 MiB/1000 个等） |
 | logger | zap 结构化 JSON 输出（stdout） | `log.file` 非空时同内容镜像写入文件（promtail 采集进 Loki）；父目录自动创建 |
 | metrics | Prometheus 指标注册器（独立 registry，内置 go_*/process_* 采集器） | HTTP 三件套（`http_requests_total` QPS / `http_request_duration_seconds` 延迟直方图 50/90/99 / `http_errors_total` 4xx/5xx）+ `http_requests_active` gauge；**业务指标**（T19c）见下；`/metrics` 端点（中间件不计自身抓取流量） |
 | auth | JWT 自签（HS256）+ bcrypt | `TokenVerifier` 接口（轻量 seam，非 ADR-0003 三类）；`Middleware`（Bearer 解析 → 401）+ `RequireAdmin`（→ 403）；JWT 有效期 2h，无 refresh |
@@ -22,7 +22,7 @@ sidebar_position: 11
 | mq | RabbitMQ 消息层（ADR-0003 seam） | 发布确认（publisher confirm）+ 持久化消息；队列自动声明（幂等）+ **死信队列 `<queue>.dlq`**；消费端 QoS 预取 1、单条消息超时 15s；Ack / Nack 重投（瞬时）/ Nack 拒收进死信（`ErrPermanent`）；**消费者熔断**（gobreaker，连续失败打开→半开探活，仅包消费） |
 | cache | Redis 缓存层（ADR-0003 seam） | 接口隔离 go-redis；订单幂等、领券/计数重建、秒杀预热/预扣/回补、固定窗口计数均以类型化能力暴露，Lua 文本与返回码协议仅存在于适配器内 |
 | ws | WebSocket 实时通道 | Hub 管理在线连接（userID → 连接集合）；JWT 经 `Sec-WebSocket-Protocol` 鉴权并在到期时主动关闭；单进程总连接/单用户/单来源 IP 配额；`PushToUser` 单向推送（缓冲满 = 慢消费者，关闭连接）；心跳保活（Ping 30s / pong_wait 2× / 写超时 10s） |
-| file | MinIO 私有媒体代理 | `POST /api/files`（multipart `file` + `kind=image/file`，Bearer）在解析前限制 21 MiB、仅保留 1 MiB 内存；图片魔数白名单 png/jpeg/webp/gif + ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD + ≤20 MiB；MySQL 原子预留每用户累计字节/对象数配额；`GET /api/files/:reference` 鉴权代理读取，非上传者由头像/好友圈/聊天业务动态授权；桶匿名不可读，浏览器不直连 MinIO |
+| file | MinIO 私有媒体代理 | `POST /api/files`（multipart `file` + `kind=image/file`，Bearer + `Idempotency-Key`）在解析前限制 21 MiB、仅保留 1 MiB 内存；图片魔数白名单 png/jpeg/webp/gif + ≤5 MiB，普通文件限定 PDF/ZIP/TXT/CSV/MD + ≤20 MiB；MySQL 原子预留每用户累计字节/对象数配额，逐对象 pending/committed 账本支持同请求回放，并由每分钟对账清理崩溃窗口中的孤儿对象；`GET /api/files/:reference` 鉴权代理读取，非上传者由头像/好友圈/聊天业务动态授权；桶匿名不可读，浏览器不直连 MinIO |
 | snowflake | 手写雪花 ID（学习点） | 41bit 毫秒时间戳（纪元 2024-01-01）+ 10bit worker + 12bit 序列号 = 63bit int64；单实例单调递增；**时钟回拨拒绝生成**；同毫秒序列号耗尽自旋 |
 | retry | 有限重试 + 指数退避（T20） | **仅幂等操作可重试**（普通下单 / 支付回调 / 秒杀消息发布）；`retry.Stop` 标记业务拒绝不重试；退避可被 ctx 取消；默认 3 次、100ms 起、上限 1s |
 | health | 依赖连通性检查 | `/healthz`：并发探测 MySQL / Redis / MQ（2s 超时），全部正常返回 200 `ok`；任一失败返回 503 `degraded`（body 含各依赖明细） |
@@ -35,7 +35,7 @@ sidebar_position: 11
 | GET | /metrics | Prometheus 抓取（HTTP 三件套 + Go runtime + 业务指标） |
 | GET | /healthz | 依赖健康检查（mysql/redis/mq） |
 | GET | /ws | WebSocket 握手（子协议携带 JWT，见 [chat](./chat) 实时通道） |
-| POST | /api/files | 媒体上传代理（`kind` 默认 image；返回托管引用及文件元数据） |
+| POST | /api/files | 媒体上传代理（要求 `Idempotency-Key`；首次 201、重放 200；`kind` 默认 image） |
 | GET | /api/files/:reference | 私有媒体授权读取/下载（Bearer；图片 inline、普通文件 attachment） |
 
 ## 业务指标（platform/metrics Business 集合，T19c）
