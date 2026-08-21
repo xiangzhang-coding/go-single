@@ -22,6 +22,7 @@ type PreDeductionRepository interface {
 	EnsureLegacyPendingOrder(ctx context.Context, seed *model.PreDeduction) (*model.PreDeduction, error)
 	ReservationTargets(ctx context.Context, activityID, userID int64) (pendingQuantity, userQuantity int, err error)
 	PendingReservationQuantityForUpdate(ctx context.Context, tx *transaction.Handle, activityID int64) (int, error)
+	HasAcceptedReservationForUpdate(ctx context.Context, tx *transaction.Handle, activityID int64) (bool, error)
 	ListRecoverable(ctx context.Context, limit int) ([]model.PreDeduction, error)
 	ListRecoverableByActivity(ctx context.Context, activityID int64) ([]model.PreDeduction, error)
 	ListOrdered(ctx context.Context, limit int) ([]model.PreDeduction, error)

@@ -5,8 +5,9 @@ import { useEffect, useRef, useState } from "react";
 import { getFlashSalePurchase, getFlashSales, purchaseFlashSale } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import type { FlashSaleActivity, FlashSalePurchaseResponse } from "../api/types";
-import { formatMoney, formatSpecs, makeClientRequestID } from "../lib/format";
+import { formatMoney, formatSpecs } from "../lib/format";
 import { recordPollAttempt, resetPollBudget, type PollBudget } from "../lib/flashsale-poll";
+import { StableRequestIDs } from "../lib/idempotency";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, ProductVisual, Spinner } from "../components/ui";
 
 const POLL_INTERVAL_MS = 1500;
@@ -124,6 +125,7 @@ export function FlashSalePage() {
   const [purchases, setPurchases] = useState<Record<number, FlashSalePurchaseResponse>>({});
   const [errors, setErrors] = useState<Record<number, string>>({});
   const [pendingId, setPendingId] = useState<number | null>(null);
+  const [requestIDs] = useState(() => new StableRequestIDs());
 
   const listQuery = useQuery({
     queryKey: ["flash-sales"],
@@ -132,9 +134,12 @@ export function FlashSalePage() {
   });
   const serverClock = useServerClock(listQuery.data?.server_time);
 
-	const purchaseMutation = useMutation({
-		mutationFn: (activityId: number) => purchaseFlashSale(activityId, makeClientRequestID()),
-    onSuccess: (result, activityId) => {
+  const purchaseMutation = useMutation({
+    mutationFn: ({ activityId, clientRequestId }: { activityId: number; clientRequestId: string }) => (
+      purchaseFlashSale(activityId, clientRequestId)
+    ),
+    onSuccess: (result, { activityId }) => {
+      requestIDs.complete(activityId);
       setPurchases((prev) => ({ ...prev, [activityId]: result }));
       setErrors((prev) => {
         const next = { ...prev };
@@ -144,7 +149,7 @@ export function FlashSalePage() {
       setPendingId(null);
       queryClient.invalidateQueries({ queryKey: ["flash-sales"] });
     },
-    onError: (error, activityId) => {
+    onError: (error, { activityId }) => {
       setErrors((prev) => ({ ...prev, [activityId]: getApiErrorMessage(error) }));
       setPendingId(null);
     },
@@ -198,7 +203,10 @@ export function FlashSalePage() {
                   return next;
                 });
                 setPendingId(activity.id);
-                purchaseMutation.mutate(activity.id);
+                purchaseMutation.mutate({
+                  activityId: activity.id,
+                  clientRequestId: requestIDs.forOperation(activity.id),
+                });
               }}
             />
           ))}

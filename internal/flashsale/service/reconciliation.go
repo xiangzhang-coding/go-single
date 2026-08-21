@@ -155,7 +155,7 @@ func recoveryDetail(status model.PreDeductionStatus) string {
 	case model.PreDeductionStatusPendingPublish:
 		return "持久预扣待继续发布"
 	case model.PreDeductionStatusPendingOrder:
-		return "消息待落单，恢复任务将用同一订单号重投"
+		return "消息已获 broker confirm，等待落单并修复 reservation"
 	case model.PreDeductionStatusPendingRollback:
 		return "持久预扣待完整回退"
 	default:

@@ -50,6 +50,9 @@ type OrderRepository interface {
 	// MarkPaid 事务内条件更新 待支付→已支付（支付回调）；WHERE 同时校验
 	// status、pay_amount 与 expire_at（状态机 + 金额 + 期限原子兜底）。
 	MarkPaid(ctx context.Context, tx *transaction.Handle, orderNo string, payAmount int64) (bool, error)
+	// CanRecordFailedPayment performs a locking current read in the payment
+	// transaction. The row lock prevents payment/cancel from racing a failed ledger.
+	CanRecordFailedPayment(ctx context.Context, tx *transaction.Handle, orderNo string) (bool, error)
 	// Ship 事务内条件更新 已支付→已发货（admin 发货）。
 	Ship(ctx context.Context, orderNo string) (bool, error)
 	// ConfirmReceipt 事务内条件更新 已发货→已完成（用户确认收货）。

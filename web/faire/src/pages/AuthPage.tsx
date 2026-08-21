@@ -5,12 +5,11 @@ import { useMutation } from "@tanstack/react-query";
 import { authApi } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import { Icon, Button, Spinner } from "../components/ui";
-import { useAuthStore } from "../store/auth";
+import { startSession } from "../lib/session";
 
 export function AuthPage({ mode }: { mode: "login" | "register" }) {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const setSession = useAuthStore((state) => state.setSession);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -30,7 +29,7 @@ export function AuthPage({ mode }: { mode: "login" | "register" }) {
     },
     onSuccess: ({ kind, result }) => {
       if (kind === "login") {
-        setSession(result.token, result.user);
+        startSession(result.token, result.user);
         const returnTo = searchParams.get("returnTo");
         navigate(returnTo?.startsWith("/") ? returnTo : "/", { replace: true });
         return;

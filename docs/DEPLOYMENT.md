@@ -11,18 +11,42 @@
 
 | # | 项 | 本地默认 | 上线要求 |
 |---|---|---|---|
-| 1 | `auth.secret`（JWT 签名密钥） | `dev-secret-change-me` | **强随机**（≥32 字节）；泄露可伪造任意角色 token |
-| 2 | MySQL / RabbitMQ / MinIO 凭据 | `shop123` / `guest:guest` / `minioadmin` | 全部改强密码（compose 与 configs 同步） |
-| 3 | `cors.allow_origins` / `ws.allow_origins` | 空（允许所有 Origin） | 配置前端域名白名单 |
-| 4 | `server.trusted_proxies` | 回环地址 + Compose 固定 Nginx 地址 `172.30.0.10` | 改为实际反代出口 IP（client_ip 日志与 WS 来源 IP 配额才真实）；Nginx 必须覆盖而非追加 X-Forwarded-For |
-| 5 | compose 业务依赖端口（MySQL 3306 / RabbitMQ 5672 / Redis 6379 / MinIO 19000） | 0.0.0.0 | 改为私网/回环绑定，并以 ufw 只放 22/80/443 兜底 |
-| 6 | `server.mode` | `debug` | `release` |
-| 7 | Grafana / Prometheus / Loki 访问 | 默认仅绑定 `127.0.0.1`；Loki 无认证 | 只允许 VPN、私网或 SSH 隧道访问；Grafana 改强密码，禁止把 3000/9090/3100 暴露到公网 |
-| 8 | 秒杀 `worker_id` | 1 | 多实例时每实例唯一（0-1023） |
+| 1 | `auth.secret`（JWT 签名密钥） | 公开演示值 | 通过 `GO_SINGLE_AUTH_SECRET` 注入**强随机**值（≥32 字节）；release 会拒绝公开默认值或空值，错误不会回显密钥 |
+| 2 | migration 的 `admin` 种子账号 | 演示密码 | 上线前轮换密码；release 会用 bcrypt 校验并拒绝演示密码，即使该密码被重新加盐哈希，错误也不会回显密码或哈希 |
+| 3 | MySQL / Redis / RabbitMQ / MinIO 凭据 | 保留本地演示默认 | 全部用下文环境变量改为强密码，并同步应用的 `GO_SINGLE_*` 配置 |
+| 4 | `cors.allow_origins` / `ws.allow_origins` | 空（允许所有 Origin） | 配置前端域名白名单 |
+| 5 | `server.trusted_proxies` | 回环地址 + Compose 固定 Nginx 地址 `172.30.0.10` | 改为实际反代出口 IP（client_ip 日志与 WS 来源 IP 配额才真实）；Nginx 必须覆盖而非追加 X-Forwarded-For |
+| 6 | compose 业务依赖端口（MySQL 3306 / RabbitMQ 5672 / Redis 6379 / MinIO 19000） | 仅绑定 `127.0.0.1` | 保持回环绑定；不要为远程管理改成 `0.0.0.0`，并以 ufw 只放 22/80/443 兜底 |
+| 7 | `server.host` | `0.0.0.0`（供 Docker Nginx 经 host-gateway 访问） | 必须先配置防火墙封锁公网 8080；不使用容器反代时改为 `127.0.0.1` |
+| 8 | `server.mode` | `debug` | `release` |
+| 9 | Grafana / Prometheus / Loki 访问 | 默认仅绑定 `127.0.0.1`；Loki 无认证 | 只允许 VPN、私网或 SSH 隧道访问；Grafana 改强密码，禁止把 3000/9090/3100 暴露到公网 |
+| 10 | 秒杀 `worker_id` | 1 | 多实例时每实例唯一（0-1023） |
 
 WebSocket JWT 经 `Sec-WebSocket-Protocol` 而非 URL query 携带；Nginx 的 `safe` access log 不记录 query/请求头，应用 recovery 不转储请求，Promtail 的所有采集作业在写入 Loki 前再次替换 JWT。修改这些配置后只影响新日志，历史 Loki chunk 不会被重写；若旧环境曾采集 query token，应在隔离窗口轮换 `auth.secret`、按留存策略清理旧日志并验证 Loki 查询无原始凭据。
 
 Grafana、Prometheus 和 Loki 的 compose 端口默认绑定回环地址，供本机浏览器或 `ssh -L 3000:127.0.0.1:3000 <vps>` 访问。生产不要为方便排障改成 `0.0.0.0`；需要团队访问时应通过受控管理网/VPN，并在其入口增加认证和访问审计。Grafana 管理密码必须通过部署环境覆盖，不能保留 `admin/admin`。
+
+### Release 启动前检查
+
+`debug` / `test` 保留开箱即用的演示配置；`release` 在连接业务依赖前拒绝短于 32 字节或公开默认的 JWT 密钥，并在 migration 完成后用 bcrypt 检查 `admin` 是否仍使用演示密码。数据库检查失败时同样拒绝启动，避免因检查服务不可用而绕过门禁。先完成以下准备：
+
+```bash
+# 生成并注入新密钥；不要把结果写进仓库或命令输出日志。
+export GO_SINGLE_AUTH_SECRET="$(openssl rand -base64 48)"
+export GO_SINGLE_SERVER_MODE=release
+
+# 先启动数据库。全新库随后运行一次 server：migration 会完成，release 会在 HTTP 监听前按预期拒绝种子账号。
+docker compose up -d --wait mysql
+go run ./cmd/server
+
+# 安装 apache2-utils（或同等 htpasswd 工具）后生成新哈希，再进入 MySQL 交互终端。
+htpasswd -nBC 12 admin  # 交互输入新密码，只取输出中冒号后的 bcrypt 哈希
+docker compose exec mysql mysql -uroot -p go_shop
+```
+
+在交互式 MySQL 中执行 `UPDATE users SET password_hash = '<上一步生成的 bcrypt 哈希>' WHERE username = 'admin' AND role = 'admin';`，确认影响一行后退出。不要把管理员明文密码放进 SQL、shell 参数、Compose 文件或工单。若决定删除种子账号，必须先通过受控 SQL 创建并验证替代管理员，否则会失去后台管理入口。
+
+Compose 凭据可通过部署主机环境或不入库的 `.env` 覆盖，未设置时保留本地演示默认：`MYSQL_ROOT_PASSWORD`、`MYSQL_USER`、`MYSQL_PASSWORD`、`REDIS_PASSWORD`、`RABBITMQ_DEFAULT_USER`、`RABBITMQ_DEFAULT_PASS`、`MINIO_ROOT_USER`、`MINIO_ROOT_PASSWORD`、`GF_SECURITY_ADMIN_USER`、`GF_SECURITY_ADMIN_PASSWORD`。应用是宿主进程，必须同步设置 `GO_SINGLE_MYSQL_USER` / `GO_SINGLE_MYSQL_PASSWORD`、`GO_SINGLE_REDIS_PASSWORD`、`GO_SINGLE_MQ_URL`、`GO_SINGLE_MINIO_ACCESS_KEY` / `GO_SINGLE_MINIO_SECRET_KEY`。RabbitMQ 已有命名卷时修改默认用户变量不会改写既有账号，应使用 `rabbitmqctl` 在维护窗口轮换并验证后再禁用旧账号。
 
 R09 为 Nginx 固定了 Compose 地址 `172.30.0.10`，并让应用只信任该代理。已有 `deploy_default` 网络不会原地变更 IPAM；首次升级需在维护窗口执行 `docker compose down && docker compose up -d` 重建网络（命名卷会保留，严禁加 `-v`），再确认后端日志中的 `client_ip` 与外部请求源一致。生产若改 Compose 子网或使用宿主 Nginx，必须同步更新 `server.trusted_proxies`，且只填实际反代出口 IP。
 
@@ -38,7 +62,7 @@ website 构建链 `@docusaurus/mdx-loader@3.10.2 → image-size@2.0.2` 的
 
 拓扑：`浏览器 → Nginx（443 SSL 终止 + 安全头 + 静态托管）→ 后端 :8080（宿主机进程）`；80 端口仅 301 跳转 HTTPS。
 
-前置：依赖容器起好（`docker compose up -d mysql redis rabbitmq minio`）、后端在跑（`go run ./cmd/server`）、前端已构建（`cd web/faire && bun install && bun run build`）。
+前置：依赖容器起好（`docker compose up -d mysql redis rabbitmq minio`）、前端已构建（`cd web/faire && bun install && bun run build`）。默认后端监听 `0.0.0.0:8080`，供 Docker 中的 Nginx 经 host-gateway 访问宿主后端；在 VPS 启动前，先执行 `ufw insert 1 allow from 172.30.0.10 to any port 8080 proto tcp` 和 `ufw deny 8080/tcp`（或等价 nftables 规则），用外部主机确认 8080 不可达；公网安全组也只放 22/80/443。若不使用容器反代，设置 `GO_SINGLE_SERVER_HOST=127.0.0.1` 收窄监听。无法确认防火墙规则生效时不得上线。
 
 ```bash
 # 1) 生成自签证书（certs/ 不入库，有效 365 天）
@@ -96,6 +120,8 @@ curl -sk https://127.0.0.1:8443/api/products
 
 `.github/workflows/pages-deploy.yml`：main 分支的 CI 全部通过后由 `ci.yml` 调用；也可手动触发。仓库 Variables/Secrets 尚未配置时明确跳过对应发布，不影响代码质量门禁；配置完成后自动构建并 `wrangler pages deploy`。首次配置：
 
+手工触发也只允许从 `main` 运行；其他分支的 dispatch 会跳过发布。main 的生产 Pages 发布共用同一 concurrency group，新提交到达时取消旧的在途发布，避免旧提交后完成而覆盖新版本。website 在 CI 和发布工作流中都先执行 `bun run typecheck`，通过后才构建。
+
 ```bash
 # 1) 仓库 Secrets：CLOUDFLARE_API_TOKEN（Cloudflare 令牌，Pages:Edit 权限）、CLOUDFLARE_ACCOUNT_ID
 # 2) 仓库 Variables：VITE_API_BASE=https://api.example.com/api / VITE_WS_BASE=wss://api.example.com/ws
@@ -118,10 +144,10 @@ npx wrangler pages project create go-single-website
 
 ```bash
 # 1) 基础环境：安装 Docker Engine + compose 插件、ufw（只放 22/80/443）、clone 仓库
-# 2) 配置：configs/config.yaml 改 MySQL/Redis/RabbitMQ/MinIO 主机为云上地址与强密码
+# 2) 配置：用不入库环境变量注入强凭据/JWT，轮换种子管理员；server.mode=release
 # 3) 证书：Let's Encrypt（certbot --nginx 或云厂商证书），替换 deploy/nginx/certs/ 自签证书
 # 4) 起服务：docker compose up -d（mysql/redis/rabbitmq/minio/nginx + 可观测全家桶）
-# 5) 后端守护：systemd unit 跑 go 构建产物（bin/server），开机自启 + 崩溃重启
+# 5) 后端守护：systemd unit 跑 go 构建产物（bin/server）；先限制 8080 仅容器反代可达
 # 6) 域名解析：api.example.com → VPS；Pages 前端 VITE_API_BASE 设为 https://api.example.com/api
 # 7) 备份与监控：MySQL 定时 dump + Redis/RabbitMQ 卷快照；Prometheus/Grafana/Loki 已预置且仅回环可达，通过 SSH 隧道/VPN 访问
 ```
@@ -131,6 +157,8 @@ npx wrangler pages project create go-single-website
 ## 4. Redis 与 RabbitMQ 持久化运维
 
 `deploy/docker-compose.yml` 是规范编排，根目录 `docker-compose.yml` 仅作 include 入口。新部署的 Compose project 固定为 `deploy`，所有命令统一从仓库根运行；Redis/RabbitMQ 卷另用全局固定名，避免工作目录改变后选中空卷。旧环境若曾从根目录启动，project 可能是 `go_single`，首次升级必须按下节保留原 project 名，否则 MySQL、MinIO 和可观测组件的 project-scoped 卷会被误认为空卷。
+
+长期运行的 Compose 服务均使用 `restart: unless-stopped`。MySQL 与 MinIO 复用 CI 验证的固定 tag+digest，Redis/RabbitMQ 同样固定 digest，Nginx 及可观测组件使用明确版本 tag；升级必须显式修改编排并按本节备份、单服务验证流程执行，不能依赖 `latest` 或大版本浮动标签。
 
 | 服务 | 命名卷与数据目录 | 持久化策略 | 恢复目标 |
 |---|---|---|---|

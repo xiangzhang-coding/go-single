@@ -6,11 +6,31 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/user/model"
 )
 
+type DeleteAddressResult uint8
+
+const (
+	DeleteAddressDeleted DeleteAddressResult = iota + 1
+	DeleteAddressNotFound
+	DeleteAddressForbidden
+)
+
+type SetDefaultAddressResult uint8
+
+const (
+	SetDefaultAddressSet SetDefaultAddressResult = iota + 1
+	SetDefaultAddressNotFound
+	SetDefaultAddressForbidden
+)
+
 // AddressRepository 地址簿数据访问接口。
 type AddressRepository interface {
-	Create(ctx context.Context, a *model.Address) error
+	// CreateWithDefault serializes a user's address mutations, creates the row,
+	// and atomically assigns the first or explicitly requested default.
+	CreateWithDefault(ctx context.Context, a *model.Address, requestedDefault bool) (isDefault bool, err error)
 	Update(ctx context.Context, a *model.Address) error
-	Delete(ctx context.Context, id int64) error
+	// DeleteAndEnsureDefault validates ownership, deletes the row, and promotes
+	// the newest remaining address in one transaction.
+	DeleteAndEnsureDefault(ctx context.Context, userID, id int64) (DeleteAddressResult, error)
 	// GetByID 读取单条地址。
 	GetByID(ctx context.Context, id int64) (*model.Address, error)
 	// GetDefaultAddress 读取用户默认地址（JOIN users.default_address_id 指针）；
@@ -18,10 +38,7 @@ type AddressRepository interface {
 	GetDefaultAddress(ctx context.Context, userID int64) (*model.Address, error)
 	// ListByUser 我的地址列表（JOIN users 派生 is_default 标记，默认地址排最前）。
 	ListByUser(ctx context.Context, userID int64) ([]model.Address, error)
-	CountByUser(ctx context.Context, userID int64) (int64, error)
-	// SetDefault 原子切换默认指向（单条 UPDATE users，唯一性由构造保证）。
-	SetDefault(ctx context.Context, userID, addressID int64) error
-	// EnsureDefaultExists 删除默认地址后的自愈：无默认指向且仍有地址时，
-	// 将最新一条设为默认（幂等，非默认删除时为空操作）。
-	EnsureDefaultExists(ctx context.Context, userID int64) error
+	// SetDefaultOwned serializes with create/delete, validates ownership, and
+	// atomically switches the user's default pointer.
+	SetDefaultOwned(ctx context.Context, userID, addressID int64) (SetDefaultAddressResult, error)
 }

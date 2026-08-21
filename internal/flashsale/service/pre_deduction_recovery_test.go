@@ -131,6 +131,22 @@ func (f *fakePreDeductions) PendingReservationQuantityForUpdate(ctx context.Cont
 	return pending, err
 }
 
+func (f *fakePreDeductions) HasAcceptedReservationForUpdate(_ context.Context, _ *transaction.Handle, activityID int64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, pd := range f.byID {
+		if pd.ActivityID != activityID {
+			continue
+		}
+		switch pd.Status {
+		case model.PreDeductionStatusPendingPublish, model.PreDeductionStatusPendingOrder,
+			model.PreDeductionStatusOrdered, model.PreDeductionStatusPendingRollback:
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *fakePreDeductions) ListRecoverable(context.Context, int) ([]model.PreDeduction, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -164,7 +180,7 @@ func (f *fakePreDeductions) ListOrdered(context.Context, int) ([]model.PreDeduct
 	defer f.mu.Unlock()
 	var out []model.PreDeduction
 	for _, p := range f.byID {
-		if p.Status == model.PreDeductionStatusOrdered {
+		if p.Status == model.PreDeductionStatusOrdered && p.ReservationReleasedAt == nil {
 			out = append(out, *p)
 		}
 	}
@@ -295,6 +311,42 @@ type recoveryFixture struct {
 	pd   *fakePreDeductions
 }
 
+type racingConfirmPublisher struct {
+	mu            sync.Mutex
+	calls         int
+	firstStarted  chan struct{}
+	secondStarted chan struct{}
+	releaseFirst  chan struct{}
+}
+
+func newRacingConfirmPublisher() *racingConfirmPublisher {
+	return &racingConfirmPublisher{
+		firstStarted: make(chan struct{}), secondStarted: make(chan struct{}), releaseFirst: make(chan struct{}),
+	}
+}
+
+func (p *racingConfirmPublisher) Publish(context.Context, string, []byte) error {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	p.mu.Unlock()
+	if call == 1 {
+		close(p.firstStarted)
+		<-p.releaseFirst
+		return nil
+	}
+	if call == 2 {
+		close(p.secondStarted)
+	}
+	return errors.New("later confirm failed")
+}
+
+func (p *racingConfirmPublisher) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
 func newRecoveryFixture(pub *fakePublisher, nos OrderNoGenerator) *recoveryFixture {
 	base := newFixture()
 	if pub == nil {
@@ -317,6 +369,55 @@ func (fx *recoveryFixture) publishedActivity(t *testing.T) *model.Activity {
 	a := fx.base.createActivity(t, nil)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
 	return a
+}
+
+func TestUpdateOfflineActivityRejectsAcceptedUnsettledReservations(t *testing.T) {
+	tests := []struct {
+		name       string
+		publishErr error
+		wantStatus model.PreDeductionStatus
+	}{
+		{name: "pending publish", publishErr: errors.New("confirm unavailable"), wantStatus: model.PreDeductionStatusPendingPublish},
+		{name: "pending order", wantStatus: model.PreDeductionStatusPendingOrder},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pub := &fakePublisher{err: tt.publishErr}
+			fx := newRecoveryFixture(pub, nil)
+			a := fx.publishedActivity(t)
+			result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "accepted-before-edit")
+			require.NoError(t, err)
+			require.Equal(t, tt.wantStatus, result.Status)
+			require.NoError(t, fx.svc.UnpublishActivity(context.Background(), a.ID))
+			pub.err = nil
+
+			err = fx.svc.UpdateActivity(context.Background(), a.ID, ActivityParams{
+				SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: a.Stock,
+				PerUserLimit: a.PerUserLimit,
+				StartAt:      time.Now().Add(time.Hour),
+				EndAt:        time.Now().Add(2 * time.Hour),
+			})
+			require.ErrorIs(t, err, ErrReservationsUnsettled)
+
+			stored, getErr := fx.base.acts.GetByID(context.Background(), a.ID)
+			require.NoError(t, getErr)
+			require.True(t, stored.StartAt.Before(time.Now()), "rejected edit must not move the activity window")
+			require.NotContains(t, fx.base.cache.stock, stockKey(a.ID), "rejected edit must not rewarm full stock")
+		})
+	}
+}
+
+func TestRepublishOfflineActivitySubtractsAcceptedReservations(t *testing.T) {
+	fx := newRecoveryFixture(nil, nil)
+	a := fx.publishedActivity(t)
+	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "accepted-before-republish")
+	require.NoError(t, err)
+	require.Equal(t, model.PreDeductionStatusPendingOrder, result.Status)
+	require.NoError(t, fx.svc.UnpublishActivity(context.Background(), a.ID))
+
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	require.Equal(t, a.Stock-1, fx.base.cache.stock[stockKey(a.ID)],
+		"republish must not expose stock reserved by an accepted pre-deduction")
 }
 
 func TestSeckillPersistsLifecycleAndPublishesStableIdentity(t *testing.T) {
@@ -459,22 +560,72 @@ func TestPublishRecoveryExhaustionCompletesRollback(t *testing.T) {
 	require.Equal(t, 100, fx.base.cache.stock[stockKey(a.ID)])
 }
 
-func TestPendingOrderRepublishFailureDoesNotRollbackConfirmedMessage(t *testing.T) {
+func TestPendingOrderRecoveryRepairsReservationWithoutRepublishing(t *testing.T) {
 	fx := newRecoveryFixture(nil, nil)
 	a := fx.publishedActivity(t)
 	result, err := fx.svc.Seckill(context.Background(), 42, a.ID, "recovery")
 	require.NoError(t, err)
 	require.Equal(t, model.PreDeductionStatusPendingOrder, result.Status)
-	fx.base.pub.err = errors.New("rabbitmq unavailable")
+	initialPublishes := fx.base.pub.attemptsCount()
+	delete(fx.base.cache.stock, stockKey(a.ID))
+	delete(fx.base.cache.count, countKey(a.ID, 42))
+	delete(fx.base.cache.idem, slotIdemKey(a.ID, 42, result.PreDeductionID))
+	delete(fx.base.cache.idemToken, slotIdemKey(a.ID, 42, result.PreDeductionID))
+	delete(fx.base.cache.reservations, reservationKey(result.PreDeductionID))
 
-	for range maxPublishAttempts + 2 {
-		_, err = fx.svc.RecoverPreDeductions(context.Background())
-		require.NoError(t, err)
-	}
+	stats, err := fx.svc.RecoverPreDeductions(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, stats.Published)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, initialPublishes, fx.base.pub.attemptsCount(),
+		"a broker-confirmed message must never be republished by recovery")
 	pd, err := fx.pd.GetByID(context.Background(), result.PreDeductionID)
 	require.NoError(t, err)
-	require.Equal(t, model.PreDeductionStatusPendingOrder, pd.Status,
-		"a broker-confirmed message must wait for consumption instead of being rolled back by republish failures")
+	require.Equal(t, model.PreDeductionStatusPendingOrder, pd.Status)
+	require.Equal(t, 99, fx.base.cache.stock[stockKey(a.ID)])
+	require.Equal(t, 1, fx.base.cache.count[countKey(a.ID, 42)])
+	require.Equal(t, pd.ReservationToken(), fx.base.cache.reservations[reservationKey(pd.ID)])
+}
+
+func TestConcurrentRecoverySerializesPublishByPreDeductionID(t *testing.T) {
+	fx := newRecoveryFixture(nil, nil)
+	a := fx.publishedActivity(t)
+	orderNo := "concurrent-confirm"
+	pd := &model.PreDeduction{
+		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo, SKUID: a.SKUID, Price: a.Price, Quantity: 1,
+		Status: model.PreDeductionStatusPendingPublish, PublishAttempts: maxPublishAttempts - 1,
+	}
+	require.NoError(t, fx.pd.Create(context.Background(), pd))
+	fx.base.cache.stock[stockKey(a.ID)] = a.Stock - 1
+	fx.base.cache.count[countKey(a.ID, pd.UserID)] = 1
+	fx.base.cache.idem[slotIdemKey(a.ID, pd.UserID, pd.PurchaseSlot)] = true
+	fx.base.cache.idemToken[slotIdemKey(a.ID, pd.UserID, pd.PurchaseSlot)] = pd.ReservationToken()
+	fx.base.cache.reservations[reservationKey(pd.ID)] = pd.ReservationToken()
+
+	pub := newRacingConfirmPublisher()
+	svc := New(repository.Store{Activities: fx.base.acts, PreDeductions: fx.pd, Tx: fx.base.acts},
+		fx.base.products, fx.base.cache, limiter.RedisCounterConfig{}, pub, &fakeNos{}, metrics.New().Business())
+	done := make(chan error, 2)
+	go func() { done <- svc.RecoverPreDeduction(context.Background(), pd.ID) }()
+	<-pub.firstStarted
+	go func() { done <- svc.RecoverPreDeduction(context.Background(), pd.ID) }()
+
+	secondPublished := false
+	select {
+	case <-pub.secondStarted:
+		secondPublished = true
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(pub.releaseFirst)
+	require.NoError(t, <-done)
+	require.NoError(t, <-done)
+	require.False(t, secondPublished, "the second recovery must wait, reload pending_order, and skip publish")
+	require.Equal(t, 1, pub.callCount())
+
+	stored, err := fx.pd.GetByID(context.Background(), pd.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.PreDeductionStatusPendingOrder, stored.Status)
+	require.Equal(t, maxPublishAttempts-1, stored.PublishAttempts)
 }
 
 func TestRecoveryStopsWhenContextIsCancelled(t *testing.T) {

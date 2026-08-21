@@ -210,6 +210,9 @@ func (stubCoupons) GetUsable(context.Context, int64, int64) (*couponmodel.UserCo
 func (stubCoupons) UseCoupon(context.Context, *transaction.Handle, int64, int64) error {
 	return nil
 }
+func (stubCoupons) RedeemForOrder(context.Context, *transaction.Handle, int64, int64, int64) (couponmodel.CouponRedemption, error) {
+	return couponmodel.CouponRedemption{}, nil
+}
 func (stubCoupons) RollbackCoupon(context.Context, *transaction.Handle, int64, int64) error {
 	return nil
 }

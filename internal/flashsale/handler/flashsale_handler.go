@@ -231,7 +231,7 @@ func writeError(c *gin.Context, err error) {
 		httpresponse.Rule{Status: http.StatusBadRequest, Errors: []error{service.ErrInvalidInput}},
 		httpresponse.Rule{Status: http.StatusNotFound, Errors: []error{service.ErrActivityNotFound, service.ErrPreDeductionNotFound}},
 		httpresponse.Rule{Status: http.StatusConflict, Errors: []error{
-			service.ErrStockIncreaseInProgress, service.ErrActivityFieldsLocked,
+			service.ErrStockIncreaseInProgress, service.ErrActivityFieldsLocked, service.ErrActivityEnded,
 			service.ErrStockBelowAcceptedReservations, service.ErrReservationsUnsettled,
 			service.ErrNotInWindow, service.ErrSoldOut, service.ErrLimitReached, service.ErrOffline,
 		}},

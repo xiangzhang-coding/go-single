@@ -33,6 +33,7 @@ import (
 	cartrepo "github.com/xiangzhang-coding/go-single/internal/cart/repository"
 	cartsvc "github.com/xiangzhang-coding/go-single/internal/cart/service"
 	couponhandler "github.com/xiangzhang-coding/go-single/internal/coupon/handler"
+	couponmodel "github.com/xiangzhang-coding/go-single/internal/coupon/model"
 	couponrepo "github.com/xiangzhang-coding/go-single/internal/coupon/repository"
 	couponsvc "github.com/xiangzhang-coding/go-single/internal/coupon/service"
 	orderhandler "github.com/xiangzhang-coding/go-single/internal/order/handler"
@@ -699,6 +700,49 @@ func TestOrderCouponThresholdAndAmount(t *testing.T) {
 		}
 	}
 	require.True(t, found, "下单后券应为 used")
+}
+
+func TestOrderCouponSettlementSerializesWithTemplateUpdate(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("cpnlock"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 10000, 2)
+	couponID := thresholdCoupon(t, env, token, 1000, 5000)
+
+	var templateID int64
+	require.NoError(t, env.gdb.Table("user_coupons").
+		Where("id = ?", couponID).Select("template_id").Scan(&templateID).Error)
+
+	adminTx := env.gdb.Begin()
+	require.NoError(t, adminTx.Error)
+	t.Cleanup(func() { _ = adminTx.Rollback().Error })
+	var lockedID int64
+	require.NoError(t, adminTx.Raw("SELECT id FROM coupon_templates WHERE id = ? FOR UPDATE", templateID).Scan(&lockedID).Error)
+	require.Equal(t, templateID, lockedID)
+	require.NoError(t, adminTx.Model(&couponmodel.CouponTemplate{}).
+		Where("id = ?", templateID).Update("value", 2500).Error)
+
+	type response struct {
+		w    *httptest.ResponseRecorder
+		body map[string]any
+	}
+	result := make(chan response, 1)
+	go func() {
+		w, body := createOrder(t, env, token, uniqueName("coupon-template-update"), addrID, skuID, 1, couponID)
+		result <- response{w: w, body: body}
+	}()
+
+	select {
+	case got := <-result:
+		t.Fatalf("模板更新事务尚未提交，订单结算不应使用事务外模板快照: status=%d body=%s", got.w.Code, got.w.Body.String())
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	require.NoError(t, adminTx.Commit().Error)
+	got := <-result
+	require.Equal(t, http.StatusCreated, got.w.Code, got.w.Body.String())
+	require.Equal(t, float64(2500), got.body["discount_amount"], "应使用先提交的管理员模板值")
+	require.Equal(t, float64(7500), got.body["pay_amount"])
 }
 
 // 取消待支付订单：回补库存 + 回退券；确认收货前状态机拦截；非 owner 拒绝。

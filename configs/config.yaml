@@ -1,4 +1,6 @@
 server:
+  # Docker Nginx 需经 host-gateway 访问；VPS 必须用防火墙封锁公网 8080。
+  host: 0.0.0.0
   port: 8080
   mode: debug
   # 单请求全链路超时（HTTP → service → 存储/MQ）：依赖超时快速失败（504）。

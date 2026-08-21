@@ -28,7 +28,8 @@ import { AdminLayout } from "./pages/admin/AdminLayout";
 import { AdminOrdersPage } from "./pages/admin/AdminOrdersPage";
 import { AdminProductsPage } from "./pages/admin/AdminProductsPage";
 import { useChatRealtime } from "./lib/chat-hooks";
-import { endSession } from "./lib/session";
+import { AUTH_SESSION_KEY, parseStoredSession } from "./lib/auth-storage";
+import { endSession, syncSessionFromStorage } from "./lib/session";
 import { useAuthStore } from "./store/auth";
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -69,8 +70,17 @@ function GuestRoute({ children }: { children: ReactNode }) {
 function SessionEvents() {
   useEffect(() => {
     const handleSessionExpired = () => endSession();
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === AUTH_SESSION_KEY) {
+        syncSessionFromStorage(parseStoredSession(event.newValue));
+      }
+    };
     window.addEventListener("faire:session-expired", handleSessionExpired);
-    return () => window.removeEventListener("faire:session-expired", handleSessionExpired);
+    window.addEventListener("storage", handleStorage);
+    return () => {
+      window.removeEventListener("faire:session-expired", handleSessionExpired);
+      window.removeEventListener("storage", handleStorage);
+    };
   }, []);
 
   return null;

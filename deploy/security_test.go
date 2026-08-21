@@ -91,6 +91,67 @@ func TestMonitoringPortsBindToLoopbackByDefault(t *testing.T) {
 	}
 }
 
+func TestDataServicePortsBindToLoopbackByDefault(t *testing.T) {
+	type composeConfig struct {
+		Services map[string]struct {
+			Ports []string `yaml:"ports"`
+		} `yaml:"services"`
+	}
+
+	content, err := os.ReadFile("docker-compose.yml")
+	require.NoError(t, err)
+	var cfg composeConfig
+	require.NoError(t, yaml.Unmarshal(content, &cfg))
+	for _, service := range []string{"mysql", "redis", "rabbitmq", "minio"} {
+		ports := cfg.Services[service].Ports
+		require.NotEmpty(t, ports, service)
+		for _, port := range ports {
+			require.True(t, strings.HasPrefix(port, "127.0.0.1:"), "%s 端口默认必须仅绑定回环地址: %s", service, port)
+		}
+	}
+}
+
+func TestLongRunningServicesUsePinnedImagesAndRestartPolicy(t *testing.T) {
+	type serviceConfig struct {
+		Image   string `yaml:"image"`
+		Restart string `yaml:"restart"`
+	}
+	type composeConfig struct {
+		Services map[string]serviceConfig `yaml:"services"`
+	}
+
+	content, err := os.ReadFile("docker-compose.yml")
+	require.NoError(t, err)
+	var cfg composeConfig
+	require.NoError(t, yaml.Unmarshal(content, &cfg))
+	for name, service := range cfg.Services {
+		require.Equal(t, "unless-stopped", service.Restart, name)
+		require.NotContains(t, service.Image, ":latest", name)
+	}
+	require.Contains(t, cfg.Services["mysql"].Image, "mysql:8.4.6@sha256:")
+	require.Contains(t, cfg.Services["minio"].Image, "minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:")
+	require.Contains(t, cfg.Services["nginx"].Image, "nginx:1.27.5-alpine")
+}
+
+func TestLocalCredentialsAllowEnvironmentOverrides(t *testing.T) {
+	content, err := os.ReadFile("docker-compose.yml")
+	require.NoError(t, err)
+	compose := string(content)
+
+	for _, setting := range []string{
+		"${MYSQL_ROOT_PASSWORD:-root123}",
+		"${MYSQL_PASSWORD:-shop123}",
+		"${REDIS_PASSWORD:-}",
+		"${RABBITMQ_DEFAULT_USER:-guest}",
+		"${RABBITMQ_DEFAULT_PASS:-guest}",
+		"${MINIO_ROOT_USER:-minioadmin}",
+		"${MINIO_ROOT_PASSWORD:-minioadmin}",
+		"${GF_SECURITY_ADMIN_PASSWORD:-admin}",
+	} {
+		require.Contains(t, compose, setting)
+	}
+}
+
 func TestNginxUsesDedicatedTrustedProxyAddress(t *testing.T) {
 	compose, err := os.ReadFile("docker-compose.yml")
 	require.NoError(t, err)
@@ -124,6 +185,38 @@ func TestPagesDeploymentRunsAfterSuccessfulCI(t *testing.T) {
 	require.NoError(t, err)
 	ciWorkflow := string(ci)
 	require.Regexp(t, regexp.MustCompile(`(?s)deploy-pages:.*?needs: lint-and-test.*?uses: \./\.github/workflows/pages-deploy\.yml`), ciWorkflow)
+}
+
+func TestPagesManualDeploymentOnlyRunsForMainAndCancelsStaleRuns(t *testing.T) {
+	pages, err := os.ReadFile("../.github/workflows/pages-deploy.yml")
+	require.NoError(t, err)
+	workflow := string(pages)
+
+	require.Contains(t, workflow, "github.ref == 'refs/heads/main'")
+	require.Regexp(t, regexp.MustCompile(`(?s)concurrency:.*?group: pages-production-\$\{\{ github.ref \}\}.*?cancel-in-progress: true`), workflow)
+}
+
+func TestWebsiteTypecheckRunsBeforeBuild(t *testing.T) {
+	ci, err := os.ReadFile("../.github/workflows/ci.yml")
+	require.NoError(t, err)
+	ciWorkflow := string(ci)
+	ciTypecheck := strings.Index(ciWorkflow, "bun run typecheck")
+	ciWebsiteBuild := strings.Index(ciWorkflow, "cd ../../website && bun run build")
+	require.NotEqual(t, -1, ciTypecheck)
+	require.NotEqual(t, -1, ciWebsiteBuild)
+	require.Less(t, ciTypecheck, ciWebsiteBuild)
+
+	pages, err := os.ReadFile("../.github/workflows/pages-deploy.yml")
+	require.NoError(t, err)
+	workflow := string(pages)
+	websiteJobStart := strings.Index(workflow, "deploy-website:")
+	require.NotEqual(t, -1, websiteJobStart)
+	websiteJob := workflow[websiteJobStart:]
+	typecheck := strings.Index(websiteJob, "bun run typecheck")
+	build := strings.Index(websiteJob, "bun run build")
+	require.NotEqual(t, -1, typecheck)
+	require.NotEqual(t, -1, build)
+	require.Less(t, typecheck, build)
 }
 
 func TestPagesDeploymentSkipsWhenRepositoryConfigurationIsMissing(t *testing.T) {

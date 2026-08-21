@@ -67,3 +67,10 @@ type UserCouponView struct {
 	UsedAt     *time.Time `json:"used_at,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 }
+
+// CouponRedemption is the immutable coupon value returned to order settlement
+// after the authoritative coupon facts have been locked and redeemed.
+type CouponRedemption struct {
+	CouponID int64
+	Value    int64
+}

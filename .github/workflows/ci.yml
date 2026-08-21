@@ -116,10 +116,16 @@ jobs:
           cd ../../website && bun install --frozen-lockfile
 
       - name: 前端与部署契约测试
-        run: bun test scripts/*.test.ts
+        run: |
+          bun test scripts/*.test.ts
+          cd web/faire && bun test scripts/*.test.ts
 
       - name: 前端依赖审计（精确允许列表）
         run: bun run scripts/frontend-audit.ts
+
+      - name: website 类型检查
+        working-directory: website
+        run: bun run typecheck
 
       - name: 前端构建（web/faire + website）
         run: |

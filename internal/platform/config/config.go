@@ -11,6 +11,8 @@ import (
 // envPrefix 使全部配置项可被环境变量覆盖（GO_SINGLE_MYSQL_HOST 等）。
 const envPrefix = "GO_SINGLE"
 
+const defaultJWTSecret = "dev-secret-change-me"
+
 // Config 全量配置，从 configs/config.yaml 加载，环境变量可覆盖。
 type Config struct {
 	Server     Server
@@ -106,6 +108,8 @@ type Snowflake struct {
 }
 
 type Server struct {
+	// Host HTTP 监听地址；Docker Nginx 需要宿主可达，VPS 必须以防火墙限制 8080。
+	Host string `mapstructure:"host"`
 	Port int
 	Mode string
 	// RequestTimeout 单请求全链路超时（T20）：HTTP handler → service → 存储/MQ
@@ -209,10 +213,25 @@ func LoadFrom(paths ...string) (*Config, error) {
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("解析配置: %w", err)
 	}
+	if err := cfg.validateForStartup(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }
 
+func (c Config) validateForStartup() error {
+	if c.Server.Mode != "release" {
+		return nil
+	}
+	secret := strings.TrimSpace(c.Auth.Secret)
+	if secret == defaultJWTSecret || len([]byte(secret)) < 32 {
+		return fmt.Errorf("release 模式拒绝默认 JWT 签名密钥；请通过 GO_SINGLE_AUTH_SECRET 注入至少 32 字节的强随机密钥")
+	}
+	return nil
+}
+
 func setDefaults(v *viper.Viper) {
+	v.SetDefault("server.host", "0.0.0.0")
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.mode", "debug")
 	v.SetDefault("server.request_timeout", "5s")
@@ -236,7 +255,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("minio.bucket", "go-shop")
 	v.SetDefault("minio.use_ssl", false)
 	v.SetDefault("migrations.path", "./migrations")
-	v.SetDefault("auth.secret", "dev-secret-change-me")
+	v.SetDefault("auth.secret", defaultJWTSecret)
 	v.SetDefault("auth.ttl", "2h")
 	v.SetDefault("auth.login_rate_limit.per_ip_max", 20)
 	v.SetDefault("auth.login_rate_limit.per_account_max", 10)

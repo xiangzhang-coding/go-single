@@ -38,6 +38,108 @@ func TestRabbitMQUnavailable(t *testing.T) {
 	require.Error(t, err)
 }
 
+type recordingAcknowledger struct {
+	mu          sync.Mutex
+	nackCalls   int
+	nackRequeue bool
+}
+
+func (a *recordingAcknowledger) Ack(uint64, bool) error { return nil }
+
+func (a *recordingAcknowledger) Nack(_ uint64, _ bool, requeue bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.nackCalls++
+	a.nackRequeue = requeue
+	return nil
+}
+
+func (a *recordingAcknowledger) Reject(uint64, bool) error { return nil }
+
+func (a *recordingAcknowledger) nackState() (int, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.nackCalls, a.nackRequeue
+}
+
+func TestConsumeOneWaitsBeforeRequeue(t *testing.T) {
+	tests := []struct {
+		name       string
+		handlerErr error
+	}{
+		{name: "transient handler error", handlerErr: errors.New("transient db error")},
+		{name: "open circuit", handlerErr: fmt.Errorf("%w: queue orders", ErrCircuitOpen)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			acknowledger := &recordingAcknowledger{}
+			delivery := amqp.Delivery{Acknowledger: acknowledger, DeliveryTag: 1}
+			backoffStarted := make(chan struct{})
+			releaseBackoff := make(chan struct{})
+			done := make(chan error, 1)
+
+			go func() {
+				done <- consumeOne(context.Background(), delivery, func(context.Context, []byte) error {
+					return tc.handlerErr
+				}, func(ctx context.Context) error {
+					close(backoffStarted)
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-releaseBackoff:
+						return nil
+					}
+				})
+			}()
+
+			select {
+			case <-backoffStarted:
+			case <-time.After(time.Second):
+				t.Fatal("瞬时失败后未进入重投退避")
+			}
+			nackCalls, _ := acknowledger.nackState()
+			require.Zero(t, nackCalls, "退避完成前不得 Nack 重投")
+
+			close(releaseBackoff)
+			require.NoError(t, <-done)
+			nackCalls, requeue := acknowledger.nackState()
+			require.Equal(t, 1, nackCalls)
+			require.True(t, requeue, "瞬时失败退避后应重投")
+		})
+	}
+}
+
+func TestConsumeOneCancelInterruptsRequeueBackoff(t *testing.T) {
+	acknowledger := &recordingAcknowledger{}
+	delivery := amqp.Delivery{Acknowledger: acknowledger, DeliveryTag: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	handlerReturned := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		done <- consumeOne(ctx, delivery, func(context.Context, []byte) error {
+			close(handlerReturned)
+			return errors.New("transient db error")
+		}, waitTransientRequeue)
+	}()
+
+	select {
+	case <-handlerReturned:
+	case <-time.After(time.Second):
+		t.Fatal("handler 未返回瞬时错误")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("ctx 取消后退避未及时退出")
+	}
+	nackCalls, _ := acknowledger.nackState()
+	require.Zero(t, nackCalls, "ctx 取消后应保留未确认消息，由 channel 关闭触发重投")
+}
+
 // newTestMQ 连接测试 RabbitMQ；不可达时本地跳过、CI 失败。
 func newTestMQ(t *testing.T) MQ {
 	t.Helper()

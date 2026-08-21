@@ -5,31 +5,41 @@ package service
 import (
 	"context"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/xiangzhang-coding/go-single/internal/user/model"
+	"github.com/xiangzhang-coding/go-single/internal/user/repository"
 )
 
 // fakeAddresses 地址簿仓储 seam 的测试替身；默认唯一性模拟
 // users.default_address_id 指针语义（map[userID]addressID 一列指向一条）。
 type fakeAddresses struct {
+	mu       sync.Mutex
 	byID     map[int64]*model.Address
 	defaults map[int64]int64
 	order    int64
 }
 
-func newFakeAddresses() *fakeAddresses {
-	return &fakeAddresses{byID: map[int64]*model.Address{}, defaults: map[int64]int64{}}
-}
-
-func (f *fakeAddresses) Create(_ context.Context, a *model.Address) error {
+func (f *fakeAddresses) CreateWithDefault(_ context.Context, a *model.Address, requestedDefault bool) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.order++
 	a.ID = f.order
 	f.byID[a.ID] = a
-	return nil
+	_, hasDefault := f.defaults[a.UserID]
+	isDefault := requestedDefault || !hasDefault
+	if isDefault {
+		f.defaults[a.UserID] = a.ID
+	}
+	return isDefault, nil
+}
+
+func newFakeAddresses() *fakeAddresses {
+	return &fakeAddresses{byID: map[int64]*model.Address{}, defaults: map[int64]int64{}}
 }
 
 func (f *fakeAddresses) Update(_ context.Context, a *model.Address) error {
@@ -40,14 +50,30 @@ func (f *fakeAddresses) Update(_ context.Context, a *model.Address) error {
 	return nil
 }
 
-func (f *fakeAddresses) Delete(_ context.Context, id int64) error {
+func (f *fakeAddresses) DeleteAndEnsureDefault(_ context.Context, userID, id int64) (repository.DeleteAddressResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.byID[id]
+	if !ok {
+		return repository.DeleteAddressNotFound, nil
+	}
+	if a.UserID != userID {
+		return repository.DeleteAddressForbidden, nil
+	}
 	delete(f.byID, id)
-	for userID, def := range f.defaults {
-		if def == id {
-			delete(f.defaults, userID)
+	if f.defaults[userID] == id {
+		delete(f.defaults, userID)
+		var latest int64
+		for _, candidate := range f.byID {
+			if candidate.UserID == userID && candidate.ID > latest {
+				latest = candidate.ID
+			}
+		}
+		if latest > 0 {
+			f.defaults[userID] = latest
 		}
 	}
-	return nil
+	return repository.DeleteAddressDeleted, nil
 }
 
 func (f *fakeAddresses) GetByID(_ context.Context, id int64) (*model.Address, error) {
@@ -90,36 +116,18 @@ func (f *fakeAddresses) ListByUser(_ context.Context, userID int64) ([]model.Add
 	return list, nil
 }
 
-func (f *fakeAddresses) CountByUser(_ context.Context, userID int64) (int64, error) {
-	var n int64
-	for _, a := range f.byID {
-		if a.UserID == userID {
-			n++
-		}
+func (f *fakeAddresses) SetDefaultOwned(_ context.Context, userID, addressID int64) (repository.SetDefaultAddressResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.byID[addressID]
+	if !ok {
+		return repository.SetDefaultAddressNotFound, nil
 	}
-	return n, nil
-}
-
-func (f *fakeAddresses) SetDefault(_ context.Context, userID, addressID int64) error {
+	if a.UserID != userID {
+		return repository.SetDefaultAddressForbidden, nil
+	}
 	f.defaults[userID] = addressID
-	return nil
-}
-
-// EnsureDefaultExists 模拟 GORM 实现：无默认且仍有余下地址时，把最新一条提为默认。
-func (f *fakeAddresses) EnsureDefaultExists(_ context.Context, userID int64) error {
-	if _, ok := f.defaults[userID]; ok {
-		return nil
-	}
-	var latest int64
-	for _, a := range f.byID {
-		if a.UserID == userID && a.ID > latest {
-			latest = a.ID
-		}
-	}
-	if latest > 0 {
-		f.defaults[userID] = latest
-	}
-	return nil
+	return repository.SetDefaultAddressSet, nil
 }
 
 // 合法地址参数。

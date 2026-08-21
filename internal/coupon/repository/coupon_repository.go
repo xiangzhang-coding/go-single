@@ -3,6 +3,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/xiangzhang-coding/go-single/internal/coupon/model"
 	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
@@ -27,6 +28,18 @@ type ClaimOutcome struct {
 	PerUserCount int64
 }
 
+// RedemptionFacts is the authoritative user coupon and template state read
+// under the caller's transaction lock. It is internal to the coupon module.
+type RedemptionFacts struct {
+	CouponID   int64
+	UserID     int64
+	Status     string
+	Value      int64
+	MinAmount  int64
+	ValidFrom  time.Time
+	ValidUntil time.Time
+}
+
 // CouponTemplateRepository 券模板数据访问接口。
 type CouponTemplateRepository interface {
 	Create(ctx context.Context, t *model.CouponTemplate) error
@@ -46,8 +59,9 @@ type UserCouponRepository interface {
 	CountByTemplate(ctx context.Context, templateID int64) (int64, error)
 	// CountUserByTemplate 用户已领该模板的张数（每人限领校验用）。
 	CountUserByTemplate(ctx context.Context, userID, templateID int64) (int64, error)
-	// GetViewByID 单张用户券 + 模板关键信息（按归属过滤），供 order 结算读取。
-	GetViewByID(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error)
+	// GetRedemptionForUpdate locks both the user coupon and its template so an
+	// order observes one serializable set of mutable template facts.
+	GetRedemptionForUpdate(ctx context.Context, tx *transaction.Handle, couponID int64) (*RedemptionFacts, error)
 	// Use 事务内条件核销：unused→used（并发下仅一次成功），供 order 下单调用。
 	// 返回是否核销成功；tx 由调用方（order 模块）开启。
 	Use(ctx context.Context, tx *transaction.Handle, userID, couponID int64) (bool, error)

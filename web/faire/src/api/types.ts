@@ -74,14 +74,18 @@ export interface Address {
   updated_at: string;
 }
 
+export type CouponType = "direct" | "threshold";
+export type UserCouponStatus = "unused" | "used" | "expired";
+export type UserCouponListStatus = "" | UserCouponStatus;
+
 export interface UserCouponView {
   id: number;
   template_id: number;
   name: string;
-  type: "direct" | "threshold" | string;
+  type: CouponType;
   value: number;
   min_amount: number;
-  status: "unused" | "used" | "expired" | string;
+  status: UserCouponStatus;
   valid_from: string;
   valid_until: string;
   used_at?: string;
@@ -92,7 +96,7 @@ export interface UserCoupon {
   id: number;
   user_id: number;
   template_id: number;
-  status: "unused" | "used" | string;
+  status: Exclude<UserCouponStatus, "expired">;
   used_at?: string;
   created_at: string;
   updated_at: string;
@@ -100,10 +104,10 @@ export interface UserCoupon {
 
 export type CouponTemplateState = "claimable" | "not_started" | "ended" | "sold_out" | "limit_reached";
 
-export interface CouponTemplateView {
+export interface CouponTemplateRecord {
   id: number;
   name: string;
-  type: "direct" | "threshold" | string;
+  type: CouponType;
   value: number;
   min_amount: number;
   total: number;
@@ -112,6 +116,14 @@ export interface CouponTemplateView {
   valid_until: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface AdminCouponTemplateView extends CouponTemplateRecord {
+  claimed_count: number;
+  state: "";
+}
+
+export interface ClaimableCouponTemplateView extends CouponTemplateRecord {
   claimed_count: number;
   state: CouponTemplateState;
 }
@@ -267,8 +279,12 @@ export interface CouponListResponse {
   total: number;
 }
 
-export interface CouponTemplateListResponse {
-  items: CouponTemplateView[];
+export interface AdminCouponTemplateListResponse {
+  items: AdminCouponTemplateView[];
+}
+
+export interface ClaimableCouponTemplateListResponse {
+  items: ClaimableCouponTemplateView[];
 }
 
 export interface LoginResponse {
@@ -302,7 +318,7 @@ export interface CreateFlashSaleRequest {
 
 export interface CreateCouponTemplateRequest {
   name: string;
-  type: "direct" | "threshold";
+  type: CouponType;
   value: number;
   min_amount: number;
   total: number;

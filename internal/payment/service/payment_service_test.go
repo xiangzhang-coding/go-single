@@ -55,9 +55,10 @@ func (f *fakePayments) GetByPaymentID(_ context.Context, paymentID string) (*pay
 // ---- fake 订单服务（payment 模块最小接口）----
 
 type fakeOrderSvc struct {
-	views    map[string]*ordermodel.OrderView
-	getErr   error
-	markPaid func(orderNo string, amount int64) (bool, error)
+	views                  map[string]*ordermodel.OrderView
+	getErr                 error
+	markPaid               func(orderNo string, amount int64) (bool, error)
+	canRecordFailedPayment func(orderNo string) (bool, error)
 }
 
 func newFakeOrderSvc() *fakeOrderSvc { return &fakeOrderSvc{views: map[string]*ordermodel.OrderView{}} }
@@ -87,6 +88,14 @@ func (f *fakeOrderSvc) MarkPaid(_ context.Context, _ *transaction.Handle, orderN
 	}
 	view.Status = ordermodel.OrderStatusPaid
 	return true, nil
+}
+
+func (f *fakeOrderSvc) CanRecordFailedPayment(_ context.Context, _ *transaction.Handle, orderNo string) (bool, error) {
+	if f.canRecordFailedPayment != nil {
+		return f.canRecordFailedPayment(orderNo)
+	}
+	view, ok := f.views[orderNo]
+	return ok && view.Status == ordermodel.OrderStatusPendingPayment && view.ExpireAt.After(time.Now()), nil
 }
 
 // ---- fixture ----
@@ -273,6 +282,18 @@ func TestMockPayRollsBackOnOrderChanged(t *testing.T) {
 	require.ErrorIs(t, err, ErrOrderChanged)
 	require.Equal(t, ordermodel.OrderStatusPendingPayment, view.Status)
 	require.Empty(t, fx.pays.byID, "条件更新失败应回滚流水，不产生孤儿记录")
+}
+
+func TestMockPayFailRollsBackOnConcurrentOrderChange(t *testing.T) {
+	fx := newFixture()
+	fx.seedOrder(42, "1001", 9900)
+	fx.order.canRecordFailedPayment = func(string) (bool, error) { return false, nil }
+	p := params("failed-after-cancel")
+	p.Result = paymentmodel.PaymentResultFail
+
+	_, err := fx.svc.MockPay(context.Background(), 42, p)
+	require.ErrorIs(t, err, ErrOrderChanged)
+	require.Empty(t, fx.pays.byID, "事务内重判失败必须回滚失败流水")
 }
 
 func TestMockPayExpiredOrderRollsBackLedger(t *testing.T) {

@@ -20,8 +20,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pages-production-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   configuration:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     outputs:
       cloudflare_configured: ${{ steps.check.outputs.cloudflare_configured }}
@@ -88,7 +93,7 @@ jobs:
           bun-version: 1.3.14
       - name: Build website
         working-directory: website
-        run: bun install --frozen-lockfile && bun run build
+        run: bun install --frozen-lockfile && bun run typecheck && bun run build
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:

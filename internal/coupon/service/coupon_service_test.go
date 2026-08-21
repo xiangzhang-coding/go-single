@@ -178,39 +178,19 @@ func (f *fakeUserCoupons) CountUserByTemplate(_ context.Context, userID, templat
 	return n, nil
 }
 
-// viewOf 组装 UserCouponView（与 ListByUser 相同的 JOIN 语义）。
-func (f *fakeUserCoupons) viewOf(c *model.UserCoupon) *model.UserCouponView {
-	t, ok := f.tmpls.byID[c.TemplateID]
-	if !ok {
-		return nil
-	}
-	now := f.nowFn()
-	derived := c.Status
-	if c.Status == model.CouponStatusUnused && now.After(t.ValidUntil) {
-		derived = model.CouponStatusExpired
-	}
-	return &model.UserCouponView{
-		ID:         c.ID,
-		TemplateID: t.ID,
-		Name:       t.Name,
-		Type:       t.Type,
-		Value:      t.Value,
-		MinAmount:  t.MinAmount,
-		Status:     derived,
-		ValidFrom:  t.ValidFrom,
-		ValidUntil: t.ValidUntil,
-		UsedAt:     c.UsedAt,
-		CreatedAt:  c.CreatedAt,
-	}
-}
-
-// GetViewByID 单张券（归属过滤）：不存在返回 (nil, nil)。
-func (f *fakeUserCoupons) GetViewByID(_ context.Context, userID, couponID int64) (*model.UserCouponView, error) {
+func (f *fakeUserCoupons) GetRedemptionForUpdate(_ context.Context, _ *transaction.Handle, couponID int64) (*repository.RedemptionFacts, error) {
 	c, ok := f.byID[couponID]
-	if !ok || c.UserID != userID {
+	if !ok {
 		return nil, nil
 	}
-	return f.viewOf(c), nil
+	t, ok := f.tmpls.byID[c.TemplateID]
+	if !ok {
+		return nil, nil
+	}
+	return &repository.RedemptionFacts{
+		CouponID: c.ID, UserID: c.UserID, Status: c.Status, Value: t.Value,
+		MinAmount: t.MinAmount, ValidFrom: t.ValidFrom, ValidUntil: t.ValidUntil,
+	}, nil
 }
 
 // Use 条件核销：unused→used + 有效期窗口（镜像 GORM 实现）；tx 忽略（单测无真实事务）。
@@ -788,34 +768,37 @@ func TestListMineExpiryDerivedFromNow(t *testing.T) {
 
 // ---- 核销与回退（order 模块事务内调用） ----
 
-// UseCoupon：正常核销；已用/不存在/事务内过期被正确区分。
-func TestUseCouponClassification(t *testing.T) {
+func TestRedeemForOrderValidatesAuthoritativeFactsAndReturnsSnapshot(t *testing.T) {
 	fx := newFixture()
-	// 每人限领 2：同一用户需领两张券。
-	tmpl := fx.createTemplate(t, func(p *TemplateParams) { p.PerUserLimit = 2 })
+	tmpl := fx.createTemplate(t, nil)
 	userID := int64(42)
-
-	// 不存在 → ErrCouponNotFound。
-	err := fx.svc.UseCoupon(context.Background(), nil, userID, 999)
-	require.ErrorIs(t, err, ErrCouponNotFound)
-
-	// 正常核销。
 	uc, err := fx.svc.Claim(context.Background(), userID, tmpl.ID)
 	require.NoError(t, err)
-	require.NoError(t, fx.svc.UseCoupon(context.Background(), nil, userID, uc.ID))
+
+	_, err = fx.svc.RedeemForOrder(context.Background(), new(transaction.Handle), userID, uc.ID, 9999)
+	require.ErrorIs(t, err, ErrCouponThresholdNotMet)
+	require.Equal(t, model.CouponStatusUnused, fx.coups.byID[uc.ID].Status)
+
+	_, err = fx.svc.RedeemForOrder(context.Background(), new(transaction.Handle), 7, uc.ID, 10000)
+	require.ErrorIs(t, err, ErrCouponNotFound, "他人券按不存在处理")
+	require.Equal(t, model.CouponStatusUnused, fx.coups.byID[uc.ID].Status)
+
+	snapshot, err := fx.svc.RedeemForOrder(context.Background(), new(transaction.Handle), userID, uc.ID, 10000)
+	require.NoError(t, err)
+	require.Equal(t, model.CouponRedemption{CouponID: uc.ID, Value: 2000}, snapshot)
 	require.Equal(t, model.CouponStatusUsed, fx.coups.byID[uc.ID].Status)
 
-	// 已用 → ErrCouponUsed（非"不存在"）。
-	err = fx.svc.UseCoupon(context.Background(), nil, userID, uc.ID)
+	_, err = fx.svc.RedeemForOrder(context.Background(), new(transaction.Handle), userID, uc.ID, 10000)
 	require.ErrorIs(t, err, ErrCouponUsed)
 
-	// 事务内过期（结算通过后券恰好到期）→ ErrCouponExpired（非 ErrCouponUsed）。
-	uc2, err := fx.svc.Claim(context.Background(), userID, tmpl.ID)
+	expiredFX := newFixture()
+	expiredTemplate := expiredFX.createTemplate(t, nil)
+	expiredCoupon, err := expiredFX.svc.Claim(context.Background(), userID, expiredTemplate.ID)
 	require.NoError(t, err)
-	fx.tmpls.byID[tmpl.ID].ValidUntil = time.Now().Add(-time.Minute)
-	err = fx.svc.UseCoupon(context.Background(), nil, userID, uc2.ID)
+	expiredFX.tmpls.byID[expiredTemplate.ID].ValidUntil = time.Now().Add(-time.Minute)
+	_, err = expiredFX.svc.RedeemForOrder(context.Background(), new(transaction.Handle), userID, expiredCoupon.ID, 10000)
 	require.ErrorIs(t, err, ErrCouponExpired)
-	require.Equal(t, model.CouponStatusUnused, fx.coups.byID[uc2.ID].Status, "过期核销失败不得改变状态")
+	require.Equal(t, model.CouponStatusUnused, expiredFX.coups.byID[expiredCoupon.ID].Status)
 }
 
 // RollbackCoupon：正常回退；非 used 状态回退失败。
@@ -832,7 +815,8 @@ func TestRollbackCoupon(t *testing.T) {
 	require.ErrorIs(t, err, ErrCouponRollbackFailed)
 
 	// 核销后回退成功。
-	require.NoError(t, fx.svc.UseCoupon(context.Background(), nil, userID, uc.ID))
+	_, err = fx.svc.RedeemForOrder(context.Background(), new(transaction.Handle), userID, uc.ID, 10000)
+	require.NoError(t, err)
 	require.NoError(t, fx.svc.RollbackCoupon(context.Background(), nil, userID, uc.ID))
 	require.Equal(t, model.CouponStatusUnused, fx.coups.byID[uc.ID].Status)
 	require.Nil(t, fx.coups.byID[uc.ID].UsedAt)

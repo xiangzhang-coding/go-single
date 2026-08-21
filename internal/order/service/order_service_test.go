@@ -203,6 +203,11 @@ func (f *fakeOrders) MarkPaid(_ context.Context, _ *transaction.Handle, orderNo 
 	return true, nil
 }
 
+func (f *fakeOrders) CanRecordFailedPayment(_ context.Context, _ *transaction.Handle, orderNo string) (bool, error) {
+	o, ok := f.byID[orderNo]
+	return ok && o.Status == model.OrderStatusPendingPayment && o.ExpireAt.After(time.Now()), nil
+}
+
 func (f *fakeOrders) Ship(_ context.Context, orderNo string) (bool, error) {
 	o, ok := f.byID[orderNo]
 	if !ok || o.Status != model.OrderStatusPaid {
@@ -420,8 +425,11 @@ func (f *fakeProducts) RestoreStock(_ context.Context, _ *transaction.Handle, sk
 
 // fakeCoupons 以券表模拟 coupon 模块。
 type fakeCoupons struct {
-	coupons map[int64]*couponmodel.UserCouponView
-	owners  map[int64]int64
+	coupons           map[int64]*couponmodel.UserCouponView
+	owners            map[int64]int64
+	transactionActive *bool
+	redeemCalls       int
+	redeemOutsideTx   bool
 }
 
 func newFakeCoupons() *fakeCoupons {
@@ -439,38 +447,27 @@ func (f *fakeCoupons) seed(id, userID, value, minAmount int64) {
 	}
 }
 
-func (f *fakeCoupons) GetUsable(_ context.Context, userID, couponID int64) (*couponmodel.UserCouponView, error) {
-	c, ok := f.coupons[couponID]
-	if !ok {
-		return nil, couponsvc.ErrCouponNotFound
+func (f *fakeCoupons) RedeemForOrder(_ context.Context, _ *transaction.Handle, userID, couponID, totalAmount int64) (couponmodel.CouponRedemption, error) {
+	f.redeemCalls++
+	if f.transactionActive == nil || !*f.transactionActive {
+		f.redeemOutsideTx = true
 	}
-	if f.owners[couponID] != userID {
-		return nil, couponsvc.ErrCouponNotFound
-	}
-	if c.Status == couponmodel.CouponStatusUsed {
-		return nil, couponsvc.ErrCouponUsed
-	}
-	now := time.Now()
-	if now.Before(c.ValidFrom) || now.After(c.ValidUntil) {
-		return nil, couponsvc.ErrCouponExpired
-	}
-	return c, nil
-}
-
-func (f *fakeCoupons) UseCoupon(_ context.Context, _ *transaction.Handle, userID, couponID int64) error {
 	c, ok := f.coupons[couponID]
 	if !ok || f.owners[couponID] != userID {
-		return couponsvc.ErrCouponNotFound
+		return couponmodel.CouponRedemption{}, couponsvc.ErrCouponNotFound
 	}
 	if c.Status != couponmodel.CouponStatusUnused {
-		return couponsvc.ErrCouponUsed
+		return couponmodel.CouponRedemption{}, couponsvc.ErrCouponUsed
 	}
 	now := time.Now()
 	if now.Before(c.ValidFrom) || now.After(c.ValidUntil) {
-		return couponsvc.ErrCouponExpired
+		return couponmodel.CouponRedemption{}, couponsvc.ErrCouponExpired
+	}
+	if totalAmount < c.MinAmount {
+		return couponmodel.CouponRedemption{}, couponsvc.ErrCouponThresholdNotMet
 	}
 	c.Status = couponmodel.CouponStatusUsed
-	return nil
+	return couponmodel.CouponRedemption{CouponID: c.ID, Value: c.Value}, nil
 }
 
 func (f *fakeCoupons) RollbackCoupon(_ context.Context, _ *transaction.Handle, userID, couponID int64) error {
@@ -580,6 +577,7 @@ func newFixture() *fixture {
 	prods, coupons, cart, users := newFakeProducts(), newFakeCoupons(), newFakeCart(), newFakeUsers()
 	var transactionActive bool
 	prods.transactionActive = &transactionActive
+	coupons.transactionActive = &transactionActive
 	svc := New(
 		repository.Store{Orders: orders, Items: items, Tx: fakeTx{active: &transactionActive}},
 		cache, &fakeNos{}, prods, coupons, cart, users,
@@ -596,6 +594,7 @@ func newFixtureWithRetry(t *testing.T, attempts int) *fixture {
 	prods, coupons, cart, users := newFakeProducts(), newFakeCoupons(), newFakeCart(), newFakeUsers()
 	var transactionActive bool
 	prods.transactionActive = &transactionActive
+	coupons.transactionActive = &transactionActive
 	svc := New(
 		repository.Store{Orders: orders, Items: items, Tx: fakeTx{active: &transactionActive}},
 		cache, &fakeNos{}, prods, coupons, cart, users,
@@ -927,6 +926,21 @@ func TestCreateCouponThreshold(t *testing.T) {
 	require.Equal(t, int64(350), res.Order.PayAmount)
 	require.NotNil(t, res.Order.CouponID)
 	require.Equal(t, couponmodel.CouponStatusUsed, fx.coupons.coupons[1].Status, "下单成功后券应核销")
+}
+
+func TestCreateRedeemsCouponFromTransactionalSnapshot(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.coupons.seed(21, 42, 50, 100)
+
+	res, err := fx.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "transactional-coupon", AddressID: 1, CouponID: 21,
+		Items: []ItemParams{{SKUID: 1, Quantity: 2}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(50), res.Order.DiscountAmount)
+	require.Equal(t, 1, fx.coupons.redeemCalls)
+	require.False(t, fx.coupons.redeemOutsideTx, "券事实读取、门槛校验与核销必须发生在订单事务内")
 }
 
 // 直减券：券额封顶为商品总额（应付不为负）。

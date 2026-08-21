@@ -2,8 +2,8 @@
 //
 // 成功路径：状态机校验（仅 待支付→已支付）+ 支付流水唯一约束（payment_id）+
 // 金额核对（回调金额 = 订单应付金额），流水落库与订单状态迁移在支付模块开启的
-// 单事务内完成（跨模块写经 order service 的 tx 参数汇入同一事务）。
-// 失败路径：订单停留待支付，仅记录失败流水（审计留档），客户端以新 payment_id 重试。
+// 单事务内完成（跨模块写经 order service 的 tx 参数汇入同一事务）。失败路径也在
+// 同一事务内锁定重判订单仍待支付且未过期，才提交失败流水供审计和后续重试。
 package service
 
 import (
@@ -35,10 +35,11 @@ var (
 
 // ---- 跨模块最小接口（进程内调用，面向接口非 HTTP；实现见 main 装配） ----
 
-// OrderService order 模块最小接口：读取订单（owner 校验）+ 支付成功状态迁移。
+// OrderService order 模块最小接口：读取订单（owner 校验）+ 事务内支付裁决。
 type OrderService interface {
 	GetDetail(ctx context.Context, userID int64, orderNo string) (*ordermodel.OrderView, error)
 	MarkPaid(ctx context.Context, tx *transaction.Handle, orderNo string, payAmount int64) (bool, error)
+	CanRecordFailedPayment(ctx context.Context, tx *transaction.Handle, orderNo string) (bool, error)
 }
 
 // PayParams 模拟支付回调参数。
@@ -74,8 +75,8 @@ func New(store repository.Store, orders OrderService, m *metrics.Business, retry
 //  2. 读取订单（owner 校验，防 IDOR——他人订单先于流水检查拒绝，不泄露流水信息）
 //  3. 幂等检查：payment_id 已存在 → 重复回调拒绝（唯一约束 + 落库 1062 兜底）
 //  4. 状态机校验：仅待支付订单可发起支付（成功/失败回调一致）；成功回调另做金额核对
-//  5. 单事务：创建支付流水 → 成功则条件更新订单 待支付→已支付（WHERE 同时
-//     校验 status 与 pay_amount，失败 = 并发状态已变，回滚整体拒绝）
+//  5. 单事务：创建支付流水 → 成功则条件更新订单 待支付→已支付；失败则锁定
+//     当前订单重判仍待支付且未过期。任一裁决失败都回滚流水
 //
 // 回调幂等（payment_id 唯一约束）且事务原子：基础设施瞬时故障（DB 抖动）有限
 // 重试 + 退避吸收；业务拒绝（重复回调/金额不符/非法跃迁等）retry.Stop 不重试。
@@ -140,6 +141,14 @@ func (s *paymentService) mockPay(ctx context.Context, userID int64, p PayParams)
 				return err
 			}
 			// 预检通过仍条件更新失败：并发下状态已变（已支付/已取消），整体回滚。
+			if !ok {
+				return ErrOrderChanged
+			}
+		} else {
+			ok, err := s.orders.CanRecordFailedPayment(ctx, tx, p.OrderNo)
+			if err != nil {
+				return err
+			}
 			if !ok {
 				return ErrOrderChanged
 			}

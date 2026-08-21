@@ -3,14 +3,14 @@ import { useState } from "react";
 
 import { adminApi } from "../../api/endpoints";
 import { getApiErrorMessage } from "../../api/client";
-import type { CouponTemplateView } from "../../api/types";
+import type { AdminCouponTemplateView } from "../../api/types";
 import { describeCouponRule, formatDate, formatMoney, toLocalInput } from "../../lib/format";
 import { Button, EmptyState, ErrorState, LoadingBlock, Spinner } from "../../components/ui";
 
 export function AdminCouponsPage() {
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
-  const [editing, setEditing] = useState<CouponTemplateView | null>(null);
+  const [editing, setEditing] = useState<AdminCouponTemplateView | null>(null);
   const [showCreate, setShowCreate] = useState(false);
 
   const templatesQuery = useQuery({
@@ -101,7 +101,7 @@ function TemplateForm({
   onDone,
   onError,
 }: {
-  initial?: CouponTemplateView | null;
+  initial?: AdminCouponTemplateView | null;
   onDone: () => void;
   onError: (text: string) => void;
 }) {

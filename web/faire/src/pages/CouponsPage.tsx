@@ -3,11 +3,11 @@ import { useState } from "react";
 
 import { claimCoupon, getClaimableCoupons, getMyCoupons } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
-import type { CouponTemplateView, UserCouponView } from "../api/types";
+import type { ClaimableCouponTemplateView, UserCouponListStatus, UserCouponView } from "../api/types";
 import { describeCouponRule, formatDate, formatMoney } from "../lib/format";
 import { Button, EmptyState, ErrorState, LoadingBlock, Spinner } from "../components/ui";
 
-const couponStateLabels: Record<CouponTemplateView["state"], string> = {
+const couponStateLabels: Record<ClaimableCouponTemplateView["state"], string> = {
   claimable: "可领取",
   not_started: "未开始",
   ended: "已结束",
@@ -15,7 +15,7 @@ const couponStateLabels: Record<CouponTemplateView["state"], string> = {
   limit_reached: "已领满",
 };
 
-const mineTabs: Array<{ value: "" | "unused" | "used" | "expired"; label: string }> = [
+const mineTabs: Array<{ value: UserCouponListStatus; label: string }> = [
   { value: "", label: "全部" },
   { value: "unused", label: "未用" },
   { value: "used", label: "已用" },
@@ -24,7 +24,7 @@ const mineTabs: Array<{ value: "" | "unused" | "used" | "expired"; label: string
 
 export function CouponsPage() {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<"" | "unused" | "used" | "expired">("");
+  const [tab, setTab] = useState<UserCouponListStatus>("");
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
 
   const claimableQuery = useQuery({
@@ -136,7 +136,7 @@ function CouponCenterCard({
   busy,
   onClaim,
 }: {
-  template: CouponTemplateView;
+  template: ClaimableCouponTemplateView;
   busy: boolean;
   onClaim: () => void;
 }) {

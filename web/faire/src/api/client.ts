@@ -1,7 +1,7 @@
 import axios, { AxiosError } from "axios";
 
-import { ACCESS_TOKEN_KEY } from "../lib/auth-storage";
 import { endSession } from "../lib/session";
+import { useAuthStore } from "../store/auth";
 import type { ErrorResponse } from "./types";
 
 export const api = axios.create({
@@ -22,7 +22,7 @@ export class ApiRequestError extends Error {
 }
 
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem(ACCESS_TOKEN_KEY);
+  const token = useAuthStore.getState().token;
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
@@ -42,7 +42,7 @@ api.interceptors.response.use(
     const requestError = new ApiRequestError(message, status);
 
     const requestToken = bearerToken(error.config?.headers.get("Authorization"));
-    const currentToken = typeof localStorage !== "undefined" ? localStorage.getItem(ACCESS_TOKEN_KEY) : null;
+    const currentToken = useAuthStore.getState().token;
     const expiresCurrentSession = requestToken === currentToken;
     if (status === 401 && typeof window !== "undefined" && expiresCurrentSession) {
       endSession();
@@ -64,7 +64,7 @@ function bearerToken(value: unknown): string | null {
 function responseBelongsToCurrentSession(authorization: unknown): boolean {
   const requestToken = bearerToken(authorization);
   if (requestToken === null) return true;
-  const currentToken = typeof localStorage !== "undefined" ? localStorage.getItem(ACCESS_TOKEN_KEY) : null;
+  const currentToken = useAuthStore.getState().token;
   return requestToken === currentToken;
 }
 

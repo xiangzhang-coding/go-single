@@ -258,15 +258,9 @@ func (s *userService) Search(ctx context.Context, username string, limit int) ([
 
 // ---- 地址簿 ----
 
-// CreateAddress 新增地址：首条自动设为默认；显式 IsDefault=true 同样设为默认。
+// CreateAddress 新增地址：仓储在一个事务内创建并决定首条/显式默认。
 func (s *userService) CreateAddress(ctx context.Context, userID int64, p AddressParams) (*model.Address, error) {
 	cleaned, err := validateAddress(p)
-	if err != nil {
-		return nil, err
-	}
-	// 先计数后落库：首条判定避免并发下"两条都以为自己是首条"的竞态；
-	// 即便并发，SetDefault 为单条 UPDATE 指针，最终仍恰好一个默认。
-	n, err := s.store.Addresses.CountByUser(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -279,17 +273,11 @@ func (s *userService) CreateAddress(ctx context.Context, userID int64, p Address
 		District: cleaned.District,
 		Detail:   cleaned.Detail,
 	}
-	if err := s.store.Addresses.Create(ctx, a); err != nil {
+	isDefault, err := s.store.Addresses.CreateWithDefault(ctx, a, cleaned.IsDefault)
+	if err != nil {
 		return nil, err
 	}
-	if cleaned.IsDefault || n == 0 {
-		if err := s.store.Addresses.SetDefault(ctx, userID, a.ID); err != nil {
-			// 设默认失败回滚刚落库的行，避免"新增成功但无默认"的部分状态。
-			_ = s.store.Addresses.Delete(ctx, a.ID)
-			return nil, err
-		}
-		a.IsDefault = true
-	}
+	a.IsDefault = isDefault
 	return a, nil
 }
 
@@ -313,28 +301,40 @@ func (s *userService) UpdateAddress(ctx context.Context, userID, id int64, p Add
 	})
 }
 
-// DeleteAddress 删除地址；若删的是默认地址，FK ON DELETE SET NULL 自动解除指向，
-// 再由 EnsureDefaultExists 自愈：仍有余下地址时把最新一条提为默认。
+// DeleteAddress 由仓储在一个事务内完成 owner 校验、删除和默认地址补位。
 func (s *userService) DeleteAddress(ctx context.Context, userID, id int64) error {
-	if err := s.ensureOwned(ctx, userID, id); err != nil {
+	result, err := s.store.Addresses.DeleteAndEnsureDefault(ctx, userID, id)
+	if err != nil {
 		return err
 	}
-	if err := s.store.Addresses.Delete(ctx, id); err != nil {
-		return err
+	switch result {
+	case repository.DeleteAddressDeleted:
+		return nil
+	case repository.DeleteAddressForbidden:
+		return ErrAddressForbidden
+	default:
+		return ErrAddressNotFound
 	}
-	return s.store.Addresses.EnsureDefaultExists(ctx, userID)
 }
 
 func (s *userService) ListAddresses(ctx context.Context, userID int64) ([]model.Address, error) {
 	return s.store.Addresses.ListByUser(ctx, userID)
 }
 
-// SetDefaultAddress 设为默认：owner 校验后单条 UPDATE 切换指针，旧默认自动失效。
+// SetDefaultAddress 由仓储在一个事务内串行 owner 校验与默认指针切换。
 func (s *userService) SetDefaultAddress(ctx context.Context, userID, id int64) error {
-	if err := s.ensureOwned(ctx, userID, id); err != nil {
+	result, err := s.store.Addresses.SetDefaultOwned(ctx, userID, id)
+	if err != nil {
 		return err
 	}
-	return s.store.Addresses.SetDefault(ctx, userID, id)
+	switch result {
+	case repository.SetDefaultAddressSet:
+		return nil
+	case repository.SetDefaultAddressForbidden:
+		return ErrAddressForbidden
+	default:
+		return ErrAddressNotFound
+	}
 }
 
 // ensureOwned 对象级授权（防 IDOR）：地址不存在 404；归属他人 403。

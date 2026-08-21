@@ -42,6 +42,7 @@ func (s *reservationCleanupService) CleanupOrderedReservations(ctx context.Conte
 	if err != nil {
 		return 0, err
 	}
+	now := time.Now()
 	cleaned := 0
 	for i := range rows {
 		if err := ctx.Err(); err != nil {
@@ -51,14 +52,14 @@ func (s *reservationCleanupService) CleanupOrderedReservations(ctx context.Conte
 		if orderNo == "" {
 			continue
 		}
+		activity, err := s.activities.GetByID(ctx, rows[i].ActivityID)
+		if err != nil {
+			return cleaned, err
+		}
+		if activity == nil {
+			continue
+		}
 		if !rows[i].Legacy {
-			activity, err := s.activities.GetByID(ctx, rows[i].ActivityID)
-			if err != nil {
-				return cleaned, err
-			}
-			if activity == nil {
-				continue
-			}
 			stockTTL := remainingTTL(activity)
 			if stockTTL <= 0 {
 				stockTTL = stockKeyMargin
@@ -84,6 +85,9 @@ func (s *reservationCleanupService) CleanupOrderedReservations(ctx context.Conte
 		switch status {
 		case ordermodel.OrderStatusPaid, ordermodel.OrderStatusShipped, ordermodel.OrderStatusCompleted:
 		default:
+			continue
+		}
+		if now.Before(activity.EndAt) {
 			continue
 		}
 		if err := s.preDeductions.MarkReservationReleased(ctx, rows[i].ID); err != nil {

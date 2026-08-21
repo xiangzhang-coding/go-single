@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/order/model"
 	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
@@ -200,6 +201,24 @@ func (s *GORMOrderStore) MarkPaid(ctx context.Context, handle *transaction.Handl
 		return false, res.Error
 	}
 	return res.RowsAffected == 1, nil
+}
+
+func (s *GORMOrderStore) CanRecordFailedPayment(ctx context.Context, handle *transaction.Handle, orderNo string) (bool, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return false, err
+	}
+	var order model.Order
+	err = tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("order_no", "status", "expire_at").
+		First(&order, "order_no = ?", orderNo).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return order.Status == model.OrderStatusPendingPayment && order.ExpireAt.After(time.Now()), nil
 }
 
 // Ship 条件更新 已支付→已发货（admin 发货）。

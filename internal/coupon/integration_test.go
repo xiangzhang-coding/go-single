@@ -227,6 +227,26 @@ func createTemplate(t *testing.T, env *testEnv, token, name string, total, perUs
 	w, body := doJSON(t, env, http.MethodPost, "/api/admin/coupons",
 		templateBody(name, total, perUserLimit, value, minAmount, fromOffset, untilOffset), token)
 	require.Equal(t, http.StatusCreated, w.Code, "发布券模板失败: %s", w.Body.String())
+	require.ElementsMatch(t, []string{
+		"id", "name", "type", "value", "min_amount", "total", "per_user_limit",
+		"valid_from", "valid_until", "created_at", "updated_at",
+	}, mapKeys(body), "创建模板响应必须完整且不得混入用户视角字段")
+	require.Equal(t, name, body["name"])
+	expectedType := "direct"
+	if minAmount > 0 {
+		expectedType = "threshold"
+	}
+	require.Equal(t, expectedType, body["type"])
+	require.Equal(t, float64(value), body["value"])
+	require.Equal(t, float64(minAmount), body["min_amount"])
+	require.Equal(t, float64(total), body["total"])
+	require.Equal(t, float64(perUserLimit), body["per_user_limit"])
+	for _, field := range []string{"valid_from", "valid_until", "created_at", "updated_at"} {
+		raw, ok := body[field].(string)
+		require.True(t, ok, "%s 必须是时间字符串", field)
+		_, err := time.Parse(time.RFC3339Nano, raw)
+		require.NoError(t, err, "%s 必须是 RFC3339 时间", field)
+	}
 	id, ok := body["id"].(float64)
 	require.True(t, ok)
 	return int64(id)
@@ -675,20 +695,38 @@ func TestTemplateUpdate(t *testing.T) {
 	tmplID := createTemplate(t, env, admin, uniqueName("可编辑券"), 10, 1, 1000, 5000, -time.Minute, time.Hour)
 
 	// 编辑 → 204。
+	updatedName := uniqueName("编辑后券")
 	w, _ := doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/coupons/%d", tmplID),
-		templateBody(uniqueName("编辑后券"), 20, 2, 1500, 8000, -time.Minute, 2*time.Hour), admin)
+		templateBody(updatedName, 20, 2, 1500, 8000, -time.Minute, 2*time.Hour), admin)
 	require.Equal(t, http.StatusNoContent, w.Code)
 
 	// admin 列表可见新值。
 	w, list := doJSON(t, env, http.MethodGet, "/api/admin/coupons", "", admin)
 	require.Equal(t, http.StatusOK, w.Code)
+	require.ElementsMatch(t, []string{"items"}, mapKeys(list))
 	found := false
 	for _, it := range list["items"].([]any) {
 		m := it.(map[string]any)
 		if int64(m["id"].(float64)) == tmplID {
 			found = true
+			require.ElementsMatch(t, []string{
+				"id", "name", "type", "value", "min_amount", "total", "per_user_limit",
+				"valid_from", "valid_until", "created_at", "updated_at", "claimed_count", "state",
+			}, mapKeys(m), "后台模板列表必须返回完整 AdminCouponTemplateView 字段")
+			require.Equal(t, updatedName, m["name"])
+			require.Equal(t, "threshold", m["type"])
+			require.Equal(t, float64(1500), m["value"])
+			require.Equal(t, float64(8000), m["min_amount"])
 			require.Equal(t, float64(20), m["total"])
 			require.Equal(t, float64(2), m["per_user_limit"])
+			require.Equal(t, float64(0), m["claimed_count"])
+			require.Equal(t, "", m["state"], "后台列表没有用户视角，state 固定为空字符串")
+			for _, field := range []string{"valid_from", "valid_until", "created_at", "updated_at"} {
+				raw, ok := m[field].(string)
+				require.True(t, ok, "%s 必须是时间字符串", field)
+				_, err := time.Parse(time.RFC3339Nano, raw)
+				require.NoError(t, err, "%s 必须是 RFC3339 时间", field)
+			}
 		}
 	}
 	require.True(t, found)

@@ -86,10 +86,10 @@ type ProductService interface {
 	FinishDetailMutation(ctx context.Context, productID int64, token string)
 }
 
-// CouponService 优惠券模块最小接口：结算前校验可用券，事务内核销/回退。
+// CouponService is the order module's complete coupon capability: checkout
+// redeems from the same transaction snapshot, while cancellation rolls it back.
 type CouponService interface {
-	GetUsable(ctx context.Context, userID, couponID int64) (*couponmodel.UserCouponView, error)
-	UseCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error
+	RedeemForOrder(ctx context.Context, tx *transaction.Handle, userID, couponID, totalAmount int64) (couponmodel.CouponRedemption, error)
 	RollbackCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error
 }
 
@@ -195,6 +195,9 @@ type Service interface {
 	// MarkPaid 支付成功状态迁移：待支付 → 已支付（支付模块事务内条件更新；
 	// WHERE 同时校验 status、pay_amount 与 expire_at）。
 	MarkPaid(ctx context.Context, tx *transaction.Handle, orderNo string, payAmount int64) (bool, error)
+	// CanRecordFailedPayment locks and rechecks that the order is still pending
+	// and unexpired in the payment transaction.
+	CanRecordFailedPayment(ctx context.Context, tx *transaction.Handle, orderNo string) (bool, error)
 	// Ship 后台发货：已支付 → 已发货（admin）。
 	Ship(ctx context.Context, orderNo string) error
 	// ConfirmReceipt 确认收货：已发货 → 已完成（owner 校验）。
@@ -268,9 +271,9 @@ func (s *orderService) Create(ctx context.Context, userID int64, p CreateParams)
 
 // createOrder 下单流程：
 //  1. 查询持久请求身份；未命中再生成订单号并以 Redis SETNX 协调在途请求
-//  2. 读取地址（固化为快照）→ 组装订单项（购物车/直购）→ 校验券可用
-//  3. 读取 SKU 价格与上架状态，累计商品总额，计算券额与应付
-//  4. 单事务：条件扣减库存 → 核销券 → 建订单+订单项 → 删除已购购物车条目
+//  2. 读取地址（固化为快照）→ 组装订单项（购物车/直购）
+//  3. 单事务读取 SKU、锁定并核销券，以同一券事实计算金额
+//  4. 条件扣减库存 → 建订单+订单项 → 删除已购购物车条目
 //
 // 任一校验失败（库存不足/券不可用等）删除幂等键，允许修正后重试。
 // 幂等语义保证重试安全：事务原子回滚 + 幂等键重复请求返回同一订单号。
@@ -330,13 +333,6 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 		return nil, ErrAddressNotFound
 	}
 
-	var coupon *couponmodel.UserCouponView
-	if p.CouponID > 0 {
-		coupon, err = s.coupons.GetUsable(ctx, userID, p.CouponID)
-		if err != nil {
-			return nil, translateCouponError(err)
-		}
-	}
 	plannedProductIDs, err := s.productIDsForCreate(ctx, userID, &p)
 	if err != nil {
 		return nil, err
@@ -354,6 +350,7 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 		cartItemIDs []int64
 	)
 	err = s.store.Tx.WithinTx(ctx, func(tx *transaction.Handle) error {
+		var coupon *couponmodel.CouponRedemption
 		if p.FromCart {
 			cartItems, err := s.cart.LockItems(ctx, tx, userID)
 			if err != nil {
@@ -382,13 +379,20 @@ func (s *orderService) createOrder(ctx context.Context, userID int64, p CreatePa
 		if !mutationsCoverProducts(mutatingProducts, productIDsFromSnapshots(snapshots)) {
 			return errCartChangedWhileFencing
 		}
+		if p.CouponID > 0 {
+			redemption, err := s.coupons.RedeemForOrder(ctx, tx, userID, p.CouponID, total)
+			if err != nil {
+				return translateCouponError(err)
+			}
+			coupon = &redemption
+		}
 
 		discount, pay, err := calculateAmounts(total, coupon)
 		if err != nil {
 			return err
 		}
 		order, items = buildOrder(userID, orderNo, p.ClientRequestID, address, snapshots, total, discount, pay, coupon)
-		return s.persistOrder(ctx, tx, userID, p.CouponID, coupon, snapshots, order, items, cartItemIDs)
+		return s.persistOrder(ctx, tx, userID, snapshots, order, items, cartItemIDs)
 	})
 	s.finishProductDetailMutations(context.WithoutCancel(ctx), mutatingProducts)
 	if err != nil {
@@ -500,8 +504,8 @@ func (s *orderService) CreateSeckillInTx(ctx context.Context, tx *transaction.Ha
 }
 
 // persistOrder 在同一事务内完成库存、券、订单、订单项与购物车清理。
-func (s *orderService) persistOrder(ctx context.Context, tx *transaction.Handle, userID, couponID int64,
-	coupon *couponmodel.UserCouponView, snapshots []lineSnapshot, order *model.Order,
+func (s *orderService) persistOrder(ctx context.Context, tx *transaction.Handle, userID int64,
+	snapshots []lineSnapshot, order *model.Order,
 	items []model.OrderItem, cartItemIDs []int64) error {
 	if err := validateAmountConsistency(order, items); err != nil {
 		return err
@@ -513,12 +517,6 @@ func (s *orderService) persistOrder(ctx context.Context, tx *transaction.Handle,
 		}
 		if !ok {
 			return ErrInsufficientStock
-		}
-	}
-	if coupon != nil {
-		// 核销失败：已用/过期/不存在经 translateCouponError 区分（409/404）。
-		if err := s.coupons.UseCoupon(ctx, tx, userID, couponID); err != nil {
-			return translateCouponError(err)
 		}
 	}
 	if err := s.store.Orders.Create(ctx, tx, order); err != nil {
@@ -614,6 +612,8 @@ func translateCouponError(err error) error {
 		return ErrCouponUsed
 	case errors.Is(err, couponsvc.ErrCouponExpired):
 		return ErrCouponExpired
+	case errors.Is(err, couponsvc.ErrCouponThresholdNotMet):
+		return ErrCouponThresholdNotMet
 	case errors.Is(err, couponsvc.ErrCouponRollbackFailed):
 		return fmt.Errorf("%w: %v", ErrCouponUsed, err)
 	}
@@ -663,12 +663,9 @@ func directLines(p *CreateParams) []orderLine {
 	return lines
 }
 
-func calculateAmounts(total int64, coupon *couponmodel.UserCouponView) (int64, int64, error) {
+func calculateAmounts(total int64, coupon *couponmodel.CouponRedemption) (int64, int64, error) {
 	discount := int64(0)
 	if coupon != nil {
-		if total < coupon.MinAmount {
-			return 0, 0, ErrCouponThresholdNotMet
-		}
 		discount = coupon.Value
 		if discount > total {
 			discount = total
@@ -765,7 +762,7 @@ func (s *orderService) loadSnapshots(ctx context.Context, tx *transaction.Handle
 
 // buildOrder 组装订单与订单项（含地址快照与金额）。
 func buildOrder(userID int64, orderNo, clientRequestID string, address *usermodel.Address,
-	snapshots []lineSnapshot, total, discount, pay int64, coupon *couponmodel.UserCouponView) (*model.Order, []model.OrderItem) {
+	snapshots []lineSnapshot, total, discount, pay int64, coupon *couponmodel.CouponRedemption) (*model.Order, []model.OrderItem) {
 
 	order := &model.Order{
 		OrderNo:         orderNo,
@@ -785,7 +782,7 @@ func buildOrder(userID int64, orderNo, clientRequestID string, address *usermode
 		ExpireAt:        time.Now().Add(normalExpire),
 	}
 	if coupon != nil {
-		order.CouponID = &coupon.ID
+		order.CouponID = &coupon.CouponID
 	}
 
 	items := make([]model.OrderItem, 0, len(snapshots))
@@ -1159,6 +1156,10 @@ func (s *orderService) MarkPaid(ctx context.Context, tx *transaction.Handle, ord
 		s.metrics.OrderStatusChanged(model.OrderStatusPaid)
 	}
 	return ok, err
+}
+
+func (s *orderService) CanRecordFailedPayment(ctx context.Context, tx *transaction.Handle, orderNo string) (bool, error) {
+	return s.store.Orders.CanRecordFailedPayment(ctx, tx, orderNo)
 }
 
 // Ship 后台发货：已支付 → 已发货（admin；发货不校验归属）。

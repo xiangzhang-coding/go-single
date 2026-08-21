@@ -31,6 +31,7 @@ var (
 	ErrInvalidInput                   = errors.New("invalid input")
 	ErrStockIncreaseInProgress        = errors.New("stock can only decrease while activity is in progress")
 	ErrActivityFieldsLocked           = errors.New("sku, price, time window, and per-user limit are locked while activity is in progress")
+	ErrActivityEnded                  = errors.New("flashsale activity has ended")
 	ErrStockBelowAcceptedReservations = errors.New("stock cannot be reduced below accepted reservations")
 	ErrReservationsUnsettled          = errors.New("flashsale reservations must settle before this activity change")
 	ErrNotInWindow                    = errors.New("flashsale not in time window")
@@ -89,11 +90,12 @@ const stockKeyMargin = time.Hour
 const idemTTL = 30 * time.Minute
 
 const (
-	maxPublishAttempts     = 10
-	preparingRecoveryDelay = 30 * time.Second
-	redisAOFTimeout        = 2 * time.Second
-	stockEditPauseTTL      = 24 * time.Hour
-	failClosedStepTimeout  = redisAOFTimeout + time.Second
+	maxPublishAttempts      = 10
+	preparingRecoveryDelay  = 30 * time.Second
+	redisAOFTimeout         = 2 * time.Second
+	stockEditPauseTTL       = 24 * time.Hour
+	failClosedStepTimeout   = redisAOFTimeout + time.Second
+	preDeductionLockStripes = 256
 )
 
 type PurchaseResult struct {
@@ -184,15 +186,16 @@ type flashSaleCache interface {
 }
 
 type flashsaleService struct {
-	store     repository.Store
-	products  ProductService
-	cache     flashSaleCache
-	perUser   *limiter.RedisCounter
-	publisher MessagePublisher
-	nos       OrderNoGenerator
-	metrics   *metrics.Business // 业务指标打点（T19c）
-	retryCfg  retry.Config      // 幂等操作有限重试（T20）：仅"抢购成功"消息发布
-	adminMu   sync.RWMutex      // 编辑与“读取活动→接受预扣”互斥，抢购之间仍可并发
+	store          repository.Store
+	products       ProductService
+	cache          flashSaleCache
+	perUser        *limiter.RedisCounter
+	publisher      MessagePublisher
+	nos            OrderNoGenerator
+	metrics        *metrics.Business // 业务指标打点（T19c）
+	retryCfg       retry.Config      // 幂等操作有限重试（T20）：仅"抢购成功"消息发布
+	adminMu        sync.RWMutex      // 编辑与“读取活动→接受预扣”互斥，抢购之间仍可并发
+	preDeductionMu [preDeductionLockStripes]sync.Mutex
 }
 
 // New 构造秒杀服务。userLimiter 为按用户限流配置（Max<=0 不启用）；
@@ -286,8 +289,24 @@ func (s *flashsaleService) UpdateActivity(ctx context.Context, id int64, p Activ
 		if err != nil {
 			return err
 		}
-		if p.Stock < pendingQuantity {
-			return ErrStockBelowAcceptedReservations
+		if pendingQuantity > 0 {
+			return ErrReservationsUnsettled
+		}
+		protectedFieldsChanged := p.SKUID != current.SKUID || p.Price != current.Price ||
+			p.PerUserLimit != current.PerUserLimit || !p.StartAt.Equal(current.StartAt) || !p.EndAt.Equal(current.EndAt)
+		if protectedFieldsChanged {
+			hasAccepted, err := s.store.PreDeductions.HasAcceptedReservationForUpdate(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			if hasAccepted {
+				if now.After(current.EndAt) {
+					return ErrActivityEnded
+				}
+				if !now.Before(current.StartAt) {
+					return ErrActivityFieldsLocked
+				}
+			}
 		}
 		return s.store.Activities.UpdateInTx(ctx, tx, &model.Activity{
 			ID: id, SKUID: p.SKUID, Title: p.Title, Price: p.Price, Stock: p.Stock,
@@ -542,16 +561,14 @@ func (s *flashsaleService) PublishActivity(ctx context.Context, id int64) error 
 			return fmt.Errorf("%w: activity already ended", ErrInvalidInput)
 		}
 		stockSnapshot := *current
-		if current.InProgress(now) {
-			pendingQuantity, err := s.store.PreDeductions.PendingReservationQuantityForUpdate(ctx, tx, id)
-			if err != nil {
-				return err
-			}
-			if pendingQuantity > current.Stock {
-				return ErrStockBelowAcceptedReservations
-			}
-			stockSnapshot.Stock -= pendingQuantity
+		pendingQuantity, err := s.store.PreDeductions.PendingReservationQuantityForUpdate(ctx, tx, id)
+		if err != nil {
+			return err
 		}
+		if pendingQuantity > current.Stock {
+			return ErrStockBelowAcceptedReservations
+		}
+		stockSnapshot.Stock -= pendingQuantity
 		if err := s.syncStock(ctx, &stockSnapshot, now); err != nil {
 			return err
 		}
@@ -687,7 +704,7 @@ func (s *flashsaleService) Seckill(ctx context.Context, userID, activityID int64
 
 	// 5. 同步尝试生成订单号并发布，任何失败都只写入持久状态；HTTP 仍返回
 	// 已被系统接管的稳定预扣 ID，后台任务会继续发布或完整回退。
-	_ = s.dispatchPreDeduction(ctx, pd)
+	_ = s.RecoverPreDeduction(ctx, pd.ID)
 	if current, getErr := s.store.PreDeductions.GetByID(ctx, pd.ID); getErr == nil && current != nil {
 		pd = current
 	}
@@ -702,7 +719,10 @@ func purchaseResult(p *model.PreDeduction) *PurchaseResult {
 	}
 }
 
-func (s *flashsaleService) dispatchPreDeduction(ctx context.Context, pd *model.PreDeduction) error {
+func (s *flashsaleService) dispatchPreDeductionLocked(ctx context.Context, pd *model.PreDeduction) error {
+	if pd.Status != model.PreDeductionStatusPendingPublish {
+		return nil
+	}
 	orderNo := pd.OrderNumber()
 	if orderNo == "" {
 		no, err := s.nos.Next()
@@ -720,8 +740,11 @@ func (s *flashsaleService) dispatchPreDeduction(ctx context.Context, pd *model.P
 		if current == nil || current.OrderNumber() == "" {
 			return s.recordPublishFailure(ctx, pd, errors.New("persisted seckill order no is missing"))
 		}
+		if current.Status != model.PreDeductionStatusPendingPublish {
+			return nil
+		}
+		pd = current
 		orderNo = current.OrderNumber()
-		pd.OrderNo = current.OrderNo
 	}
 	body, err := json.Marshal(SeckillSuccessMessage{
 		PreDeductionID: pd.ID,
@@ -741,10 +764,14 @@ func (s *flashsaleService) dispatchPreDeduction(ctx context.Context, pd *model.P
 	}); err != nil {
 		return s.recordPublishFailure(ctx, pd, fmt.Errorf("publish seckill success message: %w", err))
 	}
-	if pd.Status == model.PreDeductionStatusPendingOrder {
-		return nil
-	}
 	if err := s.store.PreDeductions.MarkPendingOrder(ctx, pd.ID); err != nil {
+		if errors.Is(err, repository.ErrPreDeductionStateChanged) {
+			current, getErr := s.store.PreDeductions.GetByID(ctx, pd.ID)
+			if getErr == nil && current != nil && (current.Status == model.PreDeductionStatusPendingOrder ||
+				current.Status == model.PreDeductionStatusOrdered) {
+				return nil
+			}
+		}
 		return fmt.Errorf("mark seckill message published: %w", err)
 	}
 	pd.Status = model.PreDeductionStatusPendingOrder
@@ -804,29 +831,19 @@ func (s *flashsaleService) RecoverPreDeductions(ctx context.Context) (RecoverySt
 			if (phase == 0 && isRollback) || (phase == 1 && !isRollback) {
 				continue
 			}
-			before := list[i].Status
-			if err := s.recoverPreDeduction(ctx, &list[i]); err != nil {
+			before, after, err := s.recoverPreDeductionByID(ctx, list[i].ID)
+			if err != nil {
 				if ctx.Err() != nil {
 					return stats, ctx.Err()
 				}
 				stats.Failed++
 				continue
 			}
-			current, err := s.store.PreDeductions.GetByID(ctx, list[i].ID)
-			if err != nil {
-				stats.Failed++
-				continue
-			}
-			if current == nil {
-				continue
-			}
 			switch {
-			case current.Status == model.PreDeductionStatusPendingOrder && before != model.PreDeductionStatusPendingOrder:
+			case after == model.PreDeductionStatusPendingOrder && before != model.PreDeductionStatusPendingOrder:
 				stats.Published++
-			case current.Status == model.PreDeductionStatusRolledBack && before != model.PreDeductionStatusRolledBack:
+			case after == model.PreDeductionStatusRolledBack && before != model.PreDeductionStatusRolledBack:
 				stats.RolledBack++
-			case before == model.PreDeductionStatusPendingOrder && current.Status == model.PreDeductionStatusPendingOrder:
-				stats.Published++
 			}
 		}
 	}
@@ -837,17 +854,38 @@ func (s *flashsaleService) RecoverPreDeduction(ctx context.Context, id int64) er
 	if s.store.PreDeductions == nil {
 		return ErrPreDeductionNotFound
 	}
-	pd, err := s.store.PreDeductions.GetByID(ctx, id)
-	if err != nil {
-		return err
-	}
-	if pd == nil {
-		return ErrPreDeductionNotFound
-	}
-	return s.recoverPreDeduction(ctx, pd)
+	_, _, err := s.recoverPreDeductionByID(ctx, id)
+	return err
 }
 
-func (s *flashsaleService) recoverPreDeduction(ctx context.Context, pd *model.PreDeduction) error {
+func (s *flashsaleService) recoverPreDeductionByID(ctx context.Context, id int64) (model.PreDeductionStatus, model.PreDeductionStatus, error) {
+	mu := &s.preDeductionMu[uint64(id)%uint64(len(s.preDeductionMu))]
+	mu.Lock()
+	defer mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
+	pd, err := s.store.PreDeductions.GetByID(ctx, id)
+	if err != nil {
+		return "", "", err
+	}
+	if pd == nil {
+		return "", "", ErrPreDeductionNotFound
+	}
+	before := pd.Status
+	recoverErr := s.recoverPreDeductionLocked(ctx, pd)
+	current, getErr := s.store.PreDeductions.GetByID(ctx, id)
+	if getErr != nil {
+		return before, before, errors.Join(recoverErr, getErr)
+	}
+	after := before
+	if current != nil {
+		after = current.Status
+	}
+	return before, after, recoverErr
+}
+
+func (s *flashsaleService) recoverPreDeductionLocked(ctx context.Context, pd *model.PreDeduction) error {
 	switch pd.Status {
 	case model.PreDeductionStatusPreparing:
 		// A live request creates the MySQL fact before running Redis Lua. Do not
@@ -862,7 +900,7 @@ func (s *flashsaleService) recoverPreDeduction(ctx context.Context, pd *model.Pr
 				return err
 			}
 			pd.Status = model.PreDeductionStatusPendingPublish
-			return s.dispatchPreDeduction(ctx, pd)
+			return s.dispatchPreDeductionLocked(ctx, pd)
 		case errors.Is(err, cache.ErrMiss):
 			if err := s.store.PreDeductions.MarkPendingRollback(ctx, pd.ID, "pre-deduction not present in Redis"); err != nil {
 				return err
@@ -878,11 +916,13 @@ func (s *flashsaleService) recoverPreDeduction(ctx context.Context, pd *model.Pr
 			pd.Status = model.PreDeductionStatusPendingRollback
 			return s.rollbackPreDeduction(ctx, pd, false)
 		}
-	case model.PreDeductionStatusPendingPublish, model.PreDeductionStatusPendingOrder:
+	case model.PreDeductionStatusPendingPublish:
 		if err := s.ensurePreDeductionReservation(ctx, pd); err != nil {
 			return err
 		}
-		return s.dispatchPreDeduction(ctx, pd)
+		return s.dispatchPreDeductionLocked(ctx, pd)
+	case model.PreDeductionStatusPendingOrder:
+		return s.ensurePreDeductionReservation(ctx, pd)
 	case model.PreDeductionStatusPendingRollback:
 		return s.rollbackPreDeduction(ctx, pd, true)
 	default:

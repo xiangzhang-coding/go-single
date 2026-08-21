@@ -33,6 +33,7 @@ type fakeActivities struct {
 	order                int64
 	respectContextCancel bool
 	updateStatusErr      error
+	beforeGetForUpdate   func(*model.Activity)
 }
 
 func newFakeActivities() *fakeActivities {
@@ -70,6 +71,10 @@ func (f *fakeActivities) GetByID(_ context.Context, id int64) (*model.Activity, 
 }
 
 func (f *fakeActivities) GetByIDForUpdate(ctx context.Context, _ *transaction.Handle, id int64) (*model.Activity, error) {
+	if f.beforeGetForUpdate != nil {
+		f.beforeGetForUpdate(f.byID[id])
+		f.beforeGetForUpdate = nil
+	}
 	return f.GetByID(ctx, id)
 }
 
@@ -1002,6 +1007,21 @@ func TestUpdateOfflineSkipsRedis(t *testing.T) {
 	require.Equal(t, 50, updated.Stock)
 }
 
+func TestUpdateOfflineStartedActivityCannotExtendWindow(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	orderNo := "started-order"
+	require.NoError(t, fx.preDeductions.Create(context.Background(), &model.PreDeduction{
+		ActivityID: a.ID, UserID: 1, OrderNo: &orderNo, Quantity: 1, Status: model.PreDeductionStatusOrdered,
+	}))
+	p := ActivityParams{
+		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: a.Stock,
+		PerUserLimit: a.PerUserLimit, StartAt: a.StartAt, EndAt: a.EndAt.Add(time.Hour),
+	}
+
+	require.ErrorIs(t, fx.svc.UpdateActivity(context.Background(), a.ID, p), ErrActivityFieldsLocked)
+}
+
 // 编辑边界：不存在 404；SKU 换绑需校验存在；非法参数 400 语义。
 func TestUpdateEdgeCases(t *testing.T) {
 	fx := newFixture()
@@ -1017,6 +1037,49 @@ func TestUpdateEdgeCases(t *testing.T) {
 	// 换绑到不存在的 SKU。
 	p.SKUID = 2
 	require.ErrorIs(t, fx.svc.UpdateActivity(context.Background(), a.ID, p), ErrInvalidInput)
+}
+
+func TestUpdateEndedActivityCannotBeReopened(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, func(p *ActivityParams) {
+		p.StartAt = time.Now().Add(-2 * time.Hour)
+		p.EndAt = time.Now().Add(-time.Hour)
+	})
+	orderNo := "ended-order"
+	require.NoError(t, fx.preDeductions.Create(context.Background(), &model.PreDeduction{
+		ActivityID: a.ID, UserID: 1, OrderNo: &orderNo, Quantity: 1, Status: model.PreDeductionStatusOrdered,
+	}))
+	p := ActivityParams{
+		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: a.Stock,
+		PerUserLimit: a.PerUserLimit,
+		StartAt:      time.Now().Add(time.Hour),
+		EndAt:        time.Now().Add(2 * time.Hour),
+	}
+
+	require.ErrorIs(t, fx.svc.UpdateActivity(context.Background(), a.ID, p), ErrActivityEnded)
+}
+
+func TestUpdateRechecksEndedActivityAfterLock(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, func(p *ActivityParams) {
+		p.StartAt = time.Now().Add(-time.Hour)
+		p.EndAt = time.Now().Add(time.Hour)
+	})
+	orderNo := "ending-order"
+	require.NoError(t, fx.preDeductions.Create(context.Background(), &model.PreDeduction{
+		ActivityID: a.ID, UserID: 1, OrderNo: &orderNo, Quantity: 1, Status: model.PreDeductionStatusOrdered,
+	}))
+	fx.acts.beforeGetForUpdate = func(locked *model.Activity) {
+		locked.EndAt = time.Now().Add(-time.Second)
+	}
+	p := ActivityParams{
+		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: a.Stock,
+		PerUserLimit: a.PerUserLimit,
+		StartAt:      time.Now().Add(time.Hour),
+		EndAt:        time.Now().Add(2 * time.Hour),
+	}
+
+	require.ErrorIs(t, fx.svc.UpdateActivity(context.Background(), a.ID, p), ErrActivityEnded)
 }
 
 // ---- 下架 ----

@@ -157,6 +157,23 @@ func (r *GORMPreDeductionRepository) PendingReservationQuantityForUpdate(ctx con
 	return total, nil
 }
 
+func (r *GORMPreDeductionRepository) HasAcceptedReservationForUpdate(ctx context.Context, handle *transaction.Handle, activityID int64) (bool, error) {
+	tx, err := transaction.GORM(handle)
+	if err != nil {
+		return false, err
+	}
+	var rows []model.PreDeduction
+	err = tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id").
+		Where("activity_id = ? AND status IN ?", activityID, []model.PreDeductionStatus{
+			model.PreDeductionStatusPendingPublish,
+			model.PreDeductionStatusPendingOrder,
+			model.PreDeductionStatusOrdered,
+			model.PreDeductionStatusPendingRollback,
+		}).Limit(1).Find(&rows).Error
+	return len(rows) > 0, err
+}
+
 func (r *GORMPreDeductionRepository) getByID(db *gorm.DB, id int64) (*model.PreDeduction, error) {
 	var p model.PreDeduction
 	if err := db.First(&p, id).Error; err != nil {

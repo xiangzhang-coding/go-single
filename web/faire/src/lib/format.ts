@@ -1,3 +1,5 @@
+import type { CouponType, UserCouponStatus } from "../api/types";
+
 export function formatMoney(cents: number) {
   return new Intl.NumberFormat("zh-CN", {
     style: "currency",
@@ -69,7 +71,7 @@ export function makeClientRequestID() {
 }
 
 export function isCouponUsable(coupon: {
-  status: string;
+  status: UserCouponStatus;
   min_amount: number;
   valid_from: string;
   valid_until: string;
@@ -83,6 +85,6 @@ export function isCouponUsable(coupon: {
   );
 }
 
-export function describeCouponRule(type: string, minAmount: number) {
+export function describeCouponRule(type: CouponType, minAmount: number) {
   return type === "threshold" ? `满 ${formatMoney(minAmount)} 可用` : "无门槛直减";
 }

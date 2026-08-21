@@ -7,31 +7,41 @@ import (
 	"time"
 )
 
-type task struct {
-	status string // pending_publish → pending_order → ordered / rolled_back
-}
-
 func main() {
 	// 秒杀抢购：预扣成功立即返回 202，落单异步进行；前端轮询预扣生命周期。
-	t := &task{status: "pending_publish"}
+	status := "pending_publish"
+	updates := taskStatuses(150 * time.Millisecond)
 
 	fmt.Println("POST /api/flashsales/:id/purchase → 202 {\"status\":\"queued\",\"pre_deduction_id\":\"42\",\"pre_deduction_status\":\"pending_publish\"}")
 
-	go func() { // 消费者异步落单
-		time.Sleep(150 * time.Millisecond)
-		t.status = "pending_order"
-		time.Sleep(150 * time.Millisecond)
-		t.status = "ordered"
-	}()
-
 	for i := 0; i < 8; i++ { // 前端 1.5s×30 轮询
 		time.Sleep(100 * time.Millisecond)
-		fmt.Printf("轮询 GET /api/flashsales/purchases/42 → %s\n", t.status)
-		if t.status == "ordered" || t.status == "rolled_back" {
+		select {
+		case next, open := <-updates:
+			if open {
+				status = next
+			}
+		default:
+		}
+		fmt.Printf("轮询 GET /api/flashsales/purchases/42 → %s\n", status)
+		if status == "ordered" || status == "rolled_back" {
 			fmt.Println("→ 生命周期已终结：已落单则跳转详情，已回退则提示失败")
 			break
 		}
 	}
+}
+
+// taskStatuses 用 channel 把消费者产生的状态交给轮询方，状态只由轮询 goroutine 持有。
+func taskStatuses(stepDelay time.Duration) <-chan string {
+	updates := make(chan string)
+	go func() {
+		defer close(updates)
+		time.Sleep(stepDelay)
+		updates <- "pending_order"
+		time.Sleep(stepDelay)
+		updates <- "ordered"
+	}()
+	return updates
 }
 
 // 项目位置：internal/flashsale/handler/flashsale_handler.go 返回 202 + pre_deduction_id；

@@ -4,11 +4,12 @@ import type {
   Category,
   CartItem,
   CartItemView,
+  ClaimableCouponTemplateListResponse,
   ConversationListResponse,
   ConversationView,
   CouponListResponse,
-  CouponTemplateListResponse,
-  CouponTemplateView,
+  AdminCouponTemplateListResponse,
+  CouponTemplateRecord,
   CreateAddressRequest,
   CreateCouponTemplateRequest,
   CreateFlashSaleRequest,
@@ -44,6 +45,7 @@ import type {
   UploadedMedia,
   MediaKind,
   UserCoupon,
+  UserCouponListStatus,
   UserSearchResult,
 } from "./types";
 
@@ -135,7 +137,7 @@ export async function setDefaultAddress(id: number) {
   await api.put(`/addresses/${id}/default`);
 }
 
-export async function getMyCoupons(status?: string) {
+export async function getMyCoupons(status: UserCouponListStatus = "") {
   const { data } = await api.get<CouponListResponse>("/coupons/mine", {
     params: { status: status || "", page: 1, page_size: 50 },
   });
@@ -143,7 +145,7 @@ export async function getMyCoupons(status?: string) {
 }
 
 export async function getClaimableCoupons() {
-  const { data } = await api.get<CouponTemplateListResponse>("/coupons");
+  const { data } = await api.get<ClaimableCouponTemplateListResponse>("/coupons");
   return data.items;
 }
 
@@ -158,10 +160,10 @@ export async function getFlashSales() {
 }
 
 export async function purchaseFlashSale(activityId: number, clientRequestId: string) {
-	const { data } = await api.post<FlashSalePurchaseResponse>(
-		`/flashsales/${activityId}/purchase`,
-		{ client_request_id: clientRequestId },
-	);
+  const { data } = await api.post<FlashSalePurchaseResponse>(
+    `/flashsales/${activityId}/purchase`,
+    { client_request_id: clientRequestId },
+  );
   return data;
 }
 
@@ -433,11 +435,11 @@ export const adminApi = {
 
   // ---- 券模板 ----
   async getCouponTemplates() {
-    const { data } = await api.get<CouponTemplateListResponse>("/admin/coupons");
+    const { data } = await api.get<AdminCouponTemplateListResponse>("/admin/coupons");
     return data.items;
   },
   async createCouponTemplate(request: CreateCouponTemplateRequest) {
-    const { data } = await api.post<CouponTemplateView>("/admin/coupons", request);
+    const { data } = await api.post<CouponTemplateRecord>("/admin/coupons", request);
     return data;
   },
   async updateCouponTemplate(id: number, request: CreateCouponTemplateRequest) {

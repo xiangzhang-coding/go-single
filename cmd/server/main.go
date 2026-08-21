@@ -100,6 +100,12 @@ func run() error {
 	if err := runMigrations(cfg, log); err != nil {
 		return err
 	}
+	validationCtx, validationCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = validateReleaseDatabase(validationCtx, cfg.Server.Mode, sqlSeedAdminChecker{db: sqlDB})
+	validationCancel()
+	if err != nil {
+		return err
+	}
 
 	// 依赖：Redis 缓存 + RabbitMQ 消息。
 	cacheClient, err := cache.NewRedis(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
@@ -147,13 +153,13 @@ func run() error {
 	background.Start()
 
 	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
+		Addr:         listenAddress(cfg.Server),
 		Handler:      router,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
 	go func() {
-		log.Info("HTTP 服务启动", zap.Int("port", cfg.Server.Port))
+		log.Info("HTTP 服务启动", zap.String("host", cfg.Server.Host), zap.Int("port", cfg.Server.Port))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("HTTP 服务异常退出", zap.Error(err))
 			os.Exit(1)

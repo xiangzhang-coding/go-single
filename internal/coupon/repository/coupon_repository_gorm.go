@@ -180,26 +180,26 @@ func (r *GORMUserCouponRepository) CountUserByTemplate(ctx context.Context, user
 	return n, err
 }
 
-// GetViewByID 单张券查询（归属过滤），与 ListByUser 同构的 JOIN + 派生状态。
-func (r *GORMUserCouponRepository) GetViewByID(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error) {
-	now := time.Now()
-	var v model.UserCouponView
-	err := r.db.WithContext(ctx).
-		Table("user_coupons AS uc").
-		Joins("JOIN coupon_templates AS t ON t.id = uc.template_id").
-		Select(
-			"uc.id, uc.template_id, t.name, t.type, t.value, t.min_amount, "+
-				derivedStatusExpr(now)+" AS status, "+
-				"t.valid_from, t.valid_until, uc.used_at, uc.created_at", now).
-		Where("uc.id = ? AND uc.user_id = ?", couponID, userID).
-		Scan(&v).Error
+func (r *GORMUserCouponRepository) GetRedemptionForUpdate(ctx context.Context, handle *transaction.Handle, couponID int64) (*RedemptionFacts, error) {
+	tx, err := transaction.GORM(handle)
 	if err != nil {
 		return nil, err
 	}
-	if v.ID == 0 {
+	var facts RedemptionFacts
+	err = tx.WithContext(ctx).
+		Table("user_coupons AS uc").
+		Joins("JOIN coupon_templates AS t ON t.id = uc.template_id").
+		Select("uc.id AS coupon_id, uc.user_id, uc.status, t.value, t.min_amount, t.valid_from, t.valid_until").
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("uc.id = ?", couponID).
+		Take(&facts).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
-	return &v, nil
+	if err != nil {
+		return nil, err
+	}
+	return &facts, nil
 }
 
 // Use 条件核销：unused→used 单条 UPDATE（含模板有效期窗口，原子校验防

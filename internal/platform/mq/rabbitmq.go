@@ -18,7 +18,11 @@ const (
 	dlqSuffix = ".dlq"
 	// msgTimeout 单条消息处理超时（全链路 context 超时逐层传递）。
 	msgTimeout = 15 * time.Second
+	// transientRequeueDelay 限制瞬时失败和熔断打开时的重投频率。
+	transientRequeueDelay = 500 * time.Millisecond
 )
+
+type requeueBackoff func(context.Context) error
 
 type rabbitMQ struct {
 	conn *amqp.Connection
@@ -125,7 +129,10 @@ func (r *rabbitMQ) Consume(ctx context.Context, queue string, handler MessageHan
 			if !ok {
 				return fmt.Errorf("MQ 消费通道关闭")
 			}
-			if err := consumeOne(ctx, d, handler); err != nil {
+			if err := consumeOne(ctx, d, handler, waitTransientRequeue); err != nil {
+				if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+					return nil
+				}
 				// Ack/Nack 自身失败（channel 异常）：退出消费循环，
 				// 由调用方（main）重连；未确认消息由 broker 自动重投（at-least-once）。
 				return err
@@ -135,8 +142,8 @@ func (r *rabbitMQ) Consume(ctx context.Context, queue string, handler MessageHan
 }
 
 // consumeOne 单条消息：超时执行 handler 后按错误分类确认。
-// 返回 nil 表示消息已确认；返回错误表示确认自身失败（channel 异常，调用方重连）。
-func consumeOne(ctx context.Context, d amqp.Delivery, handler MessageHandler) error {
+// 返回 nil 表示消息已确认；返回错误表示确认失败，或重投退避被 ctx 中断。
+func consumeOne(ctx context.Context, d amqp.Delivery, handler MessageHandler, backoff requeueBackoff) error {
 	hctx, cancel := context.WithTimeout(ctx, msgTimeout)
 	defer cancel()
 	derr := handler(hctx, d.Body)
@@ -152,12 +159,27 @@ func consumeOne(ctx context.Context, d amqp.Delivery, handler MessageHandler) er
 			return fmt.Errorf("MQ Nack 死信: %w", err)
 		}
 	default:
-		// 瞬时失败：重投（requeue=true），at-least-once 不丢消息。
+		// 瞬时失败：退避后重投，避免故障或熔断打开时形成热循环。
+		if err := backoff(ctx); err != nil {
+			// ctx 取消时保留未确认状态；关闭 channel 后 broker 自动重投。
+			return err
+		}
 		if err := d.Nack(false, true); err != nil {
 			return fmt.Errorf("MQ Nack 重投: %w", err)
 		}
 	}
 	return nil
+}
+
+func waitTransientRequeue(ctx context.Context) error {
+	timer := time.NewTimer(transientRequeueDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // declareQueue 声明主队列（含死信配置）与死信队列，声明幂等（已存在则 no-op）。

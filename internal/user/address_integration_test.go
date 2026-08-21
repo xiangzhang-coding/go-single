@@ -4,12 +4,17 @@
 package user_test
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
 )
 
 func addressBody(receiver, phone string, isDefault bool) string {
@@ -33,6 +38,18 @@ func defaultAddressID(t *testing.T, env *testEnv, userID int64) *int64 {
 	var id *int64
 	require.NoError(t, env.gdb.Raw("SELECT default_address_id FROM users WHERE id = ?", userID).Scan(&id).Error)
 	return id
+}
+
+func rootTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=Local",
+		envOr("GO_SINGLE_MYSQL_ROOT_USER", "root"), envOr("GO_SINGLE_MYSQL_ROOT_PASSWORD", "root123"),
+		envOr("GO_SINGLE_MYSQL_HOST", "127.0.0.1"), envOr("GO_SINGLE_MYSQL_PORT", "3306"), testDBName)
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	require.NoError(t, db.Ping())
+	t.Cleanup(func() { _ = db.Close() })
+	return db
 }
 
 // ---- CRUD 闭环 ----
@@ -163,6 +180,107 @@ func TestAddressDefaultUnique(t *testing.T) {
 	require.NoError(t, env.gdb.Raw(`SELECT COUNT(*) FROM user_addresses a JOIN users u ON u.id = a.user_id
 		WHERE a.user_id = ? AND u.default_address_id = a.id`, userID).Scan(&cnt).Error)
 	require.Equal(t, int64(1), cnt)
+}
+
+func TestAddressConcurrentFirstCreationReturnsOneDefault(t *testing.T) {
+	env := requireEnv(t)
+	username := fmt.Sprintf("addr_race_%d", time.Now().UnixNano())
+	reg := registerUser(t, env, username, "secret123")
+	userID := int64(reg["id"].(float64))
+	_, loginBody := login(t, env, username, "secret123")
+	token := tokenOf(t, loginBody)
+
+	const workers = 8
+	var wg sync.WaitGroup
+	responses := make([]map[string]any, workers)
+	for i := range responses {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			w, body := doJSON(t, env, http.MethodPost, "/api/addresses",
+				addressBody(fmt.Sprintf("并发%d", i), "13800138000", false), token)
+			require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+			responses[i] = body
+		}(i)
+	}
+	wg.Wait()
+
+	returnedDefaults := 0
+	for _, body := range responses {
+		if body["is_default"] == true {
+			returnedDefaults++
+		}
+	}
+	require.Equal(t, 1, returnedDefaults, "并发首条创建的响应中只能有实际成为默认的一条")
+
+	var count int64
+	require.NoError(t, env.gdb.Table("user_addresses").Where("user_id = ?", userID).Count(&count).Error)
+	require.Equal(t, int64(workers), count)
+	require.NotNil(t, defaultAddressID(t, env, userID))
+}
+
+func TestCreateAddressContextCancellationRollsBackCreation(t *testing.T) {
+	env := requireEnv(t)
+	username := fmt.Sprintf("addr_cancel_%d", time.Now().UnixNano())
+	reg := registerUser(t, env, username, "secret123")
+	userID := int64(reg["id"].(float64))
+	trigger := fmt.Sprintf("test_address_create_cancel_%d", userID)
+	rootDB := rootTestDB(t)
+	_, err := rootDB.Exec("DROP TRIGGER IF EXISTS " + trigger)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = rootDB.Exec("DROP TRIGGER IF EXISTS " + trigger) })
+	_, err = rootDB.Exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON users
+FOR EACH ROW BEGIN
+  IF OLD.id = %d AND NEW.default_address_id IS NOT NULL THEN
+    DO SLEEP(1);
+  END IF;
+END`, trigger, userID))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err = env.userSvc.CreateAddress(ctx, userID, usersvc.AddressParams{
+		Receiver: "张三", Phone: "13800138000", Province: "广东省",
+		City: "深圳市", District: "南山区", Detail: "科技园路 1 号",
+	})
+	require.Error(t, err)
+
+	var count int64
+	require.NoError(t, env.gdb.Table("user_addresses").Where("user_id = ?", userID).Count(&count).Error)
+	require.Zero(t, count, "context 取消必须回滚同事务内已创建的地址")
+	require.Nil(t, defaultAddressID(t, env, userID))
+}
+
+func TestDeleteAddressDefaultPromotionFailureRollsBackDelete(t *testing.T) {
+	env := requireEnv(t)
+	username := fmt.Sprintf("addr_dr_%d", time.Now().UnixNano())
+	reg := registerUser(t, env, username, "secret123")
+	userID := int64(reg["id"].(float64))
+	_, loginBody := login(t, env, username, "secret123")
+	token := tokenOf(t, loginBody)
+	first := createAddress(t, env, token, "张三", false)
+	createAddress(t, env, token, "李四", false)
+
+	trigger := fmt.Sprintf("test_address_delete_rollback_%d", userID)
+	rootDB := rootTestDB(t)
+	_, err := rootDB.Exec("DROP TRIGGER IF EXISTS " + trigger)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = rootDB.Exec("DROP TRIGGER IF EXISTS " + trigger) })
+	_, err = rootDB.Exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON users
+FOR EACH ROW BEGIN
+  IF OLD.id = %d AND NEW.default_address_id IS NOT NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'forced default promotion failure';
+  END IF;
+END`, trigger, userID))
+	require.NoError(t, err)
+
+	w, _ := doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/addresses/%d", first), "", token)
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+
+	var count int64
+	require.NoError(t, env.gdb.Table("user_addresses").Where("id = ?", first).Count(&count).Error)
+	require.Equal(t, int64(1), count, "补默认失败必须回滚地址删除")
+	require.Equal(t, first, *defaultAddressID(t, env, userID))
 }
 
 // ---- 对象级授权 ----

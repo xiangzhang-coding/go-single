@@ -10,9 +10,14 @@ import { AuthorizedDownload, AuthorizedImage } from "../components/AuthorizedMed
 import { useAuthStore } from "../store/auth";
 import { useChatStore } from "../store/chat";
 import { formatDate } from "../lib/format";
-import { makeClientRequestID } from "../lib/format";
 import { latestMessageID } from "../lib/chat";
 import { IMAGE_ACCEPT, MESSAGE_FILE_ACCEPT, validateImage, validateMessageFile } from "../lib/media";
+import {
+  createMediaSendOperation,
+  createTextSendOperation,
+  executeMessageSend,
+  type MessageSendOperation,
+} from "../lib/message-send";
 
 export function ChatPage() {
   const { token, user } = useAuthStore();
@@ -352,24 +357,29 @@ function MessageComposer({
 }) {
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [pendingOperation, setPendingOperation] = useState<MessageSendOperation | null>(null);
+  const pendingOperationRef = useRef<MessageSendOperation | null>(null);
   const imageInput = useRef<HTMLInputElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
+  function rememberOperation(operation: MessageSendOperation | null) {
+    pendingOperationRef.current = operation;
+    setPendingOperation(operation);
+  }
+
   const send = useMutation({
-    mutationFn: async (payload: { type: "text"; content: string } | { type: "image" | "file"; file: File }) => {
-      const uploaded = payload.type === "text" ? null : await uploadFile(payload.file, payload.type);
-      return sendMessage({
-        to_user_id: peerUserId,
-        type: payload.type,
-        content: payload.type === "text" ? payload.content : undefined,
-        url: uploaded?.url,
-        client_request_id: makeClientRequestID(),
-      });
-    },
-    onSuccess: (msg, payload) => {
-      if (payload.type === "text") setText("");
+    mutationFn: (operation: MessageSendOperation) => executeMessageSend(
+      operation,
+      peerUserId,
+      uploadFile,
+      sendMessage,
+      rememberOperation,
+    ),
+    onSuccess: ({ result: message }, operation) => {
+      if (operation.type === "text") setText("");
+      rememberOperation(null);
       setError(null);
-      onSent(msg);
+      onSent(message);
     },
     onError: (err) => setError(getApiErrorMessage(err)),
   });
@@ -378,7 +388,12 @@ function MessageComposer({
     event.preventDefault();
     const content = text.trim();
     if (!content || send.isPending) return;
-    send.mutate({ type: "text", content });
+    const pending = pendingOperationRef.current;
+    const operation = pending?.type === "text" && pending.content === content
+      ? pending
+      : createTextSendOperation(content);
+    rememberOperation(operation);
+    send.mutate(operation);
   }
 
   function pickMedia(event: React.ChangeEvent<HTMLInputElement>, type: "image" | "file") {
@@ -399,17 +414,43 @@ function MessageComposer({
         return;
       }
     }
-    send.mutate({ type, file: selected });
+    const operation = createMediaSendOperation(type, selected);
+    rememberOperation(operation);
+    send.mutate(operation);
   }
 
   return (
     <div className="chat-composer">
-      {error && <p className="notice notice-error mb-3">{error}</p>}
+      {error && (
+        <div className="notice notice-error mb-3">
+          <p>{error}</p>
+          {pendingOperation && (
+            <Button
+              type="button"
+              variant="secondary"
+              className="button-small mt-2"
+              disabled={send.isPending}
+              onClick={() => send.mutate(pendingOperation)}
+            >
+              <Icon name="refresh" size={15} /> 重试发送
+            </Button>
+          )}
+        </div>
+      )}
       <form className="chat-composer-row" onSubmit={submit}>
         <input
           className="form-control chat-composer-input"
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            const next = e.target.value;
+            setText(next);
+            const pending = pendingOperationRef.current;
+            if (send.isError && pending?.type === "text" && pending.content !== next.trim()) {
+              rememberOperation(null);
+              setError(null);
+              send.reset();
+            }
+          }}
           placeholder="输入消息，Enter 发送"
           maxLength={2000}
           disabled={disabled || send.isPending}

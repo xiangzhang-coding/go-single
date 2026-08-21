@@ -361,7 +361,7 @@ func TestSeckillOrderFullLoop(t *testing.T) {
 	require.Equal(t, 1, countSeckillOrders(t, e, id))
 }
 
-func TestSeckillOrderUsesSnapshotAcceptedBeforeSKUAndPriceEdit(t *testing.T) {
+func TestSeckillOrderKeepsAcceptedSnapshotWhenActivityEditWaitsForSettlement(t *testing.T) {
 	requireEnv(t)
 	e := requireMQEnv(t)
 	admin := adminToken(t, env)
@@ -381,8 +381,8 @@ func TestSeckillOrderUsesSnapshotAcceptedBeforeSKUAndPriceEdit(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, w.Code)
 	newSKUID := seedSKU(t, env, admin)
 	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/flashsales/%d", id),
-		activityBody(newSKUID, "换绑后的活动", 7700, 10, 1, -time.Minute, time.Hour), admin)
-	require.Equal(t, http.StatusNoContent, w.Code)
+		activityBody(newSKUID, "换绑后的活动", 7700, 10, 1, time.Hour, 2*time.Hour), admin)
+	require.Equal(t, http.StatusConflict, w.Code, "accepted reservation must settle before mutable activity fields change")
 
 	require.NoError(t, e.consumer.Handle(context.Background(), acceptedMessage))
 	order := pollOrder(t, e, response["order_no"].(string), token)

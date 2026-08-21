@@ -24,10 +24,11 @@ var (
 	ErrSoldOut           = errors.New("coupon sold out")
 	ErrClaimLimitReached = errors.New("claim limit reached")
 
-	ErrCouponNotFound       = errors.New("coupon not found")
-	ErrCouponUsed           = errors.New("coupon already used")
-	ErrCouponExpired        = errors.New("coupon is not valid at this time")
-	ErrCouponRollbackFailed = errors.New("coupon not in used state, rollback failed")
+	ErrCouponNotFound        = errors.New("coupon not found")
+	ErrCouponUsed            = errors.New("coupon already used")
+	ErrCouponExpired         = errors.New("coupon is not valid at this time")
+	ErrCouponThresholdNotMet = errors.New("coupon threshold not met")
+	ErrCouponRollbackFailed  = errors.New("coupon not in used state, rollback failed")
 )
 
 // 可领券列表的状态取值。
@@ -82,11 +83,10 @@ type Service interface {
 	Claim(ctx context.Context, userID, templateID int64) (*model.UserCoupon, error)
 	// ListMine 我的券（status 空 = 全部；unused/used/expired 筛选）。
 	ListMine(ctx context.Context, userID int64, status string, page, pageSize int) ([]model.UserCouponView, int64, error)
-	// GetUsable 校验并读取一张可用券（归属/未用/在有效期），供 order 模块结算使用。
-	GetUsable(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error)
-	// UseCoupon 事务内条件核销（unused→used + 有效期窗口原子校验，并发仅一次
-	// 成功），供 order 模块下单调用；失败时区分已用/已过期/不存在。
-	UseCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error
+	// RedeemForOrder locks user_coupon + coupon_template in the order transaction,
+	// validates ownership/status/window/threshold, redeems the coupon, and returns
+	// the exact value snapshot used by that order's amount calculation.
+	RedeemForOrder(ctx context.Context, tx *transaction.Handle, userID, couponID, totalAmount int64) (model.CouponRedemption, error)
 	// RollbackCoupon 事务内条件回退（used→unused），供 order 模块取消订单调用。
 	RollbackCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error
 }
@@ -309,50 +309,34 @@ func (s *couponService) ListMine(ctx context.Context, userID int64, status strin
 	return s.store.UserCoupon.ListByUser(ctx, userID, status, (page-1)*pageSize, pageSize)
 }
 
-// GetUsable 结算前校验：券必须存在且归属当前用户、未用、处于有效期；
-// 门槛校验（满减）由 order 模块按订单总额完成（全场券，无商品维度限制）。
-func (s *couponService) GetUsable(ctx context.Context, userID, couponID int64) (*model.UserCouponView, error) {
-	v, err := s.store.UserCoupon.GetViewByID(ctx, userID, couponID)
+func (s *couponService) RedeemForOrder(ctx context.Context, tx *transaction.Handle, userID, couponID, totalAmount int64) (model.CouponRedemption, error) {
+	facts, err := s.store.UserCoupon.GetRedemptionForUpdate(ctx, tx, couponID)
 	if err != nil {
-		return nil, err
+		return model.CouponRedemption{}, err
 	}
-	if v == nil {
-		return nil, ErrCouponNotFound
+	if facts == nil || facts.UserID != userID {
+		return model.CouponRedemption{}, ErrCouponNotFound
+	}
+	if facts.Status != model.CouponStatusUnused {
+		return model.CouponRedemption{}, ErrCouponUsed
 	}
 	now := time.Now()
-	if v.Status == model.CouponStatusUsed {
-		return nil, ErrCouponUsed
+	if now.Before(facts.ValidFrom) || now.After(facts.ValidUntil) {
+		return model.CouponRedemption{}, ErrCouponExpired
 	}
-	if now.Before(v.ValidFrom) || now.After(v.ValidUntil) {
-		return nil, ErrCouponExpired
+	if totalAmount < facts.MinAmount {
+		return model.CouponRedemption{}, ErrCouponThresholdNotMet
 	}
-	return v, nil
-}
-
-// UseCoupon 事务内核销（条件更新 unused→used + 有效期窗口），事务由 order
-// 模块开启并提交。条件更新失败时重查区分原因：已用 / 过期 / 不存在，
-// 避免"结算通过但事务内过期"被误报为已用。
-func (s *couponService) UseCoupon(ctx context.Context, tx *transaction.Handle, userID, couponID int64) error {
 	ok, err := s.store.UserCoupon.Use(ctx, tx, userID, couponID)
 	if err != nil {
-		return err
+		return model.CouponRedemption{}, err
 	}
-	if ok {
-		// 核销打点（T19c）：条件更新命中即计数；调用方（order）事务回滚时乐观多计（可接受）。
-		s.metrics.CouponRedeemed()
-		return nil
+	if !ok {
+		return model.CouponRedemption{}, ErrCouponExpired
 	}
-	v, err := s.store.UserCoupon.GetViewByID(ctx, userID, couponID)
-	if err != nil {
-		return err
-	}
-	if v == nil {
-		return ErrCouponNotFound
-	}
-	if v.Status == model.CouponStatusUsed {
-		return ErrCouponUsed
-	}
-	return ErrCouponExpired
+	// 条件更新命中即计数；调用方事务回滚时乐观多计（可接受）。
+	s.metrics.CouponRedeemed()
+	return model.CouponRedemption{CouponID: facts.CouponID, Value: facts.Value}, nil
 }
 
 // RollbackCoupon 事务内回退（条件更新 used→unused），取消订单回退券。

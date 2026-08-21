@@ -3,6 +3,7 @@ package config
 import (
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -22,6 +23,7 @@ func TestLoad(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 8080, cfg.Server.Port)
+	require.Equal(t, "0.0.0.0", cfg.Server.Host)
 	require.Equal(t, int64(64<<10), cfg.Server.MaxJSONBodyBytes)
 	require.Equal(t, "info", cfg.Log.Level)
 	require.Equal(t, "./logs/app.log", cfg.Log.File)
@@ -57,6 +59,7 @@ func TestMySQLDSN(t *testing.T) {
 
 func TestLoadEnvOverride(t *testing.T) {
 	t.Setenv("GO_SINGLE_SERVER_PORT", "9090")
+	t.Setenv("GO_SINGLE_SERVER_HOST", "0.0.0.0")
 	t.Setenv("GO_SINGLE_REDIS_ADDR", "10.0.0.1:6379")
 	t.Setenv("GO_SINGLE_SNOWFLAKE_WORKER_ID", "7")
 	t.Setenv("GO_SINGLE_WS_MAX_CONNECTIONS", "321")
@@ -68,10 +71,47 @@ func TestLoadEnvOverride(t *testing.T) {
 	cfg, err := LoadFrom(filepath.Join(root, "configs"), root)
 	require.NoError(t, err)
 	require.Equal(t, 9090, cfg.Server.Port)
+	require.Equal(t, "0.0.0.0", cfg.Server.Host)
 	require.Equal(t, "10.0.0.1:6379", cfg.Redis.Addr)
 	require.Equal(t, int64(7), cfg.Snowflake.WorkerID)
 	require.Equal(t, 321, cfg.WS.MaxConnections)
 	require.Equal(t, int64(32768), cfg.Server.MaxJSONBodyBytes)
 	require.Equal(t, 42, cfg.Auth.LoginRateLimit.PerIPMax)
 	require.Equal(t, int64(77), cfg.Upload.MaxObjectsPerUser)
+}
+
+func TestLoadReleaseRejectsDefaultJWTSecret(t *testing.T) {
+	t.Setenv("GO_SINGLE_SERVER_MODE", "release")
+
+	root := repoRoot(t)
+	_, err := LoadFrom(filepath.Join(root, "configs"), root)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "GO_SINGLE_AUTH_SECRET")
+	require.NotContains(t, err.Error(), "dev-secret-change-me")
+}
+
+func TestLoadReleaseAcceptsReplacedJWTSecret(t *testing.T) {
+	t.Setenv("GO_SINGLE_SERVER_MODE", "release")
+	t.Setenv("GO_SINGLE_AUTH_SECRET", strings.Repeat("x", 32))
+
+	root := repoRoot(t)
+	_, err := LoadFrom(filepath.Join(root, "configs"), root)
+	require.NoError(t, err)
+}
+
+func TestLoadReleaseRejectsShortJWTSecret(t *testing.T) {
+	t.Setenv("GO_SINGLE_SERVER_MODE", "release")
+	t.Setenv("GO_SINGLE_AUTH_SECRET", strings.Repeat("x", 31))
+
+	root := repoRoot(t)
+	_, err := LoadFrom(filepath.Join(root, "configs"), root)
+	require.ErrorContains(t, err, "至少 32 字节")
+}
+
+func TestLoadTestModeAcceptsDemoJWTSecret(t *testing.T) {
+	t.Setenv("GO_SINGLE_SERVER_MODE", "test")
+
+	root := repoRoot(t)
+	_, err := LoadFrom(filepath.Join(root, "configs"), root)
+	require.NoError(t, err)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiangzhang-coding/go-single/internal/user/model"
 )
@@ -19,16 +20,75 @@ func NewGORMAddress(db *gorm.DB) *GORMAddressRepository {
 	return &GORMAddressRepository{db: db}
 }
 
-func (r *GORMAddressRepository) Create(ctx context.Context, a *model.Address) error {
-	return r.db.WithContext(ctx).Create(a).Error
+func (r *GORMAddressRepository) CreateWithDefault(ctx context.Context, a *model.Address, requestedDefault bool) (bool, error) {
+	var isDefault bool
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "default_address_id").First(&user, a.UserID).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(a).Error; err != nil {
+			return err
+		}
+		isDefault = requestedDefault || user.DefaultAddressID == nil
+		if !isDefault {
+			return nil
+		}
+		return tx.Model(&model.User{}).Where("id = ?", a.UserID).
+			Update("default_address_id", a.ID).Error
+	})
+	return isDefault, err
 }
 
 func (r *GORMAddressRepository) Update(ctx context.Context, a *model.Address) error {
 	return r.db.WithContext(ctx).Model(a).Select("receiver", "phone", "province", "city", "district", "detail").Updates(a).Error
 }
 
-func (r *GORMAddressRepository) Delete(ctx context.Context, id int64) error {
-	return r.db.WithContext(ctx).Delete(&model.Address{}, id).Error
+func (r *GORMAddressRepository) DeleteAndEnsureDefault(ctx context.Context, userID, id int64) (DeleteAddressResult, error) {
+	result := DeleteAddressNotFound
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "default_address_id").First(&user, userID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+
+		var address model.Address
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&address, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if address.UserID != userID {
+			result = DeleteAddressForbidden
+			return nil
+		}
+		if err := tx.Delete(&address).Error; err != nil {
+			return err
+		}
+		result = DeleteAddressDeleted
+
+		if user.DefaultAddressID != nil && *user.DefaultAddressID != id {
+			return nil
+		}
+		var replacement model.Address
+		err := tx.Where("user_id = ?", userID).Order("id DESC").Take(&replacement).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return tx.Model(&model.User{}).Where("id = ?", userID).
+				Update("default_address_id", nil).Error
+		}
+		if err != nil {
+			return err
+		}
+		return tx.Model(&model.User{}).Where("id = ?", userID).
+			Update("default_address_id", replacement.ID).Error
+	})
+	return result, err
 }
 
 func (r *GORMAddressRepository) GetByID(ctx context.Context, id int64) (*model.Address, error) {
@@ -56,13 +116,6 @@ func (r *GORMAddressRepository) ListByUser(ctx context.Context, userID int64) ([
 	return list, err
 }
 
-func (r *GORMAddressRepository) CountByUser(ctx context.Context, userID int64) (int64, error) {
-	var n int64
-	err := r.db.WithContext(ctx).Model(&model.Address{}).
-		Where("user_id = ?", userID).Count(&n).Error
-	return n, err
-}
-
 // GetDefaultAddress 按 users.default_address_id 指针读取默认地址；
 // 无默认地址（指针为空或地址已删）返回 (nil, nil)。
 func (r *GORMAddressRepository) GetDefaultAddress(ctx context.Context, userID int64) (*model.Address, error) {
@@ -82,19 +135,35 @@ func (r *GORMAddressRepository) GetDefaultAddress(ctx context.Context, userID in
 	return &a, nil
 }
 
-// SetDefault 单条 UPDATE 原子切换默认指向；地址归属由 service 先校验。
-func (r *GORMAddressRepository) SetDefault(ctx context.Context, userID, addressID int64) error {
-	return r.db.WithContext(ctx).Model(&model.User{}).
-		Where("id = ?", userID).Update("default_address_id", addressID).Error
-}
-
-// EnsureDefaultExists 删除默认地址后自愈：默认指针为空（删除默认地址时 FK 置空）
-// 且仍有余下地址时，把最新一条设为默认。单条 UPDATE 幂等，非默认删除场景为空操作。
-func (r *GORMAddressRepository) EnsureDefaultExists(ctx context.Context, userID int64) error {
-	return r.db.WithContext(ctx).Model(&model.User{}).
-		Where("id = ? AND default_address_id IS NULL AND EXISTS ("+
-			"SELECT 1 FROM user_addresses WHERE user_id = ?)", userID, userID).
-		Update("default_address_id", gorm.Expr("(SELECT id FROM user_addresses WHERE user_id = ? ORDER BY id DESC LIMIT 1)", userID)).Error
+func (r *GORMAddressRepository) SetDefaultOwned(ctx context.Context, userID, addressID int64) (SetDefaultAddressResult, error) {
+	result := SetDefaultAddressNotFound
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").First(&user, userID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		var address model.Address
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "user_id").First(&address, addressID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if address.UserID != userID {
+			result = SetDefaultAddressForbidden
+			return nil
+		}
+		if err := tx.Model(&model.User{}).Where("id = ?", userID).
+			Update("default_address_id", addressID).Error; err != nil {
+			return err
+		}
+		result = SetDefaultAddressSet
+		return nil
+	})
+	return result, err
 }
 
 var _ AddressRepository = (*GORMAddressRepository)(nil)

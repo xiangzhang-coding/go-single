@@ -376,6 +376,49 @@ func TestMockPayFailKeepsPendingThenRetrySucceeds(t *testing.T) {
 	require.Equal(t, model.OrderStatusPaid, orderByNo(t, env, orderNo).Status)
 }
 
+func TestMockPayFailRechecksOrderAfterConcurrentCancel(t *testing.T) {
+	env := requireEnv(t)
+	token := registerAndToken(t, env, uniqueName("failrace"))
+	addrID := address(t, env, token)
+	_, skuID := onSaleSKU(t, env, 9900, 1)
+	body := createOrder(t, env, token, uniqueName("req"), addrID, skuID, 1)
+	orderNo := body["order_no"].(string)
+	payAmount := int64(body["pay_amount"].(float64))
+	paymentID := uniqueName("fail-after-cancel")
+
+	stateTx := env.gdb.Begin()
+	require.NoError(t, stateTx.Error)
+	t.Cleanup(func() { _ = stateTx.Rollback().Error })
+	var lockedOrderNo string
+	require.NoError(t, stateTx.Raw("SELECT order_no FROM orders WHERE order_no = ? FOR UPDATE", orderNo).Scan(&lockedOrderNo).Error)
+	require.Equal(t, orderNo, lockedOrderNo)
+
+	type response struct {
+		w    *httptest.ResponseRecorder
+		body map[string]any
+	}
+	result := make(chan response, 1)
+	go func() {
+		w, body := mockPay(t, env, token, orderNo, paymentID, payAmount, "fail")
+		result <- response{w: w, body: body}
+	}()
+
+	select {
+	case got := <-result:
+		t.Fatalf("订单行尚未解锁，失败回调不应提前落流水: status=%d body=%s", got.w.Code, got.w.Body.String())
+	case <-time.After(200 * time.Millisecond):
+	}
+	require.NoError(t, stateTx.Model(&model.Order{}).Where("order_no = ?", orderNo).
+		Update("status", model.OrderStatusCancelled).Error)
+	require.NoError(t, stateTx.Commit().Error)
+
+	got := <-result
+	require.Equal(t, http.StatusConflict, got.w.Code, got.w.Body.String())
+	var count int64
+	require.NoError(t, env.gdb.Model(&paymentmodel.Payment{}).Where("payment_id = ?", paymentID).Count(&count).Error)
+	require.Zero(t, count, "并发取消后不得落失败流水")
+}
+
 func TestPaymentIDUsesExactUnicodeText(t *testing.T) {
 	env := requireEnv(t)
 	token := registerAndToken(t, env, uniqueName("payment-case"))
@@ -415,13 +458,14 @@ func TestMockPayDuplicateCallbackRejected(t *testing.T) {
 	orderNo := body["order_no"].(string)
 	payAmount := int64(body["pay_amount"].(float64))
 
-	w, _ := mockPay(t, env, token, orderNo, uniqueName("pay_dup1"), payAmount, "success")
+	paymentID := uniqueName("pay_dup1")
+	w, _ := mockPay(t, env, token, orderNo, paymentID, payAmount, "success")
 	require.Equal(t, http.StatusCreated, w.Code)
 
 	// 同一 payment_id 重放：流水唯一约束拒绝（409）。
-	w, errorBody := mockPay(t, env, token, orderNo, uniqueName("pay_dup1"), payAmount, "success")
+	w, errorBody := mockPay(t, env, token, orderNo, paymentID, payAmount, "success")
 	require.Equal(t, http.StatusConflict, w.Code, "重复流水号应被拒: %s", w.Body.String())
-	require.Equal(t, map[string]any{"error": "illegal order status transition"}, errorBody)
+	require.Equal(t, map[string]any{"error": "payment already processed"}, errorBody)
 
 	// 新 payment_id 但订单已支付：状态机校验拒绝（409）。
 	w, _ = mockPay(t, env, token, orderNo, uniqueName("pay_dup2"), payAmount, "success")
