@@ -110,6 +110,11 @@ jobs:
       - name: 供应链漏洞扫描（govulncheck）
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
+      - name: 安装前端依赖（冻结锁文件）
+        run: |
+          cd web/faire && bun install --frozen-lockfile
+          cd ../../website && bun install --frozen-lockfile
+
       - name: 前端与部署契约测试
         run: bun test scripts/*.test.ts
 
@@ -118,8 +123,8 @@ jobs:
 
       - name: 前端构建（web/faire + website）
         run: |
-          cd web/faire && bun install --frozen-lockfile && bun run build
-          cd ../../website && bun install --frozen-lockfile && bun run build
+          cd web/faire && bun run build
+          cd ../../website && bun run build
 
   deploy-pages:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
