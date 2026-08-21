@@ -74,9 +74,10 @@ func TestDoRespectsContextCancel(t *testing.T) {
 }
 
 func TestDoReturnsContextErrorWhenExpiredBeforeAttempt(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	// 使用创建时已经过去的 deadline，避免依赖 timer goroutine 在短暂 Sleep 后
+	// 恰好完成调度；CI 高负载时该计时假设会产生假阴性。
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	time.Sleep(2 * time.Millisecond)
 
 	calls := 0
 	err := Do(ctx, Config{Attempts: 3, InitialBackoff: time.Millisecond}, func(ctx context.Context) error {
