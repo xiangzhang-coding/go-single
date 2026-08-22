@@ -619,6 +619,27 @@ func cleanupReservationsAtStartup(cleanup flashsalesvc.ReservationCleanup, timeo
 	return cleanup.CleanupOrderedReservations(ctx)
 }
 
+func recoverFlashSalePeriodically(ctx context.Context, recovery flashsalesvc.PreDeductionRecovery,
+	cleanup flashsalesvc.ReservationCleanup, gate flashsalesvc.PurchaseRecoveryGate,
+) (flashsalesvc.RecoveryStats, int, error) {
+	stats, err := recovery.RecoverPreDeductions(ctx)
+	if err != nil {
+		gate.BlockPurchases()
+		return stats, 0, err
+	}
+	if stats.Failed > 0 {
+		gate.BlockPurchases()
+		return stats, 0, fmt.Errorf("%d flash-sale pre-deductions failed recovery", stats.Failed)
+	}
+	cleaned, err := cleanup.CleanupOrderedReservations(ctx)
+	if err != nil {
+		gate.BlockPurchases()
+		return stats, cleaned, err
+	}
+	gate.AllowPurchases()
+	return stats, cleaned, nil
+}
+
 func healthHandler(checker *health.Checker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		res := checker.Check(c.Request.Context())
@@ -704,21 +725,10 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 		Name: "flashsale-recovery",
 		Spec: "* * * * *",
 		Fn: func(ctx context.Context) error {
-			stats, err := recovery.RecoverPreDeductions(ctx)
+			stats, cleaned, err := recoverFlashSalePeriodically(ctx, recovery, reservationCleanup, recoveryGate)
 			if err != nil {
-				recoveryGate.BlockPurchases()
 				return err
 			}
-			if stats.Failed > 0 {
-				recoveryGate.BlockPurchases()
-				return fmt.Errorf("%d flash-sale pre-deductions failed recovery", stats.Failed)
-			}
-			cleaned, err := reservationCleanup.CleanupOrderedReservations(ctx)
-			if err != nil {
-				recoveryGate.BlockPurchases()
-				return err
-			}
-			recoveryGate.AllowPurchases()
 			if stats.Published+stats.RolledBack+stats.Failed > 0 {
 				log.Info("秒杀预扣恢复完成", zap.Int("published", stats.Published),
 					zap.Int("rolled_back", stats.RolledBack), zap.Int("failed", stats.Failed))

@@ -507,6 +507,35 @@ func TestReconcilePendingUploadRemovesOrphanAndReleasesQuota(t *testing.T) {
 	require.Zero(t, e.usage.objects[ownerID])
 }
 
+func TestReconcilePendingUploadKeepsReservationWhenObjectDeleteFails(t *testing.T) {
+	e := requireEnv(t)
+	usage := newMemoryUsage()
+	svc, err := file.NewMinIO(file.MinIOConfig{
+		Endpoint: e.endpoint, AccessKey: envOr("GO_SINGLE_MINIO_ACCESS_KEY", "minioadmin"),
+		SecretKey: envOr("GO_SINGLE_MINIO_SECRET_KEY", "minioadmin"), Bucket: e.bucket,
+	}, usage, file.QuotaConfig{MaxBytesPerUser: 1 << 20, MaxObjectsPerUser: 10})
+	require.NoError(t, err)
+	const ownerID int64 = 987655
+	key := fmt.Sprintf("users/%d/file/20260822/%032x.txt", ownerID, time.Now().UnixNano())
+	require.NoError(t, usage.Reserve(context.Background(), ownerID, "delete-failure", key, 10, 1<<20, 10))
+	usage.mu.Lock()
+	reservation := usage.reservations[key]
+	reservation.CreatedAt = time.Now().Add(-11 * time.Minute)
+	usage.reservations[key] = reservation
+	usage.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	resolved, err := svc.ReconcilePendingUploads(ctx)
+	require.Error(t, err)
+	require.Zero(t, resolved)
+	usage.mu.Lock()
+	defer usage.mu.Unlock()
+	require.Contains(t, usage.reservations, key, "删除失败时必须保留 pending 账本供后续重试")
+	require.Equal(t, int64(10), usage.bytes[ownerID])
+	require.Equal(t, int64(1), usage.objects[ownerID])
+}
+
 func TestUncertainQuotaCommitDoesNotDeletePossiblyCommittedObject(t *testing.T) {
 	e := requireEnv(t)
 	usage := newMemoryUsage()

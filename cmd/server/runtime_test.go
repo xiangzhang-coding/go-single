@@ -38,10 +38,20 @@ func (runtimeRecovery) RecoverPreDeductionsAtStartup(context.Context) (flashsale
 	return flashsalesvc.RecoveryStats{}, nil
 }
 
-type runtimeRecoveryGate struct{ blocked bool }
+type runtimeRecoveryGate struct {
+	blocked    bool
+	allowCalls int
+	blockCalls int
+}
 
-func (g *runtimeRecoveryGate) BlockPurchases()        { g.blocked = true }
-func (g *runtimeRecoveryGate) AllowPurchases()        { g.blocked = false }
+func (g *runtimeRecoveryGate) BlockPurchases() {
+	g.blocked = true
+	g.blockCalls++
+}
+func (g *runtimeRecoveryGate) AllowPurchases() {
+	g.blocked = false
+	g.allowCalls++
+}
 func (g *runtimeRecoveryGate) PurchasesBlocked() bool { return g.blocked }
 
 type runtimeCleanup struct{}
@@ -52,6 +62,25 @@ type failedRuntimeCleanup struct{}
 
 func (failedRuntimeCleanup) CleanupOrderedReservations(context.Context) (int, error) {
 	return 0, errors.New("ordered reservation repair failed")
+}
+
+type configurableRuntimeRecovery struct {
+	failed int
+	err    error
+}
+
+func (r *configurableRuntimeRecovery) RecoverPreDeductions(context.Context) (flashsalesvc.RecoveryStats, error) {
+	return flashsalesvc.RecoveryStats{Failed: r.failed}, r.err
+}
+
+func (r *configurableRuntimeRecovery) RecoverPreDeductionsAtStartup(context.Context) (flashsalesvc.RecoveryStats, error) {
+	return r.RecoverPreDeductions(context.Background())
+}
+
+type configurableRuntimeCleanup struct{ err error }
+
+func (c *configurableRuntimeCleanup) CleanupOrderedReservations(context.Context) (int, error) {
+	return 0, c.err
 }
 
 func TestApplicationRuntimeStopsConsumersAndCron(t *testing.T) {
@@ -119,4 +148,34 @@ func TestApplicationRuntimeBlocksPurchasesWhenOrderedReservationRepairFails(t *t
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	require.NoError(t, runtime.Stop(ctx))
+}
+
+func TestPeriodicFlashSaleRecoveryReopensGateOnlyAfterAllRepairsSucceed(t *testing.T) {
+	tests := []struct {
+		name     string
+		recovery *configurableRuntimeRecovery
+		cleanup  *configurableRuntimeCleanup
+	}{
+		{name: "recovery error", recovery: &configurableRuntimeRecovery{err: errors.New("mysql down")}, cleanup: &configurableRuntimeCleanup{}},
+		{name: "partial recovery", recovery: &configurableRuntimeRecovery{failed: 1}, cleanup: &configurableRuntimeCleanup{}},
+		{name: "cleanup error", recovery: &configurableRuntimeRecovery{}, cleanup: &configurableRuntimeCleanup{err: errors.New("ordered reservation repair failed")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := &runtimeRecoveryGate{}
+			_, _, err := recoverFlashSalePeriodically(context.Background(), tc.recovery, tc.cleanup, gate)
+			require.Error(t, err)
+			require.True(t, gate.PurchasesBlocked())
+			require.Equal(t, 1, gate.blockCalls)
+			require.Zero(t, gate.allowCalls, "失败周期中不得短暂开放抢购")
+		})
+	}
+
+	gate := &runtimeRecoveryGate{blocked: true}
+	_, _, err := recoverFlashSalePeriodically(
+		context.Background(), &configurableRuntimeRecovery{}, &configurableRuntimeCleanup{}, gate,
+	)
+	require.NoError(t, err)
+	require.False(t, gate.PurchasesBlocked())
+	require.Equal(t, 1, gate.allowCalls)
 }
