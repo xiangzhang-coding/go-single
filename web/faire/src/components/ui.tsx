@@ -1,6 +1,7 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 
 import type { OrderStatus } from "../api/types";
+import { resolveProductArtwork } from "../lib/product-art";
 
 export type IconName =
   | "arrow-left"
@@ -167,11 +168,40 @@ export function EmptyState({
   );
 }
 
-export function ProductVisual({ seed = 0, title = "FAIRE" }: { seed?: number; title?: string }) {
+export function ProductVisual({
+  seed = 0,
+  title = "FAIRE",
+  priority = false,
+  compact = false,
+}: {
+  seed?: number;
+  title?: string;
+  priority?: boolean;
+  compact?: boolean;
+}) {
   const variant = Math.abs(seed) % 6;
+  const artwork = resolveProductArtwork(seed, title);
+  const [failedSource, setFailedSource] = useState("");
+  const imageFailed = failedSource === artwork.src;
   return (
-    <div className={`product-visual product-visual-${variant}`} aria-hidden="true">
-      <span className="product-visual-label">{title.slice(0, 1).toUpperCase()}</span>
+    <div
+      className={`product-visual product-visual-${variant}${compact ? " product-visual-compact" : ""}${imageFailed ? " is-fallback" : ""}`}
+      aria-hidden="true"
+      data-artwork={artwork.key}
+      data-fallback={title.slice(0, 1).toUpperCase()}
+    >
+      {!imageFailed && (
+        <img
+          className="product-visual-image"
+          src={artwork.src}
+          alt=""
+          loading={priority ? "eager" : "lazy"}
+          decoding="async"
+          fetchPriority={priority ? "high" : "auto"}
+          onError={() => setFailedSource(artwork.src)}
+        />
+      )}
+      <span className="product-visual-caption">{artwork.caption}</span>
       <span className="product-visual-mark">FAIRE</span>
       <span className="product-visual-dot" />
     </div>

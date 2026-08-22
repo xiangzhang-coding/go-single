@@ -138,8 +138,9 @@ func (r *GORMProductRepository) GetByIDForUpdate(ctx context.Context, handle *tr
 	return &p, nil
 }
 
-func (r *GORMProductRepository) List(ctx context.Context, categoryID *int64, status string, offset, limit int) ([]model.Product, int64, error) {
-	q := r.db.WithContext(ctx).Model(&model.Product{})
+func (r *GORMProductRepository) List(ctx context.Context, categoryID *int64, status string, offset, limit int) ([]model.ProductListItem, int64, error) {
+	q := r.db.WithContext(ctx).Model(&model.Product{}).
+		Select("products.*, (SELECT MIN(skus.price) FROM skus WHERE skus.product_id = products.id) AS min_price")
 	if categoryID != nil {
 		q = q.Where("category_id = ?", *categoryID)
 	}
@@ -152,7 +153,7 @@ func (r *GORMProductRepository) List(ctx context.Context, categoryID *int64, sta
 		return nil, 0, err
 	}
 
-	var list []model.Product
+	var list []model.ProductListItem
 	if err := q.Order("id DESC").Offset(offset).Limit(limit).Find(&list).Error; err != nil {
 		return nil, 0, err
 	}

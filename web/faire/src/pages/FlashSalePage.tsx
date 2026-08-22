@@ -344,7 +344,7 @@ function FlashSaleCard({
         className="flash-card-visual"
         aria-label={`查看商品 ${activity.product_title}`}
       >
-        <ProductVisual seed={activity.sku.product_id} title={activity.product_title} />
+        <ProductVisual seed={activity.sku.product_id} title={activity.product_title} compact />
       </Link>
       <div className="flash-card-copy">
         <div className="flash-card-top">

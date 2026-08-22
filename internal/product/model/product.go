@@ -33,6 +33,12 @@ type Product struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+// ProductListItem 商品目录读模型：SPU 摘要 + 已配置 SKU 的最低价。
+type ProductListItem struct {
+	Product
+	MinPrice *int64 `json:"min_price,omitempty" gorm:"column:min_price;->"`
+}
+
 // IsOnSale 是否已上架。
 func (p *Product) IsOnSale() bool { return p.Status == ProductStatusOnSale }
 

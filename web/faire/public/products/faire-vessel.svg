@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480" role="img" aria-labelledby="title desc">
+  <title id="title">Ceramic vessel still life</title>
+  <desc id="desc">A cream ceramic cup on a dark green plinth.</desc>
+  <rect width="480" height="480" fill="#a6b7a1"/>
+  <circle cx="392" cy="82" r="56" fill="#dce5d8"/>
+  <path d="M56 356h368v42H56z" fill="#526d57"/>
+  <path d="M135 144h178l-13 190c-2 25-20 39-43 39h-67c-24 0-41-14-43-39z" fill="#f7f0e5" stroke="#27352e" stroke-width="5"/>
+  <path d="M308 188h28c46 0 52 93 0 99h-31" fill="none" stroke="#27352e" stroke-width="16"/>
+  <ellipse cx="224" cy="145" rx="89" ry="24" fill="#e8d9c8" stroke="#27352e" stroke-width="5"/>
+  <ellipse cx="224" cy="145" rx="65" ry="13" fill="#c78668"/>
+  <path d="M185 104c-19-31 23-35 6-67M237 105c-19-31 23-35 6-67" fill="none" stroke="#f7f0e5" stroke-width="7" stroke-linecap="round"/>
+  <path d="M77 88h68M77 105h44" stroke="#27352e" stroke-width="4"/>
+</svg>

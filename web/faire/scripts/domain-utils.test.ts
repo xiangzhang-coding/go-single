@@ -13,6 +13,7 @@ import {
   toLocalInput,
 } from "../src/lib/format";
 import { validateImage, validateMessageFile } from "../src/lib/media";
+import { resolveProductArtwork } from "../src/lib/product-art";
 
 describe("checkout intent", () => {
   test("uses the cart when no direct-purchase parameters exist", () => {
@@ -133,5 +134,24 @@ describe("media validation", () => {
     expect(validateMessageFile(new File([new Uint8Array(20 * 1024 * 1024)], "limit.zip"))).toBeNull();
     expect(validateMessageFile(new File(["text"], "script.exe"))).toContain("仅支持");
     expect(validateMessageFile(new File([new Uint8Array(20 * 1024 * 1024 + 1)], "large.zip"))).toContain("20MB");
+  });
+});
+
+describe("product artwork", () => {
+  test("selects a stable editorial still life from the product title", () => {
+    expect(resolveProductArtwork(1, "手工釉面马克杯").key).toBe("vessel");
+    expect(resolveProductArtwork(2, "亚麻桌布").key).toBe("textile");
+    expect(resolveProductArtwork(3, "榉木托盘").key).toBe("tray");
+    expect(resolveProductArtwork(4, "黄铜随身夹").key).toBe("desk");
+    expect(resolveProductArtwork(5, "帆布手提袋").key).toBe("carry");
+    expect(resolveProductArtwork(6, "玻璃花瓶").key).toBe("glass");
+  });
+
+  test("falls back deterministically when a title has no visual category", () => {
+    const first = resolveProductArtwork(101, "未分类商品");
+    const second = resolveProductArtwork(101, "另一件未分类商品");
+    expect(first.key).toBe(second.key);
+    expect(first.src).toStartWith("/products/");
+    expect(first.src).toEndWith(".svg");
   });
 });

@@ -192,7 +192,7 @@ FAIRE set in Graphik 400 (or a wide-tracked geometric sans) with significant pos
 
 ## Imagery
 
-Full-bleed lifestyle and product photography carries all visual warmth. The hero uses a candid documentary shot of a woman in a boutique — green shelving, curated products, warm natural light — that establishes the brand's merchant-world identity. Product close-ups in the featured brands grid are square, tightly cropped, and fill their card edge-to-edge. No illustration, no 3D renders, no abstract graphics. Color treatment is natural and slightly desaturated to harmonize with the cream canvas; no duotone or filters. Photography is the only source of saturated color on the page.
+Full-bleed lifestyle and product photography carries all visual warmth. The hero uses a candid documentary shot of a woman in a boutique — green shelving, curated products, warm natural light — that establishes the brand's merchant-world identity. Product close-ups in the featured brands grid are square, tightly cropped, and fill their card edge-to-edge. Color treatment is natural and slightly desaturated to harmonize with the cream canvas; no duotone or filters. Until the demo API exposes product photography, catalog surfaces may use the bundled flat-color still-life plates as a deterministic fallback. Real product media takes precedence once available; the fallback must not use gradients, blur, shadows, or 3D rendering.
 
 ## Layout
 

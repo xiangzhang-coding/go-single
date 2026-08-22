@@ -90,7 +90,7 @@ function OrderCard({ order }: { order: OrderView }) {
         <StatusBadge status={order.status} />
       </div>
       <div className="order-card-body">
-        {firstItem && <ProductVisual seed={firstItem.product_id} title={firstItem.title} />}
+        {firstItem && <ProductVisual seed={firstItem.product_id} title={firstItem.title} compact />}
         <div className="min-w-0 flex-1"><h2 className="text-lg">{firstItem?.title || "订单商品"}</h2><p className="mt-2 text-sm text-smoke">{firstItem ? `${formatSpecs(firstItem.specs)} × ${firstItem.quantity}` : "订单正在准备中"}{remaining > 0 && ` · 另有 ${remaining} 件商品`}</p></div>
         <div className="order-card-money"><span>应付金额</span><strong>{formatMoney(order.pay_amount)}</strong></div>
       </div>

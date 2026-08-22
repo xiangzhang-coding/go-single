@@ -29,6 +29,10 @@ export interface Product {
   updated_at: string;
 }
 
+export interface ProductListItem extends Product {
+  min_price?: number;
+}
+
 export interface SKU {
   id: number;
   product_id: number;
@@ -258,7 +262,7 @@ export interface Payment {
 }
 
 export interface ProductListResponse {
-  items: Product[];
+  items: ProductListItem[];
   total: number;
 }
 

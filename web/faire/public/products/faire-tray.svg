@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480" role="img" aria-labelledby="title desc">
+  <title id="title">Timber tray still life</title>
+  <desc id="desc">A warm timber tray with two small objects.</desc>
+  <rect width="480" height="480" fill="#d7a183"/>
+  <path d="M66 151h348l-22 224H88z" fill="#c78668" stroke="#27352e" stroke-width="6"/>
+  <path d="M92 180h296l-16 166H108z" fill="#e4b999" stroke="#27352e" stroke-width="4"/>
+  <path d="M120 219c58-24 111-24 169 0s58 75 0 99-111 24-169 0-58-75 0-99z" fill="#f4dfc9" stroke="#27352e" stroke-width="4"/>
+  <circle cx="326" cy="268" r="39" fill="#526d57" stroke="#27352e" stroke-width="4"/>
+  <path d="M74 126h116M291 126h116" stroke="#27352e" stroke-width="14" stroke-linecap="round"/>
+  <path d="M109 399h262" stroke="#27352e" stroke-width="5"/>
+</svg>

@@ -545,6 +545,10 @@ func TestVisitorListFilterPagination(t *testing.T) {
 	p2 := createProduct(t, env, token, digital, uniqueName("平板"))
 	offline := createProduct(t, env, token, digital, uniqueName("下架品"))
 	homeProduct := createProduct(t, env, token, home, uniqueName("冰箱"))
+	createSKU(t, env, token, p1, 39900, 10)
+	createSKU(t, env, token, p1, 29900, 10)
+	createSKU(t, env, token, p2, 49900, 10)
+	createSKU(t, env, token, homeProduct, 89900, 10)
 
 	publish(t, env, token, p1, true)
 	publish(t, env, token, p2, true)
@@ -556,6 +560,19 @@ func TestVisitorListFilterPagination(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, float64(2), list["total"])
 	require.Equal(t, 2, len(list["items"].([]any)))
+	var phone map[string]any
+	for _, raw := range list["items"].([]any) {
+		item := raw.(map[string]any)
+		if item["id"] == float64(p1) {
+			phone = item
+		}
+	}
+	require.NotNil(t, phone)
+	require.Equal(t, float64(29900), phone["min_price"])
+	require.ElementsMatch(t,
+		[]string{"id", "category_id", "title", "description", "status", "created_at", "updated_at", "min_price"},
+		mapKeys(phone),
+	)
 
 	// 分页：page=1, page_size=1 → 1 条，total 仍为 2。
 	w, list = doJSON(t, env, http.MethodGet, fmt.Sprintf("/api/products?category_id=%d&page=1&page_size=1", digital), "", "")

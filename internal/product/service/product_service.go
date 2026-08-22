@@ -74,13 +74,13 @@ type Service interface {
 	DeleteSKU(ctx context.Context, id int64) error
 	// ListAllProducts 后台商品列表（T25）：可选类目/状态筛选 + 分页，
 	// 与 ListProducts 的区别是不过滤上架状态（admin 需管理草稿/下架商品）。
-	ListAllProducts(ctx context.Context, categoryID *int64, status string, page, pageSize int) ([]model.Product, int64, error)
+	ListAllProducts(ctx context.Context, categoryID *int64, status string, page, pageSize int) ([]model.ProductListItem, int64, error)
 	// GetAdminDetail 后台商品详情，包含上架及下架商品的全部 SKU，不经过公开详情缓存。
 	GetAdminDetail(ctx context.Context, id int64) (*model.ProductDetail, error)
 
 	// ---- 游客浏览 ----
 	ListCategories(ctx context.Context) ([]model.Category, error)
-	ListProducts(ctx context.Context, categoryID *int64, page, pageSize int) ([]model.Product, int64, error)
+	ListProducts(ctx context.Context, categoryID *int64, page, pageSize int) ([]model.ProductListItem, int64, error)
 	// GetDetail 详情（仅上架商品），优先缓存、缺失回填。
 	GetDetail(ctx context.Context, id int64) (*model.ProductDetail, error)
 	// GetSKU 供后续模块校验 SKU 存在。
@@ -308,7 +308,7 @@ func (s *productService) GetSKUSummaries(ctx context.Context, ids []int64) (map[
 	return byID, nil
 }
 
-func (s *productService) ListProducts(ctx context.Context, categoryID *int64, page, pageSize int) ([]model.Product, int64, error) {
+func (s *productService) ListProducts(ctx context.Context, categoryID *int64, page, pageSize int) ([]model.ProductListItem, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -322,7 +322,7 @@ func (s *productService) ListProducts(ctx context.Context, categoryID *int64, pa
 }
 
 // ListAllProducts 后台商品列表：status 空 = 全部状态（含草稿/下架）。
-func (s *productService) ListAllProducts(ctx context.Context, categoryID *int64, status string, page, pageSize int) ([]model.Product, int64, error) {
+func (s *productService) ListAllProducts(ctx context.Context, categoryID *int64, status string, page, pageSize int) ([]model.ProductListItem, int64, error) {
 	if page < 1 {
 		page = 1
 	}

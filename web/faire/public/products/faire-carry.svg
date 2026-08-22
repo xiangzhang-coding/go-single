@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480" role="img" aria-labelledby="title desc">
+  <title id="title">Canvas carry bag</title>
+  <desc id="desc">A structured canvas tote with contrasting handles.</desc>
+  <rect width="480" height="480" fill="#d49b9f"/>
+  <circle cx="90" cy="94" r="50" fill="#edc3be"/>
+  <path d="M108 181h264l-28 222H136z" fill="#e8d5bb" stroke="#27352e" stroke-width="6"/>
+  <path d="M163 194c0-101 154-101 154 0" fill="none" stroke="#27352e" stroke-width="18"/>
+  <path d="M163 191v148M317 191v148" stroke="#526d57" stroke-width="17"/>
+  <path d="M140 246h204M145 306h194" stroke="#c9b18d" stroke-width="4" stroke-dasharray="9 8"/>
+  <path d="M66 426h348" stroke="#27352e" stroke-width="5"/>
+</svg>

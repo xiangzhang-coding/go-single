@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480" role="img" aria-labelledby="title desc">
+  <title id="title">Glass vase still life</title>
+  <desc id="desc">A translucent blue vase holding three stems.</desc>
+  <rect width="480" height="480" fill="#e0c673"/>
+  <path d="M115 395h250" stroke="#27352e" stroke-width="6"/>
+  <path d="M205 166h70l-10 62c56 31 70 167-25 167s-81-136-25-167z" fill="#b8d0d4" fill-opacity=".84" stroke="#27352e" stroke-width="5"/>
+  <path d="M214 165h52v-44h-52z" fill="#dce8e8" stroke="#27352e" stroke-width="5"/>
+  <path d="M235 124c-9-70-71-62-85-95M243 126c8-77 82-73 99-109M248 152c25-59 66-40 91-79" fill="none" stroke="#526d57" stroke-width="7" stroke-linecap="round"/>
+  <ellipse cx="144" cy="35" rx="30" ry="17" fill="#c78668" stroke="#27352e" stroke-width="4" transform="rotate(25 144 35)"/>
+  <ellipse cx="347" cy="30" rx="32" ry="18" fill="#d49b9f" stroke="#27352e" stroke-width="4" transform="rotate(-29 347 30)"/>
+  <ellipse cx="345" cy="76" rx="26" ry="14" fill="#f1df9f" stroke="#27352e" stroke-width="4" transform="rotate(19 345 76)"/>
+  <path d="M199 316c34 15 69 15 91 0" fill="none" stroke="#f5fbfb" stroke-width="7" opacity=".7"/>
+</svg>

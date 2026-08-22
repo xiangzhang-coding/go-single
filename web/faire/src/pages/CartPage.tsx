@@ -70,7 +70,7 @@ export function CartPage() {
               return (
                 <article className="cart-item" key={item.id}>
                   <Link to={`/products/${item.product_id}`} className="cart-item-visual">
-                    <ProductVisual seed={item.product_id} title={item.title} />
+                    <ProductVisual seed={item.product_id} title={item.title} compact />
                   </Link>
                   <div className="cart-item-copy">
                     <div className="flex items-start justify-between gap-4">

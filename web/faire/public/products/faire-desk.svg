@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480" role="img" aria-labelledby="title desc">
+  <title id="title">Brass desk objects</title>
+  <desc id="desc">Brass clips and a dark pencil arranged on blue paper.</desc>
+  <rect width="480" height="480" fill="#8497a2"/>
+  <rect x="82" y="74" width="316" height="332" rx="4" fill="#dce3e4" stroke="#27352e" stroke-width="5" transform="rotate(3 240 240)"/>
+  <path d="M143 146c0-48 78-48 78 0v126c0 60-94 60-94 0V157c0-29 46-29 46 0v106" fill="none" stroke="#b18a34" stroke-width="16" stroke-linecap="round"/>
+  <path d="M283 112l46 230" stroke="#27352e" stroke-width="20" stroke-linecap="round"/>
+  <path d="M274 82l18 34 31-6-15-38z" fill="#c78668" stroke="#27352e" stroke-width="4"/>
+  <circle cx="344" cy="350" r="37" fill="#e0c673" stroke="#27352e" stroke-width="4"/>
+  <path d="M55 422h120" stroke="#27352e" stroke-width="5"/>
+</svg>

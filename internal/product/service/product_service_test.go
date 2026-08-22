@@ -106,9 +106,9 @@ func (f *fakeProducts) GetByIDForUpdate(ctx context.Context, _ *transaction.Hand
 	return f.GetByID(ctx, id)
 }
 
-func (f *fakeProducts) List(_ context.Context, categoryID *int64, status string, offset, limit int) ([]model.Product, int64, error) {
+func (f *fakeProducts) List(_ context.Context, categoryID *int64, status string, offset, limit int) ([]model.ProductListItem, int64, error) {
 	var total int64
-	var matched []model.Product
+	var matched []model.ProductListItem
 	for _, v := range f.byID {
 		if status != "" && v.Status != status {
 			continue
@@ -117,7 +117,7 @@ func (f *fakeProducts) List(_ context.Context, categoryID *int64, status string,
 			continue
 		}
 		total++
-		matched = append(matched, *v)
+		matched = append(matched, model.ProductListItem{Product: *v})
 	}
 	// 与 GORM 实现一致：id 倒序。
 	sort.Slice(matched, func(i, j int) bool { return matched[i].ID > matched[j].ID })

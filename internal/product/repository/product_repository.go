@@ -38,7 +38,7 @@ type ProductRepository interface {
 	// GetByIDForUpdate 在订单事务内锁定商品状态，和 SKU 锁形成稳定快照。
 	GetByIDForUpdate(ctx context.Context, tx *transaction.Handle, id int64) (*model.Product, error)
 	// List 按类目（nil 为全部）与状态分页查询，返回条目与总数。
-	List(ctx context.Context, categoryID *int64, status string, offset, limit int) ([]model.Product, int64, error)
+	List(ctx context.Context, categoryID *int64, status string, offset, limit int) ([]model.ProductListItem, int64, error)
 	// CountByCategory 统计类目下商品数（删除类目前校验）。
 	CountByCategory(ctx context.Context, categoryID int64) (int64, error)
 }

@@ -65,7 +65,7 @@ export function HomePage() {
               浏览商品 <Icon name="arrow-down" size={17} />
             </Link>
           </div>
-          <div className="hero-collage" aria-label="商品目录预览">
+          <div className="hero-collage" role="img" aria-label="商品目录预览">
             <div className="hero-collage-note">编辑精选<br /><span>03 / 目录页</span></div>
             <div className="hero-art-main"><span>OBJECTS<br />FOR<br />EVERYDAY</span></div>
             <div className="hero-art-side"><span>small<br />things<br />matter</span></div>
@@ -83,8 +83,8 @@ export function HomePage() {
           <div className="section-index" aria-hidden="true">01 <span>/</span> catalog</div>
         </div>
 
-        <div className="category-pills mt-8" aria-label="商品类目">
-          <button type="button" className={!categoryId ? "active" : ""} onClick={() => chooseCategory()}>
+        <div className="category-pills mt-8" role="group" aria-label="商品类目">
+          <button type="button" className={!categoryId ? "active" : ""} aria-pressed={!categoryId} onClick={() => chooseCategory()}>
             全部
           </button>
           {categoriesQuery.data?.map((category) => (
@@ -92,6 +92,7 @@ export function HomePage() {
               key={category.id}
               type="button"
               className={category.id === categoryId ? "active" : ""}
+              aria-pressed={category.id === categoryId}
               onClick={() => chooseCategory(category.id)}
             >
               {category.name}

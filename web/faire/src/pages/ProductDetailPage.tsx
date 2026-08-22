@@ -81,7 +81,7 @@ export function ProductDetailPage() {
       <Link to="/" className="back-link"><Icon name="arrow-left" size={16} /> 返回目录</Link>
       <div className="product-detail-grid mt-8 sm:mt-12">
         <div>
-          <ProductVisual seed={product.id} title={product.title} />
+          <ProductVisual seed={product.id} title={product.title} priority />
           <div className="product-detail-caption mt-4">
             <span>FAIRE / OBJECT {String(product.id).padStart(3, "0")}</span>
             <span>公开目录</span>
