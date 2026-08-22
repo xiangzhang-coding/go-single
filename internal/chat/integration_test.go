@@ -13,6 +13,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -47,6 +48,7 @@ import (
 	socialsvc "github.com/xiangzhang-coding/go-single/internal/social/service"
 	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
+	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
 )
@@ -187,6 +189,35 @@ var _ chatsvc.MessageNotifier = wsNotifier{}
 type stubOrders struct{}
 
 func (stubOrders) HasPurchasedSKU(context.Context, int64, int64) (bool, error) { return false, nil }
+
+type existingChatUser struct{}
+
+func (existingChatUser) GetByID(_ context.Context, id int64) (*usermodel.User, error) {
+	return &usermodel.User{ID: id}, nil
+}
+
+type chatFriends struct{}
+
+func (chatFriends) AreFriends(context.Context, int64, int64) (bool, error) { return true, nil }
+
+type touchFailingConversationRepository struct {
+	chatrepo.ConversationRepository
+	err              error
+	ensureCalls      int
+	touchCalls       int
+	touchedMessageID int64
+}
+
+func (r *touchFailingConversationRepository) Ensure(ctx context.Context, tx *transaction.Handle, conversation *chatmodel.Conversation) error {
+	r.ensureCalls++
+	return r.ConversationRepository.Ensure(ctx, tx, conversation)
+}
+
+func (r *touchFailingConversationRepository) TouchLastMessage(_ context.Context, _ *transaction.Handle, _ string, messageID int64) error {
+	r.touchCalls++
+	r.touchedMessageID = messageID
+	return r.err
+}
 
 func testDSN(dbName string) string {
 	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=Local",
@@ -644,6 +675,45 @@ func TestConversationLastMessageNeverMovesBackward(t *testing.T) {
 	require.Equal(t, secondID, conversation.LastMessageID)
 }
 
+func TestChatSendRollsBackWhenTouchLastMessageFails(t *testing.T) {
+	env := requireEnv(t)
+	senderID, _ := register(t, env, "rb_sender")
+	recipientID, _ := register(t, env, "rb_recipient")
+	key := conversationKeyOf(senderID, recipientID)
+
+	conversationRepo := chatrepo.NewGORMConversation(env.gdb)
+	messageRepo := chatrepo.NewGORMMessage(env.gdb)
+	touchErr := errors.New("injected TouchLastMessage failure")
+	failingConversationRepo := &touchFailingConversationRepository{
+		ConversationRepository: conversationRepo,
+		err:                    touchErr,
+	}
+	service := chatsvc.New(chatrepo.Store{
+		Conversations: failingConversationRepo,
+		Messages:      messageRepo,
+		Reads:         chatrepo.NewGORMReadState(env.gdb),
+		Tx:            conversationRepo,
+	}, existingChatUser{}, chatFriends{}, nil)
+
+	result, err := service.Send(context.Background(), senderID, chatsvc.SendParams{
+		ToUserID: recipientID,
+		Type:     chatmodel.MessageTypeText,
+		Content:  "must roll back",
+	})
+	require.Nil(t, result)
+	require.ErrorIs(t, err, touchErr)
+	require.Equal(t, 1, failingConversationRepo.ensureCalls)
+	require.Equal(t, 1, failingConversationRepo.touchCalls)
+	require.Positive(t, failingConversationRepo.touchedMessageID, "message must be inserted before TouchLastMessage")
+
+	conversation, err := conversationRepo.GetByKey(context.Background(), key)
+	require.NoError(t, err)
+	require.Nil(t, conversation, "conversation insert must roll back")
+	message, err := messageRepo.GetByID(context.Background(), failingConversationRepo.touchedMessageID)
+	require.NoError(t, err)
+	require.Nil(t, message, "message insert must roll back")
+}
+
 func TestChatIdempotencyKeyLength(t *testing.T) {
 	env := requireEnv(t)
 	_, aliceToken := register(t, env, "ava_kl")
@@ -666,35 +736,40 @@ func TestChatSendRejections(t *testing.T) {
 	_, carolToken := register(t, env, "carol_sr")
 
 	// 未带 token → 401。
-	w, _ := doJSON(t, env, http.MethodPost, "/api/messages", `{"to_user_id":1,"type":"text","content":"x"}`, "")
+	w, errorBody := doJSON(t, env, http.MethodPost, "/api/messages", `{"to_user_id":1,"type":"text","content":"x"}`, "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
+	testsupport.AssertAPIError(t, errorBody)
 
 	// 自加（给自己发消息）→ 400。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/messages",
+	w, errorBody = doJSON(t, env, http.MethodPost, "/api/messages",
 		fmt.Sprintf(`{"to_user_id":%d,"type":"text","content":"x"}`, aliceID), aliceToken)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, errorBody)
 
 	// 非好友 → 403（T14 好友关系为前置条件）。
-	w, errorBody := doJSON(t, env, http.MethodPost, "/api/messages",
+	w, errorBody = doJSON(t, env, http.MethodPost, "/api/messages",
 		fmt.Sprintf(`{"to_user_id":%d,"type":"text","content":"x"}`, bobID), aliceToken)
 	require.Equal(t, http.StatusForbidden, w.Code)
-	require.Equal(t, map[string]any{"error": "recipient is not your friend"}, errorBody)
+	testsupport.AssertAPIError(t, errorBody, "recipient is not your friend")
 
 	// 接收方不存在 → 404。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/messages", `{"to_user_id":999999,"type":"text","content":"x"}`, aliceToken)
+	w, errorBody = doJSON(t, env, http.MethodPost, "/api/messages", `{"to_user_id":999999,"type":"text","content":"x"}`, aliceToken)
 	require.Equal(t, http.StatusNotFound, w.Code)
+	testsupport.AssertAPIError(t, errorBody)
 
 	// 参数校验：缺 type / 非法类型 / text 缺内容 / image 缺 url / url 非 http。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/messages", fmt.Sprintf(`{"to_user_id":%d,"content":"x"}`, bobID), carolToken)
+	w, errorBody = doJSON(t, env, http.MethodPost, "/api/messages", fmt.Sprintf(`{"to_user_id":%d,"content":"x"}`, bobID), carolToken)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, errorBody)
 	for _, body := range []string{
 		fmt.Sprintf(`{"to_user_id":%d,"type":"voice","content":"x"}`, bobID),
 		fmt.Sprintf(`{"to_user_id":%d,"type":"text"}`, bobID),
 		fmt.Sprintf(`{"to_user_id":%d,"type":"image"}`, bobID),
 		fmt.Sprintf(`{"to_user_id":%d,"type":"file","url":"ftp://x"}`, bobID),
 	} {
-		w, _ = doJSON(t, env, http.MethodPost, "/api/messages", body, carolToken)
+		w, errorBody = doJSON(t, env, http.MethodPost, "/api/messages", body, carolToken)
 		require.Equal(t, http.StatusBadRequest, w.Code, "非法请求应被拒: %s", body)
+		testsupport.AssertAPIError(t, errorBody)
 	}
 
 	// 未产生任何会话（校验失败不落库）。

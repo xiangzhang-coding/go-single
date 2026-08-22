@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +14,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -82,6 +85,13 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	require.NoError(t, runMigrations(cfg, log))
 
+	redisProbe := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
+	redisCtx, redisCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	testsupport.RequireDependency(t, "Redis", redisProbe.Ping(redisCtx).Err())
+	require.NoError(t, redisProbe.FlushDB(redisCtx).Err())
+	redisCancel()
+	require.NoError(t, redisProbe.Close())
+
 	cacheClient, err := cache.NewRedis(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	testsupport.RequireDependency(t, "Redis", err)
 	require.NoError(t, cacheClient.Del(context.Background(), "router-test-probe"))
@@ -110,7 +120,6 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 
 	router, background, err := newRouter(cfg, log, gdb, sqlDB, cacheClient, mqClient, fileSvc, wsHub)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = background.Stop(context.Background()) })
 
 	actual := make(map[string]struct{})
 	for _, route := range router.Routes() {
@@ -142,6 +151,179 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 	response = httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/cart", nil))
 	require.Equal(t, http.StatusUnauthorized, response.Code)
+	var unauthorized productionErrorResponse
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &unauthorized))
+	require.Equal(t, "missing token", unauthorized.Error)
+	var unauthorizedFields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &unauthorizedFields))
+	productionRequireKeys(t, unauthorizedFields, "error")
+
+	background.Start()
+	stopBackground := func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		require.NoError(t, background.Stop(stopCtx))
+	}
+	t.Cleanup(stopBackground)
+	productionWaitForHealth(t, router, 10*time.Second)
+
+	runID := fmt.Sprintf("%d", time.Now().UnixNano())
+	t.Run("core transaction through production router", func(t *testing.T) {
+		username := "core" + runID
+		userID, userToken := productionRegisterAndLogin(t, router, username)
+		addressID := productionCreateAddress(t, router, userToken, "Core Receiver")
+		adminToken := productionLogin(t, router, "admin", "admin123", "admin")
+		productID, skuID := productionCreateOnSaleSKU(t, router, adminToken, "core-"+runID, 1250, 10)
+
+		cartItem, cartFields := productionJSON[productionCartItemResponse](t, router, http.MethodPost, "/api/cart", userToken,
+			map[string]any{"sku_id": skuID, "quantity": 2}, http.StatusCreated)
+		productionRequireKeys(t, cartFields, "id", "user_id", "sku_id", "quantity", "created_at", "updated_at")
+		require.Positive(t, cartItem.ID)
+		require.Equal(t, userID, cartItem.UserID)
+		require.Equal(t, skuID, cartItem.SKUID)
+		require.Equal(t, 2, cartItem.Quantity)
+
+		orderRequestID := "core-order-" + runID
+		order, orderFields := productionJSON[productionOrderResponse](t, router, http.MethodPost, "/api/orders", userToken,
+			map[string]any{"client_request_id": orderRequestID, "address_id": addressID, "from_cart": true}, http.StatusCreated)
+		productionRequireKeys(t, orderFields,
+			"order_no", "user_id", "order_type", "status", "total_amount", "discount_amount", "pay_amount",
+			"receiver", "phone", "province", "city", "district", "detail", "expire_at", "created_at", "updated_at", "items")
+		require.NotEmpty(t, order.OrderNo)
+		require.Equal(t, userID, order.UserID)
+		require.Equal(t, "normal", order.OrderType)
+		require.Equal(t, "pending_payment", order.Status)
+		require.Equal(t, int64(2500), order.TotalAmount)
+		require.Equal(t, int64(2500), order.PayAmount)
+		require.Equal(t, "Core Receiver", order.Receiver)
+		require.Len(t, order.Items, 1)
+		productionRequireOrderItem(t, order.Items[0], order.OrderNo, productID, skuID, 1250, 2)
+
+		cart, cartListFields := productionJSON[productionCartListResponse](t, router, http.MethodGet, "/api/cart", userToken, nil, http.StatusOK)
+		productionRequireKeys(t, cartListFields, "items")
+		require.Empty(t, cart.Items, "from-cart checkout must remove purchased items")
+		product, productFields := productionJSON[productionProductDetailResponse](t, router, http.MethodGet,
+			fmt.Sprintf("/api/products/%d", productID), userToken, nil, http.StatusOK)
+		productionRequireKeys(t, productFields, "id", "category_id", "title", "description", "status", "created_at", "updated_at", "skus")
+		require.Equal(t, 8, productionSKUStock(t, product, skuID), "checkout must deduct the purchased SKU stock")
+
+		paymentID := "core-payment-" + runID
+		payment, paymentFields := productionJSON[productionPaymentResponse](t, router, http.MethodPost, "/api/payments/mock", userToken,
+			map[string]any{"order_id": order.OrderNo, "payment_id": paymentID, "amount": order.PayAmount, "result": "success"}, http.StatusCreated)
+		productionRequireKeys(t, paymentFields, "id", "payment_id", "order_no", "user_id", "amount", "result", "created_at", "updated_at")
+		require.Equal(t, paymentID, payment.PaymentID)
+		require.Equal(t, order.OrderNo, payment.OrderNo)
+		require.Equal(t, userID, payment.UserID)
+		require.Equal(t, order.PayAmount, payment.Amount)
+		require.Equal(t, "success", payment.Result)
+
+		productionNoContent(t, router, http.MethodPost, "/api/admin/orders/"+order.OrderNo+"/ship", adminToken)
+		productionNoContent(t, router, http.MethodPost, "/api/orders/"+order.OrderNo+"/confirm", userToken)
+
+		completed, completedFields := productionJSON[productionOrderResponse](t, router, http.MethodGet, "/api/orders/"+order.OrderNo, userToken, nil, http.StatusOK)
+		productionRequireKeys(t, completedFields,
+			"order_no", "user_id", "order_type", "status", "total_amount", "discount_amount", "pay_amount",
+			"receiver", "phone", "province", "city", "district", "detail", "paid_at", "shipped_at", "completed_at",
+			"expire_at", "created_at", "updated_at", "items")
+		require.Equal(t, "completed", completed.Status)
+		require.NotNil(t, completed.PaidAt)
+		require.NotNil(t, completed.ShippedAt)
+		require.NotNil(t, completed.CompletedAt)
+		require.Equal(t, int64(2500), completed.PayAmount)
+		require.Equal(t, "Core Receiver", completed.Receiver)
+		require.Len(t, completed.Items, 1)
+		productionRequireOrderItem(t, completed.Items[0], order.OrderNo, productID, skuID, 1250, 2)
+	})
+
+	t.Run("flash sale cancellation restores a purchasable slot", func(t *testing.T) {
+		username := "flash" + runID
+		_, userToken := productionRegisterAndLogin(t, router, username)
+		productionCreateAddress(t, router, userToken, "Flash Receiver")
+		adminToken := productionLogin(t, router, "admin", "admin123", "admin")
+		_, skuID := productionCreateOnSaleSKU(t, router, adminToken, "flash-"+runID, 5000, 10)
+
+		activity, activityFields := productionJSON[productionActivityResponse](t, router, http.MethodPost, "/api/admin/flashsales", adminToken,
+			map[string]any{
+				"sku_id": skuID, "title": "flash-" + runID, "price": int64(1900), "stock": 1, "per_user_limit": 1,
+				"start_at": time.Now().Add(-time.Minute).Format(time.RFC3339Nano),
+				"end_at":   time.Now().Add(10 * time.Minute).Format(time.RFC3339Nano),
+			}, http.StatusCreated)
+		productionRequireKeys(t, activityFields,
+			"id", "sku_id", "title", "price", "stock", "per_user_limit", "status", "start_at", "end_at", "created_at", "updated_at")
+		require.Positive(t, activity.ID)
+		require.Equal(t, skuID, activity.SKUID)
+		require.Equal(t, 1, activity.Stock)
+		require.Equal(t, 1, activity.PerUserLimit)
+		require.Equal(t, "off_sale", activity.Status)
+		productionNoContent(t, router, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", activity.ID), adminToken)
+
+		list, listFields := productionJSON[productionFlashSaleListResponse](t, router, http.MethodGet, "/api/flashsales", userToken, nil, http.StatusOK)
+		productionRequireKeys(t, listFields, "server_time", "items")
+		require.NotEmpty(t, list.ServerTime)
+		activeFound := false
+		for _, item := range list.Items {
+			if item.ID == activity.ID {
+				activeFound = true
+				require.Equal(t, "in_progress", item.State)
+				require.Equal(t, 1, item.Stock)
+			}
+		}
+		require.True(t, activeFound, "published activity must be observable as active through the user API")
+
+		firstRequestID := "flash-first-" + runID
+		first, firstFields := productionJSON[productionPurchaseResponse](t, router, http.MethodPost,
+			fmt.Sprintf("/api/flashsales/%d/purchase", activity.ID), userToken,
+			map[string]any{"client_request_id": firstRequestID}, http.StatusAccepted)
+		productionRequireKeys(t, firstFields, "pre_deduction_id", "pre_deduction_status", "status", "order_no", "message")
+		require.Equal(t, "queued", first.Status)
+		require.NotEmpty(t, first.PreDeductionID)
+		require.NotEmpty(t, first.OrderNo)
+
+		firstLifecycle := productionPollPurchaseOrdered(t, router, userToken, first.PreDeductionID, 10*time.Second)
+		require.Equal(t, first.OrderNo, firstLifecycle.OrderNo)
+		firstOrder, firstOrderFields := productionJSON[productionOrderResponse](t, router, http.MethodGet, "/api/orders/"+first.OrderNo, userToken, nil, http.StatusOK)
+		productionRequireKeys(t, firstOrderFields,
+			"order_no", "user_id", "order_type", "status", "activity_id", "purchase_slot", "total_amount", "discount_amount", "pay_amount",
+			"receiver", "phone", "province", "city", "district", "detail", "expire_at", "created_at", "updated_at", "items")
+		productionRequireSeckillOrder(t, firstOrder, activity.ID, first.PreDeductionID, skuID)
+		require.Equal(t, 0, productionFlashSaleItem(t, router, userToken, activity.ID).Stock,
+			"the accepted purchase must exhaust Redis stock before cancellation")
+		blocked := productionRequest(t, router, http.MethodPost, fmt.Sprintf("/api/flashsales/%d/purchase", activity.ID), userToken,
+			map[string]any{"client_request_id": "flash-blocked-" + runID})
+		require.Equal(t, http.StatusConflict, blocked.Code, blocked.Body.String())
+		var blockedBody map[string]any
+		require.NoError(t, json.Unmarshal(blocked.Body.Bytes(), &blockedBody))
+		testsupport.AssertAPIError(t, blockedBody)
+
+		productionNoContent(t, router, http.MethodPost, "/api/orders/"+first.OrderNo+"/cancel", userToken)
+		cancelled, cancelledFields := productionJSON[productionOrderResponse](t, router, http.MethodGet, "/api/orders/"+first.OrderNo, userToken, nil, http.StatusOK)
+		productionRequireKeys(t, cancelledFields,
+			"order_no", "user_id", "order_type", "status", "activity_id", "purchase_slot", "total_amount", "discount_amount", "pay_amount",
+			"receiver", "phone", "province", "city", "district", "detail", "cancelled_at", "expire_at", "created_at", "updated_at", "items")
+		require.Equal(t, "cancelled", cancelled.Status)
+		require.NotNil(t, cancelled.CancelledAt)
+		require.Equal(t, 1, productionFlashSaleItem(t, router, userToken, activity.ID).Stock,
+			"cancellation must restore Redis stock before replacement purchase")
+
+		secondRequestID := "flash-second-" + runID
+		second, secondFields := productionJSON[productionPurchaseResponse](t, router, http.MethodPost,
+			fmt.Sprintf("/api/flashsales/%d/purchase", activity.ID), userToken,
+			map[string]any{"client_request_id": secondRequestID}, http.StatusAccepted)
+		productionRequireKeys(t, secondFields, "pre_deduction_id", "pre_deduction_status", "status", "order_no", "message")
+		require.Equal(t, "queued", second.Status)
+		require.NotEqual(t, first.PreDeductionID, second.PreDeductionID)
+		require.NotEqual(t, first.OrderNo, second.OrderNo)
+
+		secondLifecycle := productionPollPurchaseOrdered(t, router, userToken, second.PreDeductionID, 10*time.Second)
+		require.Equal(t, second.OrderNo, secondLifecycle.OrderNo)
+		replacement, replacementFields := productionJSON[productionOrderResponse](t, router, http.MethodGet, "/api/orders/"+second.OrderNo, userToken, nil, http.StatusOK)
+		productionRequireKeys(t, replacementFields,
+			"order_no", "user_id", "order_type", "status", "activity_id", "purchase_slot", "total_amount", "discount_amount", "pay_amount",
+			"receiver", "phone", "province", "city", "district", "detail", "expire_at", "created_at", "updated_at", "items")
+		productionRequireSeckillOrder(t, replacement, activity.ID, second.PreDeductionID, skuID)
+	})
+
+	stopBackground()
 
 	migrations, err := migrate.New("file://"+cfg.Migrations.Path, "mysql://"+cfg.MySQL.DSN())
 	require.NoError(t, err)
@@ -190,4 +372,338 @@ func routerEnvOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+type productionErrorResponse struct {
+	Error string `json:"error"`
+}
+
+type productionUserResponse struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+}
+
+type productionLoginResponse struct {
+	Token string                 `json:"token"`
+	User  productionUserResponse `json:"user"`
+}
+
+type productionIDResponse struct {
+	ID int64 `json:"id"`
+}
+
+type productionAddressResponse struct {
+	ID        int64  `json:"id"`
+	UserID    int64  `json:"user_id"`
+	Receiver  string `json:"receiver"`
+	IsDefault bool   `json:"is_default"`
+}
+
+type productionCartItemResponse struct {
+	ID       int64 `json:"id"`
+	UserID   int64 `json:"user_id"`
+	SKUID    int64 `json:"sku_id"`
+	Quantity int   `json:"quantity"`
+}
+
+type productionCartListResponse struct {
+	Items []productionCartItemResponse `json:"items"`
+}
+
+type productionProductDetailResponse struct {
+	ID   int64 `json:"id"`
+	SKUs []struct {
+		ID    int64 `json:"id"`
+		Stock int   `json:"stock"`
+	} `json:"skus"`
+}
+
+type productionOrderItemResponse struct {
+	ID        int64             `json:"id"`
+	OrderNo   string            `json:"order_no"`
+	SKUID     int64             `json:"sku_id"`
+	ProductID int64             `json:"product_id"`
+	Title     string            `json:"title"`
+	Specs     map[string]string `json:"specs"`
+	Price     int64             `json:"price"`
+	Quantity  int               `json:"quantity"`
+	Subtotal  int64             `json:"subtotal"`
+}
+
+type productionOrderResponse struct {
+	OrderNo        string                        `json:"order_no"`
+	UserID         int64                         `json:"user_id"`
+	OrderType      string                        `json:"order_type"`
+	Status         string                        `json:"status"`
+	ActivityID     *int64                        `json:"activity_id"`
+	PurchaseSlot   string                        `json:"purchase_slot"`
+	TotalAmount    int64                         `json:"total_amount"`
+	DiscountAmount int64                         `json:"discount_amount"`
+	PayAmount      int64                         `json:"pay_amount"`
+	Receiver       string                        `json:"receiver"`
+	PaidAt         *string                       `json:"paid_at"`
+	ShippedAt      *string                       `json:"shipped_at"`
+	CompletedAt    *string                       `json:"completed_at"`
+	CancelledAt    *string                       `json:"cancelled_at"`
+	Items          []productionOrderItemResponse `json:"items"`
+}
+
+type productionPaymentResponse struct {
+	PaymentID string `json:"payment_id"`
+	OrderNo   string `json:"order_no"`
+	UserID    int64  `json:"user_id"`
+	Amount    int64  `json:"amount"`
+	Result    string `json:"result"`
+}
+
+type productionActivityResponse struct {
+	ID           int64  `json:"id"`
+	SKUID        int64  `json:"sku_id"`
+	Stock        int    `json:"stock"`
+	PerUserLimit int    `json:"per_user_limit"`
+	Status       string `json:"status"`
+}
+
+type productionFlashSaleListResponse struct {
+	ServerTime string                                `json:"server_time"`
+	Items      []productionFlashSaleListItemResponse `json:"items"`
+}
+
+type productionFlashSaleListItemResponse struct {
+	ID    int64  `json:"id"`
+	State string `json:"state"`
+	Stock int    `json:"stock"`
+}
+
+type productionPurchaseResponse struct {
+	PreDeductionID string `json:"pre_deduction_id"`
+	Status         string `json:"status"`
+	OrderNo        string `json:"order_no"`
+}
+
+type productionPurchaseLifecycleResponse struct {
+	ID        string  `json:"id"`
+	Status    string  `json:"status"`
+	OrderNo   string  `json:"order_no"`
+	OrderedAt *string `json:"ordered_at"`
+}
+
+type productionHealthResponse struct {
+	Status string            `json:"status"`
+	Checks map[string]string `json:"checks"`
+}
+
+func productionJSON[T any](t *testing.T, router http.Handler, method, path, token string, requestBody any, expectedStatus int) (T, map[string]json.RawMessage) {
+	t.Helper()
+	response := productionRequest(t, router, method, path, token, requestBody)
+	require.Equalf(t, expectedStatus, response.Code, "%s %s returned %d: %s", method, path, response.Code, response.Body.String())
+	require.NotEmptyf(t, response.Body.Bytes(), "%s %s must return a JSON response", method, path)
+
+	var decoded T
+	require.NoErrorf(t, json.Unmarshal(response.Body.Bytes(), &decoded), "%s %s response: %s", method, path, response.Body.String())
+	var fields map[string]json.RawMessage
+	require.NoErrorf(t, json.Unmarshal(response.Body.Bytes(), &fields), "%s %s response must be a JSON object", method, path)
+	return decoded, fields
+}
+
+func productionRequest(t *testing.T, router http.Handler, method, path, token string, requestBody any) *httptest.ResponseRecorder {
+	t.Helper()
+	var body *bytes.Reader
+	if requestBody == nil {
+		body = bytes.NewReader(nil)
+	} else {
+		encoded, err := json.Marshal(requestBody)
+		require.NoError(t, err)
+		body = bytes.NewReader(encoded)
+	}
+	request := httptest.NewRequest(method, path, body)
+	if requestBody != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func productionNoContent(t *testing.T, router http.Handler, method, path, token string) {
+	t.Helper()
+	response := productionRequest(t, router, method, path, token, nil)
+	require.Equalf(t, http.StatusNoContent, response.Code, "%s %s returned %d: %s", method, path, response.Code, response.Body.String())
+	require.Empty(t, response.Body.Bytes(), "%s %s must not return a response body", method, path)
+}
+
+func productionRequireKeys(t *testing.T, fields map[string]json.RawMessage, expected ...string) {
+	t.Helper()
+	actual := make([]string, 0, len(fields))
+	for key := range fields {
+		actual = append(actual, key)
+	}
+	require.ElementsMatch(t, expected, actual)
+}
+
+func productionWaitForHealth(t *testing.T, router http.Handler, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	var lastStatus int
+	var lastBody string
+	for time.Now().Before(deadline) {
+		response := productionRequest(t, router, http.MethodGet, "/healthz", "", nil)
+		lastStatus, lastBody = response.Code, response.Body.String()
+		if response.Code == http.StatusOK {
+			var health productionHealthResponse
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &health))
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &fields))
+			productionRequireKeys(t, fields, "status", "checks")
+			require.Equal(t, "ok", health.Status)
+			require.Equal(t, map[string]string{"mysql": "ok", "redis": "ok", "mq": "ok"}, health.Checks)
+			return
+		}
+		<-ticker.C
+	}
+	require.FailNowf(t, "production router did not become healthy", "last status=%d body=%s", lastStatus, lastBody)
+}
+
+func productionRegisterAndLogin(t *testing.T, router http.Handler, username string) (int64, string) {
+	t.Helper()
+	const password = "secret123"
+	registered, registeredFields := productionJSON[productionUserResponse](t, router, http.MethodPost, "/api/auth/register", "",
+		map[string]any{"username": username, "password": password}, http.StatusCreated)
+	productionRequireKeys(t, registeredFields, "id", "username", "nickname", "avatar_url", "role", "created_at", "updated_at")
+	require.Positive(t, registered.ID)
+	require.Equal(t, username, registered.Username)
+	require.Equal(t, "user", registered.Role)
+	return registered.ID, productionLogin(t, router, username, password, "user")
+}
+
+func productionLogin(t *testing.T, router http.Handler, username, password, role string) string {
+	t.Helper()
+	login, fields := productionJSON[productionLoginResponse](t, router, http.MethodPost, "/api/auth/login", "",
+		map[string]any{"username": username, "password": password}, http.StatusOK)
+	productionRequireKeys(t, fields, "token", "user")
+	var userFields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(fields["user"], &userFields))
+	productionRequireKeys(t, userFields, "id", "username", "nickname", "avatar_url", "role", "created_at", "updated_at")
+	require.NotEmpty(t, login.Token)
+	require.Equal(t, username, login.User.Username)
+	require.Equal(t, role, login.User.Role)
+	return login.Token
+}
+
+func productionCreateAddress(t *testing.T, router http.Handler, token, receiver string) int64 {
+	t.Helper()
+	address, fields := productionJSON[productionAddressResponse](t, router, http.MethodPost, "/api/addresses", token,
+		map[string]any{
+			"receiver": receiver, "phone": "13800138000", "province": "Guangdong", "city": "Shenzhen",
+			"district": "Nanshan", "detail": "Production Router Road 1", "is_default": true,
+		}, http.StatusCreated)
+	productionRequireKeys(t, fields,
+		"id", "user_id", "receiver", "phone", "province", "city", "district", "detail", "is_default", "created_at", "updated_at")
+	require.Positive(t, address.ID)
+	require.Positive(t, address.UserID)
+	require.Equal(t, receiver, address.Receiver)
+	require.True(t, address.IsDefault)
+	return address.ID
+}
+
+func productionCreateOnSaleSKU(t *testing.T, router http.Handler, adminToken, name string, price int64, stock int) (int64, int64) {
+	t.Helper()
+	category, categoryFields := productionJSON[productionIDResponse](t, router, http.MethodPost, "/api/admin/categories", adminToken,
+		map[string]any{"name": "category-" + name}, http.StatusCreated)
+	productionRequireKeys(t, categoryFields, "id", "name", "created_at", "updated_at")
+	require.Positive(t, category.ID)
+
+	product, productFields := productionJSON[productionIDResponse](t, router, http.MethodPost, "/api/admin/products", adminToken,
+		map[string]any{"category_id": category.ID, "title": "product-" + name, "description": "production router tracer"}, http.StatusCreated)
+	productionRequireKeys(t, productFields, "id", "category_id", "title", "description", "status", "created_at", "updated_at")
+	require.Positive(t, product.ID)
+
+	sku, skuFields := productionJSON[productionIDResponse](t, router, http.MethodPost, fmt.Sprintf("/api/admin/products/%d/skus", product.ID), adminToken,
+		map[string]any{"specs": map[string]string{"color": "router-blue"}, "price": price, "stock": stock}, http.StatusCreated)
+	productionRequireKeys(t, skuFields, "id", "product_id", "specs", "price", "stock", "created_at", "updated_at")
+	require.Positive(t, sku.ID)
+	productionNoContent(t, router, http.MethodPost, fmt.Sprintf("/api/admin/products/%d/publish", product.ID), adminToken)
+	return product.ID, sku.ID
+}
+
+func productionRequireOrderItem(t *testing.T, item productionOrderItemResponse, orderNo string, productID, skuID, price int64, quantity int) {
+	t.Helper()
+	require.Positive(t, item.ID)
+	require.Equal(t, orderNo, item.OrderNo)
+	require.Equal(t, productID, item.ProductID)
+	require.Equal(t, skuID, item.SKUID)
+	require.NotEmpty(t, item.Title)
+	require.Equal(t, "router-blue", item.Specs["color"])
+	require.Equal(t, price, item.Price)
+	require.Equal(t, quantity, item.Quantity)
+	require.Equal(t, price*int64(quantity), item.Subtotal)
+}
+
+func productionSKUStock(t *testing.T, product productionProductDetailResponse, skuID int64) int {
+	t.Helper()
+	for _, sku := range product.SKUs {
+		if sku.ID == skuID {
+			return sku.Stock
+		}
+	}
+	require.FailNowf(t, "SKU missing from product detail", "sku_id=%d product_id=%d", skuID, product.ID)
+	return 0
+}
+
+func productionFlashSaleItem(t *testing.T, router http.Handler, token string, activityID int64) productionFlashSaleListItemResponse {
+	t.Helper()
+	list, fields := productionJSON[productionFlashSaleListResponse](t, router, http.MethodGet, "/api/flashsales", token, nil, http.StatusOK)
+	productionRequireKeys(t, fields, "server_time", "items")
+	for _, item := range list.Items {
+		if item.ID == activityID {
+			return item
+		}
+	}
+	require.FailNowf(t, "flash sale missing from user list", "activity_id=%d", activityID)
+	return productionFlashSaleListItemResponse{}
+}
+
+func productionPollPurchaseOrdered(t *testing.T, router http.Handler, token, preDeductionID string, timeout time.Duration) productionPurchaseLifecycleResponse {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var last productionPurchaseLifecycleResponse
+	for time.Now().Before(deadline) {
+		lifecycle, fields := productionJSON[productionPurchaseLifecycleResponse](t, router, http.MethodGet,
+			"/api/flashsales/purchases/"+preDeductionID, token, nil, http.StatusOK)
+		last = lifecycle
+		if lifecycle.Status == "ordered" {
+			productionRequireKeys(t, fields, "id", "status", "order_no", "created_at", "updated_at", "ordered_at")
+			require.Equal(t, preDeductionID, lifecycle.ID)
+			require.NotEmpty(t, lifecycle.OrderNo)
+			require.NotNil(t, lifecycle.OrderedAt)
+			return lifecycle
+		}
+		require.NotEqual(t, "rolled_back", lifecycle.Status, "purchase was rolled back before ordering")
+		<-ticker.C
+	}
+	require.FailNowf(t, "flash-sale purchase did not reach ordered", "pre_deduction_id=%s last_status=%s", preDeductionID, last.Status)
+	return productionPurchaseLifecycleResponse{}
+}
+
+func productionRequireSeckillOrder(t *testing.T, order productionOrderResponse, activityID int64, purchaseSlot string, skuID int64) {
+	t.Helper()
+	require.Equal(t, "seckill", order.OrderType)
+	require.Equal(t, "pending_payment", order.Status)
+	require.NotNil(t, order.ActivityID)
+	require.Equal(t, activityID, *order.ActivityID)
+	require.Equal(t, purchaseSlot, order.PurchaseSlot)
+	require.Equal(t, int64(1900), order.PayAmount)
+	require.Zero(t, order.DiscountAmount)
+	require.Len(t, order.Items, 1)
+	require.Equal(t, skuID, order.Items[0].SKUID)
+	require.Equal(t, int64(1900), order.Items[0].Price)
+	require.Equal(t, 1, order.Items[0].Quantity)
 }

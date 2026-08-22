@@ -29,6 +29,9 @@ type Config struct {
 // 返回 Stop 包装的错误时不重试并原样返回（业务拒绝等不可重试错误）。
 // 其余情况返回最后一次 fn 的错误。
 func Do(ctx context.Context, cfg Config, fn func(ctx context.Context) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if cfg.Attempts <= 1 {
 		return fn(ctx)
 	}

@@ -340,6 +340,8 @@ func sendRequest(t *testing.T, env *testEnv, token string, toUserID int64) map[s
 	w, body := doJSON(t, env, http.MethodPost, "/api/friend-requests",
 		fmt.Sprintf(`{"to_user_id":%d}`, toUserID), token)
 	require.Equal(t, http.StatusCreated, w.Code, "发起申请失败: %s", w.Body.String())
+	testsupport.AssertExactJSONKeys(t, body,
+		"id", "from_user_id", "to_user_id", "status", "created_at", "updated_at")
 	return body
 }
 
@@ -347,6 +349,7 @@ func friendsOf(t *testing.T, env *testEnv, token string) []any {
 	t.Helper()
 	w, body := doJSON(t, env, http.MethodGet, "/api/friends", "", token)
 	require.Equal(t, http.StatusOK, w.Code)
+	testsupport.AssertExactJSONKeys(t, body, "items")
 	items, _ := body["items"].([]any)
 	return items
 }
@@ -365,9 +368,12 @@ func TestFriendRequestAcceptClosedLoop(t *testing.T) {
 
 	w, list := doJSON(t, env, http.MethodGet, "/api/friend-requests?scope=incoming", "", bobToken)
 	require.Equal(t, http.StatusOK, w.Code)
+	testsupport.AssertExactJSONKeys(t, list, "items", "total")
 	items := list["items"].([]any)
 	require.Len(t, items, 1)
 	incoming := items[0].(map[string]any)
+	testsupport.AssertExactJSONKeys(t, incoming,
+		"id", "from_user_id", "to_user_id", "status", "created_at", "updated_at", "peer_username")
 	require.Equal(t, float64(aliceID), incoming["from_user_id"])
 	require.Equal(t, "pending", incoming["status"])
 
@@ -378,10 +384,14 @@ func TestFriendRequestAcceptClosedLoop(t *testing.T) {
 	// 双向好友列表互相可见。
 	aFriends := friendsOf(t, env, aliceToken)
 	require.Len(t, aFriends, 1)
-	require.Equal(t, float64(bobID), aFriends[0].(map[string]any)["user_id"])
+	aFriend := aFriends[0].(map[string]any)
+	testsupport.AssertExactJSONKeys(t, aFriend, "user_id", "username", "since")
+	require.Equal(t, float64(bobID), aFriend["user_id"])
 	bFriends := friendsOf(t, env, bobToken)
 	require.Len(t, bFriends, 1)
-	require.Equal(t, float64(aliceID), bFriends[0].(map[string]any)["user_id"])
+	bFriend := bFriends[0].(map[string]any)
+	testsupport.AssertExactJSONKeys(t, bFriend, "user_id", "username", "since")
+	require.Equal(t, float64(aliceID), bFriend["user_id"])
 
 	// 申请状态置为 accepted。
 	w, list = doJSON(t, env, http.MethodGet, "/api/friend-requests?scope=outgoing", "", aliceToken)
@@ -664,19 +674,22 @@ func TestFriendRequestDuplicateAndSelf(t *testing.T) {
 	bobID, _ := register(t, env, "bob_fd")
 
 	// 自加好友 → 400。
-	w, _ := doJSON(t, env, http.MethodPost, "/api/friend-requests",
+	w, body := doJSON(t, env, http.MethodPost, "/api/friend-requests",
 		fmt.Sprintf(`{"to_user_id":%d}`, aliceID), aliceToken)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	sendRequest(t, env, aliceToken, bobID)
 	// 重复申请（pending 未处理）→ 409。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/friend-requests",
+	w, body = doJSON(t, env, http.MethodPost, "/api/friend-requests",
 		fmt.Sprintf(`{"to_user_id":%d}`, bobID), aliceToken)
 	require.Equal(t, http.StatusConflict, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 目标用户不存在 → 404。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/friend-requests", `{"to_user_id":999999}`, aliceToken)
+	w, body = doJSON(t, env, http.MethodPost, "/api/friend-requests", `{"to_user_id":999999}`, aliceToken)
 	require.Equal(t, http.StatusNotFound, w.Code)
+	testsupport.AssertAPIError(t, body)
 }
 
 // ---- owner 校验（防 IDOR）----
@@ -693,19 +706,22 @@ func TestFriendRequestOwnerCheck(t *testing.T) {
 	// 申请人 / 无关第三人 处理申请 → 403。
 	w, body := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/accept", reqID), "", aliceToken)
 	require.Equal(t, http.StatusForbidden, w.Code)
-	require.Equal(t, map[string]any{"error": "friend request does not belong to user"}, body)
-	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/reject", reqID), "", carolToken)
+	testsupport.AssertAPIError(t, body, "friend request does not belong to user")
+	w, body = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/reject", reqID), "", carolToken)
 	require.Equal(t, http.StatusForbidden, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 不存在的申请 → 404。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/friend-requests/999999/accept", "", bobToken)
+	w, body = doJSON(t, env, http.MethodPost, "/api/friend-requests/999999/accept", "", bobToken)
 	require.Equal(t, http.StatusNotFound, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 拒绝后不能重复处理（非待处理）→ 409。
 	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/reject", reqID), "", bobToken)
 	require.Equal(t, http.StatusNoContent, w.Code)
-	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/accept", reqID), "", bobToken)
+	w, body = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/accept", reqID), "", bobToken)
 	require.Equal(t, http.StatusConflict, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 已是好友后再申请 → 409。
 	bobAccepts := func() {
@@ -714,9 +730,10 @@ func TestFriendRequestOwnerCheck(t *testing.T) {
 		require.Equal(t, http.StatusNoContent, w.Code)
 	}
 	bobAccepts()
-	w, _ = doJSON(t, env, http.MethodPost, "/api/friend-requests",
+	w, body = doJSON(t, env, http.MethodPost, "/api/friend-requests",
 		fmt.Sprintf(`{"to_user_id":%d}`, aliceID), bobToken)
 	require.Equal(t, http.StatusConflict, w.Code)
+	testsupport.AssertAPIError(t, body)
 }
 
 // ---- 鉴权与参数校验 ----
@@ -726,22 +743,28 @@ func TestFriendRequestAuthAndValidation(t *testing.T) {
 	aliceID, aliceToken := register(t, env, "ava_fv")
 
 	// 未带 token → 401。
-	w, _ := doJSON(t, env, http.MethodGet, "/api/friends", "", "")
+	w, body := doJSON(t, env, http.MethodGet, "/api/friends", "", "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
-	w, _ = doJSON(t, env, http.MethodPost, "/api/friend-requests", `{"to_user_id":1}`, "")
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodPost, "/api/friend-requests", `{"to_user_id":1}`, "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 缺少 to_user_id / 非法 id → 400。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/friend-requests", `{}`, aliceToken)
+	w, body = doJSON(t, env, http.MethodPost, "/api/friend-requests", `{}`, aliceToken)
 	require.Equal(t, http.StatusBadRequest, w.Code)
-	w, _ = doJSON(t, env, http.MethodPost, "/api/friend-requests/abc/accept", "", aliceToken)
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodPost, "/api/friend-requests/abc/accept", "", aliceToken)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 非法 scope / status 筛选 → 400。
-	w, _ = doJSON(t, env, http.MethodGet, "/api/friend-requests?scope=sideways", "", aliceToken)
+	w, body = doJSON(t, env, http.MethodGet, "/api/friend-requests?scope=sideways", "", aliceToken)
 	require.Equal(t, http.StatusBadRequest, w.Code)
-	w, _ = doJSON(t, env, http.MethodGet, "/api/friend-requests?scope=incoming&status=weird", "", aliceToken)
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodGet, "/api/friend-requests?scope=incoming&status=weird", "", aliceToken)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 未产生任何关系。
 	require.Empty(t, friendsOf(t, env, aliceToken))

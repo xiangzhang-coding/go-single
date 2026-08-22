@@ -105,7 +105,7 @@ jobs:
         run: go test ./... -count=1
 
       - name: race 检测（并发敏感业务包与生产装配）
-        run: go test -race -count=1 ./cmd/server ./internal/user/... ./internal/platform/limiter/... ./internal/platform/requestbody/... ./internal/platform/file/... ./internal/flashsale/... ./internal/coupon/... ./internal/social/... ./internal/platform/ws/... ./internal/platform/mq/... ./internal/chat/... ./internal/order/... ./internal/payment/... ./internal/product/... ./internal/cart/...
+        run: go test -race -count=1 ./cmd/server ./internal/user/... ./internal/platform/limiter/... ./internal/platform/requestbody/... ./internal/platform/file/... ./internal/platform/cache/... ./internal/platform/cron/... ./internal/flashsale/... ./internal/coupon/... ./internal/social/... ./internal/platform/ws/... ./internal/platform/mq/... ./internal/chat/... ./internal/order/... ./internal/payment/... ./internal/product/... ./internal/cart/...
 
       - name: 供应链漏洞扫描（govulncheck）
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
@@ -118,7 +118,7 @@ jobs:
       - name: 前端与部署契约测试
         run: |
           bun test scripts/*.test.ts
-          cd web/faire && bun test scripts/*.test.ts
+          cd web/faire && bun run test
 
       - name: 前端依赖审计（精确允许列表）
         run: bun run scripts/frontend-audit.ts

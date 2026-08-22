@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "bun test scripts/*.test.ts && bun test --preload ./scripts/test-dom.ts --preload ./scripts/test-setup.ts scripts/*.test.tsx"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.3",
@@ -17,11 +18,15 @@
     "zustand": "^5.0.8"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "^20.11.6",
     "@tailwindcss/vite": "^4.1.13",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.6",
     "@types/node": "^24.3.0",
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
     "@vitejs/plugin-react": "^5.0.2",
+    "happy-dom": "^20.11.6",
     "tailwindcss": "^4.1.13",
     "typescript": "^5.9.2",
     "vite": "^7.1.3"

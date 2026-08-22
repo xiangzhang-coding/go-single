@@ -60,7 +60,8 @@ func testSeckillQueue() string {
 
 type isolatedQueueMQ struct {
 	mq.MQ
-	queue string
+	queue            string
+	deliveryReceipts chan<- string
 }
 
 func (m isolatedQueueMQ) Publish(ctx context.Context, queue string, body []byte) error {
@@ -73,6 +74,23 @@ func (m isolatedQueueMQ) Publish(ctx context.Context, queue string, body []byte)
 func (m isolatedQueueMQ) Consume(ctx context.Context, queue string, handler mq.MessageHandler) error {
 	if queue == flashsalesvc.SeckillOrderQueue {
 		queue = m.queue
+		wrapped := handler
+		handler = func(ctx context.Context, body []byte) error {
+			if err := wrapped(ctx, body); err != nil {
+				return err
+			}
+			var probe struct {
+				DeliveryID string `json:"test_delivery_id"`
+			}
+			if json.Unmarshal(body, &probe) == nil && probe.DeliveryID != "" {
+				select {
+				case m.deliveryReceipts <- probe.DeliveryID:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		}
 	} else if queue == flashsalesvc.SeckillOrderDeadLetterQueue {
 		queue = m.queue + ".dlq"
 	}
@@ -93,6 +111,7 @@ type mqEnv struct {
 	consumer      *flashsalesvc.SeckillOrderConsumer
 	timeout       flashsalesvc.SeckillCancellation
 	reconcile     flashsalesvc.Reconciliation
+	deliveries    <-chan string
 }
 
 type testOrderCancellation struct {
@@ -133,7 +152,8 @@ func buildMQEnv() (*mqEnv, error) {
 		return nil, fmt.Errorf("RabbitMQ 连接失败: %w", err)
 	}
 	queue := testSeckillQueue()
-	mqClient := isolatedQueueMQ{MQ: rabbitMQ, queue: queue}
+	deliveryReceipts := make(chan string, 16)
+	mqClient := isolatedQueueMQ{MQ: rabbitMQ, queue: queue, deliveryReceipts: deliveryReceipts}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := mqClient.Ping(ctx); err != nil {
@@ -225,6 +245,7 @@ func buildMQEnv() (*mqEnv, error) {
 		activities: flashsaleStore.Activities, tx: flashsaleStore.Tx,
 		preDeductions: flashsaleStore.PreDeductions,
 		consumer:      consumer, timeout: timeout, reconcile: reconcile,
+		deliveries: deliveryReceipts,
 	}, nil
 }
 
@@ -459,20 +480,39 @@ func TestSeckillOrderConcurrentNoDuplicate(t *testing.T) {
 	id := seedPublishedOnSale(t, admin, 20)
 
 	const users = 30
-	orderNos := make([]string, users)
-	var wg sync.WaitGroup
+	tokens := make([]string, users)
 	for i := 0; i < users; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			token, _ := registerWithAddress(t, e, uniqueName(fmt.Sprintf("racer%d", i)))
-			w, body := purchaseOn(t, e, id, token)
-			if w.Code == http.StatusAccepted {
-				orderNos[i] = body["order_no"].(string)
-			}
-		}(i)
+		tokens[i], _ = registerWithAddress(t, e, uniqueName(fmt.Sprintf("racer%d", i)))
 	}
-	wg.Wait()
+	results := make(chan *httptest.ResponseRecorder, users)
+	for i, token := range tokens {
+		requestID := uniqueName(fmt.Sprintf("concurrent-purchase-%d", i))
+		go func() {
+			results <- performJSONOn(e.router, http.MethodPost, fmt.Sprintf("/api/flashsales/%d/purchase", id),
+				fmt.Sprintf(`{"client_request_id":%q}`, requestID), token)
+		}()
+	}
+
+	orderNos := make([]string, 0, 20)
+	for range users {
+		select {
+		case w := <-results:
+			var body map[string]any
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+			switch w.Code {
+			case http.StatusAccepted:
+				orderNo, ok := body["order_no"].(string)
+				require.True(t, ok && orderNo != "", "accepted purchase must return order_no: %s", w.Body.String())
+				orderNos = append(orderNos, orderNo)
+			case http.StatusConflict:
+				testsupport.AssertAPIError(t, body)
+			default:
+				t.Fatalf("unexpected purchase status %d: %s", w.Code, w.Body.String())
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("timed out waiting for concurrent purchase")
+		}
+	}
 
 	waitSeckillOrders(t, e, id, 20, 15*time.Second)
 	require.Equal(t, 20, countSeckillOrders(t, e, id), "并发不得重复建单")
@@ -513,19 +553,39 @@ func TestSeckillOrderRedeliveryIsPurchaseSlotScoped(t *testing.T) {
 	secondPD, err := e.preDeductions.GetByID(context.Background(), secondID)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	for _, pd := range []*flashsalemodel.PreDeduction{firstPD, secondPD} {
-		body, marshalErr := json.Marshal(flashsalesvc.SeckillSuccessMessage{
-			PreDeductionID: pd.ID, OrderNo: pd.OrderNumber(), UserID: userID, ActivityID: id,
-			SKUID: pd.SKUID, Price: pd.Price, Quantity: pd.Quantity, PurchaseSlot: pd.PurchaseSlot,
-		})
-		require.NoError(t, marshalErr)
-		require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
-		require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
+	wantDeliveries := make(map[string]struct{}, 4)
+	for pdIndex, pd := range []*flashsalemodel.PreDeduction{firstPD, secondPD} {
+		for copyIndex := 0; copyIndex < 2; copyIndex++ {
+			deliveryID := fmt.Sprintf("redelivery-%d-%d-%d", id, pdIndex, copyIndex)
+			body, marshalErr := json.Marshal(struct {
+				flashsalesvc.SeckillSuccessMessage
+				DeliveryID string `json:"test_delivery_id"`
+			}{
+				SeckillSuccessMessage: flashsalesvc.SeckillSuccessMessage{
+					PreDeductionID: pd.ID, OrderNo: pd.OrderNumber(), UserID: userID, ActivityID: id,
+					SKUID: pd.SKUID, Price: pd.Price, Quantity: pd.Quantity, PurchaseSlot: pd.PurchaseSlot,
+				},
+				DeliveryID: deliveryID,
+			})
+			require.NoError(t, marshalErr)
+			require.NoError(t, e.mqClient.Publish(ctx, flashsalesvc.SeckillOrderQueue, body))
+			wantDeliveries[deliveryID] = struct{}{}
+		}
+	}
+	seenDeliveries := make(map[string]struct{}, len(wantDeliveries))
+	for len(seenDeliveries) < len(wantDeliveries) {
+		select {
+		case deliveryID := <-e.deliveries:
+			if _, wanted := wantDeliveries[deliveryID]; wanted {
+				seenDeliveries[deliveryID] = struct{}{}
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for duplicate MQ deliveries: got %v want %v", seenDeliveries, wantDeliveries)
+		}
 	}
 
-	time.Sleep(500 * time.Millisecond)
 	require.Equal(t, 2, countSeckillOrders(t, e, id), "两个槽位各一单，重复投递不增单")
 	require.Equal(t, 8, mysqlStock(t, e, id), "每个槽位只扣减一次库存")
 }

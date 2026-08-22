@@ -186,21 +186,39 @@ func tokenOf(t *testing.T, body map[string]any) string {
 	return tok
 }
 
+func requireUserResponseShape(t *testing.T, body map[string]any) {
+	t.Helper()
+	testsupport.AssertExactJSONKeys(t, body,
+		"id", "username", "nickname", "avatar_url", "role", "created_at", "updated_at")
+	require.IsType(t, float64(0), body["id"])
+	for _, field := range []string{"username", "nickname", "avatar_url", "role", "created_at", "updated_at"} {
+		require.IsType(t, "", body[field], "field %q", field)
+	}
+}
+
 // 注册 → 登录 → 携带 token 访问受保护接口 全链路。
 func TestRegisterLoginAndMe(t *testing.T) {
 	env := requireEnv(t)
 	username := fmt.Sprintf("alice_%d", time.Now().UnixNano())
 
 	reg := registerUser(t, env, username, "secret123")
+	requireUserResponseShape(t, reg)
+	require.Equal(t, username, reg["username"])
 	require.Equal(t, "user", reg["role"])
 
 	code, loginBody := login(t, env, username, "secret123")
 	require.Equal(t, http.StatusOK, code)
-	require.Equal(t, "user", loginBody["user"].(map[string]any)["role"])
+	testsupport.AssertExactJSONKeys(t, loginBody, "token", "user")
+	loginUser, ok := loginBody["user"].(map[string]any)
+	require.True(t, ok, "login user = %#v, want JSON object", loginBody["user"])
+	requireUserResponseShape(t, loginUser)
+	require.Equal(t, username, loginUser["username"])
+	require.Equal(t, "user", loginUser["role"])
 	token := tokenOf(t, loginBody)
 
 	w, me := doJSON(t, env, http.MethodGet, "/api/users/me", "", token)
 	require.Equal(t, http.StatusOK, w.Code)
+	requireUserResponseShape(t, me)
 	require.Equal(t, username, me["username"])
 	require.Equal(t, reg["id"], me["id"])
 }
@@ -213,28 +231,32 @@ func TestLoginRejected(t *testing.T) {
 
 	code, body := login(t, env, username, "wrong-pass")
 	require.Equal(t, http.StatusUnauthorized, code)
-	require.Equal(t, map[string]any{"error": "invalid username or password"}, body)
+	testsupport.AssertAPIError(t, body, "invalid username or password")
 
-	code, _ = login(t, env, "ghost_"+username, "secret123")
+	code, body = login(t, env, "ghost_"+username, "secret123")
 	require.Equal(t, http.StatusUnauthorized, code)
+	testsupport.AssertAPIError(t, body, "invalid username or password")
 }
 
 // 未带 / 伪造 / 过期 token 访问受保护接口 → 401。
 func TestProtectedEndpointRequiresToken(t *testing.T) {
 	env := requireEnv(t)
 
-	w, _ := doJSON(t, env, http.MethodGet, "/api/users/me", "", "")
+	w, body := doJSON(t, env, http.MethodGet, "/api/users/me", "", "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
+	testsupport.AssertAPIError(t, body)
 
-	w, _ = doJSON(t, env, http.MethodGet, "/api/users/me", "", "garbage.token.here")
+	w, body = doJSON(t, env, http.MethodGet, "/api/users/me", "", "garbage.token.here")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 过期 token：用负 TTL 签发已过期令牌。
 	expired := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: -time.Hour})
 	stale, err := expired.Issue(1, "user")
 	require.NoError(t, err)
-	w, _ = doJSON(t, env, http.MethodGet, "/api/users/me", "", stale)
+	w, body = doJSON(t, env, http.MethodGet, "/api/users/me", "", stale)
 	require.Equal(t, http.StatusUnauthorized, w.Code)
+	testsupport.AssertAPIError(t, body)
 }
 
 // admin 种子账号（migration 种入）可登录且 role=admin。
@@ -267,7 +289,7 @@ func TestCrossUserDenied(t *testing.T) {
 	// A 访问 B 的资料 → 403。
 	w, body := doJSON(t, env, http.MethodGet, fmt.Sprintf("/api/users/%v", regB["id"]), "", tokenA)
 	require.Equal(t, http.StatusForbidden, w.Code)
-	require.NotEmpty(t, body["error"])
+	testsupport.AssertAPIError(t, body)
 
 	// A 访问自己 → 200。
 	w, _ = doJSON(t, env, http.MethodGet, fmt.Sprintf("/api/users/%v", regA["id"]), "", tokenA)
@@ -280,8 +302,9 @@ func TestCrossUserDenied(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 
 	// 不存在用户 → 404。
-	w, _ = doJSON(t, env, http.MethodGet, "/api/users/999999", "", adminToken)
+	w, body = doJSON(t, env, http.MethodGet, "/api/users/999999", "", adminToken)
 	require.Equal(t, http.StatusNotFound, w.Code)
+	testsupport.AssertAPIError(t, body)
 }
 
 // 重复注册 → 409；非法输入 → 400。
@@ -291,15 +314,18 @@ func TestRegisterValidation(t *testing.T) {
 
 	registerUser(t, env, username, "secret123")
 
-	w, _ := doJSON(t, env, http.MethodPost, "/api/auth/register",
+	w, body := doJSON(t, env, http.MethodPost, "/api/auth/register",
 		fmt.Sprintf(`{"username":%q,"password":"secret456"}`, username), "")
 	require.Equal(t, http.StatusConflict, w.Code)
+	testsupport.AssertAPIError(t, body)
 
-	w, _ = doJSON(t, env, http.MethodPost, "/api/auth/register", `{"username":"x","password":"12345"}`, "")
+	w, body = doJSON(t, env, http.MethodPost, "/api/auth/register", `{"username":"x","password":"12345"}`, "")
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, body)
 
-	w, _ = doJSON(t, env, http.MethodPost, "/api/auth/register", `{"username":""}`, "")
+	w, body = doJSON(t, env, http.MethodPost, "/api/auth/register", `{"username":""}`, "")
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, body)
 }
 
 func TestConcurrentLoginHasAccountBudget(t *testing.T) {
@@ -361,11 +387,13 @@ func TestOversizedJSONRejectedBeforeRegistration(t *testing.T) {
 	env := requireEnv(t)
 	username := fmt.Sprintf("oversize_%d", time.Now().UnixNano())
 	body := fmt.Sprintf(`{"username":%q,"password":"secret123","padding":%q}`, username, strings.Repeat("x", 64<<10))
-	w, _ := doJSON(t, env, http.MethodPost, "/api/auth/register", body, "")
+	w, response := doJSON(t, env, http.MethodPost, "/api/auth/register", body, "")
 	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+	testsupport.AssertAPIError(t, response)
 
-	code, _ := login(t, env, username, "secret123")
+	code, response := login(t, env, username, "secret123")
 	require.Equal(t, http.StatusUnauthorized, code)
+	testsupport.AssertAPIError(t, response)
 }
 
 func authLimitedRouter(t *testing.T, env *testEnv, cfg limiter.AuthAttemptsConfig) http.Handler {
@@ -456,12 +484,14 @@ func TestUserSearchByPrefix(t *testing.T) {
 	require.Empty(t, body["items"])
 
 	// 未携带 token → 401。
-	w, _ = doJSON(t, env, http.MethodGet, "/api/users?username="+prefix, "", "")
+	w, body = doJSON(t, env, http.MethodGet, "/api/users?username="+prefix, "", "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 空前缀 → 400。
-	w, _ = doJSON(t, env, http.MethodGet, "/api/users?username=", "", tokenA)
+	w, body = doJSON(t, env, http.MethodGet, "/api/users?username=", "", tokenA)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, body)
 }
 
 func TestUserSearchTreatsWildcardsLiterallyAndReturnsPublicFields(t *testing.T) {

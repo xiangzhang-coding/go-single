@@ -16,8 +16,6 @@ func newAtomicRedis(t *testing.T) Client {
 	t.Helper()
 	c, err := NewRedis("127.0.0.1:6379", "", redisTestDB)
 	testsupport.RequireDependency(t, "Redis", err)
-	require.NoError(t, c.(*redisCache).client.ConfigSet(context.Background(), "appendonly", "yes").Err())
-	require.NoError(t, c.(*redisCache).client.ConfigSet(context.Background(), "appendfsync", "always").Err())
 	t.Cleanup(func() { require.NoError(t, c.Close()) })
 	return c
 }

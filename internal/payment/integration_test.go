@@ -218,6 +218,16 @@ func envOr(key, def string) string {
 
 func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
+	w := performJSON(env, method, path, body, token)
+
+	var parsed map[string]any
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
+	}
+	return w, parsed
+}
+
+func performJSON(env *testEnv, method, path, body, token string) *httptest.ResponseRecorder {
 	var r *http.Request
 	if body == "" {
 		r = httptest.NewRequest(method, path, nil)
@@ -230,12 +240,7 @@ func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*http
 	}
 	w := httptest.NewRecorder()
 	env.router.ServeHTTP(w, r)
-
-	var parsed map[string]any
-	if w.Body.Len() > 0 {
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
-	}
-	return w, parsed
+	return w
 }
 
 func adminToken(t *testing.T, env *testEnv) string {
@@ -393,27 +398,31 @@ func TestMockPayFailRechecksOrderAfterConcurrentCancel(t *testing.T) {
 	require.NoError(t, stateTx.Raw("SELECT order_no FROM orders WHERE order_no = ? FOR UPDATE", orderNo).Scan(&lockedOrderNo).Error)
 	require.Equal(t, orderNo, lockedOrderNo)
 
-	type response struct {
-		w    *httptest.ResponseRecorder
-		body map[string]any
-	}
-	result := make(chan response, 1)
+	result := make(chan *httptest.ResponseRecorder, 1)
+	paymentBody := fmt.Sprintf(`{"order_id":%q,"payment_id":%q,"amount":%d,"result":"fail"}`, orderNo, paymentID, payAmount)
 	go func() {
-		w, body := mockPay(t, env, token, orderNo, paymentID, payAmount, "fail")
-		result <- response{w: w, body: body}
+		result <- performJSON(env, http.MethodPost, "/api/payments/mock", paymentBody, token)
 	}()
 
 	select {
 	case got := <-result:
-		t.Fatalf("订单行尚未解锁，失败回调不应提前落流水: status=%d body=%s", got.w.Code, got.w.Body.String())
+		t.Fatalf("订单行尚未解锁，失败回调不应提前落流水: status=%d body=%s", got.Code, got.Body.String())
 	case <-time.After(200 * time.Millisecond):
 	}
 	require.NoError(t, stateTx.Model(&model.Order{}).Where("order_no = ?", orderNo).
 		Update("status", model.OrderStatusCancelled).Error)
 	require.NoError(t, stateTx.Commit().Error)
 
-	got := <-result
-	require.Equal(t, http.StatusConflict, got.w.Code, got.w.Body.String())
+	var got *httptest.ResponseRecorder
+	select {
+	case got = <-result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for concurrent payment callback")
+	}
+	var responseBody map[string]any
+	require.NoError(t, json.Unmarshal(got.Body.Bytes(), &responseBody))
+	require.Equal(t, http.StatusConflict, got.Code, got.Body.String())
+	testsupport.AssertAPIError(t, responseBody)
 	var count int64
 	require.NoError(t, env.gdb.Model(&paymentmodel.Payment{}).Where("payment_id = ?", paymentID).Count(&count).Error)
 	require.Zero(t, count, "并发取消后不得落失败流水")

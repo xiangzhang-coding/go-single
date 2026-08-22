@@ -305,14 +305,18 @@ func offSaleSKU(t *testing.T, env *testEnv) int64 {
 func TestCartRequiresAuth(t *testing.T) {
 	env := requireEnv(t)
 
-	w, _ := doJSON(t, env, http.MethodGet, "/api/cart", "", "")
+	w, body := doJSON(t, env, http.MethodGet, "/api/cart", "", "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
-	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", `{"sku_id":1,"quantity":1}`, "")
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodPost, "/api/cart", `{"sku_id":1,"quantity":1}`, "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
-	w, _ = doJSON(t, env, http.MethodPut, "/api/cart/items/1", `{"quantity":2}`, "")
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodPut, "/api/cart/items/1", `{"quantity":2}`, "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
-	w, _ = doJSON(t, env, http.MethodDelete, "/api/cart/items/1", "", "")
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodDelete, "/api/cart/items/1", "", "")
 	require.Equal(t, http.StatusUnauthorized, w.Code)
+	testsupport.AssertAPIError(t, body)
 }
 
 // 加购闭环：加购 → 重复加购合并 → 列表快照 → 改量 → 删除。
@@ -325,6 +329,7 @@ func TestCartHappyPath(t *testing.T) {
 	w, body := doJSON(t, env, http.MethodPost, "/api/cart",
 		fmt.Sprintf(`{"sku_id":%d,"quantity":2}`, skuID), token)
 	require.Equal(t, http.StatusCreated, w.Code, "加购失败: %s", w.Body.String())
+	testsupport.AssertExactJSONKeys(t, body, "id", "user_id", "sku_id", "quantity", "created_at", "updated_at")
 	itemID := int64(body["id"].(float64))
 	require.Equal(t, float64(2), body["quantity"])
 
@@ -338,9 +343,13 @@ func TestCartHappyPath(t *testing.T) {
 	// 列表：1 条，快照含标题/规格/价格。
 	w, list := doJSON(t, env, http.MethodGet, "/api/cart", "", token)
 	require.Equal(t, http.StatusOK, w.Code)
+	testsupport.AssertExactJSONKeys(t, list, "items")
 	items := list["items"].([]any)
 	require.Len(t, items, 1)
 	item := items[0].(map[string]any)
+	testsupport.AssertExactJSONKeys(t, item,
+		"id", "user_id", "sku_id", "quantity", "created_at", "updated_at",
+		"product_id", "title", "specs", "price", "stock")
 	require.Equal(t, float64(skuID), item["sku_id"])
 	require.Equal(t, float64(5), item["quantity"])
 	require.Equal(t, float64(9900), item["price"])
@@ -359,6 +368,7 @@ func TestCartHappyPath(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, w.Code)
 	w, list = doJSON(t, env, http.MethodGet, "/api/cart", "", token)
 	require.Equal(t, http.StatusOK, w.Code)
+	testsupport.AssertExactJSONKeys(t, list, "items")
 	require.Empty(t, list["items"].([]any))
 }
 
@@ -458,29 +468,36 @@ func TestCartAddRejects(t *testing.T) {
 	// 不存在的 SKU → 404。
 	w, body := doJSON(t, env, http.MethodPost, "/api/cart", `{"sku_id":999999,"quantity":1}`, token)
 	require.Equal(t, http.StatusNotFound, w.Code)
-	require.Equal(t, map[string]any{"error": "sku not found"}, body)
+	testsupport.AssertAPIError(t, body, "sku not found")
 
 	// 下架商品的 SKU → 409。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, offSKU), token)
+	w, body = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, offSKU), token)
 	require.Equal(t, http.StatusConflict, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 数量 0 / 负数 / 超上限 → 400。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":0}`, skuID), token)
+	w, body = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":0}`, skuID), token)
 	require.Equal(t, http.StatusBadRequest, w.Code)
-	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":-1}`, skuID), token)
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":-1}`, skuID), token)
 	require.Equal(t, http.StatusBadRequest, w.Code)
-	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":100}`, skuID), token)
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":100}`, skuID), token)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 缺 sku_id → 400（binding required）。
-	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", `{"quantity":1}`, token)
+	w, body = doJSON(t, env, http.MethodPost, "/api/cart", `{"quantity":1}`, token)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// 不存在的条目改量/删除 → 404。
-	w, _ = doJSON(t, env, http.MethodPut, "/api/cart/items/999999", `{"quantity":1}`, token)
+	w, body = doJSON(t, env, http.MethodPut, "/api/cart/items/999999", `{"quantity":1}`, token)
 	require.Equal(t, http.StatusNotFound, w.Code)
-	w, _ = doJSON(t, env, http.MethodDelete, "/api/cart/items/999999", "", token)
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodDelete, "/api/cart/items/999999", "", token)
 	require.Equal(t, http.StatusNotFound, w.Code)
+	testsupport.AssertAPIError(t, body)
 }
 
 func TestCartAddRejectsStaleCachedOffSaleProduct(t *testing.T) {
@@ -500,8 +517,9 @@ func TestCartAddRejectsStaleCachedOffSaleProduct(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, w.Code)
 	require.NoError(t, env.redis.Set(ctx, key, staleDetail, 5*time.Minute).Err(), "模拟外部遗留的陈旧详情缓存")
 
-	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, skuID), user)
+	w, body := doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, skuID), user)
 	require.Equal(t, http.StatusConflict, w.Code, "加购可售性必须读取商品事实而非详情缓存")
+	testsupport.AssertAPIError(t, body)
 }
 
 // 对象级授权（防 IDOR）：他人条目的改量/删除被拒 403，购物车互不可见。
@@ -517,10 +535,12 @@ func TestCartCrossUserForbidden(t *testing.T) {
 	itemID := int64(body["id"].(float64))
 
 	// bob 改/删 alice 的条目 → 403。
-	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/cart/items/%d", itemID), `{"quantity":3}`, bob)
+	w, body = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/cart/items/%d", itemID), `{"quantity":3}`, bob)
 	require.Equal(t, http.StatusForbidden, w.Code)
-	w, _ = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/cart/items/%d", itemID), "", bob)
+	testsupport.AssertAPIError(t, body)
+	w, body = doJSON(t, env, http.MethodDelete, fmt.Sprintf("/api/cart/items/%d", itemID), "", bob)
 	require.Equal(t, http.StatusForbidden, w.Code)
+	testsupport.AssertAPIError(t, body)
 
 	// bob 的列表看不到 alice 的条目；alice 的条目仍完好。
 	w, list := doJSON(t, env, http.MethodGet, "/api/cart", "", bob)
@@ -537,6 +557,7 @@ func TestCartCrossUserForbidden(t *testing.T) {
 	w, list = doJSON(t, env, http.MethodGet, "/api/cart", "", alice)
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Len(t, list["items"].([]any), 1, "下架不应清除已加购条目")
-	w, _ = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, skuID), alice)
+	w, body = doJSON(t, env, http.MethodPost, "/api/cart", fmt.Sprintf(`{"sku_id":%d,"quantity":1}`, skuID), alice)
 	require.Equal(t, http.StatusConflict, w.Code, "下架商品不可再加购")
+	testsupport.AssertAPIError(t, body)
 }

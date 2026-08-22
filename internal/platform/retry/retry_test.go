@@ -55,6 +55,19 @@ func TestDoSingleShotOnZeroConfig(t *testing.T) {
 	require.Equal(t, 1, calls)
 }
 
+func TestDoZeroConfigReturnsCanceledContextWithoutCallingFunction(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	calls := 0
+	err := Do(ctx, Config{}, func(ctx context.Context) error {
+		calls++
+		return nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, calls)
+}
+
 func TestDoRespectsContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

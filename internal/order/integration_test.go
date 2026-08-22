@@ -225,12 +225,16 @@ func envOr(key, def string) string {
 func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 	w := performJSON(env, method, path, body, token)
+	return w, decodeJSON(t, w)
+}
 
+func decodeJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
 	var parsed map[string]any
 	if w.Body.Len() > 0 {
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
 	}
-	return w, parsed
+	return parsed
 }
 
 func performJSON(env *testEnv, method, path, body, token string) *httptest.ResponseRecorder {
@@ -247,6 +251,18 @@ func performJSON(env *testEnv, method, path, body, token string) *httptest.Respo
 	w := httptest.NewRecorder()
 	env.router.ServeHTTP(w, r)
 	return w
+}
+
+func receiveResult[T any](t *testing.T, results <-chan T) T {
+	t.Helper()
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for concurrent test operation")
+		var zero T
+		return zero
+	}
 }
 
 func adminToken(t *testing.T, env *testEnv) string {
@@ -579,27 +595,23 @@ func TestOrderCartCheckoutUsesLockedCurrentQuantity(t *testing.T) {
 	// 当前测试创建了唯一 SKU，按 SKU 更新该条目并持有行锁。
 	require.NoError(t, lockTx.Exec("UPDATE cart_items SET quantity = 3 WHERE sku_id = ?", skuID).Error)
 
-	type response struct {
-		w    *httptest.ResponseRecorder
-		body map[string]any
-	}
-	result := make(chan response, 1)
+	result := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		w, body := doJSON(t, env, http.MethodPost, "/api/orders",
+		result <- performJSON(env, http.MethodPost, "/api/orders",
 			fmt.Sprintf(`{"client_request_id":%q,"address_id":%d,"from_cart":true}`, uniqueName("req"), addrID), token)
-		result <- response{w: w, body: body}
 	}()
 
 	select {
 	case got := <-result:
-		t.Fatalf("购物车行尚未解锁，结算不应提前完成，状态码=%d body=%s", got.w.Code, got.w.Body.String())
+		t.Fatalf("购物车行尚未解锁，结算不应提前完成，状态码=%d body=%s", got.Code, got.Body.String())
 	case <-time.After(200 * time.Millisecond):
 	}
 
 	require.NoError(t, lockTx.Commit().Error)
-	got := <-result
-	require.Equal(t, http.StatusCreated, got.w.Code, "解锁后结算应成功: %s", got.w.Body.String())
-	require.Equal(t, float64(29700), got.body["total_amount"], "应使用锁释放后的最新数量 3")
+	got := receiveResult(t, result)
+	gotBody := decodeJSON(t, got)
+	require.Equal(t, http.StatusCreated, got.Code, "解锁后结算应成功: %s", got.Body.String())
+	require.Equal(t, float64(29700), gotBody["total_amount"], "应使用锁释放后的最新数量 3")
 	require.Equal(t, 7, skuStock(t, env, skuID))
 }
 
@@ -637,19 +649,23 @@ func TestOrderConcurrentCouponUseOnlyOnce(t *testing.T) {
 	_, skuID := onSaleSKU(t, env, 9900, 10)
 	couponID := thresholdCoupon(t, env, token, 5000, 5000)
 
-	var wg sync.WaitGroup
-	codes := make([]int, 2)
-	for i := range codes {
-		wg.Add(1)
+	results := make(chan *httptest.ResponseRecorder, 2)
+	for i := 0; i < 2; i++ {
 		go func(i int) {
-			defer wg.Done()
 			body := orderRequestBody(uniqueName(fmt.Sprintf("coupon-use-%d", i)), addrID, skuID, 1, couponID)
-			w := performJSON(env, http.MethodPost, "/api/orders", body, token)
-			codes[i] = w.Code
+			results <- performJSON(env, http.MethodPost, "/api/orders", body, token)
 		}(i)
 	}
-	wg.Wait()
 
+	codes := make([]int, 0, 2)
+	for i := 0; i < 2; i++ {
+		w := receiveResult(t, results)
+		body := decodeJSON(t, w)
+		codes = append(codes, w.Code)
+		if w.Code == http.StatusConflict {
+			testsupport.AssertAPIError(t, body)
+		}
+	}
 	sort.Ints(codes)
 	require.Equal(t, []int{http.StatusCreated, http.StatusConflict}, codes)
 	var orderCount int64
@@ -722,27 +738,24 @@ func TestOrderCouponSettlementSerializesWithTemplateUpdate(t *testing.T) {
 	require.NoError(t, adminTx.Model(&couponmodel.CouponTemplate{}).
 		Where("id = ?", templateID).Update("value", 2500).Error)
 
-	type response struct {
-		w    *httptest.ResponseRecorder
-		body map[string]any
-	}
-	result := make(chan response, 1)
+	result := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		w, body := createOrder(t, env, token, uniqueName("coupon-template-update"), addrID, skuID, 1, couponID)
-		result <- response{w: w, body: body}
+		result <- performJSON(env, http.MethodPost, "/api/orders",
+			orderRequestBody(uniqueName("coupon-template-update"), addrID, skuID, 1, couponID), token)
 	}()
 
 	select {
 	case got := <-result:
-		t.Fatalf("模板更新事务尚未提交，订单结算不应使用事务外模板快照: status=%d body=%s", got.w.Code, got.w.Body.String())
+		t.Fatalf("模板更新事务尚未提交，订单结算不应使用事务外模板快照: status=%d body=%s", got.Code, got.Body.String())
 	case <-time.After(200 * time.Millisecond):
 	}
 
 	require.NoError(t, adminTx.Commit().Error)
-	got := <-result
-	require.Equal(t, http.StatusCreated, got.w.Code, got.w.Body.String())
-	require.Equal(t, float64(2500), got.body["discount_amount"], "应使用先提交的管理员模板值")
-	require.Equal(t, float64(7500), got.body["pay_amount"])
+	got := receiveResult(t, result)
+	gotBody := decodeJSON(t, got)
+	require.Equal(t, http.StatusCreated, got.Code, got.Body.String())
+	require.Equal(t, float64(2500), gotBody["discount_amount"], "应使用先提交的管理员模板值")
+	require.Equal(t, float64(7500), gotBody["pay_amount"])
 }
 
 // 取消待支付订单：回补库存 + 回退券；确认收货前状态机拦截；非 owner 拒绝。
@@ -967,28 +980,24 @@ func TestOrderConcurrentIdempotency(t *testing.T) {
 	rid := uniqueName("req")
 
 	const n = 10
-	orderNos := make(chan string, n)
-	var wg sync.WaitGroup
+	results := make(chan *httptest.ResponseRecorder, n)
 	for i := 0; i < n; i++ {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			w, body := createOrder(t, env, token, rid, addrID, skuID, 1, 0)
-			require.True(t, w.Code == http.StatusCreated || w.Code == http.StatusOK || w.Code == http.StatusAccepted,
-				"并发提交应返回 201/200/202，实际 %d: %s", w.Code, w.Body.String())
-			if w.Code == http.StatusAccepted {
-				require.Equal(t, "processing", body["state"])
-				require.Len(t, body, 2, "202 响应只暴露判别状态和订单号")
-			}
-			orderNos <- body["order_no"].(string)
+			results <- performJSON(env, http.MethodPost, "/api/orders", orderRequestBody(rid, addrID, skuID, 1, 0), token)
 		}()
 	}
-	wg.Wait()
-	close(orderNos)
 
 	seen := make(map[string]bool)
-	for no := range orderNos {
-		seen[no] = true
+	for i := 0; i < n; i++ {
+		w := receiveResult(t, results)
+		body := decodeJSON(t, w)
+		require.True(t, w.Code == http.StatusCreated || w.Code == http.StatusOK || w.Code == http.StatusAccepted,
+			"并发提交应返回 201/200/202，实际 %d: %s", w.Code, w.Body.String())
+		if w.Code == http.StatusAccepted {
+			require.Equal(t, "processing", body["state"])
+			require.Len(t, body, 2, "202 响应只暴露判别状态和订单号")
+		}
+		seen[body["order_no"].(string)] = true
 	}
 	require.Len(t, seen, 1, "并发重复提交必须只生成一个订单号")
 	require.Equal(t, int64(1), countOrdersByUser(t, env, username))
@@ -1025,7 +1034,7 @@ func TestOrderInFlightReplayReturnsProcessingContract(t *testing.T) {
 	require.JSONEq(t, fmt.Sprintf(`{"state":"processing","order_no":%q}`, jsonField(t, replay, "order_no")), replay.Body.String())
 
 	require.NoError(t, lockTx.Rollback().Error)
-	first := <-firstDone
+	first := receiveResult(t, firstDone)
 	require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
 }
 
@@ -1047,28 +1056,26 @@ func TestOrderConcurrentStockRace(t *testing.T) {
 	_, skuID := onSaleSKU(t, env, 9900, 5)
 
 	const n = 6
-	results := make(chan int, n)
-	var wg sync.WaitGroup
+	results := make(chan *httptest.ResponseRecorder, n)
 	for i := 0; i < n; i++ {
-		wg.Add(1)
 		go func(i int) {
-			defer wg.Done()
-			w, _ := createOrder(t, env, token, fmt.Sprintf("race-%d-%d", i, time.Now().UnixNano()), addrID, skuID, 1, 0)
-			results <- w.Code
+			results <- performJSON(env, http.MethodPost, "/api/orders",
+				orderRequestBody(fmt.Sprintf("race-%d-%d", i, time.Now().UnixNano()), addrID, skuID, 1, 0), token)
 		}(i)
 	}
-	wg.Wait()
-	close(results)
 
 	ok, conflict := 0, 0
-	for code := range results {
-		switch code {
+	for i := 0; i < n; i++ {
+		w := receiveResult(t, results)
+		body := decodeJSON(t, w)
+		switch w.Code {
 		case http.StatusCreated:
 			ok++
 		case http.StatusConflict:
 			conflict++
+			testsupport.AssertAPIError(t, body)
 		default:
-			t.Fatalf("意外状态码 %d", code)
+			t.Fatalf("意外状态码 %d", w.Code)
 		}
 	}
 	require.Equal(t, 5, ok, "库存 5 应恰好 5 单成功")
@@ -1359,20 +1366,29 @@ func TestOrderExpiredPaymentRacesTimeoutCancellation(t *testing.T) {
 	paymentResult := make(chan *httptest.ResponseRecorder, 1)
 	cancelResult := make(chan error, 1)
 	go func() {
-		<-start
+		select {
+		case <-start:
+		case <-time.After(10 * time.Second):
+			return
+		}
 		paymentResult <- performJSON(env, http.MethodPost, "/api/payments/mock",
 			fmt.Sprintf(`{"order_id":%q,"payment_id":%q,"amount":9900,"result":"success"}`, orderNo, uniqueName("pay")), token)
 	}()
 	go func() {
-		<-start
+		select {
+		case <-start:
+		case <-time.After(10 * time.Second):
+			return
+		}
 		_, _, err := env.orderSvc.CancelExpired(context.Background())
 		cancelResult <- err
 	}()
 	close(start)
 
-	payResponse := <-paymentResult
+	payResponse := receiveResult(t, paymentResult)
 	require.Equal(t, http.StatusConflict, payResponse.Code, "过期支付不得在超时取消竞态中成功: %s", payResponse.Body.String())
-	require.NoError(t, <-cancelResult)
+	testsupport.AssertAPIError(t, decodeJSON(t, payResponse))
+	require.NoError(t, receiveResult(t, cancelResult))
 
 	if orderByNo(t, env, orderNo).Status == model.OrderStatusPendingPayment {
 		_, _, err := env.orderSvc.CancelExpired(context.Background())

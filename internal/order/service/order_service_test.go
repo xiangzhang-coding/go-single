@@ -347,6 +347,7 @@ type fakeProducts struct {
 	deductCalls       int
 	mutationBegun     []int64
 	mutationFinished  []int64
+	mutationBeginHook func()
 	finishDeadlines   []time.Time
 	finishContextErrs []error
 	transactionActive *bool
@@ -358,6 +359,9 @@ func (f *fakeProducts) BeginDetailMutation(_ context.Context, productID int64) (
 		f.fenceInsideTx = true
 	}
 	f.mutationBegun = append(f.mutationBegun, productID)
+	if f.mutationBeginHook != nil {
+		f.mutationBeginHook()
+	}
 	return fmt.Sprintf("mutation-%d-%d", productID, len(f.mutationBegun)), nil
 }
 
@@ -720,7 +724,12 @@ func TestOrderMutationCleanupSharesIndependentDeadline(t *testing.T) {
 	fx.seed(t)
 	fx.prods.seed(3, 2, 300, 5)
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
+	fx.prods.mutationBeginHook = func() {
+		if len(fx.prods.mutationBegun) == 2 {
+			cancel()
+		}
+	}
 
 	_, err := fx.svc.Create(ctx, 42, CreateParams{
 		ClientRequestID: "cleanup-context", AddressID: 1,

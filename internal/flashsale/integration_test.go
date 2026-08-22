@@ -138,12 +138,6 @@ func buildEnv() (*testEnv, error) {
 	if err := rc.Ping(redisCtx).Err(); err != nil {
 		return nil, fmt.Errorf("Redis 连接失败: %w", err)
 	}
-	if err := rc.ConfigSet(redisCtx, "appendonly", "yes").Err(); err != nil {
-		return nil, fmt.Errorf("Redis 开启 AOF: %w", err)
-	}
-	if err := rc.ConfigSet(redisCtx, "appendfsync", "always").Err(); err != nil {
-		return nil, fmt.Errorf("Redis 设置测试 AOF fsync: %w", err)
-	}
 	if err := rc.FlushDB(redisCtx).Err(); err != nil {
 		return nil, err
 	}
@@ -317,6 +311,16 @@ func doJSON(t *testing.T, env *testEnv, method, path, body, token string) (*http
 
 func doJSONOn(t *testing.T, router http.Handler, method, path, body, token string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
+	w := performJSONOn(router, method, path, body, token)
+
+	var parsed map[string]any
+	if w.Body.Len() > 0 {
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
+	}
+	return w, parsed
+}
+
+func performJSONOn(router http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
 	var r *http.Request
 	if body == "" {
 		r = httptest.NewRequest(method, path, nil)
@@ -329,12 +333,7 @@ func doJSONOn(t *testing.T, router http.Handler, method, path, body, token strin
 	}
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, r)
-
-	var parsed map[string]any
-	if w.Body.Len() > 0 {
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
-	}
-	return w, parsed
+	return w
 }
 
 // purchase 在指定路由上发起抢购请求。
