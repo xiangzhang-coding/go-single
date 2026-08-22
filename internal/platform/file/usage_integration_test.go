@@ -221,7 +221,7 @@ func TestUploadReservationMigrationDownReleasesOnlyPendingQuota(t *testing.T) {
 }
 
 func openUsageTestDB() (*gorm.DB, error) {
-	const dbName = "go_shop_test"
+	const dbName = "go_shop_test_file"
 	rootDSN := fmt.Sprintf("%s:%s@tcp(%s:%s)/", envOr("GO_SINGLE_MYSQL_ROOT_USER", "root"),
 		envOr("GO_SINGLE_MYSQL_ROOT_PASSWORD", "root123"), envOr("GO_SINGLE_MYSQL_HOST", "127.0.0.1"),
 		envOr("GO_SINGLE_MYSQL_PORT", "3306"))

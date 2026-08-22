@@ -52,7 +52,7 @@ import (
 )
 
 const (
-	testDBName    = "go_shop_test"
+	testDBName    = "go_shop_test_chat"
 	testSecret    = "integration-test-secret"
 	migrationsDir = "../../migrations"
 	// wsHeartbeat WS 集成测试心跳间隔（短间隔使保活/死连接检测快速收敛）。

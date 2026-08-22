@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	testDBName    = "go_shop_test"
+	testDBName    = "go_shop_test_coupon"
 	testSecret    = "integration-test-secret"
 	migrationsDir = "../../migrations"
 	redisAddr     = "127.0.0.1:6379"

@@ -188,7 +188,9 @@ func TestHubHandshakeRequiresToken(t *testing.T) {
 }
 
 func TestHubClosesConnectionWhenAuthorizationExpires(t *testing.T) {
-	hub, handler := newTestHub(t)
+	// This test isolates authorization expiry. Heartbeat timeout and slow-
+	// consumer eviction have dedicated tests and must not win this close race.
+	hub, handler := newTestHubWithConfig(t, Config{HeartbeatInterval: 2 * time.Second})
 	client := dialClient(t, handler, "short-token")
 	require.NotNil(t, client)
 	require.Eventually(t, func() bool { return hub.ConnectedCount() == 1 }, time.Second, 10*time.Millisecond)
@@ -200,7 +202,9 @@ func TestHubClosesConnectionWhenAuthorizationExpires(t *testing.T) {
 	}()
 	go func() {
 		defer close(pushDone)
-		ticker := time.NewTicker(5 * time.Millisecond)
+		// Keep writes concurrent with expiry without filling sendBuffer under
+		// the race detector; buffer saturation exercises a different close path.
+		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {

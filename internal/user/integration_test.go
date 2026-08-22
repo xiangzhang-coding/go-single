@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	testDBName    = "go_shop_test"
+	testDBName    = "go_shop_test_user"
 	testSecret    = "integration-test-secret"
 	migrationsDir = "../../migrations"
 )
