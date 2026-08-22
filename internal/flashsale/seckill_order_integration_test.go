@@ -41,6 +41,7 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/snowflake"
 	"github.com/xiangzhang-coding/go-single/internal/testsupport"
 	userhandler "github.com/xiangzhang-coding/go-single/internal/user/handler"
+	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
 	userrepo "github.com/xiangzhang-coding/go-single/internal/user/repository"
 	usersvc "github.com/xiangzhang-coding/go-single/internal/user/service"
 )
@@ -283,6 +284,23 @@ func registerWithAddress(t *testing.T, e *mqEnv, name string) (string, int64) {
 	return token, userID
 }
 
+func seedUserWithAddressAndToken(t *testing.T, name string) (string, int64) {
+	t.Helper()
+	user := usermodel.User{Username: name, PasswordHash: "unused-test-hash", Role: usermodel.RoleUser}
+	require.NoError(t, env.gdb.Create(&user).Error)
+	address := usermodel.Address{
+		UserID: user.ID, Receiver: "张三", Phone: "13800138000", Province: "广东省",
+		City: "深圳市", District: "南山区", Detail: "科技园 1 号",
+	}
+	require.NoError(t, env.gdb.Create(&address).Error)
+	require.NoError(t, env.gdb.Model(&usermodel.User{}).Where("id = ?", user.ID).
+		Update("default_address_id", address.ID).Error)
+	issuer := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
+	token, err := issuer.Issue(user.ID, user.Role)
+	require.NoError(t, err)
+	return token, user.ID
+}
+
 // pollOrder 轮询订单详情直至落单完成（status 非空）；超时返回 nil。
 func pollOrder(t *testing.T, e *mqEnv, orderNo, token string) map[string]any {
 	t.Helper()
@@ -482,7 +500,7 @@ func TestSeckillOrderConcurrentNoDuplicate(t *testing.T) {
 	const users = 30
 	tokens := make([]string, users)
 	for i := 0; i < users; i++ {
-		tokens[i], _ = registerWithAddress(t, e, uniqueName(fmt.Sprintf("racer%d", i)))
+		tokens[i], _ = seedUserWithAddressAndToken(t, uniqueName(fmt.Sprintf("racer%d", i)))
 	}
 	results := make(chan *httptest.ResponseRecorder, users)
 	for i, token := range tokens {
