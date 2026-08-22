@@ -41,9 +41,17 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 		ReconcilePendingUploads(context.Context) (int, error)
 	},
 	seckillCancellation flashsalesvc.SeckillCancellation,
-	reconcile flashsalesvc.Reconciliation) (*platformcron.Registry, error) {
+	reconcile flashsalesvc.Reconciliation) (*platformcron.Registry, []platformcron.Job, error) {
 	registry := platformcron.New(log, 5*time.Minute)
-	if err := registry.Register(platformcron.Job{
+	jobs := make([]platformcron.Job, 0, 6)
+	register := func(job platformcron.Job) error {
+		if err := registry.Register(job); err != nil {
+			return err
+		}
+		jobs = append(jobs, job)
+		return nil
+	}
+	if err := register(platformcron.Job{
 		Name: "order-timeout-cancel",
 		Spec: "* * * * *",
 		Fn: func(ctx context.Context) error {
@@ -55,9 +63,9 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		return nil, fmt.Errorf("注册超时取消任务: %w", err)
+		return nil, nil, fmt.Errorf("注册超时取消任务: %w", err)
 	}
-	if err := registry.Register(platformcron.Job{
+	if err := register(platformcron.Job{
 		Name: "flashsale-recovery",
 		Spec: "* * * * *",
 		Fn: func(ctx context.Context) error {
@@ -75,9 +83,9 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		return nil, fmt.Errorf("注册秒杀预扣恢复任务: %w", err)
+		return nil, nil, fmt.Errorf("注册秒杀预扣恢复任务: %w", err)
 	}
-	if err := registry.Register(platformcron.Job{
+	if err := register(platformcron.Job{
 		Name: "upload-reservation-recovery",
 		Spec: "* * * * *",
 		Fn: func(ctx context.Context) error {
@@ -91,9 +99,9 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		return nil, fmt.Errorf("注册未完成上传对账任务: %w", err)
+		return nil, nil, fmt.Errorf("注册未完成上传对账任务: %w", err)
 	}
-	if err := registry.Register(platformcron.Job{
+	if err := register(platformcron.Job{
 		Name: "seckill-timeout-cancel",
 		Spec: "* * * * *",
 		Fn: func(ctx context.Context) error {
@@ -106,9 +114,9 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		return nil, fmt.Errorf("注册秒杀超时取消任务: %w", err)
+		return nil, nil, fmt.Errorf("注册秒杀超时取消任务: %w", err)
 	}
-	if err := registry.Register(platformcron.Job{
+	if err := register(platformcron.Job{
 		Name: "flashsale-reconcile-active",
 		Spec: "0 * * * *",
 		Fn: func(ctx context.Context) error {
@@ -130,9 +138,9 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		return nil, fmt.Errorf("注册秒杀对账任务: %w", err)
+		return nil, nil, fmt.Errorf("注册秒杀对账任务: %w", err)
 	}
-	if err := registry.Register(platformcron.Job{
+	if err := register(platformcron.Job{
 		Name: "flashsale-reconcile-ended",
 		Spec: "* * * * *",
 		Fn: func(ctx context.Context) error {
@@ -146,7 +154,7 @@ func registerCron(log *zap.Logger, orderSvc ordersvc.Service, recovery flashsale
 			return nil
 		},
 	}); err != nil {
-		return nil, fmt.Errorf("注册秒杀收尾对账任务: %w", err)
+		return nil, nil, fmt.Errorf("注册秒杀收尾对账任务: %w", err)
 	}
-	return registry, nil
+	return registry, jobs, nil
 }

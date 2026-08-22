@@ -277,6 +277,7 @@ func uploadMedia(t *testing.T, env *testEnv, token, filename, kind string, conte
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	var response map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	testsupport.AssertExactJSONKeys(t, response, "url", "kind", "filename", "content_type", "size")
 	reference, _ := response["url"].(string)
 	require.True(t, strings.HasPrefix(reference, "/files/"))
 	return reference
@@ -316,6 +317,7 @@ func befriend(t *testing.T, env *testEnv, aliceToken string, bobID int64, bobTok
 	w, body := doJSON(t, env, http.MethodPost, "/api/friend-requests",
 		fmt.Sprintf(`{"to_user_id":%d}`, bobID), aliceToken)
 	require.Equal(t, http.StatusCreated, w.Code, "发起申请失败: %s", w.Body.String())
+	testsupport.AssertExactJSONKeys(t, body, "id", "from_user_id", "to_user_id", "status", "created_at", "updated_at")
 	reqID := int64(body["id"].(float64))
 	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/accept", reqID), "", bobToken)
 	require.Equal(t, http.StatusNoContent, w.Code)
@@ -339,6 +341,13 @@ func sendMsg(t *testing.T, env *testEnv, token string, toUserID int64, msgType, 
 	}
 	w, body := doJSON(t, env, http.MethodPost, "/api/messages", "{"+strings.Join(bodyParts, ",")+"}", token)
 	require.Equal(t, http.StatusCreated, w.Code, "发送失败: %s", w.Body.String())
+	wantKeys := []string{"id", "conversation_key", "sender_id", "recipient_id", "type", "created_at"}
+	if msgType == chatmodel.MessageTypeText {
+		wantKeys = append(wantKeys, "content")
+	} else {
+		wantKeys = append(wantKeys, "url")
+	}
+	testsupport.AssertExactJSONKeys(t, body, wantKeys...)
 	return body
 }
 
@@ -346,6 +355,7 @@ func conversationsOf(t *testing.T, env *testEnv, token, query string) ([]any, bo
 	t.Helper()
 	w, body := doJSON(t, env, http.MethodGet, "/api/conversations"+query, "", token)
 	require.Equal(t, http.StatusOK, w.Code)
+	testsupport.AssertExactJSONKeys(t, body, "items", "has_more")
 	items, _ := body["items"].([]any)
 	hasMore, _ := body["has_more"].(bool)
 	return items, hasMore
@@ -355,6 +365,7 @@ func messagesOf(t *testing.T, env *testEnv, token, key, query string) ([]any, bo
 	t.Helper()
 	w, body := doJSON(t, env, http.MethodGet, "/api/conversations/"+key+"/messages"+query, "", token)
 	require.Equal(t, http.StatusOK, w.Code, "拉取消息失败: %s", w.Body.String())
+	testsupport.AssertExactJSONKeys(t, body, "items", "has_more")
 	items, _ := body["items"].([]any)
 	hasMore, _ := body["has_more"].(bool)
 	return items, hasMore
@@ -436,16 +447,19 @@ func TestChatConversationAndMessageList(t *testing.T) {
 	aliceConvs, _ := conversationsOf(t, env, aliceToken, "")
 	require.Len(t, aliceConvs, 1)
 	aConv := aliceConvs[0].(map[string]any)
+	testsupport.AssertExactJSONKeys(t, aConv, "conversation_key", "peer_user_id", "peer_username", "last_message", "unread_count")
 	require.Equal(t, key, aConv["conversation_key"])
 	require.Equal(t, float64(bobID), aConv["peer_user_id"])
 	require.True(t, strings.HasPrefix(aConv["peer_username"].(string), "bob_"), "对方用户名经跨模块补齐")
 	last := aConv["last_message"].(map[string]any)
+	testsupport.AssertExactJSONKeys(t, last, "id", "conversation_key", "sender_id", "recipient_id", "type", "content", "created_at")
 	require.Equal(t, "m4", last["content"], "预览为最近一条消息")
 	require.Equal(t, float64(0), aConv["unread_count"], "alice 发给自己没有未读")
 
 	bobConvs, _ := conversationsOf(t, env, bobToken, "")
 	require.Len(t, bobConvs, 1)
 	bConv := bobConvs[0].(map[string]any)
+	testsupport.AssertExactJSONKeys(t, bConv, "conversation_key", "peer_user_id", "peer_username", "last_message", "unread_count")
 	require.Equal(t, float64(aliceID), bConv["peer_user_id"])
 	require.Equal(t, float64(5), bConv["unread_count"], "bob 有 5 条未读")
 
@@ -453,6 +467,10 @@ func TestChatConversationAndMessageList(t *testing.T) {
 	items, hasMore := messagesOf(t, env, bobToken, key, "?limit=2")
 	require.True(t, hasMore)
 	require.Len(t, items, 2)
+	for _, item := range items {
+		testsupport.AssertExactJSONKeys(t, item.(map[string]any),
+			"id", "conversation_key", "sender_id", "recipient_id", "type", "content", "created_at")
+	}
 	require.Equal(t, "m3", items[0].(map[string]any)["content"])
 	require.Equal(t, "m4", items[1].(map[string]any)["content"])
 

@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,8 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/golang-migrate/migrate/v4"
+	miniogo "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -33,9 +37,10 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 	cfg.Server.RequestTimeout = 15 * time.Second
 	cfg.MySQL.Database = "go_shop_router_test"
 	cfg.Redis.DB = 12
-	cfg.MinIO.Bucket = "go-shop-router-test"
+	cfg.MinIO.Bucket = fmt.Sprintf("go-shop-router-test-%d", time.Now().UnixNano())
 	cfg.Migrations.Path = "../../migrations"
 	cfg.Auth.Secret = "production-router-test-secret"
+	cfg.Auth.RegisterRateLimit.PerIPMax = 20
 
 	root, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%d)/",
 		routerEnvOr("GO_SINGLE_MYSQL_ROOT_USER", "root"),
@@ -110,6 +115,28 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 		MaxBytesPerUser: cfg.Upload.MaxBytesPerUser, MaxObjectsPerUser: cfg.Upload.MaxObjectsPerUser,
 	})
 	testsupport.RequireDependency(t, "MinIO", err)
+	minioCleanup, err := miniogo.New(cfg.MinIO.Endpoint, &miniogo.Options{
+		Creds:  credentials.NewStaticV4(cfg.MinIO.AccessKey, cfg.MinIO.SecretKey, ""),
+		Secure: cfg.MinIO.UseSSL,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		for object := range minioCleanup.ListObjects(cleanupCtx, cfg.MinIO.Bucket, miniogo.ListObjectsOptions{Recursive: true}) {
+			if object.Err != nil {
+				t.Errorf("列出测试 MinIO 对象: %v", object.Err)
+				return
+			}
+			if removeErr := minioCleanup.RemoveObject(cleanupCtx, cfg.MinIO.Bucket, object.Key, miniogo.RemoveObjectOptions{}); removeErr != nil {
+				t.Errorf("删除测试 MinIO 对象 %s: %v", object.Key, removeErr)
+				return
+			}
+		}
+		if removeErr := minioCleanup.RemoveBucket(cleanupCtx, cfg.MinIO.Bucket); removeErr != nil {
+			t.Errorf("删除测试 MinIO bucket: %v", removeErr)
+		}
+	})
 
 	wsHub := ws.New(ws.Config{
 		HeartbeatInterval: cfg.WS.HeartbeatInterval, WriteWait: cfg.WS.WriteWait,
@@ -233,6 +260,8 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 		require.Equal(t, "Core Receiver", completed.Receiver)
 		require.Len(t, completed.Items, 1)
 		productionRequireOrderItem(t, completed.Items[0], order.OrderNo, productID, skuID, 1250, 2)
+
+		productionExerciseMediaAuthorization(t, router, runID, userID, userToken, skuID)
 	})
 
 	t.Run("flash sale cancellation restores a purchasable slot", func(t *testing.T) {
@@ -260,10 +289,13 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 		list, listFields := productionJSON[productionFlashSaleListResponse](t, router, http.MethodGet, "/api/flashsales", userToken, nil, http.StatusOK)
 		productionRequireKeys(t, listFields, "server_time", "items")
 		require.NotEmpty(t, list.ServerTime)
+		listItemFields := productionJSONObjects(t, listFields["items"])
+		require.Len(t, listItemFields, len(list.Items))
 		activeFound := false
-		for _, item := range list.Items {
+		for index, item := range list.Items {
 			if item.ID == activity.ID {
 				activeFound = true
+				productionRequireFlashSaleItemContract(t, listItemFields[index])
 				require.Equal(t, "in_progress", item.State)
 				require.Equal(t, 1, item.Stock)
 			}
@@ -317,6 +349,95 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 			"order_no", "user_id", "order_type", "status", "activity_id", "purchase_slot", "total_amount", "discount_amount", "pay_amount",
 			"receiver", "phone", "province", "city", "district", "detail", "expire_at", "created_at", "updated_at", "items")
 		productionRequireSeckillOrder(t, replacement, activity.ID, second.PreDeductionID, skuID)
+	})
+
+	t.Run("seckill permanent failure rolls back through registered recovery job", func(t *testing.T) {
+		stopCronCtx, stopCronCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCronCancel()
+		require.NoError(t, background.cron.Stop(stopCronCtx))
+
+		userID, userToken := productionRegisterAndLogin(t, router, "rollback"+runID)
+		adminToken := productionLogin(t, router, "admin", "admin123", "admin")
+		_, skuID := productionCreateOnSaleSKU(t, router, adminToken, "rollback-"+runID, 5000, 10)
+		activity, activityFields := productionJSON[productionActivityResponse](t, router, http.MethodPost, "/api/admin/flashsales", adminToken,
+			map[string]any{
+				"sku_id": skuID, "title": "rollback-" + runID, "price": int64(1900), "stock": 10, "per_user_limit": 1,
+				"start_at": time.Now().Add(-time.Minute).Format(time.RFC3339Nano),
+				"end_at":   time.Now().Add(10 * time.Minute).Format(time.RFC3339Nano),
+			}, http.StatusCreated)
+		productionRequireKeys(t, activityFields,
+			"id", "sku_id", "title", "price", "stock", "per_user_limit", "status", "start_at", "end_at", "created_at", "updated_at")
+		productionNoContent(t, router, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", activity.ID), adminToken)
+
+		purchase, purchaseFields := productionPurchaseAccepted(t, router, userToken, activity.ID, "rollback-"+runID, 30*time.Second)
+		productionRequireKeys(t, purchaseFields, "pre_deduction_id", "pre_deduction_status", "status", "order_no", "message")
+
+		type preDeductionState struct {
+			Status       string
+			LastError    string
+			PurchaseSlot int64
+			RolledBackAt *time.Time
+		}
+		var state preDeductionState
+		require.Eventually(t, func() bool {
+			state = preDeductionState{}
+			err := gdb.Table("flashsale_pre_deductions").
+				Select("status", "last_error", "purchase_slot", "rolled_back_at").
+				Where("id = ?", purchase.PreDeductionID).Scan(&state).Error
+			return err == nil && state.Status == "pending_rollback" && state.LastError == "message reached dead-letter queue"
+		}, 10*time.Second, 100*time.Millisecond, "the real DLQ consumer must persist its rollback marker")
+		require.Positive(t, state.PurchaseSlot)
+
+		stockKey := fmt.Sprintf("flashsale:stock:%d", activity.ID)
+		countKey := fmt.Sprintf("flashsale:count:%d:%d", activity.ID, userID)
+		idemKey := fmt.Sprintf("flashsale:idem:%d:%d:%d", activity.ID, userID, state.PurchaseSlot)
+		reservationKey := "flashsale:reservation:" + purchase.PreDeductionID
+		value, err := cacheClient.Get(context.Background(), stockKey)
+		require.NoError(t, err)
+		require.Equal(t, "9", value)
+		value, err = cacheClient.Get(context.Background(), countKey)
+		require.NoError(t, err)
+		require.Equal(t, "1", value)
+		value, err = cacheClient.Get(context.Background(), idemKey)
+		require.NoError(t, err)
+		require.Equal(t, purchase.PreDeductionID, value)
+		value, err = cacheClient.Get(context.Background(), reservationKey)
+		require.NoError(t, err)
+		require.Equal(t, purchase.PreDeductionID, value)
+
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer recoveryCancel()
+		require.NoError(t, registeredCronJob(t, background.cronJobs, "flashsale-recovery").Fn(recoveryCtx))
+
+		state = preDeductionState{}
+		require.NoError(t, gdb.Table("flashsale_pre_deductions").
+			Select("status", "last_error", "purchase_slot", "rolled_back_at").
+			Where("id = ?", purchase.PreDeductionID).Scan(&state).Error)
+		require.Equal(t, "rolled_back", state.Status)
+		require.NotNil(t, state.RolledBackAt)
+
+		lifecycle, lifecycleFields := productionJSON[productionPurchaseLifecycleResponse](t, router, http.MethodGet,
+			"/api/flashsales/purchases/"+purchase.PreDeductionID, userToken, nil, http.StatusOK)
+		productionRequireKeys(t, lifecycleFields, "id", "status", "order_no", "created_at", "updated_at", "rolled_back_at")
+		require.Equal(t, "rolled_back", lifecycle.Status)
+		require.NotNil(t, lifecycle.RolledBackAt)
+
+		var orderCount int64
+		require.NoError(t, gdb.Table("orders").Where("order_no = ?", purchase.OrderNo).Count(&orderCount).Error)
+		require.Zero(t, orderCount)
+		var mysqlStock int
+		require.NoError(t, gdb.Table("flashsale_activities").Select("stock").Where("id = ?", activity.ID).Scan(&mysqlStock).Error)
+		require.Equal(t, 10, mysqlStock)
+		value, err = cacheClient.Get(context.Background(), stockKey)
+		require.NoError(t, err)
+		require.Equal(t, "10", value)
+		value, err = cacheClient.Get(context.Background(), countKey)
+		require.NoError(t, err)
+		require.Equal(t, "0", value)
+		_, err = cacheClient.Get(context.Background(), idemKey)
+		require.ErrorIs(t, err, cache.ErrMiss)
+		_, err = cacheClient.Get(context.Background(), reservationKey)
+		require.ErrorIs(t, err, cache.ErrMiss)
 	})
 
 	stopBackground()
@@ -375,9 +496,11 @@ type productionErrorResponse struct {
 }
 
 type productionUserResponse struct {
-	ID       int64  `json:"id"`
-	Username string `json:"username"`
-	Role     string `json:"role"`
+	ID        int64  `json:"id"`
+	Username  string `json:"username"`
+	Nickname  string `json:"nickname"`
+	AvatarURL string `json:"avatar_url"`
+	Role      string `json:"role"`
 }
 
 type productionLoginResponse struct {
@@ -479,15 +602,77 @@ type productionPurchaseResponse struct {
 }
 
 type productionPurchaseLifecycleResponse struct {
-	ID        string  `json:"id"`
-	Status    string  `json:"status"`
-	OrderNo   string  `json:"order_no"`
-	OrderedAt *string `json:"ordered_at"`
+	ID           string  `json:"id"`
+	Status       string  `json:"status"`
+	OrderNo      string  `json:"order_no"`
+	OrderedAt    *string `json:"ordered_at"`
+	RolledBackAt *string `json:"rolled_back_at"`
 }
 
 type productionHealthResponse struct {
 	Status string            `json:"status"`
 	Checks map[string]string `json:"checks"`
+}
+
+type productionUploadResponse struct {
+	URL         string `json:"url"`
+	Kind        string `json:"kind"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Size        int64  `json:"size"`
+}
+
+type productionFriendRequestResponse struct {
+	ID         int64  `json:"id"`
+	FromUserID int64  `json:"from_user_id"`
+	ToUserID   int64  `json:"to_user_id"`
+	Status     string `json:"status"`
+}
+
+type productionPostResponse struct {
+	ID             int64  `json:"id"`
+	UserID         int64  `json:"user_id"`
+	SKUID          int64  `json:"sku_id"`
+	Content        string `json:"content"`
+	ImageURL       string `json:"image_url"`
+	AuthorUsername string `json:"author_username"`
+}
+
+type productionMessageResponse struct {
+	ID              int64  `json:"id"`
+	ConversationKey string `json:"conversation_key"`
+	SenderID        int64  `json:"sender_id"`
+	RecipientID     int64  `json:"recipient_id"`
+	Type            string `json:"type"`
+	URL             string `json:"url"`
+}
+
+type productionConversationResponse struct {
+	Items []struct {
+		ConversationKey string                    `json:"conversation_key"`
+		PeerUserID      int64                     `json:"peer_user_id"`
+		PeerUsername    string                    `json:"peer_username"`
+		LastMessage     productionMessageResponse `json:"last_message"`
+		UnreadCount     int64                     `json:"unread_count"`
+	} `json:"items"`
+	HasMore bool `json:"has_more"`
+}
+
+type productionMessageListResponse struct {
+	Items   []productionMessageResponse `json:"items"`
+	HasMore bool                        `json:"has_more"`
+}
+
+var productionPNG1x1 = []byte{
+	0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+	0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+	0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41,
+	0x54, 0x78, 0x9C, 0x62, 0x60, 0x01, 0x00, 0x00,
+	0x00, 0xFF, 0xFF, 0x03, 0x00, 0x00, 0x06, 0x00,
+	0x05, 0x57, 0xBF, 0xAB, 0xD4, 0x00, 0x00, 0x00,
+	0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 }
 
 func productionJSON[T any](t *testing.T, router http.Handler, method, path, token string, requestBody any, expectedStatus int) (T, map[string]json.RawMessage) {
@@ -523,6 +708,75 @@ func productionRequest(t *testing.T, router http.Handler, method, path, token st
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 	return response
+}
+
+func productionUpload(t *testing.T, router http.Handler, token, requestID, kind, filename string, content []byte) productionUploadResponse {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("kind", kind))
+	part, err := writer.CreateFormFile("file", filename)
+	require.NoError(t, err)
+	_, err = part.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	request := httptest.NewRequest(http.MethodPost, "/api/files", &body)
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	request.Header.Set("Idempotency-Key", requestID)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusCreated, response.Code, response.Body.String())
+
+	var uploaded productionUploadResponse
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &uploaded))
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &fields))
+	productionRequireKeys(t, fields, "url", "kind", "filename", "content_type", "size")
+	require.True(t, bytes.HasPrefix([]byte(uploaded.URL), []byte("/files/")))
+	require.Equal(t, kind, uploaded.Kind)
+	require.Equal(t, filename, uploaded.Filename)
+	require.Equal(t, int64(len(content)), uploaded.Size)
+	return uploaded
+}
+
+func productionRequireMediaRead(t *testing.T, router http.Handler, token, reference string, want []byte,
+	wantContentType, wantDisposition, wantFilename string,
+) {
+	t.Helper()
+	response := productionRequest(t, router, http.MethodGet, "/api"+reference, token, nil)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, want, response.Body.Bytes())
+	require.Equal(t, wantContentType, response.Header().Get("Content-Type"))
+	require.Equal(t, "private, no-store", response.Header().Get("Cache-Control"))
+	require.Equal(t, "nosniff", response.Header().Get("X-Content-Type-Options"))
+	disposition, params, err := mime.ParseMediaType(response.Header().Get("Content-Disposition"))
+	require.NoError(t, err)
+	require.Equal(t, wantDisposition, disposition)
+	require.Equal(t, wantFilename, params["filename"])
+}
+
+func productionRequireAPIError(t *testing.T, response *httptest.ResponseRecorder, status int, message ...string) {
+	t.Helper()
+	require.Equal(t, status, response.Code, response.Body.String())
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+	testsupport.AssertAPIError(t, body, message...)
+}
+
+func productionJSONObjects(t *testing.T, raw json.RawMessage) []map[string]json.RawMessage {
+	t.Helper()
+	var items []map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &items))
+	return items
+}
+
+func productionJSONObject(t *testing.T, raw json.RawMessage) map[string]json.RawMessage {
+	t.Helper()
+	var object map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &object))
+	return object
 }
 
 func productionNoContent(t *testing.T, router http.Handler, method, path, token string) {
@@ -592,6 +846,109 @@ func productionLogin(t *testing.T, router http.Handler, username, password, role
 	return login.Token
 }
 
+func productionExerciseMediaAuthorization(t *testing.T, router http.Handler, runID string,
+	ownerID int64, ownerToken string, purchasedSKUID int64,
+) {
+	t.Helper()
+	peerID, peerToken := productionRegisterAndLogin(t, router, "peer"+runID)
+	_, outsiderToken := productionRegisterAndLogin(t, router, "outside"+runID)
+
+	friendRequest, friendFields := productionJSON[productionFriendRequestResponse](t, router, http.MethodPost,
+		"/api/friend-requests", ownerToken, map[string]any{"to_user_id": peerID}, http.StatusCreated)
+	productionRequireKeys(t, friendFields, "id", "from_user_id", "to_user_id", "status", "created_at", "updated_at")
+	require.Equal(t, ownerID, friendRequest.FromUserID)
+	require.Equal(t, peerID, friendRequest.ToUserID)
+	require.Equal(t, "pending", friendRequest.Status)
+	productionNoContent(t, router, http.MethodPost, fmt.Sprintf("/api/friend-requests/%d/accept", friendRequest.ID), peerToken)
+
+	avatar := productionUpload(t, router, ownerToken, "router-avatar-"+runID, file.KindImage, "avatar.png", productionPNG1x1)
+	productionRequireAPIError(t, productionRequest(t, router, http.MethodGet, "/api"+avatar.URL, outsiderToken, nil),
+		http.StatusForbidden, "file access forbidden")
+	profile, profileFields := productionJSON[productionUserResponse](t, router, http.MethodPatch, "/api/users/me", ownerToken,
+		map[string]any{"avatar_url": avatar.URL}, http.StatusOK)
+	productionRequireKeys(t, profileFields, "id", "username", "nickname", "avatar_url", "role", "created_at", "updated_at")
+	require.Equal(t, avatar.URL, profile.AvatarURL)
+	productionRequireMediaRead(t, router, outsiderToken, avatar.URL, productionPNG1x1, "image/png", "inline", "avatar.png")
+
+	postImage := productionUpload(t, router, ownerToken, "router-post-"+runID, file.KindImage, "post.png", productionPNG1x1)
+	productionRequireAPIError(t, productionRequest(t, router, http.MethodGet, "/api"+postImage.URL, peerToken, nil),
+		http.StatusForbidden, "file access forbidden")
+	post, postFields := productionJSON[productionPostResponse](t, router, http.MethodPost, "/api/posts", ownerToken,
+		map[string]any{"sku_id": purchasedSKUID, "content": "production media post", "image_url": postImage.URL}, http.StatusCreated)
+	productionRequireKeys(t, postFields, "id", "user_id", "sku_id", "content", "image_url", "created_at", "updated_at")
+	require.Equal(t, ownerID, post.UserID)
+	require.Equal(t, purchasedSKUID, post.SKUID)
+	require.Equal(t, postImage.URL, post.ImageURL)
+
+	feed, feedFields := productionJSON[struct {
+		Items []productionPostResponse `json:"items"`
+		Total int64                    `json:"total"`
+	}](t, router, http.MethodGet, "/api/posts/feed?page=1&page_size=10", peerToken, nil, http.StatusOK)
+	productionRequireKeys(t, feedFields, "items", "total")
+	require.Len(t, feed.Items, 1)
+	require.Equal(t, post.ID, feed.Items[0].ID)
+	require.NotEmpty(t, feed.Items[0].AuthorUsername)
+	feedItemFields := productionJSONObjects(t, feedFields["items"])
+	require.Len(t, feedItemFields, 1)
+	productionRequireKeys(t, feedItemFields[0],
+		"id", "user_id", "sku_id", "content", "image_url", "created_at", "updated_at", "author_username")
+	productionRequireMediaRead(t, router, peerToken, postImage.URL, productionPNG1x1, "image/png", "inline", "post.png")
+	productionRequireAPIError(t, productionRequest(t, router, http.MethodGet, "/api"+postImage.URL, outsiderToken, nil),
+		http.StatusForbidden, "file access forbidden")
+	productionNoContent(t, router, http.MethodDelete, fmt.Sprintf("/api/posts/%d", post.ID), ownerToken)
+	productionRequireAPIError(t, productionRequest(t, router, http.MethodGet, "/api"+postImage.URL, peerToken, nil),
+		http.StatusForbidden, "file access forbidden")
+
+	pdf := []byte("%PDF-1.7\nproduction router media\n")
+	chatFile := productionUpload(t, router, ownerToken, "router-chat-file-"+runID, file.KindFile, "router-media.pdf", pdf)
+	productionRequireAPIError(t, productionRequest(t, router, http.MethodGet, "/api"+chatFile.URL, peerToken, nil),
+		http.StatusForbidden, "file access forbidden")
+	messageBody := map[string]any{
+		"to_user_id": peerID, "type": "file", "url": chatFile.URL, "client_request_id": "router-message-" + runID,
+	}
+	message, messageFields := productionJSON[productionMessageResponse](t, router, http.MethodPost, "/api/messages", ownerToken,
+		messageBody, http.StatusCreated)
+	productionRequireKeys(t, messageFields, "id", "conversation_key", "sender_id", "recipient_id", "type", "url", "created_at")
+	require.Equal(t, ownerID, message.SenderID)
+	require.Equal(t, peerID, message.RecipientID)
+	require.Equal(t, "file", message.Type)
+	require.Equal(t, chatFile.URL, message.URL)
+	replayed, replayFields := productionJSON[productionMessageResponse](t, router, http.MethodPost, "/api/messages", ownerToken,
+		messageBody, http.StatusOK)
+	productionRequireKeys(t, replayFields, "id", "conversation_key", "sender_id", "recipient_id", "type", "url", "created_at")
+	require.Equal(t, message.ID, replayed.ID)
+
+	productionRequireMediaRead(t, router, peerToken, chatFile.URL, pdf, "application/pdf", "attachment", "router-media.pdf")
+	productionRequireAPIError(t, productionRequest(t, router, http.MethodGet, "/api"+chatFile.URL, outsiderToken, nil),
+		http.StatusForbidden, "file access forbidden")
+	productionRequireAPIError(t, productionRequest(t, router, http.MethodGet, "/api"+chatFile.URL, "", nil),
+		http.StatusUnauthorized, "missing token")
+
+	conversations, conversationFields := productionJSON[productionConversationResponse](t, router, http.MethodGet,
+		"/api/conversations", peerToken, nil, http.StatusOK)
+	productionRequireKeys(t, conversationFields, "items", "has_more")
+	require.Len(t, conversations.Items, 1)
+	require.Equal(t, message.ConversationKey, conversations.Items[0].ConversationKey)
+	require.Equal(t, ownerID, conversations.Items[0].PeerUserID)
+	require.Equal(t, int64(1), conversations.Items[0].UnreadCount)
+	conversationItems := productionJSONObjects(t, conversationFields["items"])
+	require.Len(t, conversationItems, 1)
+	productionRequireKeys(t, conversationItems[0],
+		"conversation_key", "peer_user_id", "peer_username", "last_message", "unread_count")
+	productionRequireKeys(t, productionJSONObject(t, conversationItems[0]["last_message"]),
+		"id", "conversation_key", "sender_id", "recipient_id", "type", "url", "created_at")
+
+	messages, messagesFields := productionJSON[productionMessageListResponse](t, router, http.MethodGet,
+		"/api/conversations/"+message.ConversationKey+"/messages", peerToken, nil, http.StatusOK)
+	productionRequireKeys(t, messagesFields, "items", "has_more")
+	require.Len(t, messages.Items, 1)
+	require.Equal(t, message.ID, messages.Items[0].ID)
+	messageItems := productionJSONObjects(t, messagesFields["items"])
+	require.Len(t, messageItems, 1)
+	productionRequireKeys(t, messageItems[0],
+		"id", "conversation_key", "sender_id", "recipient_id", "type", "url", "created_at")
+}
+
 func productionCreateAddress(t *testing.T, router http.Handler, token, receiver string) int64 {
 	t.Helper()
 	address, fields := productionJSON[productionAddressResponse](t, router, http.MethodPost, "/api/addresses", token,
@@ -656,13 +1013,24 @@ func productionFlashSaleItem(t *testing.T, router http.Handler, token string, ac
 	t.Helper()
 	list, fields := productionJSON[productionFlashSaleListResponse](t, router, http.MethodGet, "/api/flashsales", token, nil, http.StatusOK)
 	productionRequireKeys(t, fields, "server_time", "items")
-	for _, item := range list.Items {
+	itemFields := productionJSONObjects(t, fields["items"])
+	require.Len(t, itemFields, len(list.Items))
+	for index, item := range list.Items {
 		if item.ID == activityID {
+			productionRequireFlashSaleItemContract(t, itemFields[index])
 			return item
 		}
 	}
 	require.FailNowf(t, "flash sale missing from user list", "activity_id=%d", activityID)
 	return productionFlashSaleListItemResponse{}
+}
+
+func productionRequireFlashSaleItemContract(t *testing.T, fields map[string]json.RawMessage) {
+	t.Helper()
+	productionRequireKeys(t, fields,
+		"id", "sku_id", "title", "price", "stock", "per_user_limit", "status", "start_at", "end_at",
+		"created_at", "updated_at", "state", "product_title", "sku")
+	productionRequireKeys(t, productionJSONObject(t, fields["sku"]), "id", "product_id", "specs", "price")
 }
 
 func productionPurchaseAccepted(t *testing.T, router http.Handler, token string, activityID int64, requestID string, timeout time.Duration) (productionPurchaseResponse, map[string]json.RawMessage) {

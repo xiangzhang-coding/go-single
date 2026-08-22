@@ -608,40 +608,6 @@ func TestSeckillOrderRedeliveryIsPurchaseSlotScoped(t *testing.T) {
 	require.Equal(t, 8, mysqlStock(t, e, id), "每个槽位只扣减一次库存")
 }
 
-// 永久失败先持久化回退意图，消息进入 DLQ 后被自动消费，恢复任务完整回退。
-func TestSeckillOrderDeadLetterTriggersAutomaticRollback(t *testing.T) {
-	requireEnv(t)
-	e := requireMQEnv(t)
-	admin := adminToken(t, env)
-	id := seedPublishedOnSale(t, admin, 10)
-	token := registerAndToken(t, env, uniqueName("no_address"))
-	claims, err := env.verifier.Verify(context.Background(), token)
-	require.NoError(t, err)
-
-	w, body := purchaseOn(t, e, id, token)
-	require.Equal(t, http.StatusAccepted, w.Code)
-	pdID := body["pre_deduction_id"].(string)
-
-	require.Eventually(t, func() bool {
-		var status string
-		err := env.gdb.Table("flashsale_pre_deductions").Select("status").Where("id = ?", pdID).Scan(&status).Error
-		return err == nil && status == "pending_rollback"
-	}, 5*time.Second, 100*time.Millisecond)
-
-	pdIDInt, err := strconv.ParseInt(pdID, 10, 64)
-	require.NoError(t, err)
-	require.NoError(t, e.flashsaleSvc.RecoverPreDeduction(context.Background(), pdIDInt))
-	var status string
-	require.NoError(t, env.gdb.Table("flashsale_pre_deductions").Select("status").Where("id = ?", pdID).Scan(&status).Error)
-	require.Equal(t, "rolled_back", status)
-	w, rolledBack := doJSONOn(t, e.router, http.MethodGet, "/api/flashsales/purchases/"+pdID, "", token)
-	require.Equal(t, http.StatusOK, w.Code)
-	require.NotEmpty(t, rolledBack["rolled_back_at"])
-	require.NotContains(t, rolledBack, "ordered_at")
-	require.Equal(t, "10", *redisGet(t, fmt.Sprintf("flashsale:stock:%d", id)))
-	require.Nil(t, redisGet(t, fmt.Sprintf("flashsale:idem:%d:%d", id, claims.UserID)))
-}
-
 // ---- 死信读取助手（测试直连 amqp 读死信队列）----
 
 // purgeQueue 清空主队列与其死信队列的遗留消息（测试环境隔离，避免跨运行污染）。

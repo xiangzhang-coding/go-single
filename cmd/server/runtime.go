@@ -23,6 +23,7 @@ type applicationRuntime struct {
 	log                *zap.Logger
 	mq                 mq.MQ
 	cron               *platformcron.Registry
+	cronJobs           []platformcron.Job
 	recovery           flashsalesvc.PreDeductionRecovery
 	recoveryGate       flashsalesvc.PurchaseRecoveryGate
 	reservationCleanup flashsalesvc.ReservationCleanup

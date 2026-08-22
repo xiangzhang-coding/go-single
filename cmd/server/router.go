@@ -226,7 +226,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	// T13 秒杀超时取消——每分钟扫描待支付秒杀订单，回补活动库存 + Redis 库存 +
 	// 用户计数（允许再次抢购）；对账——每小时进行中只比对告警（补单信号）、
 	// 每分钟收尾以 MySQL 对齐刚结束活动的 Redis 库存。
-	cronRegistry, err := registerCron(log, orderSvc, flashsaleSvc, flashsaleSvc, reservationCleanup, fileSvc, seckillCancellation, reconcile)
+	cronRegistry, cronJobs, err := registerCron(log, orderSvc, flashsaleSvc, flashsaleSvc, reservationCleanup, fileSvc, seckillCancellation, reconcile)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -266,7 +266,7 @@ func newRouter(cfg *config.Config, log *zap.Logger, db *gorm.DB, sqlDB *sql.DB, 
 	fileHandler.RegisterRoutes(fileAPI)
 
 	background := &applicationRuntime{
-		log: log, mq: mqClient, cron: cronRegistry,
+		log: log, mq: mqClient, cron: cronRegistry, cronJobs: cronJobs,
 		recovery: flashsaleSvc, recoveryGate: flashsaleSvc, reservationCleanup: reservationCleanup,
 		consumers: []consumerBinding{
 			{queue: flashsalesvc.SeckillOrderQueue, name: "秒杀落单消费者", handler: seckillConsumer.Handle},
