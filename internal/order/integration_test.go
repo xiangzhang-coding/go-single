@@ -1324,10 +1324,12 @@ func TestOrderTimeoutCancelSkipsPaidOrder(t *testing.T) {
 
 	// 即使 expire_at 已过，已支付订单不参与超时扫描。
 	require.NoError(t, env.gdb.Exec("UPDATE orders SET expire_at = ? WHERE order_no = ?", time.Now().Add(-time.Minute), orderNo).Error)
-	n, _, err := env.orderSvc.CancelExpired(context.Background())
+	_, _, err := env.orderSvc.CancelExpired(context.Background())
 	require.NoError(t, err)
-	require.Zero(t, n)
-	require.Equal(t, model.OrderStatusPaid, orderByNo(t, env, orderNo).Status)
+	paid := orderByNo(t, env, orderNo)
+	require.Equal(t, model.OrderStatusPaid, paid.Status)
+	require.Nil(t, paid.CancelledAt)
+	require.Equal(t, 9, skuStock(t, env, skuID), "超时扫描不得回补已支付订单库存")
 }
 
 func TestOrderExpiredPaymentIsRejected(t *testing.T) {

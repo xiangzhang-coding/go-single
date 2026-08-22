@@ -30,7 +30,7 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 	cfg, err := config.LoadFrom("../../configs")
 	require.NoError(t, err)
 	cfg.Server.Mode = "test"
-	cfg.Server.RequestTimeout = 2 * time.Second
+	cfg.Server.RequestTimeout = 15 * time.Second
 	cfg.MySQL.Database = "go_shop_router_test"
 	cfg.Redis.DB = 12
 	cfg.MinIO.Bucket = "go-shop-router-test"

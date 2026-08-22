@@ -248,8 +248,8 @@ func TestSeckillPurchaseGlobalRateLimit(t *testing.T) {
 	env := requireEnv(t)
 	admin := adminToken(t, env)
 	id := seedPublished(t, env, admin, 10)
-	// QPS 1 / burst 1：第一个请求用掉唯一令牌，第二个必被 429。
-	router := env.newFlashsaleRouter(t, limiter.TokenBucketConfig{QPS: 1, Burst: 1}, limiter.RedisCounterConfig{})
+	// 极低补充速率 / burst 1：即使 CI 下首个真实抢购较慢，第二个请求仍无令牌。
+	router := env.newFlashsaleRouter(t, limiter.TokenBucketConfig{QPS: 0.001, Burst: 1}, limiter.RedisCounterConfig{})
 	token := registerAndToken(t, env, uniqueName("hammer"))
 
 	w, _ := purchase(t, router, id, token)
