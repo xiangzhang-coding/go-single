@@ -87,9 +87,10 @@ const (
 )
 
 type FlashSaleWarmParams struct {
-	StockKey string
-	Stock    int
-	TTL      time.Duration
+	StockKey  string
+	Stock     int
+	TTL       time.Duration
+	Overwrite bool
 }
 
 type FlashSaleDecreaseParams struct {
@@ -200,6 +201,7 @@ type FlashSaleAdoptLegacyReservationParams struct {
 // FlashSaleStore owns the scripts that mutate flash-sale Redis state.
 type FlashSaleStore interface {
 	WarmFlashSaleStock(ctx context.Context, p FlashSaleWarmParams) (FlashSaleWarmResult, error)
+	WarmFlashSaleStockDurably(ctx context.Context, p FlashSaleWarmParams, timeout time.Duration) (FlashSaleWarmResult, error)
 	DecreaseFlashSaleStockDurably(ctx context.Context, p FlashSaleDecreaseParams, timeout time.Duration) error
 	PauseFlashSaleStockDurably(ctx context.Context, p FlashSalePauseParams, timeout time.Duration) (int, error)
 	HoldFlashSalePauseDurably(ctx context.Context, pauseKey string, timeout time.Duration) error

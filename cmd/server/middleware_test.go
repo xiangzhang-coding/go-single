@@ -101,6 +101,33 @@ func TestTrustedProxyRestoresSourceIP(t *testing.T) {
 	require.Equal(t, "203.0.113.99", rec.Body.String())
 }
 
+func TestRouterErrorsUseJSONEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	configureHTTPErrorResponses(r)
+	r.GET("/api/ping", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		target string
+		status int
+		body   string
+	}{
+		{name: "unmatched route", method: http.MethodGet, target: "/api/missing", status: http.StatusNotFound, body: `{"error":"route not found"}`},
+		{name: "unmatched method", method: http.MethodPost, target: "/api/ping", status: http.StatusMethodNotAllowed, body: `{"error":"method not allowed"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.target, nil))
+
+			require.Equal(t, tc.status, rec.Code)
+			require.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+			require.JSONEq(t, tc.body, rec.Body.String())
+		})
+	}
+}
+
 func TestUntrustedDockerPeerCannotSpoofSourceIP(t *testing.T) {
 	r := gin.New()
 	configureTrustedProxies(r, []string{"172.30.0.10"}, zap.NewNop())

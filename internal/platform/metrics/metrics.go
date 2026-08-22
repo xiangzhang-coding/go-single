@@ -15,8 +15,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// metricRoute 中间件不计自身抓取流量，避免轮询打点污染 QPS。
-const metricRoute = "/metrics"
+const (
+	// metricRoute 中间件不计自身抓取流量，避免轮询打点污染 QPS。
+	metricRoute = "/metrics"
+	// websocketRoute 由 WS 连接状态单独观测，不计入普通 HTTP 请求生命周期。
+	websocketRoute = "/ws"
+)
 
 // Registry 指标注册器：独立 registry（不污染全局默认注册器），内置 Go/进程采集器。
 type Registry struct {
@@ -74,7 +78,7 @@ func (r *Registry) Register(c prometheus.Collector) error {
 // 使 panic 被恢复为 500 后仍能完成计数与活跃请求递减。
 func (r *Registry) GinMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if c.FullPath() == metricRoute {
+		if route := c.FullPath(); route == metricRoute || route == websocketRoute {
 			c.Next()
 			return
 		}

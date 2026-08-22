@@ -175,19 +175,12 @@ func (h *Handler) SearchUsers(c *gin.Context) {
 		return
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
-	users, err := h.svc.Search(c.Request.Context(), strings.TrimSpace(c.Query("username")), limit)
+	users, err := h.svc.Search(c.Request.Context(), claims.UserID, strings.TrimSpace(c.Query("username")), limit)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
-	items := make([]model.PublicUser, 0, len(users))
-	for _, u := range users {
-		if u.ID == claims.UserID {
-			continue
-		}
-		items = append(items, u)
-	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	c.JSON(http.StatusOK, gin.H{"items": users})
 }
 
 // GetUser 查询指定用户；仅本人或 admin 可见（防 IDOR）。

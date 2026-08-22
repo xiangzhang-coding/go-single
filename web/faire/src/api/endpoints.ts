@@ -19,6 +19,7 @@ import type {
   CreateProductRequest,
   CreateSKURequest,
   UpdateSKURequest,
+  UpdateAddressRequest,
   FlashSaleActivity,
   FlashSaleActivityRecord,
   FlashSaleAdminListResponse,
@@ -127,7 +128,7 @@ export async function createAddress(request: CreateAddressRequest) {
 }
 
 // 编辑地址（不触碰默认指向；后端返回 204 无 body）。
-export async function updateAddress(id: number, request: CreateAddressRequest) {
+export async function updateAddress(id: number, request: UpdateAddressRequest) {
   await api.put(`/addresses/${id}`, request);
 }
 

@@ -56,16 +56,21 @@ func TestSeckillPurchaseOK(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, preDeductionID, lifecycle["id"])
 	require.Equal(t, "pending_order", lifecycle["status"])
-	require.Equal(t, float64(1), lifecycle["quantity"])
-	require.Equal(t, preDeductionID, lifecycle["purchase_slot"])
-	require.NotZero(t, lifecycle["sku_id"])
-	require.Equal(t, float64(9900), lifecycle["price"])
+	require.ElementsMatch(t, []string{"id", "status", "order_no", "created_at", "updated_at"}, jsonKeys(lifecycle))
 
 	other := registerAndToken(t, env, uniqueName("otherbuyer"))
 	w, _ = doJSONOn(t, router, http.MethodGet,
 		"/api/flashsales/purchases/"+preDeductionID, "", other)
 	require.Equal(t, http.StatusNotFound, w.Code, "pre-deduction status is owner-scoped")
 	require.Equal(t, 9, redisStock(t, env, id))
+}
+
+func jsonKeys(values map[string]any) []string {
+	result := make([]string, 0, len(values))
+	for key := range values {
+		result = append(result, key)
+	}
+	return result
 }
 
 func TestSeckillPurchaseRequiresClientRequestID(t *testing.T) {
@@ -187,6 +192,29 @@ func TestSeckillPurchaseDuplicateReturnsExistingLifecycle(t *testing.T) {
 	n, err := env.redis.Exists(context.Background(), slotIdemKey(id, claims.UserID, pdID)).Result()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), n, "预扣成功后幂等键应保留")
+}
+
+func TestSeckillRejectedRequestReplayNeverReturnsQueued(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	id := seedPublished(t, env, admin, 1)
+	router := env.newFlashsaleRouter(t, purchasePermissive, limiter.RedisCounterConfig{})
+	winner := registerAndToken(t, env, uniqueName("winner"))
+	rejected := registerAndToken(t, env, uniqueName("rejected"))
+	w, _ := purchase(t, router, id, winner, "winning-request")
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	w, first := purchase(t, router, id, rejected, "stable-rejection")
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.NotEmpty(t, first["error"])
+	w, replay := purchase(t, router, id, rejected, "stable-rejection")
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotEmpty(t, replay["pre_deduction_id"])
+	require.Equal(t, "", replay["order_no"])
+	require.Equal(t, "rolled_back", replay["pre_deduction_status"])
+	require.Equal(t, "rolled_back", replay["status"])
+	require.Equal(t, "抢购已回退", replay["message"])
 }
 
 func TestSeckillPurchaseLimitTwoCreatesTwoIndependentSlots(t *testing.T) {

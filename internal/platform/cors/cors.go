@@ -7,6 +7,8 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
 )
 
 // Middleware 返回按 Origin 白名单放行的 CORS 中间件：
@@ -32,7 +34,8 @@ func Middleware(allowOrigins []string) gin.HandlerFunc {
 		if !allowAll {
 			if _, ok := allowed[origin]; !ok {
 				if c.Request.Method == http.MethodOptions {
-					c.AbortWithStatus(http.StatusForbidden)
+					c.Abort()
+					httpresponse.Write(c, http.StatusForbidden, "origin not allowed")
 					return
 				}
 				c.Next()

@@ -489,6 +489,35 @@ func TestWarmFlashSaleStockPropagatesRedisError(t *testing.T) {
 	requireCacheState(t, c, key, "", false)
 }
 
+func TestWarmFlashSaleStockDurablyHonorsWindowSemantics(t *testing.T) {
+	tests := []struct {
+		name      string
+		overwrite bool
+		want      FlashSaleWarmResult
+		wantStock string
+	}{
+		{name: "future activity overwrites stale stock", overwrite: true, want: FlashSaleStockUpdated, wantStock: "10"},
+		{name: "in-progress activity retains lower live stock", want: FlashSaleStockRetained, wantStock: "4"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newAtomicRedis(t)
+			key := atomicTestKey(t, "flashsale-durable-warm")
+			t.Cleanup(func() { require.NoError(t, c.Del(context.Background(), key)) })
+			require.NoError(t, c.Set(context.Background(), key, "4", 2*time.Minute))
+
+			result, err := c.WarmFlashSaleStockDurably(context.Background(), FlashSaleWarmParams{
+				StockKey: key, Stock: 10, TTL: 30 * time.Second, Overwrite: tc.overwrite,
+			}, 2*time.Second)
+
+			require.NoError(t, err)
+			require.Equal(t, tc.want, result)
+			requireCacheState(t, c, key, tc.wantStock, true)
+		})
+	}
+}
+
 func TestDecreaseFlashSaleStockDurablyPreservesReservationsAndTTL(t *testing.T) {
 	c := newAtomicRedis(t)
 	key := atomicTestKey(t, "flashsale-decrease")

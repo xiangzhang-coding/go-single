@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"runtime/debug"
 	"time"
 
@@ -55,6 +56,16 @@ func configureTrustedProxies(r *gin.Engine, proxies []string, log *zap.Logger) {
 		log.Error("设置可信反代白名单失败，已禁用代理头", zap.Error(err))
 		_ = r.SetTrustedProxies(nil)
 	}
+}
+
+func configureHTTPErrorResponses(r *gin.Engine) {
+	r.HandleMethodNotAllowed = true
+	r.NoRoute(func(c *gin.Context) {
+		httpresponse.Write(c, http.StatusNotFound, "route not found")
+	})
+	r.NoMethod(func(c *gin.Context) {
+		httpresponse.Write(c, http.StatusMethodNotAllowed, "method not allowed")
+	})
 }
 
 // requestTimeout 全链路 context 超时（T20）：为请求派生带截止时间的 ctx 并

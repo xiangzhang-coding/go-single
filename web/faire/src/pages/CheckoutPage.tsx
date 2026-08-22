@@ -14,8 +14,16 @@ import { getApiErrorMessage } from "../api/client";
 import type { Address, CreateAddressRequest, UserCouponView } from "../api/types";
 import { buildOrderRequest, parseCheckoutIntent } from "../lib/checkout";
 import { isOrderProcessingResponse } from "../lib/order";
-import { formatAddress, formatMoney, formatSpecs, isCouponUsable, makeClientRequestID } from "../lib/format";
+import { formatAddress, formatMoney, formatSpecs, isCouponUsable } from "../lib/format";
+import {
+  beginCheckoutOperation,
+  clearCheckoutOperation,
+  markCheckoutOperationProcessing,
+  readCheckoutOperation,
+  type PendingCheckoutOperation,
+} from "../lib/pending-operations";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, Spinner } from "../components/ui";
+import { useAuthStore } from "../store/auth";
 
 const emptyDraft: CreateAddressRequest = {
   receiver: "",
@@ -37,11 +45,14 @@ interface CheckoutItem {
 
 export function CheckoutPage() {
   const navigate = useNavigate();
+  const userId = useAuthStore((state) => state.user?.id ?? 0);
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const checkoutIntent = parseCheckoutIntent(searchParams);
   const directProductId = checkoutIntent?.kind === "direct" ? checkoutIntent.productId : 0;
-  const [clientRequestId] = useState(() => makeClientRequestID());
+  const [pendingOperation, setPendingOperation] = useState(() => (
+    checkoutIntent && userId ? readCheckoutOperation(userId, checkoutIntent) : null
+  ));
   const [selectedAddressId, setSelectedAddressId] = useState<number | null>(null);
   const [selectedCouponId, setSelectedCouponId] = useState<number | null>(null);
   const [showAddressForm, setShowAddressForm] = useState(false);
@@ -68,6 +79,15 @@ export function CheckoutPage() {
     const defaultAddress = addressesQuery.data.find((address) => address.is_default) || addressesQuery.data[0];
     setSelectedAddressId(defaultAddress.id);
   }, [addressesQuery.data, selectedAddressId]);
+
+  useEffect(() => {
+    if (pendingOperation?.status === "processing" && pendingOperation.orderNo) {
+      navigate(`/orders/${pendingOperation.orderNo}`, {
+        replace: true,
+        state: { awaitingCreation: true },
+      });
+    }
+  }, [navigate, pendingOperation]);
 
   const directSKU = checkoutIntent?.kind === "direct"
     ? directProductQuery.data?.skus.find((sku) => sku.id === checkoutIntent.skuId)
@@ -100,13 +120,13 @@ export function CheckoutPage() {
     onError: (error) => setActionError(getApiErrorMessage(error)),
   });
   const orderMutation = useMutation({
-    mutationFn: () => createOrder(buildOrderRequest(
+    mutationFn: (operation: PendingCheckoutOperation) => createOrder(buildOrderRequest(
       checkoutIntent!,
-      clientRequestId,
+      operation.clientRequestId,
       selectedAddressId!,
       selectedCouponId || 0,
     )),
-    onSuccess: (order) => {
+    onSuccess: (order, operation) => {
       if (checkoutIntent?.kind === "cart") {
         queryClient.invalidateQueries({ queryKey: ["cart"] });
       } else if (checkoutIntent?.kind === "direct") {
@@ -114,9 +134,19 @@ export function CheckoutPage() {
       }
       queryClient.invalidateQueries({ queryKey: ["orders"] });
       queryClient.invalidateQueries({ queryKey: ["coupons"] });
-      navigate(`/orders/${order.order_no}`, {
-        state: isOrderProcessingResponse(order) ? { awaitingCreation: true } : undefined,
-      });
+      if (isOrderProcessingResponse(order)) {
+        const processing = markCheckoutOperationProcessing(
+          userId,
+          checkoutIntent!,
+          order.order_no,
+          operation,
+        );
+        setPendingOperation(processing);
+        return;
+      }
+      clearCheckoutOperation(userId, checkoutIntent!);
+      setPendingOperation(null);
+      navigate(`/orders/${order.order_no}`);
     },
     onError: (error) => setActionError(getApiErrorMessage(error)),
   });
@@ -165,7 +195,9 @@ export function CheckoutPage() {
       return;
     }
     setActionError("");
-    orderMutation.mutate();
+    const operation = pendingOperation ?? beginCheckoutOperation(userId, checkoutIntent!);
+    setPendingOperation(operation);
+    orderMutation.mutate(operation);
   }
 
   return (
@@ -245,7 +277,7 @@ export function CheckoutPage() {
             <div className="summary-total"><dt>应付金额</dt><dd>{formatMoney(payAmount)}</dd></div>
           </dl>
           <div className="summary-address mt-8"><div className="flex items-center gap-2 text-sm text-smoke"><Icon name="pin" size={16} /> 地址簿记录</div>{selectedAddressId && <p className="mt-3 text-sm leading-6">{formatSelectedAddress(addressesQuery.data || [], selectedAddressId)}</p>}</div>
-          <Button className="mt-8 w-full justify-center" onClick={submitOrder} disabled={orderMutation.isPending || !selectedAddressId}>{orderMutation.isPending ? <Spinner label="正在创建订单" /> : <>提交订单 <Icon name="arrow-right" size={17} /></>}</Button>
+          <Button className="mt-8 w-full justify-center" onClick={submitOrder} disabled={orderMutation.isPending || !selectedAddressId}>{orderMutation.isPending ? <Spinner label="正在创建订单" /> : <>{pendingOperation?.status === "submitting" ? "继续提交订单" : "提交订单"} <Icon name="arrow-right" size={17} /></>}</Button>
           <p className="mt-4 text-xs leading-5 text-smoke">提交后会生成待支付订单，商品库存和优惠券会在服务端事务内确认。</p>
         </aside>
       </div>

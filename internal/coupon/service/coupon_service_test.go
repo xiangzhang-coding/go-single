@@ -5,6 +5,8 @@ package service
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sort"
 	"sync"
 	"testing"
@@ -317,18 +319,28 @@ func (f *fakeClaimCache) SyncCouponCounts(_ context.Context, p cache.CouponCount
 // ---- 测试夹具 ----
 
 type fixture struct {
-	svc   Service
-	tmpls *fakeTemplates
-	coups *fakeUserCoupons
-	cache *fakeClaimCache
+	svc     Service
+	tmpls   *fakeTemplates
+	coups   *fakeUserCoupons
+	cache   *fakeClaimCache
+	metrics *metrics.Registry
 }
 
 func newFixture() *fixture {
 	tmpls := newFakeTemplates()
 	coups := newFakeUserCoupons(tmpls)
 	fc := newFakeClaimCache()
-	svc := New(repository.Store{Template: tmpls, UserCoupon: coups}, fc, metrics.New().Business())
-	return &fixture{svc: svc, tmpls: tmpls, coups: coups, cache: fc}
+	metricRegistry := metrics.New()
+	svc := New(repository.Store{Template: tmpls, UserCoupon: coups}, fc, metricRegistry.Business())
+	return &fixture{svc: svc, tmpls: tmpls, coups: coups, cache: fc, metrics: metricRegistry}
+}
+
+func scrapeCouponMetrics(t *testing.T, registry *metrics.Registry) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	return rec.Body.String()
 }
 
 // 有效窗口模板：开始于 1 分钟前，结束于 1 小时后。
@@ -799,6 +811,17 @@ func TestRedeemForOrderValidatesAuthoritativeFactsAndReturnsSnapshot(t *testing.
 	_, err = expiredFX.svc.RedeemForOrder(context.Background(), new(transaction.Handle), userID, expiredCoupon.ID, 10000)
 	require.ErrorIs(t, err, ErrCouponExpired)
 	require.Equal(t, model.CouponStatusUnused, expiredFX.coups.byID[expiredCoupon.ID].Status)
+}
+
+func TestRedeemForOrderDoesNotRecordBeforeCallerCommit(t *testing.T) {
+	fx := newFixture()
+	tmpl := fx.createTemplate(t, nil)
+	uc, err := fx.svc.Claim(context.Background(), 42, tmpl.ID)
+	require.NoError(t, err)
+
+	_, err = fx.svc.RedeemForOrder(context.Background(), new(transaction.Handle), 42, uc.ID, 10000)
+	require.NoError(t, err)
+	require.Contains(t, scrapeCouponMetrics(t, fx.metrics), "coupon_redeemed_total 0")
 }
 
 // RollbackCoupon：正常回退；非 used 状态回退失败。

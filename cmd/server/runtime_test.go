@@ -83,6 +83,20 @@ func (c *configurableRuntimeCleanup) CleanupOrderedReservations(context.Context)
 	return 0, c.err
 }
 
+type gateObservingRecovery struct {
+	gate             *runtimeRecoveryGate
+	blockedDuringRun bool
+}
+
+func (r *gateObservingRecovery) RecoverPreDeductions(context.Context) (flashsalesvc.RecoveryStats, error) {
+	r.blockedDuringRun = r.gate.PurchasesBlocked()
+	return flashsalesvc.RecoveryStats{}, nil
+}
+
+func (r *gateObservingRecovery) RecoverPreDeductionsAtStartup(ctx context.Context) (flashsalesvc.RecoveryStats, error) {
+	return r.RecoverPreDeductions(ctx)
+}
+
 func TestApplicationRuntimeStopsConsumersAndCron(t *testing.T) {
 	client := &blockingRuntimeMQ{started: make(chan string, 2)}
 	runtime := &applicationRuntime{
@@ -178,4 +192,15 @@ func TestPeriodicFlashSaleRecoveryReopensGateOnlyAfterAllRepairsSucceed(t *testi
 	require.NoError(t, err)
 	require.False(t, gate.PurchasesBlocked())
 	require.Equal(t, 1, gate.allowCalls)
+}
+
+func TestPeriodicFlashSaleRecoveryClosesGateBeforeRepair(t *testing.T) {
+	gate := &runtimeRecoveryGate{}
+	recovery := &gateObservingRecovery{gate: gate}
+
+	_, _, err := recoverFlashSalePeriodically(context.Background(), recovery, runtimeCleanup{}, gate)
+
+	require.NoError(t, err)
+	require.True(t, recovery.blockedDuringRun)
+	require.False(t, gate.PurchasesBlocked())
 }

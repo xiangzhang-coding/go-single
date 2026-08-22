@@ -158,7 +158,10 @@ func (s *paymentService) mockPay(ctx context.Context, userID int64, p PayParams)
 	if err != nil {
 		return nil, err
 	}
-	// 支付回调结果打点（T19c）：流水落库且事务提交后计数。
+	// 支付与订单状态打点（T19c）：流水和订单事务提交后计数。
+	if p.Result == paymentmodel.PaymentResultSuccess {
+		s.metrics.OrderStatusChanged(ordermodel.OrderStatusPaid)
+	}
 	s.metrics.PaymentResult(p.Result == paymentmodel.PaymentResultSuccess)
 	return payment, nil
 }

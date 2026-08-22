@@ -82,7 +82,7 @@ func (r *GORMUserRepository) HasAvatarURL(ctx context.Context, reference string)
 }
 
 // SearchByUsername 按字面前缀搜索；显式转义 LIKE 通配符，避免 %/_ 改变查询模式。
-func (r *GORMUserRepository) SearchByUsername(ctx context.Context, prefix string, limit int) ([]model.PublicUser, error) {
+func (r *GORMUserRepository) SearchByUsername(ctx context.Context, prefix string, excludeUserID int64, limit int) ([]model.PublicUser, error) {
 	if prefix == "" || limit <= 0 {
 		return []model.PublicUser{}, nil
 	}
@@ -91,6 +91,7 @@ func (r *GORMUserRepository) SearchByUsername(ctx context.Context, prefix string
 	if err := r.db.WithContext(ctx).Model(&model.User{}).
 		Select("id", "username").
 		Where("username LIKE ? ESCAPE '!'", escaped+"%").
+		Where("id <> ?", excludeUserID).
 		Order("id ASC").Limit(limit).Scan(&users).Error; err != nil {
 		return nil, err
 	}

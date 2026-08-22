@@ -79,7 +79,7 @@ type Service interface {
 	CanReadAvatar(ctx context.Context, reference string) (bool, error)
 	// Search 按用户名前缀搜索用户（社交"加好友"发现入口）：
 	// 前缀须非空且 ≤32 字符（与注册同名规则），limit 截断到 [1, maxSearchLimit]。
-	Search(ctx context.Context, username string, limit int) ([]model.PublicUser, error)
+	Search(ctx context.Context, currentUserID int64, username string, limit int) ([]model.PublicUser, error)
 
 	// ---- 地址簿 ----
 	// CreateAddress 新增地址：首条自动设为默认；IsDefault=true 时显式设为默认。
@@ -248,7 +248,7 @@ const (
 )
 
 // Search 前缀搜索：校验 → 限量查询（≤maxSearchLimit，非法 limit 用默认值）。
-func (s *userService) Search(ctx context.Context, username string, limit int) ([]model.PublicUser, error) {
+func (s *userService) Search(ctx context.Context, currentUserID int64, username string, limit int) ([]model.PublicUser, error) {
 	if username == "" || len(username) > 32 {
 		return nil, ErrInvalidUsername
 	}
@@ -258,7 +258,7 @@ func (s *userService) Search(ctx context.Context, username string, limit int) ([
 	if limit > maxSearchLimit {
 		limit = maxSearchLimit
 	}
-	users, err := s.store.Users.SearchByUsername(ctx, username, limit)
+	users, err := s.store.Users.SearchByUsername(ctx, username, currentUserID, limit)
 	if err != nil {
 		return nil, err
 	}

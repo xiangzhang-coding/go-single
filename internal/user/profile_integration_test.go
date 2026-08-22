@@ -160,7 +160,7 @@ func TestAvatarUploadThenSetProfile(t *testing.T) {
 	issuer := auth.NewJWT(auth.JWTConfig{Secret: testSecret, TTL: 2 * time.Hour})
 	userSvc := usersvc.NewWithMedia(userrepo.Store{Users: userrepo.NewGORM(env.gdb), Addresses: userrepo.NewGORMAddress(env.gdb)}, issuer, fileSvc)
 	userhandler.New(userSvc, env.verifier, testsupport.AllowAllAuthAttempts{}).RegisterRoutes(api)
-	file.NewHandler(fileSvc, env.verifier, avatarAuthorizer{users: userSvc}).RegisterRoutes(api)
+	file.NewHandler(fileSvc, env.verifier, avatarAuthorizer{users: userSvc}, file.UploadConcurrencyConfig{}).RegisterRoutes(api)
 
 	username := fmt.Sprintf("avatar_%d", time.Now().UnixNano())
 	w := doReq(t, r, http.MethodPost, "/api/auth/register",

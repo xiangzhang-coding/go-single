@@ -70,6 +70,10 @@ upload:
   max_objects_per_user: 1000
   # 20 MiB 文件允许较慢网络完成读取与 MinIO 写入；普通 JSON 仍使用 5s 预算。
   request_timeout: 2m
+  # multipart 解析前占用单进程并发槽位，限制总量、单用户与可信来源 IP。
+  max_concurrent: 16
+  max_concurrent_per_user: 2
+  max_concurrent_per_ip: 4
 
 snowflake:
   # 多实例部署时每个实例必须配置不同的 worker_id（0-1023）。

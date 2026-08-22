@@ -135,7 +135,7 @@ func TestUploadIdempotencyReplaysThroughRealMySQLAndMinIO(t *testing.T) {
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: "integration-test-secret", TTL: 2 * time.Hour})
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	file.NewHandler(svc, verifier, nil).RegisterRoutes(router.Group("/api"))
+	file.NewHandler(svc, verifier, nil, file.UploadConcurrencyConfig{}).RegisterRoutes(router.Group("/api"))
 	env := &testEnv{router: router}
 	requestID := fmt.Sprintf("real-replay-%d", time.Now().UnixNano())
 	ownerToken := tokenFor(t, ownerID, 2*time.Hour)

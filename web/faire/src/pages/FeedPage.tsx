@@ -15,6 +15,7 @@ import { Button, EmptyState, ErrorState, Icon, LoadingBlock, Spinner } from "../
 import { AuthorizedImage } from "../components/AuthorizedMedia";
 import { formatDate } from "../lib/format";
 import { IMAGE_ACCEPT, validateImage } from "../lib/media";
+import { executeMediaSave, type PreparedMediaUpload } from "../lib/media-save";
 
 type FeedTab = "share" | "feed" | "mine";
 
@@ -79,6 +80,7 @@ function ShareForm({
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
+  const preparedImageRef = useRef<PreparedMediaUpload | null>(null);
   const queryClient = useQueryClient();
 
   useEffect(() => () => {
@@ -102,17 +104,25 @@ function ShareForm({
 
   const share = useMutation({
     mutationFn: async () => {
-      const uploaded = imageFile ? await uploadFile(imageFile, "image") : null;
-      return sharePost({
-        sku_id: Number(skuId),
-        content: content.trim() || undefined,
-        image_url: uploaded?.url,
-      });
+      return executeMediaSave(
+        imageFile,
+        preparedImageRef.current,
+        (file) => uploadFile(file, "image"),
+        (reference) => sharePost({
+          sku_id: Number(skuId),
+          content: content.trim() || undefined,
+          image_url: reference,
+        }),
+        (prepared) => {
+          preparedImageRef.current = prepared;
+        },
+      );
     },
     onSuccess: () => {
       onNotice({ kind: "success", text: "已分享到好友圈。" });
       setContent("");
       setImageFile(null);
+      preparedImageRef.current = null;
       setImagePreview("");
       if (fileInput.current) fileInput.current.value = "";
       setSkuId("");
@@ -132,6 +142,7 @@ function ShareForm({
       return;
     }
     setImageFile(file);
+    preparedImageRef.current = null;
     setImagePreview(URL.createObjectURL(file));
     onNotice(null);
   }
@@ -189,7 +200,7 @@ function ShareForm({
             {imagePreview ? (
               <div className="share-image-preview">
                 <img src={imagePreview} alt="分享配图" />
-                <button type="button" className="icon-button" aria-label="移除配图" onClick={() => { setImageFile(null); setImagePreview(""); }}>
+                <button type="button" className="icon-button" aria-label="移除配图" onClick={() => { setImageFile(null); preparedImageRef.current = null; setImagePreview(""); }}>
                   <Icon name="close" size={16} />
                 </button>
               </div>

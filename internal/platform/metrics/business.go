@@ -81,7 +81,7 @@ func (r *Registry) Business() *Business {
 		}),
 		couponRedeemed: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "coupon_redeemed_total",
-			Help: "优惠券核销（unused→used 条件更新成功）累计数；下单事务回滚可能乐观多计",
+			Help: "优惠券核销并随订单事务提交成功的累计数",
 		}),
 	}
 	r.reg.MustRegister(
@@ -155,7 +155,7 @@ func (b *Business) CouponIssued() {
 	b.couponIssued.Inc()
 }
 
-// CouponRedeemed 记录一次优惠券核销（条件更新成功；下单事务回滚可能乐观多计）。
+// CouponRedeemed 记录一次随订单事务提交成功的优惠券核销。
 func (b *Business) CouponRedeemed() {
 	b.couponRedeemed.Inc()
 }

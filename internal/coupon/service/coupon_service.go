@@ -334,8 +334,6 @@ func (s *couponService) RedeemForOrder(ctx context.Context, tx *transaction.Hand
 	if !ok {
 		return model.CouponRedemption{}, ErrCouponExpired
 	}
-	// 条件更新命中即计数；调用方事务回滚时乐观多计（可接受）。
-	s.metrics.CouponRedeemed()
 	return model.CouponRedemption{CouponID: facts.CouponID, Value: facts.Value}, nil
 }
 

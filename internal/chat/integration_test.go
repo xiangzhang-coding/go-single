@@ -162,7 +162,7 @@ func buildEnv() (*testEnv, error) {
 	userhandler.New(userSvc, verifier, testsupport.AllowAllAuthAttempts{}).RegisterRoutes(api)
 	socialhandler.New(socialSvc, postSvc, verifier).RegisterRoutes(api)
 	chathandler.New(chatSvc, verifier).RegisterRoutes(api)
-	file.NewHandler(fileSvc, verifier, chatMediaAuthorizer{chat: chatSvc}).RegisterRoutes(api)
+	file.NewHandler(fileSvc, verifier, chatMediaAuthorizer{chat: chatSvc}, file.UploadConcurrencyConfig{}).RegisterRoutes(api)
 	return &testEnv{router: r, verifier: verifier, hub: wsHub, gdb: gdb}, nil
 }
 

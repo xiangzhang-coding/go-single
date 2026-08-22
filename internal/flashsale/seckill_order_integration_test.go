@@ -190,7 +190,7 @@ func buildMQEnv() (*mqEnv, error) {
 	log := zap.NewNop()
 	consumer := flashsalesvc.NewSeckillOrderConsumer(
 		flashsaleStore.Activities, flashsaleStore.PreDeductions, cacheClient, flashsaleStore.Tx,
-		orderSvc, userSvc, metrics.New().Business(), log)
+		orderSvc, metrics.New().Business(), log)
 	go func() {
 		for {
 			if err := mqClient.Consume(context.Background(), flashsalesvc.SeckillOrderQueue, consumer.Handle); err != nil {
@@ -365,6 +365,7 @@ func TestSeckillOrderFullLoop(t *testing.T) {
 	require.Equal(t, "seckill", order["order_type"])
 	require.Equal(t, "pending_payment", order["status"])
 	require.Equal(t, float64(id), order["activity_id"])
+	require.Equal(t, preDeductionID, order["purchase_slot"])
 	require.Equal(t, float64(9900), order["pay_amount"], "应付 = 秒杀价")
 	require.Equal(t, float64(0), order["discount_amount"], "秒杀订单不使用券")
 
@@ -377,13 +378,15 @@ func TestSeckillOrderFullLoop(t *testing.T) {
 	require.Equal(t, 1, countSeckillOrders(t, e, id))
 }
 
-func TestSeckillOrderKeepsAcceptedSnapshotWhenActivityEditWaitsForSettlement(t *testing.T) {
+func TestSeckillOrderKeepsAcceptedSnapshotAfterProductUnpublish(t *testing.T) {
 	requireEnv(t)
 	e := requireMQEnv(t)
 	admin := adminToken(t, env)
 	id := seedPublishedOnSale(t, admin, 10)
 	var acceptedSKUID int64
 	require.NoError(t, env.gdb.Table("flashsale_activities").Select("sku_id").Where("id = ?", id).Scan(&acceptedSKUID).Error)
+	var productID int64
+	require.NoError(t, env.gdb.Table("skus").Select("product_id").Where("id = ?", acceptedSKUID).Scan(&productID).Error)
 	token, _ := registerWithAddress(t, e, uniqueName("snapshot"))
 
 	w, response := purchase(t, env.router, id, token, "snapshot-request")
@@ -392,6 +395,8 @@ func TestSeckillOrderKeepsAcceptedSnapshotWhenActivityEditWaitsForSettlement(t *
 	acceptedMessage := append([]byte(nil), env.publisher.body...)
 	env.publisher.mu.Unlock()
 	require.NotEmpty(t, acceptedMessage)
+	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/products/%d/unpublish", productID), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
 
 	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/unpublish", id), "", admin)
 	require.Equal(t, http.StatusNoContent, w.Code)
@@ -408,7 +413,7 @@ func TestSeckillOrderKeepsAcceptedSnapshotWhenActivityEditWaitsForSettlement(t *
 	require.Equal(t, float64(9900), item["price"])
 	purchaseSlot, err := strconv.ParseInt(response["pre_deduction_id"].(string), 10, 64)
 	require.NoError(t, err)
-	require.Equal(t, float64(purchaseSlot), order["purchase_slot"])
+	require.Equal(t, strconv.FormatInt(purchaseSlot, 10), order["purchase_slot"])
 }
 
 func TestSeckillOrderTransactionRollsBackWhenActivityStockDeductionFails(t *testing.T) {

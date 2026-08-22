@@ -513,7 +513,7 @@ func TestRecoverPreDeductionRetriesFailedCancellationCompensation(t *testing.T) 
 	require.NoError(t, err)
 	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), result.PreDeductionID, "order cancelled"))
 
-	fx.base.cache.err = errors.New("redis down")
+	fx.base.cache.restoreErr = errors.New("redis down")
 	stats, err := fx.svc.RecoverPreDeductions(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 1, stats.Failed)
@@ -522,7 +522,7 @@ func TestRecoverPreDeductionRetriesFailedCancellationCompensation(t *testing.T) 
 	require.Equal(t, model.PreDeductionStatusPendingRollback, pd.Status)
 	require.Equal(t, 1, pd.RollbackAttempts)
 
-	fx.base.cache.err = nil
+	fx.base.cache.restoreErr = nil
 	restarted := New(repository.Store{Activities: fx.base.acts, PreDeductions: fx.pd, Tx: fx.base.acts}, fx.base.products, fx.base.cache,
 		limiter.RedisCounterConfig{}, fx.base.pub, &fakeNos{}, metrics.New().Business())
 	stats, err = restarted.RecoverPreDeductions(context.Background())
@@ -669,7 +669,7 @@ func TestRollbackDoesNotAdvanceWhenAOFConfirmationFails(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, fx.pd.MarkPendingRollback(context.Background(), result.PreDeductionID, "order cancelled"))
 
-	fx.base.cache.aofErr = errors.New("WAITAOF timeout")
+	fx.base.cache.restoreAOFErr = errors.New("WAITAOF timeout")
 	_, err = fx.svc.RecoverPreDeductions(context.Background())
 	require.NoError(t, err)
 	pd, err := fx.pd.GetByID(context.Background(), result.PreDeductionID)
@@ -684,7 +684,7 @@ func TestRollbackDoesNotAdvanceWhenAOFConfirmationFails(t *testing.T) {
 	fx.base.cache.idem[slotIdemKey(a.ID, 42, pd.PurchaseSlot)] = true
 	fx.base.cache.idemToken[slotIdemKey(a.ID, 42, pd.PurchaseSlot)] = pd.ReservationToken()
 	fx.base.cache.reservations[reservationKey(pd.ID)] = pd.ReservationToken()
-	fx.base.cache.aofErr = nil
+	fx.base.cache.restoreAOFErr = nil
 	_, err = fx.svc.RecoverPreDeductions(context.Background())
 	require.NoError(t, err)
 	pd, err = fx.pd.GetByID(context.Background(), pd.ID)

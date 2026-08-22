@@ -172,17 +172,8 @@ export type FlashSalePurchaseStatus =
 
 export interface FlashSalePurchase {
   id: string;
-  user_id: number;
-  activity_id: number;
-  order_no?: string;
-  sku_id: number;
-  price: number;
-  quantity: number;
-  purchase_slot: string;
   status: FlashSalePurchaseStatus;
-  publish_attempts: number;
-  rollback_attempts: number;
-  last_error?: string;
+  order_no?: string;
   created_at: string;
   updated_at: string;
   ordered_at?: string;
@@ -191,8 +182,8 @@ export interface FlashSalePurchase {
 
 export interface FlashSalePurchaseResponse {
   pre_deduction_id: string;
-  order_no: string;
-  status: "queued";
+  order_no?: string | null;
+  status: "queued" | "rolled_back";
   pre_deduction_status: FlashSalePurchaseStatus;
   message: string;
 }
@@ -224,7 +215,7 @@ export interface Order {
   order_type: "normal" | "seckill" | string;
   status: OrderStatus;
   activity_id?: number;
-  purchase_slot?: number;
+  purchase_slot?: string;
   total_amount: number;
   discount_amount: number;
   pay_amount: number;
@@ -355,13 +346,16 @@ export type CreateOrderRequest =
       items: [CreateOrderItemRequest, ...CreateOrderItemRequest[]];
     });
 
-export interface CreateAddressRequest {
+export interface UpdateAddressRequest {
   receiver: string;
   phone: string;
   province: string;
   city: string;
   district: string;
   detail: string;
+}
+
+export interface CreateAddressRequest extends UpdateAddressRequest {
   is_default: boolean;
 }
 

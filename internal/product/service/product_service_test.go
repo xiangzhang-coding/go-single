@@ -224,16 +224,18 @@ func (f *fakeSKUs) RestoreStock(_ context.Context, _ *transaction.Handle, skuID 
 // ---- fake 缓存 ----
 
 type fakeCache struct {
-	data      map[string]string
-	ttl       map[string]time.Duration
-	versions  map[string]int64
-	mutations map[string]map[string]struct{}
-	err       error
-	beginErr  error
-	finishErr error
-	getCalls  int
-	setCalls  int
-	delCalls  int
+	data              map[string]string
+	ttl               map[string]time.Duration
+	versions          map[string]int64
+	mutations         map[string]map[string]struct{}
+	err               error
+	beginErr          error
+	finishErr         error
+	finishHasDeadline bool
+	finishContextErr  error
+	getCalls          int
+	setCalls          int
+	delCalls          int
 }
 
 func newFakeCache() *fakeCache {
@@ -314,7 +316,9 @@ func (f *fakeCache) BeginProductDetailMutation(_ context.Context, keys cache.Pro
 	return nil
 }
 
-func (f *fakeCache) FinishProductDetailMutation(_ context.Context, keys cache.ProductDetailKeys, token string, _ time.Duration) error {
+func (f *fakeCache) FinishProductDetailMutation(ctx context.Context, keys cache.ProductDetailKeys, token string, _ time.Duration) error {
+	_, f.finishHasDeadline = ctx.Deadline()
+	f.finishContextErr = ctx.Err()
 	if f.finishErr != nil {
 		return f.finishErr
 	}
@@ -459,6 +463,19 @@ func TestUpdateProduct(t *testing.T) {
 
 	// 不存在的类目 → 404。
 	require.ErrorIs(t, fx.svc.UpdateProduct(context.Background(), p.ID, 999, "x", ""), ErrCategoryNotFound)
+}
+
+func TestProductMutationCleanupUsesIndependentBoundedContext(t *testing.T) {
+	fx := newFixture()
+	c := fx.category(t, "数码")
+	p, err := fx.svc.CreateProduct(context.Background(), c.ID, "手机", "")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.NoError(t, fx.svc.UpdateProduct(ctx, p.ID, c.ID, "手机 Pro", ""))
+	require.True(t, fx.cache.finishHasDeadline, "cleanup must have its own deadline")
+	require.NoError(t, fx.cache.finishContextErr, "request cancellation must not skip cleanup")
 }
 
 // ---- SKU ----

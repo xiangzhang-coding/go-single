@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -20,48 +22,261 @@ const (
 	msgTimeout = 15 * time.Second
 	// transientRequeueDelay 限制瞬时失败和熔断打开时的重投频率。
 	transientRequeueDelay = 500 * time.Millisecond
+	// 重拨采用共享的有界指数退避，避免 broker 故障时并发调用形成拨号风暴。
+	reconnectMinBackoff  = 25 * time.Millisecond
+	reconnectMaxBackoff  = time.Second
+	reconnectDialTimeout = 5 * time.Second
 )
 
 type requeueBackoff func(context.Context) error
 
-type rabbitMQ struct {
+var errRabbitMQClosed = errors.New("RabbitMQ 已关闭")
+
+type deferredConfirmation interface {
+	WaitContext(context.Context) (bool, error)
+}
+
+type amqpChannel interface {
+	Close() error
+	Qos(prefetchCount, prefetchSize int, global bool) error
+	QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (amqp.Queue, error)
+	Confirm(noWait bool) error
+	PublishWithDeferredConfirm(exchange, key string, mandatory, immediate bool, msg amqp.Publishing) (deferredConfirmation, error)
+	Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error)
+}
+
+type amqpConnection interface {
+	Channel() (amqpChannel, error)
+	Close() error
+	IsClosed() bool
+}
+
+type connectionDialer func(context.Context, string, amqp.Config) (amqpConnection, error)
+
+type realConnection struct {
 	conn *amqp.Connection
+}
+
+func (c *realConnection) Channel() (amqpChannel, error) {
+	ch, err := c.conn.Channel()
+	if err != nil {
+		return nil, err
+	}
+	return &realChannel{Channel: ch}, nil
+}
+
+func (c *realConnection) Close() error {
+	err := c.conn.CloseDeadline(time.Now())
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return nil
+	}
+	return err
+}
+
+func (c *realConnection) IsClosed() bool { return c.conn.IsClosed() }
+
+type realChannel struct {
+	*amqp.Channel
+}
+
+func (c *realChannel) PublishWithDeferredConfirm(exchange, key string, mandatory, immediate bool, msg amqp.Publishing) (deferredConfirmation, error) {
+	return c.Channel.PublishWithDeferredConfirm(exchange, key, mandatory, immediate, msg)
+}
+
+type managedConnection struct {
+	conn amqpConnection
+}
+
+type contextChannel struct {
+	ctx       context.Context
+	interrupt func()
+	channel   amqpChannel
+}
+
+func (c *contextChannel) Close() error {
+	return callErrorWithContext(c.ctx, c.interrupt, c.channel.Close)
+}
+
+func (c *contextChannel) Qos(prefetchCount, prefetchSize int, global bool) error {
+	return callErrorWithContext(c.ctx, c.interrupt, func() error {
+		return c.channel.Qos(prefetchCount, prefetchSize, global)
+	})
+}
+
+func (c *contextChannel) QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (amqp.Queue, error) {
+	return callWithContext(c.ctx, c.interrupt, func() (amqp.Queue, error) {
+		return c.channel.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+	})
+}
+
+func (c *contextChannel) Confirm(noWait bool) error {
+	return callErrorWithContext(c.ctx, c.interrupt, func() error {
+		return c.channel.Confirm(noWait)
+	})
+}
+
+func (c *contextChannel) PublishWithDeferredConfirm(exchange, key string, mandatory, immediate bool, msg amqp.Publishing) (deferredConfirmation, error) {
+	return callWithContext(c.ctx, c.interrupt, func() (deferredConfirmation, error) {
+		return c.channel.PublishWithDeferredConfirm(exchange, key, mandatory, immediate, msg)
+	})
+}
+
+func (c *contextChannel) Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error) {
+	return callWithContext(c.ctx, c.interrupt, func() (<-chan amqp.Delivery, error) {
+		return c.channel.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
+	})
+}
+
+func callErrorWithContext(ctx context.Context, interrupt func(), call func() error) error {
+	_, err := callWithContext(ctx, interrupt, func() (struct{}, error) {
+		return struct{}{}, call()
+	})
+	return err
+}
+
+func callWithContext[T any](ctx context.Context, interrupt func(), call func() (T, error)) (T, error) {
+	interrupted := make(chan struct{})
+	stopInterrupt := context.AfterFunc(ctx, func() {
+		defer close(interrupted)
+		interrupt()
+	})
+	result, err := call()
+	stopped := stopInterrupt()
+	if !stopped {
+		<-interrupted
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if stopped {
+			interrupt()
+		}
+		var zero T
+		return zero, ctxErr
+	}
+	return result, err
+}
+
+type rabbitMQ struct {
+	mu           sync.Mutex
+	conn         *managedConnection
+	url          string
+	config       amqp.Config
+	dial         connectionDialer
+	closed       bool
+	closeCtx     context.Context
+	closeCancel  context.CancelFunc
+	reconnecting chan struct{}
+	retryAt      time.Time
+	retryDelay   time.Duration
 }
 
 // NewRabbitMQ 建立 RabbitMQ 连接（amqp091 客户端）。
 func NewRabbitMQ(url string) (MQ, error) {
-	conn, err := amqp.DialConfig(url, amqp.Config{
+	return newRabbitMQWithDialer(url, dialAMQP)
+}
+
+func newRabbitMQWithDialer(url string, dial connectionDialer) (MQ, error) {
+	config := amqp.Config{
 		Heartbeat: 10 * time.Second,
-	})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), reconnectDialTimeout)
+	defer cancel()
+	conn, err := dial(ctx, url, config)
 	if err != nil {
 		return nil, fmt.Errorf("RabbitMQ 连接失败: %w", err)
 	}
-	return &rabbitMQ{conn: conn}, nil
+	closeCtx, closeCancel := context.WithCancel(context.Background())
+	return &rabbitMQ{
+		conn:        &managedConnection{conn: conn},
+		url:         url,
+		config:      config,
+		dial:        dial,
+		closeCtx:    closeCtx,
+		closeCancel: closeCancel,
+		retryDelay:  reconnectMinBackoff,
+	}, nil
+}
+
+func dialAMQP(ctx context.Context, url string, config amqp.Config) (amqpConnection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var stopContextClose func() bool
+	var rawConn net.Conn
+	config.Dial = func(network, address string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		rawConn = conn
+		stopContextClose = context.AfterFunc(ctx, func() { _ = conn.Close() })
+		deadline := time.Now().Add(reconnectDialTimeout)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		if err := conn.SetDeadline(deadline); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}
+	conn, err := amqp.DialConfig(url, config)
+	if stopContextClose != nil {
+		stopContextClose()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if rawConn != nil {
+		if err := rawConn.SetDeadline(time.Time{}); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("清除 RabbitMQ 拨号超时: %w", err)
+		}
+	}
+	return &realConnection{conn: conn}, nil
 }
 
 // Ping 通过打开/关闭一个 channel 验证连接可用，受 ctx 超时约束。
 func (r *rabbitMQ) Ping(ctx context.Context) error {
-	done := make(chan error, 1)
-	go func() {
-		ch, err := r.conn.Channel()
+	for {
+		conn, ch, err := r.openChannel(ctx)
 		if err != nil {
-			done <- fmt.Errorf("RabbitMQ 不可用: %w", err)
-			return
+			return fmt.Errorf("RabbitMQ 不可用: %w", err)
 		}
-		ch.Close()
-		done <- nil
-	}()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-done:
-		return err
+		err = ch.Close()
+		if err == nil {
+			return nil
+		}
+		if !r.connectionClosed(conn, err) {
+			return fmt.Errorf("RabbitMQ 不可用: %w", err)
+		}
+		r.invalidate(conn)
 	}
 }
 
 func (r *rabbitMQ) Close() error {
-	return r.conn.Close()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	r.closeCancel()
+	conn := r.conn
+	r.conn = nil
+	r.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	err := conn.conn.Close()
+	if errors.Is(err, amqp.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 // Publish 投递持久化消息：
@@ -70,12 +285,27 @@ func (r *rabbitMQ) Close() error {
 //
 // 每次发布使用独立 channel（并发安全，学习取舍；高吞吐可换连接级复用）。
 func (r *rabbitMQ) Publish(ctx context.Context, queue string, body []byte) error {
-	ch, err := r.conn.Channel()
-	if err != nil {
-		return fmt.Errorf("MQ 发布开 channel: %w", err)
+	for {
+		conn, ch, err := r.openChannel(ctx)
+		if err != nil {
+			return fmt.Errorf("MQ 发布开 channel: %w", err)
+		}
+		err = publishOnce(ctx, ch, queue, body)
+		_ = ch.Close()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		if !r.connectionClosed(conn, err) {
+			return err
+		}
+		r.invalidate(conn)
 	}
-	defer ch.Close()
+}
 
+func publishOnce(ctx context.Context, ch amqpChannel, queue string, body []byte) error {
 	if err := declareQueue(ch, queue); err != nil {
 		return err
 	}
@@ -102,13 +332,32 @@ func (r *rabbitMQ) Publish(ctx context.Context, queue string, body []byte) error
 }
 
 // Consume 消费队列：手动 Ack 三态（成功/重投/死信）+ 每条消息独立超时；
-// 运行至 ctx 取消返回 nil，或 channel 异常返回错误（调用方负责重连）。
+// 连接中断时自动重拨并恢复消费，运行至 ctx 取消返回 nil。
 func (r *rabbitMQ) Consume(ctx context.Context, queue string, handler MessageHandler) error {
-	ch, err := r.conn.Channel()
-	if err != nil {
-		return fmt.Errorf("MQ 消费开 channel: %w", err)
+	for {
+		conn, ch, err := r.openChannel(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("MQ 消费开 channel: %w", err)
+		}
+		err = consumeSession(ctx, ch, queue, handler)
+		_ = ch.Close()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err == nil {
+			return nil
+		}
+		if !r.connectionClosed(conn, err) {
+			return err
+		}
+		r.invalidate(conn)
 	}
-	defer ch.Close()
+}
+
+func consumeSession(ctx context.Context, ch amqpChannel, queue string, handler MessageHandler) error {
 	// 消费端 QoS：预取 1，单消费者顺序处理、天然串行落单。
 	if err := ch.Qos(1, 0, false); err != nil {
 		return fmt.Errorf("MQ 消费 QoS: %w", err)
@@ -120,25 +369,157 @@ func (r *rabbitMQ) Consume(ctx context.Context, queue string, handler MessageHan
 	if err != nil {
 		return fmt.Errorf("MQ 开始消费: %w", err)
 	}
-
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case d, ok := <-msgs:
 			if !ok {
-				return fmt.Errorf("MQ 消费通道关闭")
+				return fmt.Errorf("MQ 消费通道关闭: %w", amqp.ErrClosed)
 			}
 			if err := consumeOne(ctx, d, handler, waitTransientRequeue); err != nil {
 				if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 					return nil
 				}
-				// Ack/Nack 自身失败（channel 异常）：退出消费循环，
-				// 由调用方（main）重连；未确认消息由 broker 自动重投（at-least-once）。
 				return err
 			}
 		}
 	}
+}
+
+func (r *rabbitMQ) openChannel(ctx context.Context) (*managedConnection, amqpChannel, error) {
+	for {
+		conn, err := r.connection(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		interrupt := func() { r.invalidate(conn) }
+		ch, err := callWithContext(ctx, interrupt, conn.conn.Channel)
+		if err == nil {
+			return conn, &contextChannel{ctx: ctx, interrupt: interrupt, channel: ch}, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		if !r.connectionClosed(conn, err) {
+			return nil, nil, err
+		}
+		r.invalidate(conn)
+	}
+}
+
+func (r *rabbitMQ) connection(ctx context.Context) (*managedConnection, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return nil, errRabbitMQClosed
+		}
+		if r.conn != nil && !r.conn.conn.IsClosed() {
+			conn := r.conn
+			r.mu.Unlock()
+			return conn, nil
+		}
+		if r.conn != nil {
+			r.conn = nil
+		}
+		if r.reconnecting != nil {
+			done := r.reconnecting
+			closeDone := r.closeCtx.Done()
+			r.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-closeDone:
+				return nil, errRabbitMQClosed
+			case <-done:
+				continue
+			}
+		}
+		if wait := time.Until(r.retryAt); wait > 0 {
+			closeDone := r.closeCtx.Done()
+			r.mu.Unlock()
+			if err := waitReconnect(ctx, closeDone, wait); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		done := make(chan struct{})
+		r.reconnecting = done
+		url, config, dial := r.url, r.config, r.dial
+		closeCtx := r.closeCtx
+		r.mu.Unlock()
+
+		dialCtx, cancel := context.WithCancel(ctx)
+		stopCloseCancel := context.AfterFunc(closeCtx, cancel)
+		newConn, err := dial(dialCtx, url, config)
+		stopCloseCancel()
+		cancel()
+
+		r.mu.Lock()
+		r.reconnecting = nil
+		close(done)
+		if r.closed {
+			r.mu.Unlock()
+			if newConn != nil {
+				_ = newConn.Close()
+			}
+			return nil, errRabbitMQClosed
+		}
+		if err != nil {
+			if ctx.Err() == nil {
+				r.retryAt = time.Now().Add(r.retryDelay)
+				r.retryDelay = min(r.retryDelay*2, reconnectMaxBackoff)
+			}
+			r.mu.Unlock()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		conn := &managedConnection{conn: newConn}
+		r.conn = conn
+		r.retryAt = time.Time{}
+		r.retryDelay = reconnectMinBackoff
+		r.mu.Unlock()
+		return conn, nil
+	}
+}
+
+func waitReconnect(ctx context.Context, closed <-chan struct{}, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-closed:
+		return errRabbitMQClosed
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (r *rabbitMQ) connectionClosed(conn *managedConnection, err error) bool {
+	return conn.conn.IsClosed() || errors.Is(err, amqp.ErrClosed)
+}
+
+func (r *rabbitMQ) invalidate(conn *managedConnection) {
+	r.mu.Lock()
+	if r.conn != conn {
+		r.mu.Unlock()
+		return
+	}
+	r.conn = nil
+	r.mu.Unlock()
+	_ = conn.conn.Close()
 }
 
 // consumeOne 单条消息：超时执行 handler 后按错误分类确认。
@@ -184,7 +565,7 @@ func waitTransientRequeue(ctx context.Context) error {
 
 // declareQueue 声明主队列（含死信配置）与死信队列，声明幂等（已存在则 no-op）。
 // 主队列 x-dead-letter-exchange 为空串 = 默认交换机，路由键指向死信队列名。
-func declareQueue(ch *amqp.Channel, queue string) error {
+func declareQueue(ch amqpChannel, queue string) error {
 	if strings.HasSuffix(queue, dlqSuffix) {
 		if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
 			return fmt.Errorf("MQ 声明死信队列 %s: %w", queue, err)

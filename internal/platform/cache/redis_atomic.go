@@ -129,7 +129,26 @@ func (r *redisCache) SyncCouponCounts(ctx context.Context, p CouponCountParams) 
 }
 
 func (r *redisCache) WarmFlashSaleStock(ctx context.Context, p FlashSaleWarmParams) (FlashSaleWarmResult, error) {
-	code, err := r.evalInt(ctx, warmFlashSaleStockScript, []string{p.StockKey}, p.Stock, int64(p.TTL.Seconds()))
+	return r.warmFlashSaleStock(ctx, p, 0)
+}
+
+func (r *redisCache) WarmFlashSaleStockDurably(ctx context.Context, p FlashSaleWarmParams, timeout time.Duration) (FlashSaleWarmResult, error) {
+	if timeout <= 0 {
+		return 0, fmt.Errorf("durable flash-sale stock warm timeout must be positive")
+	}
+	return r.warmFlashSaleStock(ctx, p, timeout)
+}
+
+func (r *redisCache) warmFlashSaleStock(ctx context.Context, p FlashSaleWarmParams, aofTimeout time.Duration) (FlashSaleWarmResult, error) {
+	if p.StockKey == "" || p.Stock < 0 || p.TTL < time.Second {
+		return 0, fmt.Errorf("flash-sale stock warm requires key, non-negative stock, and TTL")
+	}
+	overwrite := 0
+	if p.Overwrite {
+		overwrite = 1
+	}
+	code, err := r.evalFlashSaleInt(ctx, aofTimeout, warmFlashSaleStockScript, []string{p.StockKey},
+		p.Stock, int64(p.TTL.Seconds()), overwrite)
 	if err != nil {
 		return 0, err
 	}

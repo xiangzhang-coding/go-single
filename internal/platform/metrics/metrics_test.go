@@ -124,22 +124,26 @@ func TestGinMiddlewareRecordsHTTPMetrics(t *testing.T) {
 	require.Equal(t, float64(0), v)
 }
 
-func TestGinMiddlewareSkipsMetricsEndpoint(t *testing.T) {
+func TestGinMiddlewareSkipsInfrastructureAndWebSocketEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	reg := metrics.New()
 
 	r := gin.New()
 	r.Use(reg.GinMiddleware())
 	r.GET("/metrics", gin.WrapH(reg.Handler()))
+	r.GET("/ws", func(c *gin.Context) { c.Status(http.StatusSwitchingProtocols) })
 	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	require.Equal(t, http.StatusOK, doRequest(t, r, http.MethodGet, "/metrics"))
 	require.Equal(t, http.StatusOK, doRequest(t, r, http.MethodGet, "/metrics"))
+	require.Equal(t, http.StatusSwitchingProtocols, doRequest(t, r, http.MethodGet, "/ws"))
 	require.Equal(t, http.StatusOK, doRequest(t, r, http.MethodGet, "/ok"))
 
 	families := scrape(t, reg.Handler())
 	_, ok := findSample(t, families, "http_requests_total", map[string]string{"route": "/metrics"})
 	require.False(t, ok, "抓取流量不应计入指标")
+	_, ok = findSample(t, families, "http_requests_total", map[string]string{"route": "/ws"})
+	require.False(t, ok, "WebSocket 生命周期由专用状态观测，不应污染普通 HTTP 指标")
 	_, ok = findSample(t, families, "http_requests_total", map[string]string{"route": "/ok"})
 	require.True(t, ok, "业务请求仍应计入指标")
 }

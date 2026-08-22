@@ -98,9 +98,12 @@ type AuthRateLimit struct {
 
 // Upload is the durable per-user object-storage budget.
 type Upload struct {
-	MaxBytesPerUser   int64         `mapstructure:"max_bytes_per_user"`
-	MaxObjectsPerUser int64         `mapstructure:"max_objects_per_user"`
-	RequestTimeout    time.Duration `mapstructure:"request_timeout"`
+	MaxBytesPerUser      int64         `mapstructure:"max_bytes_per_user"`
+	MaxObjectsPerUser    int64         `mapstructure:"max_objects_per_user"`
+	RequestTimeout       time.Duration `mapstructure:"request_timeout"`
+	MaxConcurrent        int           `mapstructure:"max_concurrent"`
+	MaxConcurrentPerUser int           `mapstructure:"max_concurrent_per_user"`
+	MaxConcurrentPerIP   int           `mapstructure:"max_concurrent_per_ip"`
 }
 
 // Snowflake 雪花订单号生成器配置；多实例部署时每个实例必须使用不同 worker_id。
@@ -267,6 +270,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("auth.register_rate_limit.window", "1m")
 	v.SetDefault("upload.max_bytes_per_user", 512<<20)
 	v.SetDefault("upload.max_objects_per_user", 1000)
+	v.SetDefault("upload.max_concurrent", 16)
+	v.SetDefault("upload.max_concurrent_per_user", 2)
+	v.SetDefault("upload.max_concurrent_per_ip", 4)
 	v.SetDefault("snowflake.worker_id", 1)
 	v.SetDefault("flashsale.qps", 50)
 	v.SetDefault("flashsale.burst", 100)

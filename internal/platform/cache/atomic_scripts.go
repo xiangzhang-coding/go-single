@@ -118,9 +118,15 @@ return updated
 
 const warmFlashSaleStockScript = `
 local cur = tonumber(redis.call('GET', KEYS[1]) or '-1')
-if cur < 0 or tonumber(ARGV[1]) < cur then
+if ARGV[3] == '1' or cur < 0 or tonumber(ARGV[1]) < cur then
     redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
     return 1
+end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl > 0 then
+    redis.call('SET', KEYS[1], cur, 'PX', ttl)
+else
+    redis.call('SET', KEYS[1], cur)
 end
 return 0
 `

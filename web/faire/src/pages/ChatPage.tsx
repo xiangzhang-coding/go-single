@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useMutation } from "@tanstack/react-query";
 
-import { getMessages, markConversationRead, sendMessage, uploadFile } from "../api/endpoints";
+import { getConversations, getMessages, markConversationRead, sendMessage, uploadFile } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import type { Message } from "../api/types";
 import { Button, EmptyState, Icon, LoadingBlock, Spinner } from "../components/ui";
@@ -10,7 +10,7 @@ import { AuthorizedDownload, AuthorizedImage } from "../components/AuthorizedMed
 import { useAuthStore } from "../store/auth";
 import { useChatStore } from "../store/chat";
 import { formatDate } from "../lib/format";
-import { latestMessageID } from "../lib/chat";
+import { conversationBeforeID, latestMessageID } from "../lib/chat";
 import { IMAGE_ACCEPT, MESSAGE_FILE_ACCEPT, validateImage, validateMessageFile } from "../lib/media";
 import {
   createMediaSendOperation,
@@ -21,7 +21,14 @@ import {
 
 export function ChatPage() {
   const { token, user } = useAuthStore();
-  const { conversations, messagesByKey, activeKey, setActiveKey } = useChatStore();
+  const {
+    conversations,
+    conversationsHasMore,
+    messagesByKey,
+    activeKey,
+    setActiveKey,
+    setConversationPage,
+  } = useChatStore();
   const [searchParams] = useSearchParams();
   const peerParam = searchParams.get("peer");
 
@@ -44,6 +51,21 @@ export function ChatPage() {
   useEffect(() => {
     if (Number.isFinite(peerId) && !existing && newPeerId !== peerId) setNewPeerId(peerId);
   }, [peerId, existing, newPeerId]);
+
+  useEffect(() => () => {
+    setActiveKey(null);
+  }, [setActiveKey]);
+
+  const loadMoreConversations = useMutation({
+    mutationFn: async () => {
+      const beforeId = conversationBeforeID(conversations);
+      if (!beforeId) return null;
+      return getConversations({ beforeId, limit: 20 });
+    },
+    onSuccess: (page) => {
+      if (page) setConversationPage(page.items, page.has_more);
+    },
+  });
 
   const activeConversation = conversations.find((c) => c.conversation_key === activeKey) ?? null;
   const activeMessages = activeKey ? (messagesByKey[activeKey] ?? []) : [];
@@ -69,6 +91,9 @@ export function ChatPage() {
             setActiveKey(key);
             setNewPeerId(null);
           }}
+          hasMore={conversationsHasMore}
+          loadingMore={loadMoreConversations.isPending}
+          onLoadMore={() => loadMoreConversations.mutate()}
           hidden={Boolean(activeKey)}
         />
         <div className={`chat-thread ${activeKey || newPeerId ? "" : "chat-thread-empty"}`}>
@@ -115,11 +140,17 @@ function ConversationList({
   conversations,
   activeKey,
   onSelect,
+  hasMore,
+  loadingMore,
+  onLoadMore,
   hidden,
 }: {
   conversations: Array<{ conversation_key: string; peer_username: string; last_message?: Message; unread_count: number }>;
   activeKey: string | null;
   onSelect: (key: string) => void;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
   hidden: boolean;
 }) {
   const navigate = useNavigate();
@@ -155,6 +186,13 @@ function ConversationList({
               </button>
             </li>
           ))}
+          {hasMore && (
+            <li className="flex justify-center py-2">
+              <button type="button" className="chat-load-older" disabled={loadingMore} onClick={onLoadMore}>
+                {loadingMore ? "加载中…" : "加载更多会话"}
+              </button>
+            </li>
+          )}
         </ul>
       )}
     </aside>

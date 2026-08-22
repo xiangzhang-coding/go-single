@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { User } from "../src/api/types";
 import { queryClient } from "../src/lib/query-client";
 import { startSession, syncSessionFromStorage } from "../src/lib/session";
+import { currentSessionRequestSignal } from "../src/lib/session-request";
 import { useAuthStore } from "../src/store/auth";
 import { useChatStore } from "../src/store/chat";
 
@@ -23,6 +24,17 @@ afterEach(() => {
 });
 
 describe("session resources", () => {
+  test("switching identities aborts old requests and starts a fresh request generation", () => {
+    useAuthStore.setState({ token: "alice-token", user: user(1, "alice") });
+    const aliceSignal = currentSessionRequestSignal();
+
+    startSession("bob-token", user(2, "bob"));
+
+    expect(aliceSignal.aborted).toBe(true);
+    expect(currentSessionRequestSignal()).not.toBe(aliceSignal);
+    expect(currentSessionRequestSignal().aborted).toBe(false);
+  });
+
   test("switching accounts clears server cache and chat state before applying the new session", () => {
     useAuthStore.setState({ token: "alice-token", user: user(1, "alice") });
     queryClient.setQueryData(["private-profile"], { username: "alice" });

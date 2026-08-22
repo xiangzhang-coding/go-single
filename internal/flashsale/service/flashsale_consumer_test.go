@@ -1,4 +1,4 @@
-// 秒杀异步落单消费者单元测试（中间 seam）：fake 活动仓储 + fake order/user 服务，
+// 秒杀异步落单消费者单元测试（中间 seam）：fake 活动仓储 + fake order 服务，
 // 覆盖消息解析、活动/默认地址缺失（永久失败 → 死信）、落单错误分类
 // （业务永久 / 基础设施瞬时 → 重投）与成功路径。
 package service
@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/repository"
@@ -24,9 +25,11 @@ import (
 // ---- fake 消费者依赖 ----
 
 type fakeOrderService struct {
-	created  []ordersvc.SeckillCreateParams
-	inserted bool
-	err      error
+	created      []ordersvc.SeckillCreateParams
+	inserted     bool
+	err          error
+	snapshot     *ordersvc.SeckillOrderSnapshot
+	prepareError error
 }
 
 func (f *fakeOrderService) CreateSeckillInTx(_ context.Context, _ *transaction.Handle, p ordersvc.SeckillCreateParams) (bool, error) {
@@ -34,35 +37,23 @@ func (f *fakeOrderService) CreateSeckillInTx(_ context.Context, _ *transaction.H
 	return f.inserted, f.err
 }
 
-type fakeUserService struct {
-	addresses map[int64]*usermodel.Address // userID → 默认地址
-	err       error
-}
-
-func newFakeUserService() *fakeUserService {
-	return &fakeUserService{addresses: map[int64]*usermodel.Address{}}
-}
-
-func (f *fakeUserService) GetDefaultAddress(_ context.Context, userID int64) (*usermodel.Address, error) {
-	if f.err != nil {
-		return nil, f.err
+func (f *fakeOrderService) PrepareSeckillOrder(_ context.Context, userID, skuID int64) (*ordersvc.SeckillOrderSnapshot, error) {
+	if f.prepareError != nil {
+		return nil, f.prepareError
 	}
-	return f.addresses[userID], nil
-}
-
-// seedAddress 为用户种默认地址（与 order 单测同构的快照数据）。
-func (f *fakeUserService) seedAddress(userID int64) {
-	f.addresses[userID] = &usermodel.Address{
-		ID: 1, UserID: userID, Receiver: "张三", Phone: "13800138000",
-		Province: "广东省", City: "深圳市", District: "南山区", Detail: "科技园 1 号",
+	if f.snapshot == nil {
+		return nil, nil
 	}
+	snapshot := *f.snapshot
+	snapshot.SKUID = skuID
+	snapshot.Address.UserID = userID
+	return &snapshot, nil
 }
 
 // consumerFixture 消费者测试夹具。
 type consumerFixture struct {
 	consumer *SeckillOrderConsumer
 	orders   *fakeOrderService
-	users    *fakeUserService
 	acts     *fakeActivities
 	pd       *fakePreDeductions
 	cache    *fakeCache
@@ -71,13 +62,11 @@ type consumerFixture struct {
 func newConsumerFixture() *consumerFixture {
 	acts := newFakeActivities()
 	orders := &fakeOrderService{inserted: true}
-	users := newFakeUserService()
 	pd := newFakePreDeductions()
 	cache := newFakeCache()
 	return &consumerFixture{
-		consumer: NewSeckillOrderConsumer(acts, pd, cache, fakeSeckillTx{}, orders, users, metrics.New().Business(), zap.NewNop()),
+		consumer: NewSeckillOrderConsumer(acts, pd, cache, fakeSeckillTx{}, orders, metrics.New().Business(), zap.NewNop()),
 		orders:   orders,
-		users:    users,
 		acts:     acts,
 		pd:       pd,
 		cache:    cache,
@@ -87,7 +76,13 @@ func newConsumerFixture() *consumerFixture {
 // seed 种活动（进行中、秒杀价 9900）与用户默认地址，返回活动。
 func (fx *consumerFixture) seed(t *testing.T, userID int64) *model.Activity {
 	t.Helper()
-	fx.users.seedAddress(userID)
+	fx.orders.snapshot = &ordersvc.SeckillOrderSnapshot{
+		SKUID: 5, ProductID: 9, ProductTitle: "秒杀商品", Specs: json.RawMessage(`{"color":"红"}`),
+		Address: usermodel.Address{
+			ID: 1, UserID: userID, Receiver: "张三", Phone: "13800138000",
+			Province: "广东省", City: "深圳市", District: "南山区", Detail: "科技园 1 号",
+		},
+	}
 	a := &model.Activity{ID: 1, SKUID: 5, Title: "限时秒杀", Price: 9900, Stock: 10, Status: "on_sale"}
 	require.NoError(t, fx.acts.Create(context.Background(), a))
 	fx.cache.stock[stockKey(a.ID)] = a.Stock
@@ -121,7 +116,7 @@ func TestConsumerHappyPath(t *testing.T) {
 	require.Equal(t, a.SKUID, p.SKUID)
 	require.Equal(t, a.Price, p.Price, "订单应固化秒杀价")
 	require.Equal(t, 1, p.Quantity)
-	require.Equal(t, "张三", p.Address.Receiver, "地址快照应取自默认地址")
+	require.Equal(t, "张三", p.Snapshot.Address.Receiver, "地址快照应取自默认地址")
 	require.Equal(t, 9, a.Stock, "落单应在同一事务中扣减活动库存")
 }
 
@@ -187,7 +182,6 @@ func TestConsumerInvalidMessagePermanent(t *testing.T) {
 // 活动不存在：永久失败（死信；持久生命周期回退），不落单。
 func TestConsumerActivityMissingPermanent(t *testing.T) {
 	fx := newConsumerFixture()
-	fx.users.seedAddress(42)
 
 	err := fx.consumer.Handle(context.Background(),
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: 999}))
@@ -199,7 +193,7 @@ func TestConsumerActivityMissingPermanent(t *testing.T) {
 func TestConsumerNoDefaultAddressPermanent(t *testing.T) {
 	fx := newConsumerFixture()
 	a := fx.seed(t, 42)
-	fx.users.addresses = map[int64]*usermodel.Address{} // 清掉地址
+	fx.orders.snapshot = nil
 
 	err := fx.consumer.Handle(context.Background(),
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: a.ID}))
@@ -210,9 +204,8 @@ func TestConsumerNoDefaultAddressPermanent(t *testing.T) {
 // 活动读取 DB 故障：瞬时失败（重投），不落单。
 func TestConsumerActivityReadFailureTransient(t *testing.T) {
 	fx := newConsumerFixture()
-	fx.users.seedAddress(42)
 
-	fx.consumer = NewSeckillOrderConsumer(&failingActivities{}, fx.pd, fx.cache, fakeSeckillTx{}, fx.orders, fx.users, metrics.New().Business(), zap.NewNop())
+	fx.consumer = NewSeckillOrderConsumer(&failingActivities{}, fx.pd, fx.cache, fakeSeckillTx{}, fx.orders, metrics.New().Business(), zap.NewNop())
 	err := fx.consumer.Handle(context.Background(),
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: 1}))
 	require.Error(t, err)
@@ -224,7 +217,7 @@ func TestConsumerActivityReadFailureTransient(t *testing.T) {
 func TestConsumerAddressReadFailureTransient(t *testing.T) {
 	fx := newConsumerFixture()
 	a := fx.seed(t, 42)
-	fx.users.err = errors.New("mysql down")
+	fx.orders.prepareError = errors.New("mysql down")
 
 	err := fx.consumer.Handle(context.Background(),
 		marshalMsg(t, SeckillSuccessMessage{OrderNo: "10001", UserID: 42, ActivityID: a.ID}))
@@ -299,7 +292,7 @@ func TestConsumerTransitionsPreDeductionToOrdered(t *testing.T) {
 func TestConsumerPermanentFailureSchedulesDurableRollback(t *testing.T) {
 	fx := newConsumerFixture()
 	a := fx.seed(t, 42)
-	fx.users.addresses = map[int64]*usermodel.Address{}
+	fx.orders.snapshot = nil
 	orderNo := "10001"
 	pd := &model.PreDeduction{
 		UserID: 42, ActivityID: a.ID, OrderNo: &orderNo,
@@ -323,7 +316,7 @@ func TestLegacyConsumerPermanentFailureCreatesRollbackLifecycle(t *testing.T) {
 	a := fx.seed(t, 42)
 	delete(fx.cache.stock, stockKey(a.ID))
 	delete(fx.cache.count, countKey(a.ID, 42))
-	fx.users.addresses = map[int64]*usermodel.Address{}
+	fx.orders.snapshot = nil
 
 	err := fx.consumer.Handle(context.Background(), marshalMsg(t, SeckillSuccessMessage{
 		OrderNo: "legacy-10001", UserID: 42, ActivityID: a.ID,
@@ -379,6 +372,20 @@ func TestDeadLetterSchedulesDurableRollback(t *testing.T) {
 	stored, getErr := fx.pd.GetByID(context.Background(), pd.ID)
 	require.NoError(t, getErr)
 	require.Equal(t, model.PreDeductionStatusPendingRollback, stored.Status)
+}
+
+func TestDeadLetterParseFailureLogsOnlyBodyMetadata(t *testing.T) {
+	fx := newConsumerFixture()
+	core, logs := observer.New(zap.ErrorLevel)
+	fx.consumer.log = zap.New(core)
+
+	require.NoError(t, fx.consumer.HandleDeadLetter(context.Background(), []byte("abc")))
+	require.Equal(t, 1, logs.Len())
+	fields := logs.All()[0].ContextMap()
+	require.NotContains(t, fields, "body")
+	require.EqualValues(t, 3, fields["body_length"])
+	require.Equal(t, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", fields["body_sha256"])
+	require.NotContains(t, logs.All()[0].Message, "abc")
 }
 
 func TestLegacyDeadLetterCreatesRollbackLifecycle(t *testing.T) {

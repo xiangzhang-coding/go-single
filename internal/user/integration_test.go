@@ -444,6 +444,11 @@ func TestUserSearchByPrefix(t *testing.T) {
 	}
 	require.Contains(t, usernames, userB)
 	require.NotContains(t, usernames, userA)
+	w, body = doJSON(t, env, http.MethodGet, "/api/users?username="+prefix+"&limit=1", "", tokenA)
+	require.Equal(t, http.StatusOK, w.Code)
+	limited := body["items"].([]any)
+	require.Len(t, limited, 1, "排除自己必须发生在 SQL LIMIT 前")
+	require.Equal(t, userB, limited[0].(map[string]any)["username"])
 
 	// 无匹配：空列表。
 	w, body = doJSON(t, env, http.MethodGet, "/api/users?username=nomatch_zz_"+fmt.Sprint(uid), "", tokenA)

@@ -4,6 +4,7 @@ import { AxiosError } from "axios";
 import { api, ApiRequestError, getApiErrorMessage } from "../src/api/client";
 import { uploadFile } from "../src/api/endpoints";
 import type { User } from "../src/api/types";
+import { startSession } from "../src/lib/session";
 import { useAuthStore } from "../src/store/auth";
 
 const user = (id: number, username: string): User => ({
@@ -29,6 +30,21 @@ afterEach(() => {
 });
 
 describe("API client session boundaries", () => {
+  test("binds authenticated requests to the current session abort generation", async () => {
+    let requestSignal: AbortSignal | undefined;
+    api.defaults.adapter = async (config) => {
+      requestSignal = config.signal;
+      return { data: { ok: true }, status: 200, statusText: "OK", headers: {}, config };
+    };
+    useAuthStore.setState({ token: "alice-token", user: user(1, "alice") });
+
+    await api.get("/probe");
+    startSession("bob-token", user(2, "bob"));
+
+    expect(requestSignal).toBeDefined();
+    expect(requestSignal?.aborted).toBe(true);
+  });
+
   test("attaches the current bearer token to requests", async () => {
     let authorization: unknown;
     api.defaults.adapter = async (config) => {

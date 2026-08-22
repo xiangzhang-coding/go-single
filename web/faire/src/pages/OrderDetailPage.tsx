@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -6,14 +6,18 @@ import { cancelOrder, confirmOrder, getOrder, mockPay } from "../api/endpoints";
 import { ApiRequestError, getApiErrorMessage } from "../api/client";
 import { formatAddress, formatDate, formatMoney, formatSpecs } from "../lib/format";
 import { shouldRetryOrderDetail } from "../lib/order";
+import { clearCheckoutOperationByOrderNo, isCheckoutOrderProcessing } from "../lib/pending-operations";
 import { Button, ErrorState, Icon, LoadingBlock, ProductVisual, Spinner, StatusBadge } from "../components/ui";
+import { useAuthStore } from "../store/auth";
 
 export function OrderDetailPage() {
   const { orderNo = "" } = useParams();
   const location = useLocation();
   const queryClient = useQueryClient();
+  const userId = useAuthStore((state) => state.user?.id ?? 0);
   const [actionError, setActionError] = useState("");
-  const awaitingCreation = Boolean((location.state as { awaitingCreation?: boolean } | null)?.awaitingCreation);
+  const awaitingCreation = Boolean((location.state as { awaitingCreation?: boolean } | null)?.awaitingCreation)
+    || (Boolean(orderNo && userId) && isCheckoutOrderProcessing(userId, orderNo));
   const orderQuery = useQuery({
     queryKey: ["order", orderNo],
     queryFn: () => getOrder(orderNo),
@@ -29,6 +33,9 @@ export function OrderDetailPage() {
     queryClient.invalidateQueries({ queryKey: ["order", orderNo] });
     queryClient.invalidateQueries({ queryKey: ["orders"] });
   };
+  useEffect(() => {
+    if (orderQuery.data && userId) clearCheckoutOperationByOrderNo(userId, orderNo);
+  }, [orderNo, orderQuery.data, userId]);
   const payMutation = useMutation({
     mutationFn: (result: "success" | "fail") => mockPay(orderNo, orderQuery.data!.pay_amount, result),
     onSuccess: (payment) => {
@@ -101,7 +108,7 @@ export function OrderDetailPage() {
             </div>
 
             {isPending && (
-              <div className="payment-panel mt-8"><p className="eyebrow text-smoke">模拟支付</p><h2 className="mt-3 font-nantes text-3xl">现在完成支付</h2><p className="mt-3 text-sm leading-6 text-smoke">这是内部演示接口，不会连接真实支付渠道。成功后订单进入“已支付”。</p><Button className="mt-6 w-full justify-center" onClick={() => pay("success")} disabled={busy}>{payMutation.isPending ? <Spinner label="支付处理中" /> : <>模拟支付成功 <Icon name="check" size={17} /></>}</Button><Button variant="ghost" className="mt-2 w-full justify-center text-sm" onClick={() => pay("fail")} disabled={busy}>模拟支付失败</Button>{order.order_type !== "seckill" && <Button variant="danger" className="mt-5 w-full justify-center" onClick={cancel} disabled={busy}>取消订单</Button>}</div>
+              <div className="payment-panel mt-8"><p className="eyebrow text-smoke">模拟支付</p><h2 className="mt-3 font-nantes text-3xl">现在完成支付</h2><p className="mt-3 text-sm leading-6 text-smoke">这是内部演示接口，不会连接真实支付渠道。成功后订单进入“已支付”。</p><Button className="mt-6 w-full justify-center" onClick={() => pay("success")} disabled={busy}>{payMutation.isPending ? <Spinner label="支付处理中" /> : <>模拟支付成功 <Icon name="check" size={17} /></>}</Button><Button variant="ghost" className="mt-2 w-full justify-center text-sm" onClick={() => pay("fail")} disabled={busy}>模拟支付失败</Button><Button variant="danger" className="mt-5 w-full justify-center" onClick={cancel} disabled={busy}>取消订单</Button></div>
             )}
             {order.status === "paid" && <div className="waiting-panel mt-8"><p className="eyebrow text-smoke">配送中</p><h2 className="mt-3 font-nantes text-3xl">等待发货</h2><p className="mt-3 text-sm leading-6 text-smoke">订单已支付，等待后台完成发货。</p></div>}
             {order.status === "shipped" && <div className="payment-panel mt-8"><p className="eyebrow text-smoke">确认收货</p><h2 className="mt-3 font-nantes text-3xl">东西到了吗？</h2><p className="mt-3 text-sm leading-6 text-smoke">确认后订单会进入已完成状态。</p><Button className="mt-6 w-full justify-center" onClick={() => confirmMutation.mutate()} disabled={busy}>{confirmMutation.isPending ? <Spinner label="正在确认" /> : <>确认收货 <Icon name="check" size={17} /></>}</Button></div>}

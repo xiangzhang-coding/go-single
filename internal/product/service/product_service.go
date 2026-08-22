@@ -32,9 +32,10 @@ var (
 
 // 商品详情缓存约定：key product:detail:{id}，TTL 5min（见规格容错节）。
 const (
-	detailCacheTTL    = 5 * time.Minute
-	detailMutationTTL = 30 * time.Minute
-	detailAOFTimeout  = 2 * time.Second
+	detailCacheTTL       = 5 * time.Minute
+	detailMutationTTL    = 30 * time.Minute
+	detailAOFTimeout     = 2 * time.Second
+	detailCleanupTimeout = detailAOFTimeout + time.Second
 	// 分页上限与默认页大小。
 	defaultPageSize = 20
 	maxPageSize     = 50
@@ -516,7 +517,11 @@ func (s *productService) withDetailMutation(ctx context.Context, productID int64
 	if err != nil {
 		return err
 	}
-	defer s.FinishDetailMutation(context.WithoutCancel(ctx), productID, token)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detailCleanupTimeout)
+		defer cancel()
+		s.FinishDetailMutation(cleanupCtx, productID, token)
+	}()
 	return mutate()
 }
 

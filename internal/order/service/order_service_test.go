@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sort"
 	"strconv"
 	"sync"
@@ -227,7 +229,10 @@ func (f *fakeOrders) ConfirmReceipt(_ context.Context, orderNo string) (bool, er
 }
 
 // fakeTx 单测事务运行器：执行回调并暴露事务活动窗口供围栏时序断言。
-type fakeTx struct{ active *bool }
+type fakeTx struct {
+	active    *bool
+	commitErr error
+}
 
 var serviceTestTx = new(transaction.Handle)
 
@@ -236,7 +241,10 @@ func (f fakeTx) WithinTx(_ context.Context, fn func(tx *transaction.Handle) erro
 		*f.active = true
 		defer func() { *f.active = false }()
 	}
-	return fn(nil)
+	if err := fn(nil); err != nil {
+		return err
+	}
+	return f.commitErr
 }
 
 type fakeItems struct {
@@ -339,6 +347,8 @@ type fakeProducts struct {
 	deductCalls       int
 	mutationBegun     []int64
 	mutationFinished  []int64
+	finishDeadlines   []time.Time
+	finishContextErrs []error
 	transactionActive *bool
 	fenceInsideTx     bool
 }
@@ -351,10 +361,13 @@ func (f *fakeProducts) BeginDetailMutation(_ context.Context, productID int64) (
 	return fmt.Sprintf("mutation-%d-%d", productID, len(f.mutationBegun)), nil
 }
 
-func (f *fakeProducts) FinishDetailMutation(_ context.Context, productID int64, _ string) {
+func (f *fakeProducts) FinishDetailMutation(ctx context.Context, productID int64, _ string) {
 	if f.transactionActive != nil && *f.transactionActive {
 		f.fenceInsideTx = true
 	}
+	deadline, _ := ctx.Deadline()
+	f.finishDeadlines = append(f.finishDeadlines, deadline)
+	f.finishContextErrs = append(f.finishContextErrs, ctx.Err())
 	f.mutationFinished = append(f.mutationFinished, productID)
 }
 
@@ -375,6 +388,18 @@ func (f *fakeProducts) GetSKU(_ context.Context, id int64) (*productmodel.SKU, e
 		return nil, productsvc.ErrSKUNotFound
 	}
 	return s, nil
+}
+
+func (f *fakeProducts) GetProduct(_ context.Context, id int64) (*productmodel.Product, error) {
+	detail, ok := f.details[id]
+	if !ok {
+		return nil, productsvc.ErrProductNotFound
+	}
+	product := detail.Product
+	if f.offSale[id] {
+		product.Status = productmodel.ProductStatusOffSale
+	}
+	return &product, nil
 }
 
 func (f *fakeProducts) GetSKUForUpdate(ctx context.Context, _ *transaction.Handle, id int64) (*productmodel.SKU, error) {
@@ -551,6 +576,15 @@ func (f *fakeUsers) GetAddress(_ context.Context, userID, id int64) (*usermodel.
 	return a, nil
 }
 
+func (f *fakeUsers) GetDefaultAddress(_ context.Context, userID int64) (*usermodel.Address, error) {
+	for _, address := range f.addresses {
+		if address.UserID == userID {
+			return address, nil
+		}
+	}
+	return nil, nil
+}
+
 // fakeNos 序列号生成器：1, 2, 3, ...
 type fakeNos struct{ next int64 }
 
@@ -570,6 +604,8 @@ type fixture struct {
 	coupons *fakeCoupons
 	cart    *fakeCart
 	users   *fakeUsers
+	tx      *fakeTx
+	metrics *metrics.Registry
 }
 
 func newFixture() *fixture {
@@ -578,13 +614,15 @@ func newFixture() *fixture {
 	var transactionActive bool
 	prods.transactionActive = &transactionActive
 	coupons.transactionActive = &transactionActive
+	tx := &fakeTx{active: &transactionActive}
+	metricRegistry := metrics.New()
 	svc := New(
-		repository.Store{Orders: orders, Items: items, Tx: fakeTx{active: &transactionActive}},
+		repository.Store{Orders: orders, Items: items, Tx: tx},
 		cache, &fakeNos{}, prods, coupons, cart, users,
-		metrics.New().Business(),
+		metricRegistry.Business(),
 	)
 	return &fixture{svc: svc, orders: orders, items: items, cache: cache, prods: prods,
-		coupons: coupons, cart: cart, users: users}
+		coupons: coupons, cart: cart, users: users, tx: tx, metrics: metricRegistry}
 }
 
 // newFixtureWithRetry 同 newFixture，但订单服务启用有限重试（退避极小，测试快速）。
@@ -595,17 +633,27 @@ func newFixtureWithRetry(t *testing.T, attempts int) *fixture {
 	var transactionActive bool
 	prods.transactionActive = &transactionActive
 	coupons.transactionActive = &transactionActive
+	tx := &fakeTx{active: &transactionActive}
+	metricRegistry := metrics.New()
 	svc := New(
-		repository.Store{Orders: orders, Items: items, Tx: fakeTx{active: &transactionActive}},
+		repository.Store{Orders: orders, Items: items, Tx: tx},
 		cache, &fakeNos{}, prods, coupons, cart, users,
-		metrics.New().Business(), retry.Config{
+		metricRegistry.Business(), retry.Config{
 			Attempts:       attempts,
 			InitialBackoff: time.Millisecond,
 			MaxBackoff:     2 * time.Millisecond,
 		},
 	)
 	return &fixture{svc: svc, orders: orders, items: items, cache: cache, prods: prods,
-		coupons: coupons, cart: cart, users: users}
+		coupons: coupons, cart: cart, users: users, tx: tx, metrics: metricRegistry}
+}
+
+func scrapeMetrics(t *testing.T, registry *metrics.Registry) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	return rec.Body.String()
 }
 
 // seed 标准商品 + 地址 + 券：skuID=1 售价 100 分 库存 10。
@@ -665,6 +713,27 @@ func TestCreateDirectHappyPath(t *testing.T) {
 	require.Equal(t, []int64{1}, fx.prods.mutationBegun)
 	require.Equal(t, []int64{1}, fx.prods.mutationFinished, "事务结束后应解除详情写入围栏")
 	require.False(t, fx.prods.fenceInsideTx, "Redis 围栏操作不应占用 MySQL 事务和行锁")
+}
+
+func TestOrderMutationCleanupSharesIndependentDeadline(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.prods.seed(3, 2, 300, 5)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := fx.svc.Create(ctx, 42, CreateParams{
+		ClientRequestID: "cleanup-context", AddressID: 1,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}, {SKUID: 3, Quantity: 1}},
+	})
+	require.NoError(t, err)
+	require.Len(t, fx.prods.finishDeadlines, 2)
+	require.False(t, fx.prods.finishDeadlines[0].IsZero())
+	require.Equal(t, fx.prods.finishDeadlines[0], fx.prods.finishDeadlines[1],
+		"all fences must share one total cleanup budget")
+	for _, cleanupErr := range fx.prods.finishContextErrs {
+		require.NoError(t, cleanupErr, "request cancellation must not skip cleanup")
+	}
 }
 
 func TestCreateMaximumPriceBoundary(t *testing.T) {
@@ -1489,7 +1558,75 @@ func TestCreateFromCartWithCoupon(t *testing.T) {
 	require.Equal(t, couponmodel.CouponStatusUsed, fx.coupons.coupons[11].Status)
 }
 
+func TestCouponRedeemedMetricRequiresOrderCommit(t *testing.T) {
+	failed := newFixture()
+	failed.seed(t)
+	failed.coupons.seed(12, 42, 50, 0)
+	failed.tx.commitErr = errors.New("commit failed")
+	_, err := failed.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "coupon-metric-failed", AddressID: 1, CouponID: 12,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}},
+	})
+	require.Error(t, err)
+	require.Contains(t, scrapeMetrics(t, failed.metrics), "coupon_redeemed_total 0")
+
+	committed := newFixture()
+	committed.seed(t)
+	committed.coupons.seed(13, 42, 50, 0)
+	_, err = committed.svc.Create(context.Background(), 42, CreateParams{
+		ClientRequestID: "coupon-metric-committed", AddressID: 1, CouponID: 13,
+		Items: []ItemParams{{SKUID: 1, Quantity: 1}},
+	})
+	require.NoError(t, err)
+	require.Contains(t, scrapeMetrics(t, committed.metrics), "coupon_redeemed_total 1")
+}
+
+func TestMarkPaidDoesNotRecordStatusBeforeCallerCommit(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	created, err := fx.svc.Create(context.Background(), 42, fx.directParams("mark-paid-metric", 1, 1))
+	require.NoError(t, err)
+
+	ok, err := fx.svc.MarkPaid(context.Background(), new(transaction.Handle), created.Order.OrderNo, created.Order.PayAmount)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NotContains(t, scrapeMetrics(t, fx.metrics), `orders_status_total{status="paid"}`)
+}
+
 // ---- 秒杀异步落单（T12：CreateSeckillInTx）----
+
+func TestPrepareSeckillOrderUsesInternalSnapshotAfterProductUnpublish(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	fx.prods.offSale[1] = true
+
+	snapshot, err := fx.svc.PrepareSeckillOrder(context.Background(), 42, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(1), snapshot.SKUID)
+	require.Equal(t, int64(1), snapshot.ProductID)
+	require.Equal(t, "商品", snapshot.ProductTitle)
+	require.JSONEq(t, `{"color":"红"}`, string(snapshot.Specs))
+	require.Equal(t, "张三", snapshot.Address.Receiver)
+}
+
+func TestCreateSeckillUsesPreparedSnapshotAfterProductChanges(t *testing.T) {
+	fx := newFixture()
+	fx.seed(t)
+	snapshot, err := fx.svc.PrepareSeckillOrder(context.Background(), 42, 1)
+	require.NoError(t, err)
+	delete(fx.prods.skus, 1)
+	delete(fx.prods.details, 1)
+
+	params := fx.seckillParams("prepared-snapshot")
+	params.Snapshot = snapshot
+	created, err := fx.svc.CreateSeckillInTx(context.Background(), serviceTestTx, params)
+
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, "商品", fx.items.byOrder["prepared-snapshot"][0].Title)
+	require.JSONEq(t, `{"color":"红"}`, string(fx.items.byOrder["prepared-snapshot"][0].Specs))
+}
 
 // seckillParams 合法秒杀落单参数（用户 42 默认地址 seed 自 fx.seed）。
 func (fx *fixture) seckillParams(orderNo string) SeckillCreateParams {
@@ -1502,7 +1639,10 @@ func (fx *fixture) seckillParams(orderNo string) SeckillCreateParams {
 		SKUID:        1,
 		Price:        9900,
 		Quantity:     1,
-		Address:      addr,
+		Snapshot: &SeckillOrderSnapshot{
+			SKUID: 1, ProductID: 1, ProductTitle: "商品", Specs: json.RawMessage(`{"color":"红"}`),
+			Address: *addr,
+		},
 	}
 }
 
@@ -1612,7 +1752,7 @@ func TestCreateSeckillValidation(t *testing.T) {
 		mut  func(*SeckillCreateParams)
 	}{
 		{"空订单号", func(p *SeckillCreateParams) { p.OrderNo = "" }},
-		{"缺地址", func(p *SeckillCreateParams) { p.Address = nil }},
+		{"缺快照", func(p *SeckillCreateParams) { p.Snapshot = nil }},
 		{"非法活动", func(p *SeckillCreateParams) { p.ActivityID = 0 }},
 		{"非法购买槽位", func(p *SeckillCreateParams) { p.PurchaseSlot = 0 }},
 		{"非法数量", func(p *SeckillCreateParams) { p.Quantity = 0 }},
@@ -1627,14 +1767,12 @@ func TestCreateSeckillValidation(t *testing.T) {
 	}
 }
 
-// SKU 不存在：ErrSKUNotFound（永久失败 → 死信）。
-func TestCreateSeckillSKUMissing(t *testing.T) {
+// SKU 不存在：准备快照时返回 ErrSKUNotFound（永久失败 → 死信）。
+func TestPrepareSeckillSKUMissing(t *testing.T) {
 	fx := newFixture()
 	fx.seed(t)
-	p := fx.seckillParams("S1")
-	p.SKUID = 999
 
-	_, err := fx.svc.CreateSeckillInTx(context.Background(), serviceTestTx, p)
+	_, err := fx.svc.PrepareSeckillOrder(context.Background(), 42, 999)
 	require.ErrorIs(t, err, ErrSKUNotFound)
 }
 

@@ -208,7 +208,7 @@ func buildEnv() (*testEnv, error) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	api := r.Group("/api")
-	file.NewHandler(svc, verifier, nil).RegisterRoutes(api)
+	file.NewHandler(svc, verifier, nil, file.UploadConcurrencyConfig{}).RegisterRoutes(api)
 	return &testEnv{router: r, bucket: cfg.Bucket, endpoint: cfg.Endpoint, client: client, svc: svc, usage: usage}, nil
 }
 
@@ -472,7 +472,7 @@ func TestUploadQuotaStopsRepeatedLegalUploads(t *testing.T) {
 	verifier := auth.NewJWT(auth.JWTConfig{Secret: "integration-test-secret", TTL: 2 * time.Hour})
 	r := gin.New()
 	api := r.Group("/api")
-	file.NewHandler(svc, verifier, nil).RegisterRoutes(api)
+	file.NewHandler(svc, verifier, nil, file.UploadConcurrencyConfig{}).RegisterRoutes(api)
 	limited := &testEnv{router: r}
 
 	ownerToken := tokenFor(t, 9001, 2*time.Hour)

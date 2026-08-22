@@ -3,6 +3,7 @@ import { useAuthStore } from "../store/auth";
 import { useChatStore } from "../store/chat";
 import { sessionIdentityChanged, type StoredSession } from "./auth-storage";
 import { queryClient } from "./query-client";
+import { beginSessionRequestGeneration } from "./session-request";
 import { chatSocket } from "./ws";
 
 export function endSession() {
@@ -27,6 +28,7 @@ function currentSession(): StoredSession | null {
 }
 
 function resetSessionResources() {
+  beginSessionRequestGeneration();
   chatSocket.disconnect();
   queryClient.clear();
   useChatStore.getState().reset();

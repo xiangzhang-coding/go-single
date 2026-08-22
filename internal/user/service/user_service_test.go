@@ -82,10 +82,10 @@ func (f *fakeUsers) HasAvatarURL(_ context.Context, reference string) (bool, err
 	return false, nil
 }
 
-func (f *fakeUsers) SearchByUsername(_ context.Context, prefix string, limit int) ([]model.PublicUser, error) {
+func (f *fakeUsers) SearchByUsername(_ context.Context, prefix string, excludeUserID int64, limit int) ([]model.PublicUser, error) {
 	users := make([]model.PublicUser, 0, limit)
 	for _, u := range f.byID {
-		if strings.HasPrefix(u.Username, prefix) {
+		if u.ID != excludeUserID && strings.HasPrefix(u.Username, prefix) {
 			users = append(users, model.PublicUser{ID: u.ID, Username: u.Username})
 		}
 	}
@@ -235,7 +235,7 @@ func TestSearchUsersByPrefix(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	got, err := svc.Search(context.Background(), "al", 10)
+	got, err := svc.Search(context.Background(), 99, "al", 10)
 	require.NoError(t, err)
 	usernames := make([]string, 0, len(got))
 	for _, u := range got {
@@ -243,6 +243,20 @@ func TestSearchUsersByPrefix(t *testing.T) {
 	}
 	// fake 按注册顺序（id 升序）返回：alice(1) → alex(2) → alina(4)。
 	assert.Equal(t, []string{"alice", "alex", "alina"}, usernames)
+}
+
+func TestSearchUsersExcludesCurrentUserBeforeLimit(t *testing.T) {
+	repo := newFakeUsers()
+	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
+	current, err := svc.Register(context.Background(), "alice", "secret123")
+	require.NoError(t, err)
+	_, err = svc.Register(context.Background(), "alex", "secret123")
+	require.NoError(t, err)
+
+	got, err := svc.Search(context.Background(), current.ID, "al", 1)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, "alex", got[0].Username)
 }
 
 func TestSearchUsersLimit(t *testing.T) {
@@ -254,11 +268,11 @@ func TestSearchUsersLimit(t *testing.T) {
 	}
 
 	// 非法 limit（0/负）收敛为默认 10；超上限截断为 20。
-	got, err := svc.Search(context.Background(), "u", 0)
+	got, err := svc.Search(context.Background(), 99, "u", 0)
 	require.NoError(t, err)
 	assert.Len(t, got, 5)
 
-	got, err = svc.Search(context.Background(), "u", 999)
+	got, err = svc.Search(context.Background(), 99, "u", 999)
 	require.NoError(t, err)
 	assert.Len(t, got, 5)
 }
@@ -268,13 +282,13 @@ func TestSearchUsersValidation(t *testing.T) {
 	svc := newTestService(repo, newFakeAddresses(), &fakeIssuer{})
 
 	// 空前缀被拒；超长前缀（>32 字节）被拒。
-	_, err := svc.Search(context.Background(), "", 10)
+	_, err := svc.Search(context.Background(), 99, "", 10)
 	require.ErrorIs(t, err, ErrInvalidUsername)
-	_, err = svc.Search(context.Background(), "abcdefghijklmnopqrstuvwxyz123456789", 10)
+	_, err = svc.Search(context.Background(), 99, "abcdefghijklmnopqrstuvwxyz123456789", 10)
 	require.ErrorIs(t, err, ErrInvalidUsername)
 
 	// 无匹配：空列表而非报错。
-	got, err := svc.Search(context.Background(), "zzz", 10)
+	got, err := svc.Search(context.Background(), 99, "zzz", 10)
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }

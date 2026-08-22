@@ -1,5 +1,5 @@
 // 秒杀异步落单消费者（T12）：订阅 SeckillOrderQueue 队列处理"抢购成功"消息，
-// 落单链路为 查活动 → 查默认地址（固化地址快照）→ order 服务单事务建单 +
+// 落单链路为 查活动 → order 准备地址/商品快照 → order 服务单事务建单 +
 // 扣活动库存（购买槽位唯一约束幂等，预扣成功绝不丢单）。
 // 失败分类：业务拒绝/数据缺失 = 永久失败（先持久化回退意图，再进死信队列）；
 // 基础设施故障 = 瞬时失败（Nack 重投，at-least-once）。
@@ -7,6 +7,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +22,6 @@ import (
 	"github.com/xiangzhang-coding/go-single/internal/platform/metrics"
 	"github.com/xiangzhang-coding/go-single/internal/platform/mq"
 	"github.com/xiangzhang-coding/go-single/internal/platform/transaction"
-	usermodel "github.com/xiangzhang-coding/go-single/internal/user/model"
 	"go.uber.org/zap"
 )
 
@@ -31,16 +32,12 @@ var ErrSeckillStockInsufficient = errors.New("seckill activity stock insufficien
 // OrderService flashsale 消费侧最小接口（跨模块进程内调用，order 服务实现）：
 // 异步落单（幂等建单 + 同事务扣活动库存）。
 type OrderService interface {
+	PrepareSeckillOrder(ctx context.Context, userID, skuID int64) (*ordersvc.SeckillOrderSnapshot, error)
 	CreateSeckillInTx(ctx context.Context, tx *transaction.Handle, p ordersvc.SeckillCreateParams) (created bool, err error)
 }
 
-// UserService 用户模块最小接口：读取默认地址固化为秒杀订单地址快照。
-type UserService interface {
-	GetDefaultAddress(ctx context.Context, userID int64) (*usermodel.Address, error)
-}
-
 // SeckillOrderConsumer 秒杀异步落单消费者（T12）。
-// 消费链路：消息 → 查活动（sku/秒杀价）→ 查默认地址 → 开启事务 →
+// 消费链路：消息 → 查活动（sku/秒杀价）→ order 准备快照 → 开启事务 →
 // order.CreateSeckillInTx + 活动库存条件扣减。
 // 预扣成功绝不丢单：重复投递/并发消费由购买槽位唯一约束幂等；
 // 瞬时失败由 MQ 重投；永久失败与死信由持久生命周期驱动完整回退。
@@ -50,7 +47,6 @@ type SeckillOrderConsumer struct {
 	legacyCache   legacyReservationCache
 	tx            seckillTxRunner
 	orders        OrderService
-	users         UserService
 	metrics       *metrics.Business
 	log           *zap.Logger
 }
@@ -58,11 +54,11 @@ type SeckillOrderConsumer struct {
 // NewSeckillOrderConsumer 构造秒杀落单消费者。
 func NewSeckillOrderConsumer(activities repository.ActivityRepository, preDeductions repository.PreDeductionRepository,
 	legacyCache legacyReservationCache,
-	tx seckillTxRunner, orders OrderService, users UserService, m *metrics.Business,
+	tx seckillTxRunner, orders OrderService, m *metrics.Business,
 	log *zap.Logger) *SeckillOrderConsumer {
 	return &SeckillOrderConsumer{
 		activities: activities, preDeductions: preDeductions, legacyCache: legacyCache,
-		tx: tx, orders: orders, users: users, metrics: m, log: log,
+		tx: tx, orders: orders, metrics: m, log: log,
 	}
 }
 
@@ -117,15 +113,21 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 		return c.permanent(ctx, "invalid seckill purchase snapshot", &msg, nil)
 	}
 
-	// 默认地址固化为地址快照（秒杀下单无选地址步骤；无地址为永久失败，对账兜底）。
-	address, err := c.users.GetDefaultAddress(ctx, msg.UserID)
+	// order 模块准备默认地址与内部商品快照。已接受预扣不再经过公开商品详情，
+	// 因此商品之后下架不会让异步落单失败。
+	snapshot, err := c.orders.PrepareSeckillOrder(ctx, msg.UserID, msg.SKUID)
 	if err != nil {
-		c.log.Warn("秒杀落单读取默认地址失败（瞬时，将重投）",
+		switch {
+		case errors.Is(err, ordersvc.ErrInvalidInput), errors.Is(err, ordersvc.ErrAddressNotFound),
+			errors.Is(err, ordersvc.ErrSKUNotFound), errors.Is(err, ordersvc.ErrSKUUnavailable):
+			return c.permanent(ctx, "prepare seckill order rejected", &msg, err)
+		}
+		c.log.Warn("秒杀落单准备订单快照失败（瞬时，将重投）",
 			zap.String("order_no", msg.OrderNo), zap.Int64("user_id", msg.UserID), zap.Error(err))
 		return err // 瞬时：DB 故障重投
 	}
-	if address == nil {
-		return c.permanent(ctx, "user has no default address", &msg, nil)
+	if snapshot == nil {
+		return c.permanent(ctx, "prepare seckill order returned no snapshot", &msg, nil)
 	}
 
 	created := false
@@ -167,7 +169,7 @@ func (c *SeckillOrderConsumer) Handle(ctx context.Context, body []byte) error {
 			SKUID:        msg.SKUID,
 			Price:        msg.Price,
 			Quantity:     msg.Quantity,
-			Address:      address,
+			Snapshot:     snapshot,
 		})
 		if err != nil {
 			return err
@@ -224,7 +226,9 @@ func (c *SeckillOrderConsumer) permanent(ctx context.Context, reason string, msg
 func (c *SeckillOrderConsumer) HandleDeadLetter(ctx context.Context, body []byte) error {
 	var msg SeckillSuccessMessage
 	if err := json.Unmarshal(body, &msg); err != nil || msg.OrderNo == "" || msg.UserID <= 0 || msg.ActivityID <= 0 {
-		c.log.Error("无法关联预扣事实的秒杀死信已丢弃", zap.ByteString("body", body), zap.Error(err))
+		digest := sha256.Sum256(body)
+		c.log.Error("无法关联预扣事实的秒杀死信已丢弃",
+			zap.Int("body_length", len(body)), zap.String("body_sha256", hex.EncodeToString(digest[:])), zap.Error(err))
 		return nil
 	}
 	if msg.PreDeductionID <= 0 {

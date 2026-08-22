@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from "react";
+import { Fragment, useEffect, type ReactNode } from "react";
 import {
   BrowserRouter,
   Navigate,
@@ -40,7 +40,7 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
     const returnTo = `${location.pathname}${location.search}`;
     return <Navigate to={`/login?returnTo=${encodeURIComponent(returnTo)}`} replace />;
   }
-  return children;
+  return <Fragment key={token}>{children}</Fragment>;
 }
 
 // AdminRoute 后台路由守卫（T25）：已登录 + admin 角色才放行；
@@ -56,7 +56,7 @@ function AdminRoute({ children }: { children: ReactNode }) {
   if (user.role !== "admin") {
     return <Navigate to="/" replace />;
   }
-  return children;
+  return <Fragment key={token}>{children}</Fragment>;
 }
 
 function GuestRoute({ children }: { children: ReactNode }) {

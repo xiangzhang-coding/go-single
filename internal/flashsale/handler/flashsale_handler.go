@@ -1,6 +1,7 @@
 // Package handler 暴露 flashsale 模块的 HTTP 接口：admin 秒杀活动管理
 // （创建/编辑/列表/上架/下架）+ 用户抢购（限流 → 幂等键 → 原子预扣 →
-// 持久生命周期 → MQ 异步落单 → 202 排队中 + pre_deduction_id 供前端轮询）。
+// 持久生命周期 → MQ 异步落单 → 202 排队中 + pre_deduction_id 供前端轮询；
+// 幂等重放已回退事实时返回 200 生命周期终态）。
 package handler
 
 import (
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/xiangzhang-coding/go-single/internal/flashsale/model"
 	"github.com/xiangzhang-coding/go-single/internal/flashsale/service"
 	"github.com/xiangzhang-coding/go-single/internal/platform/auth"
 	"github.com/xiangzhang-coding/go-single/internal/platform/httpresponse"
@@ -40,7 +42,7 @@ func New(svc service.Service, verifier auth.TokenVerifier) *Handler {
 //
 //	GET  /api/flashsales             秒杀页活动列表（进行中/即将开始，携带 server_time
 //	                                  供前端对齐倒计时；状态/剩余库存服务端派生）
-//	POST /api/flashsales/:id/purchase      抢购（成功返回 202 + pre_deduction_id）
+//	POST /api/flashsales/:id/purchase      抢购（在途返回 202；回退重放返回 200）
 //	GET  /api/flashsales/purchases/:id     查询本人预扣生命周期
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup, seckillTokenBucket gin.HandlerFunc) {
 	admin := rg.Group("/admin", auth.Middleware(h.verifier), auth.RequireAdmin())
@@ -68,6 +70,16 @@ type activityRequest struct {
 
 type purchaseRequest struct {
 	ClientRequestID string `json:"client_request_id" binding:"required"`
+}
+
+type purchaseLifecycleResponse struct {
+	ID           string                   `json:"id"`
+	Status       model.PreDeductionStatus `json:"status"`
+	OrderNo      *string                  `json:"order_no,omitempty"`
+	CreatedAt    time.Time                `json:"created_at"`
+	UpdatedAt    time.Time                `json:"updated_at"`
+	OrderedAt    *time.Time               `json:"ordered_at,omitempty"`
+	RolledBackAt *time.Time               `json:"rolled_back_at,omitempty"`
 }
 
 func (h *Handler) CreateActivity(c *gin.Context) {
@@ -145,7 +157,7 @@ func (h *Handler) UnpublishActivity(c *gin.Context) {
 
 // Purchase 抢购：限流（全局令牌桶中间件 + 按用户 Redis 计数）→ 幂等键 →
 // 缓存原子预扣 → 持久恢复生命周期 → MQ 异步落单；预扣成功立即返回
-// 202"排队中"与稳定预扣 ID，前端据此查询最终落单或完整回退状态。
+// 在途返回 202"排队中"与稳定预扣 ID；回退事实的幂等重放返回 200 终态。
 func (h *Handler) Purchase(c *gin.Context) {
 	id, ok := idParam(c)
 	if !ok {
@@ -165,13 +177,20 @@ func (h *Handler) Purchase(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{
+	response := gin.H{
 		"pre_deduction_id":     strconv.FormatInt(result.PreDeductionID, 10),
 		"pre_deduction_status": result.Status,
 		"status":               "queued",
 		"order_no":             result.OrderNo,
 		"message":              "排队中",
-	})
+	}
+	if result.Status == model.PreDeductionStatusRolledBack {
+		response["status"] = model.PreDeductionStatusRolledBack
+		response["message"] = "抢购已回退"
+		c.JSON(http.StatusOK, response)
+		return
+	}
+	c.JSON(http.StatusAccepted, response)
 }
 
 func (h *Handler) GetPurchase(c *gin.Context) {
@@ -189,7 +208,11 @@ func (h *Handler) GetPurchase(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, pd)
+	c.JSON(http.StatusOK, purchaseLifecycleResponse{
+		ID: strconv.FormatInt(pd.ID, 10), Status: pd.Status, OrderNo: pd.OrderNo,
+		CreatedAt: pd.CreatedAt, UpdatedAt: pd.UpdatedAt,
+		OrderedAt: pd.OrderedAt, RolledBackAt: pd.RolledBackAt,
+	})
 }
 
 func activityParams(req activityRequest) service.ActivityParams {

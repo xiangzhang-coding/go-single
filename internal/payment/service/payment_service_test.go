@@ -6,6 +6,8 @@ package service
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -101,14 +103,17 @@ func (f *fakeOrderSvc) CanRecordFailedPayment(_ context.Context, _ *transaction.
 // ---- fixture ----
 
 type fixture struct {
-	svc   Service
-	pays  *fakePayments
-	order *fakeOrderSvc
+	svc       Service
+	pays      *fakePayments
+	order     *fakeOrderSvc
+	metrics   *metrics.Registry
+	commitErr error
 }
 
 func newFixture() *fixture {
 	f := &fixture{pays: newFakePayments(), order: newFakeOrderSvc()}
-	f.svc = New(repository.Store{Payments: f.pays, Tx: fixtureTx{f}}, f.order, metrics.New().Business())
+	f.metrics = metrics.New()
+	f.svc = New(repository.Store{Payments: f.pays, Tx: fixtureTx{f}}, f.order, f.metrics.Business())
 	return f
 }
 
@@ -126,12 +131,31 @@ func (t fixtureTx) WithinTx(_ context.Context, fn func(tx *transaction.Handle) e
 	for k, v := range t.f.pays.byOrder {
 		byOrder[k] = append([]paymentmodel.Payment(nil), v...)
 	}
-	if err := fn(nil); err != nil {
+	statuses := make(map[string]string, len(t.f.order.views))
+	for orderNo, view := range t.f.order.views {
+		statuses[orderNo] = view.Status
+	}
+	err := fn(nil)
+	if err == nil {
+		err = t.f.commitErr
+	}
+	if err != nil {
 		t.f.pays.byID = byID
 		t.f.pays.byOrder = byOrder
+		for orderNo, status := range statuses {
+			t.f.order.views[orderNo].Status = status
+		}
 		return err
 	}
 	return nil
+}
+
+func scrapePaymentMetrics(t *testing.T, registry *metrics.Registry) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	registry.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	return rec.Body.String()
 }
 
 // seedOrder 预置一张待支付订单，返回其订单视图。
@@ -165,6 +189,21 @@ func TestMockPaySuccessTransitionsOrderToPaid(t *testing.T) {
 	require.Equal(t, int64(9900), p.Amount)
 	require.Equal(t, ordermodel.OrderStatusPaid, fx.order.views["1001"].Status, "支付成功订单应进入已支付")
 	require.Equal(t, 1, len(fx.pays.byID), "成功回调应落一条流水")
+}
+
+func TestPaidStatusMetricRequiresPaymentCommit(t *testing.T) {
+	failed := newFixture()
+	failed.seedOrder(42, "1001", 9900)
+	failed.commitErr = errors.New("commit failed")
+	_, err := failed.svc.MockPay(context.Background(), 42, params("failed-commit"))
+	require.Error(t, err)
+	require.NotContains(t, scrapePaymentMetrics(t, failed.metrics), `orders_status_total{status="paid"}`)
+
+	committed := newFixture()
+	committed.seedOrder(42, "1001", 9900)
+	_, err = committed.svc.MockPay(context.Background(), 42, params("committed"))
+	require.NoError(t, err)
+	require.Contains(t, scrapePaymentMetrics(t, committed.metrics), `orders_status_total{status="paid"} 1`)
 }
 
 func TestMockPayFailKeepsOrderPendingAndRecordsLedger(t *testing.T) {

@@ -247,7 +247,7 @@ function CategorySection({
               <Button variant="primary" size="small" disabled={saveMutation.isPending}>
                 保存
               </Button>
-              <Button variant="ghost" size="small" onClick={() => setEditing(null)}>
+              <Button type="button" variant="ghost" size="small" onClick={() => setEditing(null)}>
                 取消
               </Button>
             </form>
@@ -372,7 +372,7 @@ function ProductForm({
           {mutation.isPending ? <Spinner label="保存中" /> : initial ? "保存修改" : "创建商品"}
         </Button>
         {!initial && (
-          <Button variant="ghost" onClick={() => setForm(emptyProductForm)}>清空</Button>
+          <Button type="button" variant="ghost" onClick={() => setForm(emptyProductForm)}>清空</Button>
         )}
       </div>
     </form>
@@ -545,7 +545,7 @@ function SKUForm({
           {mutation.isPending ? <Spinner label="保存中" /> : initial ? "保存 SKU" : "添加 SKU"}
         </Button>
         {initial && (
-          <Button variant="ghost" onClick={() => onDone()}>取消</Button>
+          <Button type="button" variant="ghost" onClick={() => onDone()}>取消</Button>
         )}
       </div>
     </form>

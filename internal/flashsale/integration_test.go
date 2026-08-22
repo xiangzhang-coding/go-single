@@ -369,7 +369,7 @@ func registerAndToken(t *testing.T, env *testEnv, username string) string {
 
 func uniqueName(prefix string) string { return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano()) }
 
-// seedSKU admin 建类目→商品→SKU，返回 SKU id（秒杀活动绑定目标）。
+// seedSKU admin 建类目→商品→SKU 并上架商品，返回可售 SKU id。
 func seedSKU(t *testing.T, env *testEnv, admin string) int64 {
 	t.Helper()
 	w, cat := doJSON(t, env, http.MethodPost, "/api/admin/categories", fmt.Sprintf(`{"name":%q}`, uniqueName("类目")), admin)
@@ -383,6 +383,9 @@ func seedSKU(t *testing.T, env *testEnv, admin string) int64 {
 		fmt.Sprintf("/api/admin/products/%d/skus", int64(prod["id"].(float64))),
 		`{"specs":{"color":"红"},"price":19900,"stock":500}`, admin)
 	require.Equal(t, http.StatusCreated, w.Code, "建 SKU 失败: %s", w.Body.String())
+	w, _ = doJSON(t, env, http.MethodPost,
+		fmt.Sprintf("/api/admin/products/%d/publish", int64(prod["id"].(float64))), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code, "上架商品失败: %s", w.Body.String())
 	return int64(sku["id"].(float64))
 }
 
@@ -517,11 +520,48 @@ func TestPublishPrewarmConsistency(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, w.Code)
 	require.Equal(t, 50, redisStock(t, env, id))
 
-	// 编辑未开始活动（配置库存变化）→ 预热库存覆盖为新值（DEL+SET）。
+	// 编辑未开始活动（配置库存变化）→ durable Lua 预热库存覆盖为新值。
 	w, _ = doJSON(t, env, http.MethodPut, fmt.Sprintf("/api/admin/flashsales/%d", id),
 		activityBody(skuID, "改", 9900, 80, 1, time.Hour, 2*time.Hour), admin)
 	require.Equal(t, http.StatusNoContent, w.Code)
 	require.Equal(t, 80, redisStock(t, env, id))
+}
+
+func TestPublishRejectsSKUWhoseProductIsOffSale(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	skuID := seedSKU(t, env, admin)
+	var productID int64
+	require.NoError(t, env.gdb.Table("skus").Select("product_id").Where("id = ?", skuID).Scan(&productID).Error)
+	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/products/%d/unpublish", productID), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	id := createActivity(t, env, admin, skuID, 10, 1, -time.Minute, time.Hour)
+
+	w, _ = doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", id), "", admin)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	_, err := env.redis.Get(context.Background(), stockKey(id)).Result()
+	require.ErrorIs(t, err, redis.Nil)
+}
+
+func TestPeriodicRecoveryRebuildsMissingPublishedStockWithoutReservations(t *testing.T) {
+	env := requireEnv(t)
+	admin := adminToken(t, env)
+	skuID := seedSKU(t, env, admin)
+	id := createActivity(t, env, admin, skuID, 37, 1, -time.Minute, time.Hour)
+	w, _ := doJSON(t, env, http.MethodPost, fmt.Sprintf("/api/admin/flashsales/%d/publish", id), "", admin)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	var preDeductions int64
+	require.NoError(t, env.gdb.Table("flashsale_pre_deductions").Where("activity_id = ?", id).Count(&preDeductions).Error)
+	require.Zero(t, preDeductions)
+	require.NoError(t, env.redis.Del(context.Background(), stockKey(id)).Err())
+	require.False(t, env.flashsaleSvc.PurchasesBlocked())
+
+	stats, err := env.flashsaleSvc.RecoverPreDeductions(context.Background())
+
+	require.NoError(t, err)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 37, redisStock(t, env, id))
 }
 
 // 进行中编辑库存只减不增：调高被拒（409，DB 与 Redis 均不变）；调低生效（Redis 同步降低）。

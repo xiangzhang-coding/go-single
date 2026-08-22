@@ -83,6 +83,8 @@ func TestPreflightDisallowedOrigin(t *testing.T) {
 
 	require.Equal(t, http.StatusForbidden, w.Code)
 	require.Empty(t, w.Header().Get("Access-Control-Allow-Origin"))
+	require.Equal(t, "application/json; charset=utf-8", w.Header().Get("Content-Type"))
+	require.JSONEq(t, `{"error":"origin not allowed"}`, w.Body.String())
 }
 
 func TestEmptyAllowListAllowsAll(t *testing.T) {

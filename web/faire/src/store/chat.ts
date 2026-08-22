@@ -41,11 +41,13 @@ function mergeConversations(
 
 interface ChatState {
   conversations: ConversationView[];
+  conversationsHasMore: boolean;
   messagesByKey: Record<string, Message[]>;
   activeKey: string | null;
   wsOnline: boolean;
 
-  setConversations: (items: ConversationView[]) => void;
+  setConversations: (items: ConversationView[], hasMore: boolean) => void;
+  setConversationPage: (items: ConversationView[], hasMore: boolean) => void;
   upsertConversation: (conv: ConversationView) => void;
   setActiveKey: (key: string | null) => void;
   setMessages: (key: string, messages: Message[]) => void;
@@ -58,12 +60,21 @@ interface ChatState {
 
 export const useChatStore = create<ChatState>()((set, get) => ({
   conversations: [],
+  conversationsHasMore: false,
   messagesByKey: {},
   activeKey: null,
   wsOnline: false,
 
-  setConversations: (items) => set((state) => ({
+  setConversations: (items, hasMore) => set((state) => ({
     conversations: mergeConversations(state.conversations, items),
+    conversationsHasMore: state.conversations.length > items.length
+      ? state.conversationsHasMore
+      : hasMore,
+  })),
+
+  setConversationPage: (items, hasMore) => set((state) => ({
+    conversations: mergeConversations(state.conversations, items),
+    conversationsHasMore: hasMore,
   })),
 
   upsertConversation: (conv) => {
@@ -91,7 +102,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
 
   setWsOnline: (online) => set({ wsOnline: online }),
 
-  reset: () => set({ conversations: [], messagesByKey: {}, activeKey: null, wsOnline: false }),
+  reset: () => set({ conversations: [], conversationsHasMore: false, messagesByKey: {}, activeKey: null, wsOnline: false }),
 
   handleMessage: (message, isOwn) => {
     const { conversations, messagesByKey, activeKey } = get();

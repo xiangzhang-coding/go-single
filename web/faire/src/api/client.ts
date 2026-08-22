@@ -1,6 +1,7 @@
 import axios, { AxiosError } from "axios";
 
 import { endSession } from "../lib/session";
+import { currentSessionRequestSignal } from "../lib/session-request";
 import { useAuthStore } from "../store/auth";
 import type { ErrorResponse } from "./types";
 
@@ -25,6 +26,10 @@ api.interceptors.request.use((config) => {
   const token = useAuthStore.getState().token;
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
+    const sessionSignal = currentSessionRequestSignal();
+    config.signal = config.signal
+      ? AbortSignal.any([config.signal as AbortSignal, sessionSignal])
+      : sessionSignal;
   }
   return config;
 });

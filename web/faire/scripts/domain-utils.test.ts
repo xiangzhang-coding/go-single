@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { buildOrderRequest, parseCheckoutIntent } from "../src/lib/checkout";
+import { toUpdateAddressRequest } from "../src/lib/address";
 import {
   describeCouponRule,
   formatAddress,
@@ -56,6 +57,27 @@ describe("checkout intent", () => {
     ]) {
       expect(parseCheckoutIntent(new URLSearchParams(query))).toBeNull();
     }
+  });
+});
+
+describe("address requests", () => {
+  test("an update omits the create-only default selection", () => {
+    expect(toUpdateAddressRequest({
+      receiver: "Alice",
+      phone: "13800138000",
+      province: "粤",
+      city: "深",
+      district: "南山",
+      detail: "科技园",
+      is_default: true,
+    })).toEqual({
+      receiver: "Alice",
+      phone: "13800138000",
+      province: "粤",
+      city: "深",
+      district: "南山",
+      detail: "科技园",
+    });
   });
 });
 

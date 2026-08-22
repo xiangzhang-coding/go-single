@@ -41,7 +41,7 @@ type Order struct {
 	OrderType       string     `json:"order_type"`
 	Status          string     `json:"status"`
 	ActivityID      *int64     `json:"activity_id,omitempty" gorm:"column:activity_id"`
-	PurchaseSlot    *int64     `json:"purchase_slot,omitempty" gorm:"column:purchase_slot"`
+	PurchaseSlot    *int64     `json:"purchase_slot,omitempty,string" gorm:"column:purchase_slot"`
 	TotalAmount     int64      `json:"total_amount" gorm:"column:total_amount"`
 	DiscountAmount  int64      `json:"discount_amount" gorm:"column:discount_amount"`
 	PayAmount       int64      `json:"pay_amount" gorm:"column:pay_amount"`

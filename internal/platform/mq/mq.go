@@ -19,15 +19,16 @@ type MessageHandler func(ctx context.Context, body []byte) error
 
 // MQ 消息层接口（ADR-0003 seam），RabbitMQ 实现，Kafka 可换。
 type MQ interface {
-	// Ping 检查连接可用性。
+	// Ping 检查连接可用性；连接中断时按 ctx 自动恢复。
 	Ping(ctx context.Context) error
-	// Close 释放底层连接。
+	// Close 释放底层连接；关闭后 Publish/Consume/Ping 不再重拨。
 	Close() error
 	// Publish 向队列投递持久化消息（队列不存在自动声明，声明幂等）；
-	// 经发布确认（publisher confirm）确保送达，失败返回错误（调用方决定重试/降级）。
+	// 经发布确认（publisher confirm）确保送达；连接中断时按 ctx 自动恢复，
+	// 其余失败返回错误（调用方决定重试/降级）。
 	Publish(ctx context.Context, queue string, body []byte) error
 	// Consume 消费队列消息直到 ctx 取消；每条消息以独立超时执行 handler，
 	// 按 handler 返回错误分类 Ack / 退避重投 / 死信（见 MessageHandler）。
-	// 消费者退出/连接断开时未 Ack 的消息由 RabbitMQ 自动重投（at-least-once）。
+	// 连接中断时按 ctx 自动恢复消费；未 Ack 的消息由 RabbitMQ 自动重投（at-least-once）。
 	Consume(ctx context.Context, queue string, handler MessageHandler) error
 }

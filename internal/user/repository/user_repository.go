@@ -33,9 +33,9 @@ type UserRepository interface {
 	UpdateProfile(ctx context.Context, userID int64, patch ProfilePatch) error
 	// HasAvatarURL 判断托管引用是否仍绑定为用户头像。
 	HasAvatarURL(ctx context.Context, reference string) (bool, error)
-	// SearchByUsername 按用户名前缀搜索（"加好友"发现入口），id 升序
-	// 返回至多 limit 条；prefix 为空或 limit <= 0 返回空列表，不触达数据库。
-	SearchByUsername(ctx context.Context, prefix string, limit int) ([]model.PublicUser, error)
+	// SearchByUsername 按用户名前缀搜索（"加好友"发现入口），在 LIMIT 前排除
+	// excludeUserID 并按 id 升序返回；prefix 为空或 limit <= 0 不触达数据库。
+	SearchByUsername(ctx context.Context, prefix string, excludeUserID int64, limit int) ([]model.PublicUser, error)
 	// GetPublicByIDs 批量读取可公开资料；空 id 集合不触达数据库。
 	GetPublicByIDs(ctx context.Context, ids []int64) ([]model.PublicUser, error)
 }

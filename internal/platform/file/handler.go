@@ -21,15 +21,16 @@ type Handler struct {
 	svc        *MinIO
 	verifier   auth.TokenVerifier
 	authorizer AccessAuthorizer
+	concurrent *uploadConcurrency
 }
 
 // NewHandler 构造处理器。authorizer 为 nil 时仅上传者本人可读取。
-func NewHandler(svc *MinIO, verifier auth.TokenVerifier, authorizer AccessAuthorizer) *Handler {
-	return &Handler{svc: svc, verifier: verifier, authorizer: authorizer}
+func NewHandler(svc *MinIO, verifier auth.TokenVerifier, authorizer AccessAuthorizer, concurrency UploadConcurrencyConfig) *Handler {
+	return &Handler{svc: svc, verifier: verifier, authorizer: authorizer, concurrent: newUploadConcurrency(concurrency)}
 }
 
 func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
-	rg.POST("/files", auth.Middleware(h.verifier), h.Upload)
+	rg.POST("/files", auth.Middleware(h.verifier), h.concurrent.middleware(), h.Upload)
 	rg.GET("/files/:reference", auth.Middleware(h.verifier), h.Read)
 }
 

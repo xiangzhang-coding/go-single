@@ -12,8 +12,10 @@ import {
 } from "../api/endpoints";
 import { getApiErrorMessage } from "../api/client";
 import type { Address, CreateAddressRequest, UpdateProfileRequest } from "../api/types";
+import { toUpdateAddressRequest } from "../lib/address";
 import { formatAddress } from "../lib/format";
 import { IMAGE_ACCEPT, validateImage } from "../lib/media";
+import { executeMediaSave, type PreparedMediaUpload } from "../lib/media-save";
 import { Button, EmptyState, ErrorState, Icon, LoadingBlock, Spinner } from "../components/ui";
 import { AuthorizedImage } from "../components/AuthorizedMedia";
 import { useAuthStore } from "../store/auth";
@@ -53,6 +55,7 @@ function ProfileSection() {
   const setUser = useAuthStore((state) => state.setUser);
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const preparedAvatarRef = useRef<PreparedMediaUpload | null>(null);
 
   const [nickname, setNickname] = useState(user?.nickname || "");
   const [previewUrl, setPreviewUrl] = useState(""); // 本地预览（objectURL），空 = 未换头像
@@ -82,16 +85,21 @@ function ProfileSection() {
 
   const saveMutation = useMutation({
     mutationFn: async (request: UpdateProfileRequest) => {
-      if (request.avatar_url === undefined && pendingAvatar) {
-        const uploaded = await uploadFile(pendingAvatar, "image");
-        return authApi.updateProfile({ ...request, avatar_url: uploaded.url });
-      }
-      return authApi.updateProfile(request);
+      return executeMediaSave(
+        request.avatar_url === undefined ? pendingAvatar : null,
+        preparedAvatarRef.current,
+        (file) => uploadFile(file, "image"),
+        (reference) => authApi.updateProfile(reference ? { ...request, avatar_url: reference } : request),
+        (prepared) => {
+          preparedAvatarRef.current = prepared;
+        },
+      );
     },
     onSuccess: (updated) => {
       setUser(updated);
       queryClient.setQueryData(["me"], updated);
       setPendingAvatar(null);
+      preparedAvatarRef.current = null;
       setPreviewUrl("");
       setAvatarRemoved(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -110,6 +118,7 @@ function ProfileSection() {
       return;
     }
     setPendingAvatar(file);
+    preparedAvatarRef.current = null;
     setPreviewUrl(URL.createObjectURL(file));
     setAvatarRemoved(false);
     setNotice(null);
@@ -118,6 +127,7 @@ function ProfileSection() {
   function clearAvatar() {
     if (pendingAvatar) {
       setPendingAvatar(null);
+      preparedAvatarRef.current = null;
       setPreviewUrl("");
     } else {
       setAvatarRemoved(true);
@@ -237,7 +247,7 @@ function AddressSection() {
   const saveMutation = useMutation({
     mutationFn: async ({ id, draft }: { id: number | null; draft: CreateAddressRequest }) => {
       if (id) {
-        await updateAddress(id, draft);
+        await updateAddress(id, toUpdateAddressRequest(draft));
         return;
       }
       return createAddress(draft);

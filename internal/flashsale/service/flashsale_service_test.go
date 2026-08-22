@@ -166,6 +166,8 @@ type fakeCache struct {
 	rl                   map[string]int // flashsale:rl:{user} → 限流计数
 	err                  error
 	aofErr               error
+	restoreErr           error
+	restoreAOFErr        error
 	decreaseErr          error
 	paused               map[string]string
 	respectContextCancel bool
@@ -294,11 +296,16 @@ func (f *fakeCache) WarmFlashSaleStock(_ context.Context, p cache.FlashSaleWarmP
 	if f.err != nil {
 		return 0, f.err
 	}
-	if cur, ok := f.stock[p.StockKey]; !ok || p.Stock < cur {
+	if cur, ok := f.stock[p.StockKey]; p.Overwrite || !ok || p.Stock < cur {
 		f.stock[p.StockKey] = p.Stock
 		return cache.FlashSaleStockUpdated, nil
 	}
 	return cache.FlashSaleStockRetained, nil
+}
+
+func (f *fakeCache) WarmFlashSaleStockDurably(ctx context.Context, p cache.FlashSaleWarmParams, _ time.Duration) (cache.FlashSaleWarmResult, error) {
+	result, err := f.WarmFlashSaleStock(ctx, p)
+	return result, f.afterAOF(err)
 }
 
 func (f *fakeCache) DecreaseFlashSaleStockDurably(_ context.Context, p cache.FlashSaleDecreaseParams, _ time.Duration) error {
@@ -501,6 +508,9 @@ func (f *fakeCache) RestoreFlashSale(_ context.Context, p cache.FlashSaleRestore
 	if f.err != nil {
 		return 0, f.err
 	}
+	if f.restoreErr != nil {
+		return 0, f.restoreErr
+	}
 	if f.reservations[p.ReservationKey] == "rolled_back:"+p.ReservationToken {
 		return cache.FlashSaleAlreadyRestored, nil
 	}
@@ -551,6 +561,9 @@ func (f *fakeCache) RestoreFlashSale(_ context.Context, p cache.FlashSaleRestore
 
 func (f *fakeCache) RestoreFlashSaleDurably(ctx context.Context, p cache.FlashSaleRestoreParams, _ time.Duration) (cache.FlashSaleRestoreResult, error) {
 	result, err := f.RestoreFlashSale(ctx, p)
+	if err == nil && f.restoreAOFErr != nil {
+		return result, f.restoreAOFErr
+	}
 	return result, f.afterAOF(err)
 }
 
@@ -754,7 +767,7 @@ func TestPublishPrewarmsStock(t *testing.T) {
 	require.Equal(t, model.ActivityStatusOnSale, updated.Status)
 }
 
-// 未开始的活动上架：覆盖已有存量（DEL+SET）。
+// 未开始的活动上架：durable Lua 覆盖已有存量。
 func TestPublishNotStartedOverwrites(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, func(p *ActivityParams) {
@@ -789,6 +802,97 @@ func TestPublishPropagatesWarmCacheError(t *testing.T) {
 	require.Equal(t, model.ActivityStatusOffSale, updated.Status, "预热失败时活动不得上架")
 }
 
+func TestPublishRequiresAOFConfirmationBeforeGoingOnSale(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, func(p *ActivityParams) {
+		p.StartAt = time.Now().Add(time.Hour)
+		p.EndAt = time.Now().Add(2 * time.Hour)
+	})
+	fx.cache.aofErr = errors.New("WAITAOF timeout")
+
+	err := fx.svc.PublishActivity(context.Background(), a.ID)
+
+	require.ErrorContains(t, err, "WAITAOF timeout")
+	updated, getErr := fx.acts.GetByID(context.Background(), a.ID)
+	require.NoError(t, getErr)
+	require.Equal(t, model.ActivityStatusOffSale, updated.Status,
+		"Redis mutation without AOF confirmation must not make the activity sellable")
+}
+
+func TestStartupRecoveryRebuildsPublishedStockWithoutPreDeductions(t *testing.T) {
+	tests := []struct {
+		name   string
+		window func(*ActivityParams)
+		seed   int
+		want   int
+	}{
+		{
+			name: "future activity overwrites stale stock",
+			window: func(p *ActivityParams) {
+				p.StartAt = time.Now().Add(time.Hour)
+				p.EndAt = time.Now().Add(2 * time.Hour)
+			},
+			seed: 42, want: 100,
+		},
+		{name: "in-progress activity rebuilds missing stock", want: 100},
+		{name: "in-progress activity retains lower live stock", seed: 42, want: 42},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := newFixture()
+			a := fx.createActivity(t, tt.window)
+			require.NoError(t, fx.acts.UpdateStatus(context.Background(), a.ID, model.ActivityStatusOnSale))
+			if tt.seed > 0 {
+				fx.cache.stock[stockKey(a.ID)] = tt.seed
+			}
+
+			stats, err := fx.svc.RecoverPreDeductionsAtStartup(context.Background())
+
+			require.NoError(t, err)
+			require.Equal(t, RecoveryStats{}, stats)
+			require.Equal(t, tt.want, fx.cache.stock[stockKey(a.ID)])
+		})
+	}
+}
+
+func TestStartupRecoveryRequiresAOFConfirmationForPublishedStock(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.acts.UpdateStatus(context.Background(), a.ID, model.ActivityStatusOnSale))
+	fx.cache.aofErr = errors.New("WAITAOF timeout")
+
+	_, err := fx.svc.RecoverPreDeductionsAtStartup(context.Background())
+
+	require.ErrorContains(t, err, "WAITAOF timeout")
+}
+
+func TestPeriodicRecoveryRequiresAOFConfirmationForPublishedStock(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.acts.UpdateStatus(context.Background(), a.ID, model.ActivityStatusOnSale))
+	fx.cache.aofErr = errors.New("WAITAOF timeout")
+
+	_, err := fx.svc.RecoverPreDeductions(context.Background())
+
+	require.ErrorContains(t, err, "recover published flash-sale stock")
+	require.ErrorContains(t, err, "WAITAOF timeout")
+}
+
+func TestPeriodicRecoveryRebuildsMissingPublishedStockWithoutPreDeductions(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	require.False(t, fx.svc.PurchasesBlocked())
+	require.Empty(t, fx.preDeductions.byID)
+	delete(fx.cache.stock, stockKey(a.ID))
+
+	_, err := fx.svc.RecoverPreDeductions(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, a.Stock, fx.cache.stock[stockKey(a.ID)])
+}
+
 // 已结束的活动不可上架。
 func TestPublishEndedRejected(t *testing.T) {
 	fx := newFixture()
@@ -802,6 +906,20 @@ func TestPublishEndedRejected(t *testing.T) {
 func TestPublishNotFound(t *testing.T) {
 	fx := newFixture()
 	require.ErrorIs(t, fx.svc.PublishActivity(context.Background(), 999), ErrActivityNotFound)
+}
+
+func TestPublishRejectsSKUWhoseProductIsNotOnSale(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	fx.products.products[1].Status = productmodel.ProductStatusOffSale
+
+	err := fx.svc.PublishActivity(context.Background(), a.ID)
+
+	require.ErrorIs(t, err, ErrInvalidInput)
+	updated, getErr := fx.acts.GetByID(context.Background(), a.ID)
+	require.NoError(t, getErr)
+	require.Equal(t, model.ActivityStatusOffSale, updated.Status)
+	require.NotContains(t, fx.cache.stock, stockKey(a.ID))
 }
 
 // ---- 进行中编辑库存只减不增 ----
@@ -937,8 +1055,8 @@ func TestUpdateSyncFailureFailsClosedAfterRequestCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	fx.acts.respectContextCancel = true
 	fx.cache.respectContextCancel = true
-	fx.cache.delErrOnce = errors.New("redis sync failed")
-	fx.cache.onDelError = cancel
+	cancel()
+	fx.cache.aofErr = context.Canceled
 
 	p := ActivityParams{
 		SKUID: a.SKUID, Title: a.Title, Price: a.Price, Stock: 90,
@@ -971,7 +1089,7 @@ func TestUpdateCannotReduceStockBelowAcceptedReservations(t *testing.T) {
 	require.Equal(t, 5, fx.cache.stock[stockKey(a.ID)])
 }
 
-// 未开始的已上架活动编辑：可覆盖 Redis 存量（DEL+SET）。
+// 未开始的已上架活动编辑：可原子覆盖 Redis 存量。
 func TestUpdateNotStartedOverwrites(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, func(p *ActivityParams) {
@@ -1418,6 +1536,44 @@ func TestSeckillDuplicateReturnsExistingLifecycle(t *testing.T) {
 	require.NoError(t, discardSeckill(fx.svc, context.Background(), 7, a2.ID))
 }
 
+func TestSeckillRejectedRequestReplayReturnsRolledBackLifecycle(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	fx.cache.stock[stockKey(a.ID)] = 0
+
+	first, err := fx.svc.Seckill(context.Background(), 7, a.ID, "rejected-request")
+	require.Nil(t, first)
+	require.ErrorIs(t, err, ErrSoldOut)
+
+	replayed, err := fx.svc.Seckill(context.Background(), 7, a.ID, "rejected-request")
+	require.NoError(t, err)
+	require.NotZero(t, replayed.PreDeductionID)
+	require.Equal(t, model.PreDeductionStatusRolledBack, replayed.Status)
+	require.Empty(t, replayed.OrderNo)
+	require.Equal(t, 0, fx.cache.stock[stockKey(a.ID)])
+}
+
+func TestSeckillRolledBackReplayReturnsOriginalLifecycle(t *testing.T) {
+	fx := newFixture()
+	a := fx.createActivity(t, nil)
+	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+
+	accepted, err := fx.svc.Seckill(context.Background(), 7, a.ID, "rolled-back-request")
+	require.NoError(t, err)
+	require.NotEmpty(t, accepted.OrderNo)
+	require.NoError(t, fx.preDeductions.MarkPendingRollback(
+		context.Background(), accepted.PreDeductionID, "order creation failed",
+	))
+	require.NoError(t, fx.svc.RecoverPreDeduction(context.Background(), accepted.PreDeductionID))
+
+	replayed, err := fx.svc.Seckill(context.Background(), 7, a.ID, "rolled-back-request")
+	require.NoError(t, err)
+	require.Equal(t, accepted.PreDeductionID, replayed.PreDeductionID)
+	require.Equal(t, model.PreDeductionStatusRolledBack, replayed.Status)
+	require.Equal(t, accepted.OrderNo, replayed.OrderNo)
+}
+
 func TestSeckillPerUserLimitAllocatesIndependentPurchaseSlots(t *testing.T) {
 	fx := newFixture()
 	a := fx.createActivity(t, func(p *ActivityParams) { p.PerUserLimit = 2 })
@@ -1669,10 +1825,10 @@ func TestListUserActivitiesRemainingStockAndSummary(t *testing.T) {
 
 func TestListUserActivitiesSkipsBrokenSummary(t *testing.T) {
 	fx := newFixture()
-	// SKU 不存在的活动（如 SKU 被删除）：活动仍返回，摘要为空。
+	// 已上架后 SKU 被删除：活动仍返回，摘要为空。
 	a := fx.createActivity(t, nil)
-	delete(fx.products.skus, 1)
 	require.NoError(t, fx.svc.PublishActivity(context.Background(), a.ID))
+	delete(fx.products.skus, 1)
 
 	views, err := fx.svc.ListUserActivities(context.Background())
 	require.NoError(t, err)

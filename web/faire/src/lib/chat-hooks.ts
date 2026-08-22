@@ -21,7 +21,7 @@ export function useChatRealtime() {
 
   const conversationsQuery = useQuery({
     queryKey: ["conversations", userId],
-    queryFn: async () => (await getConversations({ limit: 50 })).items,
+    queryFn: () => getConversations({ limit: 20 }),
     enabled: Boolean(token && userId),
     refetchInterval: 60_000,
     staleTime: 30_000,
@@ -29,7 +29,7 @@ export function useChatRealtime() {
 
   useEffect(() => {
     if (token && userId && conversationsQuery.data) {
-      setConversations(conversationsQuery.data);
+      setConversations(conversationsQuery.data.items, conversationsQuery.data.has_more);
     }
   }, [conversationsQuery.data, setConversations, token, userId]);
 

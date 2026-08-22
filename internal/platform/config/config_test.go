@@ -52,6 +52,9 @@ func TestLoad(t *testing.T) {
 	require.Equal(t, int64(512<<20), cfg.Upload.MaxBytesPerUser)
 	require.Equal(t, int64(1000), cfg.Upload.MaxObjectsPerUser)
 	require.Equal(t, 2*time.Minute, cfg.Upload.RequestTimeout)
+	require.Equal(t, 16, cfg.Upload.MaxConcurrent)
+	require.Equal(t, 2, cfg.Upload.MaxConcurrentPerUser)
+	require.Equal(t, 4, cfg.Upload.MaxConcurrentPerIP)
 }
 
 func TestMySQLDSN(t *testing.T) {
@@ -68,6 +71,9 @@ func TestLoadEnvOverride(t *testing.T) {
 	t.Setenv("GO_SINGLE_SERVER_MAX_JSON_BODY_BYTES", "32768")
 	t.Setenv("GO_SINGLE_AUTH_LOGIN_RATE_LIMIT_PER_IP_MAX", "42")
 	t.Setenv("GO_SINGLE_UPLOAD_MAX_OBJECTS_PER_USER", "77")
+	t.Setenv("GO_SINGLE_UPLOAD_MAX_CONCURRENT", "9")
+	t.Setenv("GO_SINGLE_UPLOAD_MAX_CONCURRENT_PER_USER", "3")
+	t.Setenv("GO_SINGLE_UPLOAD_MAX_CONCURRENT_PER_IP", "5")
 
 	root := repoRoot(t)
 	cfg, err := LoadFrom(filepath.Join(root, "configs"), root)
@@ -80,6 +86,9 @@ func TestLoadEnvOverride(t *testing.T) {
 	require.Equal(t, int64(32768), cfg.Server.MaxJSONBodyBytes)
 	require.Equal(t, 42, cfg.Auth.LoginRateLimit.PerIPMax)
 	require.Equal(t, int64(77), cfg.Upload.MaxObjectsPerUser)
+	require.Equal(t, 9, cfg.Upload.MaxConcurrent)
+	require.Equal(t, 3, cfg.Upload.MaxConcurrentPerUser)
+	require.Equal(t, 5, cfg.Upload.MaxConcurrentPerIP)
 }
 
 func TestLoadReleaseRejectsDefaultJWTSecret(t *testing.T) {

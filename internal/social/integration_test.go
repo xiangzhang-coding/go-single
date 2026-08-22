@@ -153,7 +153,7 @@ func buildEnv() (*testEnv, error) {
 	api := r.Group("/api")
 	userhandler.New(userSvc, verifier, testsupport.AllowAllAuthAttempts{}).RegisterRoutes(api)
 	socialhandler.New(socialSvc, postSvc, verifier).RegisterRoutes(api)
-	file.NewHandler(fileSvc, verifier, postMediaAuthorizer{posts: postSvc}).RegisterRoutes(api)
+	file.NewHandler(fileSvc, verifier, postMediaAuthorizer{posts: postSvc}, file.UploadConcurrencyConfig{}).RegisterRoutes(api)
 	return &testEnv{router: r, verifier: verifier, gdb: gdb}, nil
 }
 
@@ -185,6 +185,9 @@ func (stubOrderNoGen) Next() (int64, error) { return 0, nil }
 type stubProducts struct{}
 
 func (stubProducts) GetSKU(context.Context, int64) (*productmodel.SKU, error) { return nil, nil }
+func (stubProducts) GetProduct(context.Context, int64) (*productmodel.Product, error) {
+	return nil, nil
+}
 func (stubProducts) GetSKUForUpdate(context.Context, *transaction.Handle, int64) (*productmodel.SKU, error) {
 	return nil, nil
 }
