@@ -7,6 +7,9 @@ export const IMAGE_ACCEPT = IMAGE_TYPES.join(",");
 export const MESSAGE_FILE_ACCEPT = MESSAGE_FILE_EXTENSIONS.map((extension) => `.${extension}`).join(",");
 
 export function validateImage(file: File, subject = "图片"): string | null {
+  if (file.size === 0) {
+    return `${subject}不能为空。`;
+  }
   if (!IMAGE_TYPES.includes(file.type)) {
     return `${subject}仅支持 png / jpeg / webp / gif。`;
   }
@@ -17,6 +20,9 @@ export function validateImage(file: File, subject = "图片"): string | null {
 }
 
 export function validateMessageFile(file: File): string | null {
+  if (file.size === 0) {
+    return "文件不能为空。";
+  }
   const extension = file.name.split(".").pop()?.toLowerCase() || "";
   if (!MESSAGE_FILE_EXTENSIONS.includes(extension)) {
     return "文件仅支持 PDF、ZIP、TXT、CSV 和 Markdown。";

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { latestMessageID } from "../web/faire/src/lib/chat";
-import { useChatStore } from "../web/faire/src/store/chat";
+import { totalUnread, useChatStore } from "../web/faire/src/store/chat";
 
 const message = (id: number) => ({
   id,
@@ -64,6 +64,36 @@ describe("chat read state", () => {
     expect(useChatStore.getState().messagesByKey["1:2"]?.map((item) => item.id)).toEqual([42, 43]);
     expect(useChatStore.getState().conversations[0]?.last_message?.id).toBe(43);
     expect(useChatStore.getState().conversations[0]?.unread_count).toBe(2);
+  });
+
+  test("does not count active incoming messages as unread", () => {
+    useChatStore.getState().setActiveKey("1:2");
+    useChatStore.getState().handleMessage(message(43), false);
+
+    expect(useChatStore.getState().messagesByKey["1:2"]?.map((item) => item.id)).toEqual([43]);
+    expect(useChatStore.getState().conversations[0]?.unread_count).toBe(0);
+  });
+
+  test("does not count an own message in an inactive conversation as unread", () => {
+    useChatStore.getState().handleMessage(message(44), true);
+
+    expect(useChatStore.getState().messagesByKey["1:2"]?.map((item) => item.id)).toEqual([44]);
+    expect(useChatStore.getState().conversations[0]?.unread_count).toBe(0);
+  });
+
+  test("a duplicate WebSocket delivery increments inactive unread state only once", () => {
+    useChatStore.getState().handleMessage(message(43), false);
+    useChatStore.getState().handleMessage(message(43), false);
+
+    expect(useChatStore.getState().messagesByKey["1:2"]?.map((item) => item.id)).toEqual([43]);
+    expect(useChatStore.getState().conversations[0]?.unread_count).toBe(1);
+  });
+
+  test("sums unread counts across conversations", () => {
+    expect(totalUnread([
+      { conversation_key: "1:2", peer_user_id: 2, peer_username: "bob", unread_count: 2 },
+      { conversation_key: "1:3", peer_user_id: 3, peer_username: "carol", unread_count: 4 },
+    ])).toBe(6);
   });
 
   test("an older HTTP message page cannot overwrite a newer WebSocket message", () => {

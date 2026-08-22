@@ -314,11 +314,11 @@ export async function markConversationRead(conversationKey: string, lastMessageI
 const uploadRequestIDs = new WeakMap<File, string>();
 
 export async function uploadFile(file: File, kind: MediaKind = "image") {
-	let requestID = uploadRequestIDs.get(file);
-	if (!requestID) {
-		requestID = makeClientRequestID();
-		uploadRequestIDs.set(file, requestID);
-	}
+  let requestID = uploadRequestIDs.get(file);
+  if (!requestID) {
+    requestID = makeClientRequestID();
+    uploadRequestIDs.set(file, requestID);
+  }
   const form = new FormData();
   form.append("file", file);
   form.append("kind", kind);
