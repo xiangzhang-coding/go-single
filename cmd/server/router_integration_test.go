@@ -271,9 +271,7 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 		require.True(t, activeFound, "published activity must be observable as active through the user API")
 
 		firstRequestID := "flash-first-" + runID
-		first, firstFields := productionJSON[productionPurchaseResponse](t, router, http.MethodPost,
-			fmt.Sprintf("/api/flashsales/%d/purchase", activity.ID), userToken,
-			map[string]any{"client_request_id": firstRequestID}, http.StatusAccepted)
+		first, firstFields := productionPurchaseAccepted(t, router, userToken, activity.ID, firstRequestID, 90*time.Second)
 		productionRequireKeys(t, firstFields, "pre_deduction_id", "pre_deduction_status", "status", "order_no", "message")
 		require.Equal(t, "queued", first.Status)
 		require.NotEmpty(t, first.PreDeductionID)
@@ -306,9 +304,7 @@ func TestProductionRouterRegistersCompleteApplication(t *testing.T) {
 			"cancellation must restore Redis stock before replacement purchase")
 
 		secondRequestID := "flash-second-" + runID
-		second, secondFields := productionJSON[productionPurchaseResponse](t, router, http.MethodPost,
-			fmt.Sprintf("/api/flashsales/%d/purchase", activity.ID), userToken,
-			map[string]any{"client_request_id": secondRequestID}, http.StatusAccepted)
+		second, secondFields := productionPurchaseAccepted(t, router, userToken, activity.ID, secondRequestID, 90*time.Second)
 		productionRequireKeys(t, secondFields, "pre_deduction_id", "pre_deduction_status", "status", "order_no", "message")
 		require.Equal(t, "queued", second.Status)
 		require.NotEqual(t, first.PreDeductionID, second.PreDeductionID)
@@ -667,6 +663,32 @@ func productionFlashSaleItem(t *testing.T, router http.Handler, token string, ac
 	}
 	require.FailNowf(t, "flash sale missing from user list", "activity_id=%d", activityID)
 	return productionFlashSaleListItemResponse{}
+}
+
+func productionPurchaseAccepted(t *testing.T, router http.Handler, token string, activityID int64, requestID string, timeout time.Duration) (productionPurchaseResponse, map[string]json.RawMessage) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	path := fmt.Sprintf("/api/flashsales/%d/purchase", activityID)
+	body := map[string]any{"client_request_id": requestID}
+	for {
+		response := productionRequest(t, router, http.MethodPost, path, token, body)
+		if response.Code == http.StatusAccepted {
+			var purchase productionPurchaseResponse
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &purchase))
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &fields))
+			return purchase, fields
+		}
+		if response.Code != http.StatusServiceUnavailable || !bytes.Contains(response.Body.Bytes(), []byte("flashsale recovery incomplete")) {
+			require.FailNowf(t, "purchase request failed", "POST %s returned %d: %s", path, response.Code, response.Body.String())
+		}
+		if time.Now().After(deadline) {
+			require.FailNowf(t, "flash-sale recovery gate did not open", "last response: %s", response.Body.String())
+		}
+		<-ticker.C
+	}
 }
 
 func productionPollPurchaseOrdered(t *testing.T, router http.Handler, token, preDeductionID string, timeout time.Duration) productionPurchaseLifecycleResponse {
